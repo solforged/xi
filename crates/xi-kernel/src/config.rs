@@ -1,6 +1,7 @@
 //! Configuration layers, workspace trust and sandbox construction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -106,6 +107,13 @@ pub struct SandboxConfig {
     /// Environment variable names passed through to tools.
     #[serde(default)]
     pub env: Vec<String>,
+    /// A host command, run once per session in the workspace, that prints
+    /// the environment tools should see as a JSON object of names to
+    /// strings, or to `null` to unset, such as `mise env --json` or
+    /// `direnv export json`. Its values replace the host's only for
+    /// variables already passed through.
+    #[serde(default)]
+    pub env_command: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -131,6 +139,7 @@ struct SandboxLayer {
     readable: Option<Vec<PathBuf>>,
     writable: Option<Vec<PathBuf>>,
     env: Option<Vec<String>>,
+    env_command: Option<Vec<String>>,
 }
 
 /// Fully layered settings for one canonical workspace.
@@ -288,6 +297,9 @@ impl Config {
                 if let Some(env) = sandbox.env {
                     config.sandbox.env = env;
                 }
+                if let Some(command) = sandbox.env_command {
+                    config.sandbox.env_command = command;
+                }
             }
             config.registries.push(RegistryConfig {
                 provider: layer.provider,
@@ -318,7 +330,8 @@ impl Config {
 
     /// Constructs the per-session sandbox and validates its paths. `git` is
     /// the directory from [`write_sandbox_git`]; its `config` becomes the
-    /// sandbox's global git config.
+    /// sandbox's global git config. Runs `sandbox.env_command` on the host
+    /// when one is set.
     pub fn sandbox_spec(
         &self,
         tmp: &Path,
@@ -332,6 +345,11 @@ impl Config {
         spec.writable
             .extend(self.sandbox.writable.iter().map(|p| self.paths.expand(p)));
         spec.env.extend(self.sandbox.env.iter().cloned());
+        let overlay = self.host_env()?;
+        let host = |name: &str| match overlay.get(name) {
+            Some(value) => value.clone().map(OsString::from),
+            None => std::env::var_os(name),
+        };
         for path in [
             "~/.cargo",
             "~/.rustup",
@@ -346,7 +364,7 @@ impl Config {
         }
         // Toolchain homes that rustup and cargo find through the environment.
         for var in ["CARGO_HOME", "RUSTUP_HOME"] {
-            if let Some(path) = std::env::var_os(var).map(PathBuf::from)
+            if let Some(path) = host(var).map(PathBuf::from)
                 && path.is_absolute()
                 && path.exists()
             {
@@ -357,14 +375,55 @@ impl Config {
         // The toolchain pin (mise and rust-toolchain files set it), so cargo
         // picks the same toolchain as outside.
         spec.env.push("RUSTUP_TOOLCHAIN".into());
+        let mut path: Vec<PathBuf> = host("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        #[cfg(target_os = "macos")]
+        if let Some((sdk, dirs)) = developer_tools() {
+            // /usr/bin's developer tools are xcrun shims. xcrun caches its
+            // lookups in the per-user cache directory, which Seatbelt hides,
+            // so inside every call runs xcodebuild, which prints noise. The
+            // real directories, resolved here, go just ahead of /usr/bin, and
+            // SDKROOT spares compilers the same lookup.
+            if let Some(at) = path.iter().position(|d| d == Path::new("/usr/bin")) {
+                let new: Vec<PathBuf> = dirs
+                    .into_iter()
+                    .filter(|d| !path[..at].contains(d))
+                    .collect();
+                path.splice(at..at, new);
+            }
+            if host("SDKROOT").is_some() {
+                spec.env.push("SDKROOT".into());
+            } else {
+                spec.vars.insert("SDKROOT".into(), sdk);
+            }
+        }
         // Every directory on PATH, so tools the user runs resolve the same
         // way inside. The home directory and its ancestors are skipped: they
         // would expose every credential store under home.
-        if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path) {
-                if dir.is_absolute() && dir.is_dir() && !self.paths.home.starts_with(&dir) {
-                    spec.readable.push(dir);
+        for dir in &path {
+            if dir.is_absolute() && dir.is_dir() && !self.paths.home.starts_with(dir) {
+                spec.readable.push(dir.clone());
+            }
+        }
+        if !path.is_empty() {
+            let path = std::env::join_paths(&path)
+                .map_err(|e| Error::Config(format!("sandbox PATH: {e}")))?;
+            spec.vars
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
+        }
+        // The command's values stand in for the host's, but only for names
+        // that pass through anyway: anything else it prints, such as secrets
+        // in a tool manager's environment, stays outside.
+        for (name, value) in overlay {
+            if name == "PATH" || !spec.env.contains(&name) {
+                continue;
+            }
+            match value {
+                Some(value) => {
+                    spec.vars.insert(name, value);
                 }
+                None => spec.env.retain(|n| *n != name),
             }
         }
         if let Ok(user) = std::env::var("USER") {
@@ -383,6 +442,61 @@ impl Config {
         spec.validate().map_err(|e| Error::Config(e.to_string()))?;
         Ok(spec)
     }
+
+    /// The environment `sandbox.env_command` prints, or nothing without one.
+    fn host_env(&self) -> Result<HashMap<String, Option<String>>> {
+        let Some((program, args)) = self.sandbox.env_command.split_first() else {
+            return Ok(HashMap::new());
+        };
+        let fail = |why: String| {
+            Error::Config(format!(
+                "sandbox.env_command `{}`: {why}",
+                self.sandbox.env_command.join(" ")
+            ))
+        };
+        let output = std::process::Command::new(self.paths.expand(Path::new(program)))
+            .args(args)
+            .current_dir(&self.workspace)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| fail(e.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(fail(format!("{}: {}", output.status, stderr.trim())));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|e| fail(format!("expected a JSON object of strings or nulls: {e}")))
+    }
+}
+
+/// The SDK path and the directories xcrun's shims in /usr/bin point to, or
+/// `None` without an active developer directory.
+#[cfg(target_os = "macos")]
+fn developer_tools() -> Option<(String, Vec<PathBuf>)> {
+    let run = |program: &str, args: &[&str]| {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8(output.stdout).ok()?;
+        let text = text.trim();
+        (output.status.success() && !text.is_empty()).then(|| text.to_owned())
+    };
+    // Checked first: without one, xcrun offers to install the tools.
+    run("/usr/bin/xcode-select", &["-p"])?;
+    let sdk = run("/usr/bin/xcrun", &["--show-sdk-path"])?;
+    let mut dirs = Vec::new();
+    for tool in ["git", "clang"] {
+        if let Some(dir) = run("/usr/bin/xcrun", &["-f", tool])
+            .and_then(|p| Path::new(&p).parent().map(Path::to_owned))
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
+    }
+    Some((sdk, dirs))
 }
 
 /// Writes the global git config used inside the sandbox into the directory
