@@ -298,12 +298,15 @@ impl Config {
         self.paths.data.join("sessions").join(slug)
     }
 
-    /// Constructs the per-session sandbox and validates its paths.
+    /// Constructs the per-session sandbox and validates its paths. `git` is
+    /// the directory from [`write_sandbox_git`]; its `config` becomes the
+    /// sandbox's global git config.
     pub fn sandbox_spec(
         &self,
         tmp: &Path,
         spill: &Path,
         skills: &[PathBuf],
+        git: &Path,
     ) -> Result<xi_sandbox::Spec> {
         let mut spec = xi_sandbox::Spec::new(&self.workspace, tmp);
         spec.readable
@@ -331,9 +334,67 @@ impl Config {
         }
         spec.readable.extend(skills.iter().cloned());
         spec.readable.push(spill.to_owned());
+        spec.readable.push(git.to_owned());
+        spec.vars.insert(
+            "GIT_CONFIG_GLOBAL".into(),
+            git.join("config").to_string_lossy().into_owned(),
+        );
         spec.validate().map_err(|e| Error::Config(e.to_string()))?;
         Ok(spec)
     }
+}
+
+/// Writes the global git config used inside the sandbox into the directory
+/// `dir`, as `config` plus a copy of the user's global ignore file. The
+/// user's own files live under the home directory, which is unreadable in
+/// the sandbox, and macOS git fails hard on that. They may also name hooks,
+/// credential helpers or signing keys that need secrets outside the sandbox.
+/// Sandboxed git gets the user's identity and ignore patterns, with signing
+/// turned off.
+pub fn write_sandbox_git(dir: &Path, paths: &Paths) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let quote = |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut text = String::from("[user]\n");
+    for key in ["name", "email"] {
+        if let Some(value) = host_git_config(&format!("user.{key}"), false) {
+            text.push_str(&format!("\t{key} = {}\n", quote(&value)));
+        }
+    }
+    let excludes = host_git_config("core.excludesFile", true)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map_or_else(|| paths.home.join(".config"), PathBuf::from)
+                .join("git/ignore")
+        });
+    let ignore = dir.join("ignore");
+    match std::fs::read(&excludes) {
+        Ok(patterns) => std::fs::write(&ignore, patterns)?,
+        Err(_) => std::fs::write(&ignore, "")?,
+    }
+    text.push_str(&format!(
+        "[core]\n\texcludesFile = {}\n[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n",
+        quote(&ignore.to_string_lossy())
+    ));
+    std::fs::write(dir.join("config"), text)
+}
+
+/// Reads one value from the host's global git config, outside the sandbox.
+fn host_git_config(key: &str, path: bool) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command.args(["config", "--global", "--get"]);
+    if path {
+        command.arg("--type=path");
+    }
+    let out = command
+        .arg(key)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!value.is_empty() && !value.contains('\n')).then_some(value)
 }
 
 /// Parses a provider/model selector, retaining slashes inside the model id.
