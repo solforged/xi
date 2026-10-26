@@ -289,7 +289,7 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 | `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server and sandboxed extension host. | Implemented |
 | `xi-cli` | The `xi` binary: line mode, headless `-p`, `serve`, `trust`. | Implemented |
 | `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |
-| `xi-tui` | Terminal client. | Implemented (in process; no `/tree` or child sessions yet) |
+| `xi-tui` | Terminal client: scrollback commits, a live region, `ctrl+o` full results and a `/tree` checkout overlay. | Implemented (in process; no child sessions yet) |
 | `sdk/typescript` | Zero-dependency extension SDK and full-duplex NDJSON peer. | Implemented |
 
 ## Build order

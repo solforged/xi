@@ -15,6 +15,7 @@ pub mod screen;
 pub mod status;
 pub mod style;
 pub mod transcript;
+pub mod tree;
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -30,7 +31,7 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
 use xi_kernel::config::{Config, parse_model};
 use xi_kernel::{EventBus, Notification, Session, TurnOptions, TurnOutcome};
-use xi_protocol::{Block, Event, EventId, SessionId};
+use xi_protocol::{Block, Event, EventId, SessionId, Timestamp};
 use xi_provider::ModelInfo;
 
 use crate::editor::Editor;
@@ -38,6 +39,7 @@ use crate::screen::Screen;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
 use crate::transcript::{SPINNER, Transcript, duration, tokens};
+use crate::tree::Tree;
 
 /// A client error.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -86,6 +88,7 @@ impl Drop for Raw {
 enum Focus {
     Composer,
     Approval,
+    Tree,
 }
 
 type Reply = oneshot::Receiver<Result<TurnOutcome, String>>;
@@ -95,6 +98,8 @@ struct App {
     transcript: Transcript,
     editor: Editor,
     focus: Focus,
+    /// The session tree overlay, while it is open.
+    tree: Option<Tree>,
     /// Option selected in the approval: 0 allow, 1 deny.
     choice: usize,
     /// Replies of prompts sent to the running turn.
@@ -127,6 +132,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
         transcript: Transcript::default(),
         editor: Editor::default(),
         focus: Focus::Composer,
+        tree: None,
         choice: 0,
         pending: FuturesUnordered::new(),
         started: None,
@@ -304,7 +310,7 @@ impl App {
             self.focus = Focus::Approval;
             self.choice = 0;
         }
-        if now == 0 {
+        if now == 0 && self.focus == Focus::Approval {
             self.focus = Focus::Composer;
         }
     }
@@ -402,6 +408,14 @@ impl App {
                 self.note(vec![style::rule(self.cols)]);
                 self.attach().await;
             }
+            "/tree" if self.running() => self.note(vec![
+                Line::default().dim("  /tree waits for the turn to end · esc stops it"),
+            ]),
+            "/tree" => {
+                let info = self.launch.session.info().await;
+                self.tree = Some(Tree::new(&info.events, info.head));
+                self.focus = Focus::Tree;
+            }
             "/model" if rest.trim().is_empty() => {
                 let model = self.model.as_ref().map_or_else(
                     || "unknown".to_owned(),
@@ -429,6 +443,10 @@ impl App {
             _ => {
                 let rows = [
                     ("/new", "start a new session"),
+                    (
+                        "/tree",
+                        "browse branches; check out a point to branch from it",
+                    ),
                     ("/model PROVIDER/MODEL", "switch models"),
                     ("/quit", "leave; ctrl+d on an empty line does the same"),
                     ("enter", "send; during a turn, steer it"),
@@ -436,6 +454,10 @@ impl App {
                     ("ctrl+j", "new line"),
                     ("esc", "stop the turn"),
                     ("tab", "answer a waiting approval"),
+                    (
+                        "ctrl+o",
+                        "show the newest cut-short result whole; again for older",
+                    ),
                 ];
                 let mut lines = Vec::new();
                 if name != "/help" {
@@ -476,17 +498,91 @@ impl App {
         self.focus = Focus::Composer;
     }
 
+    fn close_tree(&mut self) {
+        self.tree = None;
+        self.focus = Focus::Composer;
+    }
+
+    /// Checks out the selected tree node and rebuilds what the client knows
+    /// from the new head's branch. Scrollback stays as it was.
+    async fn checkout(&mut self) {
+        let Some(node) = self.tree.as_ref().and_then(Tree::current).cloned() else {
+            return;
+        };
+        self.close_tree();
+        if let Err(error) = self.launch.session.checkout(node.target).await {
+            self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+            return;
+        }
+        let info = self.launch.session.info().await;
+        let mut transcript = Transcript::default();
+        for event in lineage(&info.events, info.head) {
+            let n = Notification::Event(xi_protocol::methods::client::EventParams {
+                session: info.session,
+                event,
+            });
+            transcript.apply(&n, self.cols);
+        }
+        transcript.end_turn();
+        transcript.session = self.transcript.session;
+        transcript.keep_details(&mut self.transcript);
+        self.transcript = transcript;
+        self.refresh_model();
+        let what = match &node.prompt {
+            Some(prompt) => {
+                if self.editor.is_empty() {
+                    self.editor.insert(prompt);
+                }
+                "before this prompt · edit it or send it as is to start a new branch"
+            }
+            None => "your next prompt continues from here",
+        };
+        let mut line = Line::default()
+            .brass("  ↳ ")
+            .ink("checked out · ")
+            .dim(what);
+        if self.transcript.tainted {
+            line = line.dim(" · ").murex("◆ tainted");
+        }
+        self.note(vec![line.truncate(self.cols)]);
+    }
+
+    async fn tree_key(&mut self, key: KeyEvent) {
+        let Some(tree) = self.tree.as_mut() else {
+            self.focus = Focus::Composer;
+            return;
+        };
+        let page = isize::try_from(self.rows / 2).unwrap_or(1).max(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => tree.step(-1),
+            KeyCode::Down | KeyCode::Char('j') => tree.step(1),
+            KeyCode::PageUp => tree.step(-page),
+            KeyCode::PageDown => tree.step(page),
+            KeyCode::Home => tree.jump(false),
+            KeyCode::End => tree.jump(true),
+            KeyCode::Enter => self.checkout().await,
+            KeyCode::Esc | KeyCode::Char('q') => self.close_tree(),
+            _ => {}
+        }
+    }
+
     async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if ctrl && key.code == KeyCode::Char('c') {
-            if self.running() {
+            if self.focus == Focus::Tree {
+                self.close_tree();
+            } else if self.running() {
                 self.launch.session.cancel();
             } else if !self.editor.is_empty() {
                 self.editor.clear();
             } else {
                 self.quit = true;
             }
+            return Ok(());
+        }
+        if self.focus == Focus::Tree {
+            self.tree_key(key).await;
             return Ok(());
         }
         if self.focus == Focus::Approval {
@@ -507,6 +603,17 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => e.insert("\n"),
             KeyCode::Enter => self.submit(false).await?,
             KeyCode::Char('j') if ctrl => e.insert("\n"),
+            KeyCode::Char('o') if ctrl => {
+                let lines = self.transcript.expand(self.cols).unwrap_or_else(|| {
+                    let why = if self.transcript.collapsed() {
+                        "  that was the oldest cut-short result · ctrl+o starts again from the newest"
+                    } else {
+                        "  nothing cut short yet · results longer than three lines show whole here"
+                    };
+                    self.transcript.note(vec![Line::default().dim(why)])
+                });
+                self.commit.extend(lines);
+            }
             KeyCode::Tab if !self.transcript.asks().is_empty() => {
                 self.focus = Focus::Approval;
                 self.choice = 0;
@@ -691,6 +798,16 @@ impl App {
             }
             lines.extend(self.approval_box(cols));
         }
+        if self.focus == Focus::Tree
+            && let Some(tree) = &self.tree
+        {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            let composer = self.editor.render(cols, Role::Dim, "").0.len();
+            let rows = self.rows.saturating_sub(composer + 3);
+            lines.extend(tree.render(cols, rows, Timestamp::now()));
+        }
         if self.running() {
             if !lines.is_empty() {
                 lines.push(Line::default());
@@ -734,7 +851,7 @@ impl App {
                 cols,
             ));
         }
-        let border = if self.focus == Focus::Approval {
+        let border = if matches!(self.focus, Focus::Approval | Focus::Tree) {
             Role::Dim
         } else if self.transcript.tainted {
             Role::Murex
