@@ -326,6 +326,29 @@ impl Config {
                 spec.readable.push(path);
             }
         }
+        // Toolchain homes that rustup and cargo find through the environment.
+        for var in ["CARGO_HOME", "RUSTUP_HOME"] {
+            if let Some(path) = std::env::var_os(var).map(PathBuf::from)
+                && path.is_absolute()
+                && path.exists()
+            {
+                spec.readable.push(path);
+                spec.env.push(var.into());
+            }
+        }
+        // The toolchain pin (mise and rust-toolchain files set it), so cargo
+        // picks the same toolchain as outside.
+        spec.env.push("RUSTUP_TOOLCHAIN".into());
+        // Every directory on PATH, so tools the user runs resolve the same
+        // way inside. The home directory and its ancestors are skipped: they
+        // would expose every credential store under home.
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                if dir.is_absolute() && dir.is_dir() && !self.paths.home.starts_with(&dir) {
+                    spec.readable.push(dir);
+                }
+            }
+        }
         if let Ok(user) = std::env::var("USER") {
             let path = PathBuf::from("/etc/profiles/per-user").join(user);
             if path.exists() {
