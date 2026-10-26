@@ -395,11 +395,23 @@ impl SessionLog {
     }
 }
 
+/// Takes the exclusive lock, waiting up to half a second for a holder to go
+/// away. A lock briefly outlives its owner: a child spawned by any thread in
+/// this process holds inherited copies of open descriptors until it execs,
+/// so a log reopened right after closing it can see itself as locked.
 fn lock(file: &File, path: &Path) -> Result<(), Error> {
-    file.try_lock().map_err(|error| match error {
-        TryLockError::WouldBlock => Error::Locked(path.to_owned()),
-        TryLockError::Error(source) => io_error(path, source),
-    })
+    const ATTEMPTS: u32 = 100;
+    for attempt in 1..=ATTEMPTS {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if attempt < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(TryLockError::WouldBlock) => return Err(Error::Locked(path.to_owned())),
+            Err(TryLockError::Error(source)) => return Err(io_error(path, source)),
+        }
+    }
+    unreachable!("the last attempt returns")
 }
 
 fn io_error(path: &Path, source: io::Error) -> Error {
