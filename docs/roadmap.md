@@ -45,9 +45,9 @@ The goal is a client good enough for daily work, including developing xi with xi
 | Slice | Contents | Protocol | Status |
 |---|---|---|---|
 | 1. Model and reasoning | Model picker, `shift+tab` reasoning cycle, `/reasoning` (also in line mode), reasoning in the footer | `session/models`, `session/set_reasoning`, `reasoning` in `SessionDetails` | Done |
-| 2. Sessions and approvals | `/resume` picker, approvals inbox across sessions, approval scopes | `remember` on `approval/resolve`; `session/list` and `approval/list` exist | Planned |
+| 2. Sessions and approvals | `/resume` picker, approvals inbox across sessions with `/approvals`, approval scopes for once, session and workspace | `remember` on `approval/resolve`; `taint` and `trusted` on pending asks; `started`, `updated` and `title` in `session/list` | Done |
 | 3. Composer | Saved history with `ctrl+r`, `ctrl+g` external editor, `/` and `@` completion, extension commands and `/compact` in the TUI; `/help` built from the key dispatch table | `session/commands` | Done |
-| 4. Rendering and keys | `edit` diffs, `ctrl+t` thinking display, `/copy`, `[keys]` in `tui.toml` | None | Planned |
+| 4. Rendering and keys | `edit` diffs, `ctrl+t` thinking display, `/copy`, `[keys]` and `[display]` in `tui.toml` | None | Done |
 | 5. Settings | Settings view with config layers, save as default | None; the client edits the global config file | Planned |
 
 After these, in rough order of daily value: `!cmd` and `!!cmd` run in the session sandbox (needs `session/shell`), session rename and auto-naming, a large-paste menu, image paste, `alt+up` to pull queued prompts back, git branch and session cost in the footer, `/export`, and themes. Plan mode, todo, advisor, an agent hub and dashboards stay packages in the feature queue.

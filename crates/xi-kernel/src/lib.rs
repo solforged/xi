@@ -17,7 +17,7 @@ mod extension_session;
 pub mod extensions;
 pub mod worker;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,8 +25,8 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use xi_policy::{Action, Taint};
-use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
+use xi_policy::{Action, ActionKind, Taint};
+use xi_protocol::event::{Approver, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, ResetParams};
 use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::{
@@ -51,6 +51,9 @@ pub enum Error {
     /// No ask is pending for that call.
     #[error("no pending approval for that call")]
     NotPending,
+    /// A requested approval scope is not valid for this ask.
+    #[error("{0}")]
+    InvalidRemember(String),
     /// Filesystem failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -234,13 +237,29 @@ struct Queued {
     content: Vec<Block>,
     reply: Reply,
 }
+struct ApprovalAnswer {
+    approved: bool,
+    remember: Remember,
+    grant: Option<(String, String)>,
+}
+
+struct PendingAsk {
+    answer: oneshot::Sender<ApprovalAnswer>,
+    taint: bool,
+    kind: ActionKind,
+    subject: String,
+    grant: (String, String),
+    workspace: PathBuf,
+    trusted: bool,
+}
+
 #[derive(Default)]
 struct Control {
     running: bool,
     generation: u64,
     cancel: CancellationToken,
     queue: VecDeque<Queued>,
-    approvals: HashMap<ToolCallId, oneshot::Sender<bool>>,
+    approvals: HashMap<ToolCallId, PendingAsk>,
 }
 struct State {
     log: SessionLog,
@@ -251,6 +270,7 @@ struct State {
     tools_context: xi_tools::Context,
     backend: Option<ActiveBackend>,
     extensions: Option<extensions::Extensions>,
+    grants: HashSet<(String, String)>,
 }
 
 impl State {
@@ -398,6 +418,7 @@ impl Session {
                 _ => {}
             }
         }
+        let grants = lineage_grants(&log, head);
         let system = SystemContext::at(&config, log.root().at)?;
         let spill = log.file_path().with_extension("spill");
         let tmp = log.file_path().with_extension("tmp");
@@ -439,6 +460,7 @@ impl Session {
                 tools_context,
                 backend,
                 extensions: None,
+                grants,
             }),
             control: Mutex::new(Control::default()),
             commands: Mutex::new(Vec::new()),
@@ -457,6 +479,7 @@ impl Session {
                             call: call.clone(),
                             approved: false,
                             by: Approver::Interrupted,
+                            remember: Remember::Once,
                         },
                     )?;
                 }
@@ -573,16 +596,31 @@ impl Session {
     }
 
     /// Resolves a pending ask. Duplicate and unknown answers fail.
-    pub fn approve(&self, call: &ToolCallId, approved: bool) -> Result<()> {
-        let tx = self
-            .0
-            .control
-            .lock()
-            .expect("control lock")
-            .approvals
-            .remove(call)
-            .ok_or(Error::NotPending)?;
-        tx.send(approved).map_err(|_| Error::NotPending)
+    pub fn approve(&self, call: &ToolCallId, approved: bool, remember: Remember) -> Result<()> {
+        let mut control = self.0.control.lock().expect("control lock");
+        let pending = control.approvals.get(call).ok_or(Error::NotPending)?;
+        if !remember.is_once() && (!approved || pending.taint) {
+            return Err(Error::InvalidRemember(
+                "only an approved, non-taint ask can be remembered".into(),
+            ));
+        }
+        if remember == Remember::Workspace {
+            if !pending.trusted {
+                return Err(Error::InvalidRemember(
+                    "workspace approvals require a trusted workspace".into(),
+                ));
+            }
+            config::append_workspace_allow(&pending.workspace, pending.kind, &pending.subject)?;
+        }
+        let pending = control.approvals.remove(call).ok_or(Error::NotPending)?;
+        pending
+            .answer
+            .send(ApprovalAnswer {
+                approved,
+                remember,
+                grant: (!remember.is_once()).then_some(pending.grant),
+            })
+            .map_err(|_| Error::NotPending)
     }
 
     /// Moves the head only when no turn is running.
@@ -609,6 +647,7 @@ impl Session {
                 _ => {}
             }
         }
+        state.grants = lineage_grants(&state.log, event);
         state.head = event;
         state.config.reasoning = reasoning;
         if let Some(model) = selected
@@ -1069,6 +1108,7 @@ impl Session {
                             action: format!("tool {name}"),
                             decision: Decision::Deny,
                             rule: Some("extension pre_tool".into()),
+                            taint: false,
                         },
                     )?;
                     return self.append(
@@ -1133,6 +1173,7 @@ impl Session {
         };
         let mut verdict = state.config.policy.evaluate(Action::Tool { name }, taint);
         let mut action = format!("tool {name}");
+        let mut deciding = None;
         for crossing in &crossings {
             let candidate = state.config.policy.evaluate(
                 match crossing {
@@ -1145,6 +1186,7 @@ impl Session {
             );
             if candidate.decision > verdict.decision {
                 verdict = candidate;
+                deciding = Some(crossing);
                 action = match crossing {
                     Crossing::Read(p) => format!("read {}", p.display()),
                     Crossing::Write(p) => format!("write {}", p.display()),
@@ -1153,8 +1195,20 @@ impl Session {
                 };
             }
         }
-        let decision = verdict.decision;
-        let rule = verdict.rule.map(|rule| rule.to_string());
+        let taint_ask = verdict.taint_downgraded;
+        let mut decision = verdict.decision;
+        let mut rule = verdict.rule.map(|rule| rule.to_string());
+        if decision == Decision::Ask
+            && !taint_ask
+            && !(taint == Taint::Tainted && matches!(deciding, Some(Crossing::Net(_))))
+            && state
+                .grants
+                .iter()
+                .any(|(tool, granted)| tool == name && granted == &action)
+        {
+            decision = Decision::Allow;
+            rule = Some("session".into());
+        }
         // Register the waiter before announcing the decision: fast clients may
         // answer as soon as they see the event.
         let waiter = if decision == Decision::Ask
@@ -1166,7 +1220,32 @@ impl Session {
                 .lock()
                 .expect("control lock")
                 .approvals
-                .insert(call.clone(), tx);
+                .insert(
+                    call.clone(),
+                    PendingAsk {
+                        answer: tx,
+                        taint: taint_ask,
+                        kind: match deciding {
+                            Some(Crossing::Read(_)) => ActionKind::Read,
+                            Some(Crossing::Write(_)) => ActionKind::Write,
+                            Some(Crossing::Exec(_)) => ActionKind::Exec,
+                            Some(Crossing::Net(_)) => ActionKind::Net,
+                            None => ActionKind::Tool,
+                        },
+                        subject: match deciding {
+                            Some(Crossing::Read(path) | Crossing::Write(path)) => {
+                                path.to_string_lossy().into_owned()
+                            }
+                            Some(Crossing::Exec(subject) | Crossing::Net(subject)) => {
+                                subject.clone()
+                            }
+                            None => name.into(),
+                        },
+                        grant: (name.into(), action.clone()),
+                        workspace: state.config.workspace.clone(),
+                        trusted: state.config.trusted,
+                    },
+                );
             Some(rx)
         } else {
             None
@@ -1178,14 +1257,17 @@ impl Session {
                 action,
                 decision,
                 rule: rule.clone(),
+                taint: taint_ask,
             },
         )?;
         let approved = match decision {
             Decision::Allow => true,
             Decision::Deny => false,
             Decision::Ask => {
-                let (approved, by) = match self.0.options.approval {
-                    ApprovalMode::Headless(approved) => (approved, Approver::Headless),
+                let (approved, by, remember, grant) = match self.0.options.approval {
+                    ApprovalMode::Headless(approved) => {
+                        (approved, Approver::Headless, Remember::Once, None)
+                    }
                     ApprovalMode::Client => {
                         let timeout = async {
                             match state.config.daemon.approval_timeout {
@@ -1197,13 +1279,13 @@ impl Session {
                         };
                         let result = tokio::select! {
                             biased;
-                            () = cancel.cancelled() => (false, Approver::Cancelled),
-                            () = self.0.stop.cancelled() => (false, Approver::Cancelled),
+                            () = cancel.cancelled() => (false, Approver::Cancelled, Remember::Once, None),
+                            () = self.0.stop.cancelled() => (false, Approver::Cancelled, Remember::Once, None),
                             result = waiter.expect("client waiter") => match result {
-                                Ok(approved) => (approved, Approver::User),
-                                Err(_) => (false, Approver::Cancelled),
+                                Ok(answer) => (answer.approved, Approver::User, answer.remember, answer.grant),
+                                Err(_) => (false, Approver::Cancelled, Remember::Once, None),
                             },
-                            () = timeout => (false, Approver::Timeout),
+                            () = timeout => (false, Approver::Timeout, Remember::Once, None),
                         };
                         self.0
                             .control
@@ -1221,8 +1303,12 @@ impl Session {
                         call: call.clone(),
                         approved,
                         by,
+                        remember,
                     },
                 )?;
+                if let Some(grant) = grant {
+                    state.grants.insert(grant);
+                }
                 if cancelled {
                     return self.append(
                         state,
@@ -1353,6 +1439,38 @@ impl Session {
         }
         Ok(())
     }
+}
+
+fn lineage_grants(log: &SessionLog, head: EventId) -> HashSet<(String, String)> {
+    let mut tools = HashMap::new();
+    let mut actions = HashMap::new();
+    let mut grants = HashSet::new();
+    for event in log.lineage(head).expect("known head") {
+        match &event.kind {
+            EventKind::AssistantMessage { content, .. } => {
+                for block in content {
+                    if let Block::ToolUse { id, name, .. } = block {
+                        tools.insert(id, name);
+                    }
+                }
+            }
+            EventKind::ToolDecision { call, action, .. } => {
+                actions.insert(call, action);
+            }
+            EventKind::ApprovalResolved {
+                call,
+                approved: true,
+                remember: Remember::Session | Remember::Workspace,
+                ..
+            } => {
+                if let (Some(tool), Some(action)) = (tools.get(call), actions.get(call)) {
+                    grants.insert(((*tool).clone(), (*action).clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    grants
 }
 
 fn push_partial(blocks: &mut Vec<Block>, text: &str, thinking: bool) {

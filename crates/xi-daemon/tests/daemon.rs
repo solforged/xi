@@ -12,11 +12,11 @@ use xi_client::peer::{Incoming, Peer, PeerError};
 use xi_daemon::{Daemon, DaemonOptions, InProcessSpawner, Spawner, WorkerProcess};
 use xi_kernel::Backend;
 use xi_kernel::config::{DaemonSettings, Paths};
-use xi_protocol::event::{ModelRef, StopReason, Usage};
+use xi_protocol::event::{ModelRef, Remember, StopReason, Usage};
 use xi_protocol::methods::client::*;
 use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestMethod, RpcError};
-use xi_protocol::{Block, EventId, EventKind, SessionId};
+use xi_protocol::{Block, EventId, EventKind, SessionId, Timestamp};
 use xi_provider::{Provider, Request, Response};
 
 struct Script(Mutex<VecDeque<Response>>);
@@ -714,6 +714,8 @@ async fn asks_enter_inbox_broadcast_and_resolve_once() {
     assert_eq!(pending.session, session);
     assert_eq!(pending.call, "outside-read".into());
     assert_eq!(pending.tool, "read");
+    assert!(!pending.taint);
+    assert!(!pending.trusted);
     assert_eq!(
         request::<ApprovalList>(&observer, &()).await.unwrap(),
         vec![pending.clone()]
@@ -735,6 +737,7 @@ async fn asks_enter_inbox_broadcast_and_resolve_once() {
             session,
             call: pending.call.clone(),
             approved: true,
+            remember: Remember::Once,
         },
     )
     .await
@@ -747,7 +750,8 @@ async fn asks_enter_inbox_broadcast_and_resolve_once() {
                 &ResolveParams {
                     session,
                     call: pending.call,
-                    approved: true
+                    approved: true,
+                    remember: Remember::Once,
                 }
             )
             .await
@@ -1144,4 +1148,227 @@ async fn stubborn_workers_are_killed_and_closing_sessions_are_not_live() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn session_list_enriches_live_and_saved_sessions_and_orders_by_mtime() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], false);
+    let (peer, mut events) = connection(&daemon);
+    initialize(&peer).await;
+    let first = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap();
+    request::<SessionPrompt>(
+        &peer,
+        &PromptParams {
+            session: first.info.session,
+            content: vec![
+                Block::Text {
+                    text: " \n  first ".into(),
+                },
+                Block::Text {
+                    text: "prompt  \nnot the title".into(),
+                },
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    prompt(&peer, first.info.session).await;
+    let second = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap();
+    request::<SessionPrompt>(
+        &peer,
+        &PromptParams {
+            session: second.info.session,
+            content: vec![Block::Text {
+                text: "界".repeat(81),
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    for (path, seconds) in [(&first.info.path, 100), (&second.info.path, 200)] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    }
+    let listed = request::<SessionList>(&peer, &ListParams::default())
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].session, second.info.session);
+    assert_eq!(listed[1].session, first.info.session);
+    assert_eq!(listed[0].updated, Some(Timestamp(200_000)));
+    assert_eq!(listed[1].updated, Some(Timestamp(100_000)));
+    assert_eq!(listed[0].started, Some(second.events[0].at));
+    assert_eq!(listed[1].started, Some(first.events[0].at));
+    assert_eq!(listed[0].title, Some(format!("{}…", "界".repeat(80))));
+    assert_eq!(listed[1].title.as_deref(), Some("first prompt"));
+    for session in [first.info.session, second.info.session] {
+        request::<SessionClose>(&peer, &SessionRef { session })
+            .await
+            .unwrap();
+        notification(&mut events, "session/exited").await;
+    }
+    let saved = request::<SessionList>(&peer, &ListParams::default())
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 2);
+    for (saved, live) in saved.iter().zip(&listed) {
+        assert_eq!(saved.session, live.session);
+        assert_eq!(saved.head, None);
+        assert_eq!(saved.title, live.title);
+        assert_eq!(saved.started, live.started);
+        assert_eq!(saved.updated, live.updated);
+    }
+    stop(&peer, &daemon).await;
+}
+
+struct ApprovalProbe;
+
+impl xi_tools::Tool for ApprovalProbe {
+    fn spec(&self) -> xi_protocol::manifest::ToolSpec {
+        xi_protocol::manifest::ToolSpec {
+            name: "probe".into(),
+            description: "Approval metadata probe".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn crossings(
+        &self,
+        _: &Value,
+        _: &xi_tools::Context,
+    ) -> Result<Vec<xi_tools::Crossing>, String> {
+        Ok(vec![xi_tools::Crossing::Net("example.org".into())])
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: &'a xi_protocol::ToolCallId,
+        input: Value,
+        _: &'a xi_tools::Context,
+    ) -> BoxFuture<'a, xi_tools::Ran> {
+        Box::pin(async move {
+            xi_tools::Ran {
+                output: xi_protocol::ToolOutput {
+                    content: Vec::new(),
+                    is_error: false,
+                    untrusted: input["untrusted"].as_bool().unwrap_or(false),
+                },
+                spill: None,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn pending_approvals_report_taint_and_workspace_trust() {
+    let fixture = Fixture::new();
+    fixture.paths.trust(&fixture.cwd).unwrap();
+    std::fs::write(
+        fixture.paths.config.join("config.toml"),
+        "[[rule]]\neffect='allow'\naction='net'\npattern='**'\n",
+    )
+    .unwrap();
+    let script = Arc::new(Script(Mutex::new(VecDeque::from([
+        Response {
+            content: vec![
+                Block::ToolUse {
+                    id: "ingest".into(),
+                    name: "probe".into(),
+                    input: json!({"untrusted": true}),
+                },
+                Block::ToolUse {
+                    id: "taint-ask".into(),
+                    name: "probe".into(),
+                    input: json!({}),
+                },
+            ],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+        },
+        done(),
+    ]))));
+    let spawner = InProcessSpawner {
+        paths: fixture.paths.clone(),
+        backend: Some(Arc::new(move || Backend {
+            provider: script.clone(),
+            model: ModelInfo {
+                provider: "anthropic".into(),
+                id: "claude-sonnet-5-5".into(),
+                context_window: 8192,
+                max_output: 1024,
+                reasoning: true,
+                pricing: None,
+            },
+            tools: vec![Arc::new(ApprovalProbe)],
+        })),
+    };
+    let daemon = Daemon::new(DaemonOptions {
+        settings: DaemonSettings::default(),
+        paths: fixture.paths.clone(),
+        spawner: Arc::new(spawner),
+        private: false,
+    });
+    let (peer, mut events) = connection(&daemon);
+    initialize(&peer).await;
+    let session = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap()
+        .info
+        .session;
+    let prompting = peer.clone();
+    let turn = tokio::spawn(async move { prompt(&prompting, session).await });
+    let pending: PendingApproval =
+        serde_json::from_value(notification(&mut events, "approval/pending").await).unwrap();
+    assert_eq!(pending.call.0, "taint-ask");
+    assert!(pending.taint);
+    assert!(pending.trusted);
+    assert_eq!(
+        request::<ApprovalList>(&peer, &()).await.unwrap(),
+        vec![pending.clone()]
+    );
+    let attached = request::<SessionAttach>(
+        &peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(attached.pending_approvals, vec![pending.clone()]);
+    assert_eq!(
+        error_code(
+            request::<ApprovalResolve>(
+                &peer,
+                &ResolveParams {
+                    session,
+                    call: pending.call.clone(),
+                    approved: true,
+                    remember: Remember::Session,
+                }
+            )
+            .await
+        ),
+        RpcError::INVALID_PARAMS,
+    );
+    request::<ApprovalResolve>(
+        &peer,
+        &ResolveParams {
+            session,
+            call: pending.call,
+            approved: false,
+            remember: Remember::Once,
+        },
+    )
+    .await
+    .unwrap();
+    turn.await.unwrap();
+    stop(&peer, &daemon).await;
 }

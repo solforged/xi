@@ -43,6 +43,14 @@ impl<W: Write> Screen<W> {
         self.cols = cols.max(1);
     }
 
+    /// Writes a terminal control sequence before the next frame flushes it.
+    ///
+    /// # Errors
+    /// Returns the writer's I/O error.
+    pub fn control(&mut self, sequence: &str) -> io::Result<()> {
+        self.out.write_all(sequence.as_bytes())
+    }
+
     fn rewind(&self, buf: &mut String) {
         if self.widths.is_empty() {
             return;

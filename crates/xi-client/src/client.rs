@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use xi_protocol::content::Block;
-use xi_protocol::event::ModelRef;
+use xi_protocol::event::{ModelRef, Remember};
 use xi_protocol::ids::{EventId, SessionId, ToolCallId};
 use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::*;
@@ -269,11 +269,13 @@ impl Client {
         session: SessionId,
         call: ToolCallId,
         approved: bool,
+        remember: Remember,
     ) -> Result<(), ClientError> {
         self.request::<ApprovalResolve>(&ResolveParams {
             session,
             call,
             approved,
+            remember,
         })
         .await
     }

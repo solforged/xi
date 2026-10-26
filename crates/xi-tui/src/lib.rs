@@ -9,12 +9,17 @@
 //!
 //! The client attaches to a daemon session over the typed JSON-RPC connection.
 
+pub mod approvals;
+pub mod clipboard;
 pub mod complete;
+pub mod config;
 pub mod editor;
 pub mod external;
 pub mod history;
+pub mod keys;
 pub mod picker;
 pub mod screen;
+pub mod sessions;
 pub mod status;
 pub mod style;
 pub mod transcript;
@@ -35,16 +40,23 @@ use tokio::sync::{mpsc, oneshot};
 use xi_client::client::{Client, ClientError, ClientNotification};
 use xi_protocol::event::ModelRef;
 use xi_protocol::manifest::CommandSpec;
-use xi_protocol::methods::client::{AttachResult, CreateParams, EventParams, PromptResult};
+use xi_protocol::methods::client::{
+    AttachResult, CreateParams, EventParams, ListParams, OpenParams, PendingApproval, PromptResult,
+    SessionSummary,
+};
 use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::RpcError;
 use xi_protocol::{Block, Event, EventId, SessionId, Timestamp, ToolCallId};
 
+use crate::approvals::{Approval, Approvals, Choice};
 use crate::complete::{FileIndex, Menu};
+use crate::config::TuiConfig;
 use crate::editor::Editor;
 use crate::history::{History, Search};
+use crate::keys::{Action, Keymap};
 use crate::picker::Picker;
 use crate::screen::Screen;
+use crate::sessions::Sessions;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
 use crate::transcript::{SPINNER, Transcript, duration, tokens};
@@ -65,6 +77,8 @@ pub struct Launch {
     pub attached: AttachResult,
     /// Shared prompt history, or in-memory history when absent.
     pub history: Option<PathBuf>,
+    /// Client key and display settings, or defaults when absent.
+    pub tui_config: Option<PathBuf>,
 }
 
 /// Whether the client can run here: both stdin and stdout are terminals.
@@ -93,255 +107,13 @@ impl Drop for Raw {
 }
 
 #[derive(Clone, Copy)]
-enum Action {
-    Send,
-    Queue,
-    Newline,
-    Escape,
-    Interrupt,
-    DeleteOrQuit,
-    Up,
-    Down,
-    Complete,
-    Search,
-    External,
-    Models,
-    Reasoning,
-    Expand,
-    Home,
-    End,
-    Left,
-    Right,
-    KillBefore,
-    KillAfter,
-    KillWord,
-    Backspace,
-    Delete,
-}
-
-// Both help and composer dispatch use these effective bindings.
-const KEYS: &[(KeyCode, KeyModifiers, Action, &str, &str)] = &[
-    (
-        KeyCode::Enter,
-        KeyModifiers::NONE,
-        Action::Send,
-        "enter",
-        "send; during a turn, steer; accept a completion",
-    ),
-    (
-        KeyCode::Enter,
-        KeyModifiers::ALT,
-        Action::Queue,
-        "alt+enter",
-        "queue a follow-up for after the turn",
-    ),
-    (
-        KeyCode::Enter,
-        KeyModifiers::SHIFT,
-        Action::Newline,
-        "shift+enter",
-        "new line",
-    ),
-    (
-        KeyCode::Char('j'),
-        KeyModifiers::CONTROL,
-        Action::Newline,
-        "ctrl+j",
-        "new line",
-    ),
-    (
-        KeyCode::Esc,
-        KeyModifiers::NONE,
-        Action::Escape,
-        "esc",
-        "close a menu or overlay; otherwise stop the turn",
-    ),
-    (
-        KeyCode::Char('c'),
-        KeyModifiers::CONTROL,
-        Action::Interrupt,
-        "ctrl+c",
-        "close overlay, stop turn, clear composer, or quit",
-    ),
-    (
-        KeyCode::Char('d'),
-        KeyModifiers::CONTROL,
-        Action::DeleteOrQuit,
-        "ctrl+d",
-        "quit when empty and idle; otherwise delete forward",
-    ),
-    (
-        KeyCode::Up,
-        KeyModifiers::NONE,
-        Action::Up,
-        "up",
-        "previous completion or workspace prompt",
-    ),
-    (
-        KeyCode::Down,
-        KeyModifiers::NONE,
-        Action::Down,
-        "down",
-        "next completion or workspace prompt",
-    ),
-    (
-        KeyCode::Tab,
-        KeyModifiers::NONE,
-        Action::Complete,
-        "tab",
-        "accept a completion; otherwise answer a waiting approval",
-    ),
-    (
-        KeyCode::Char('r'),
-        KeyModifiers::CONTROL,
-        Action::Search,
-        "ctrl+r",
-        "search prompt history; repeat for older matches",
-    ),
-    (
-        KeyCode::Char('g'),
-        KeyModifiers::CONTROL,
-        Action::External,
-        "ctrl+g",
-        "edit the prompt in the external editor",
-    ),
-    (
-        KeyCode::Char('m'),
-        KeyModifiers::ALT,
-        Action::Models,
-        "alt+m",
-        "open the model picker",
-    ),
-    (
-        KeyCode::BackTab,
-        KeyModifiers::NONE,
-        Action::Reasoning,
-        "shift+tab",
-        "cycle reasoning: off, low, medium, high",
-    ),
-    (
-        KeyCode::Char('o'),
-        KeyModifiers::CONTROL,
-        Action::Expand,
-        "ctrl+o",
-        "expand the newest collapsed result; repeat for older",
-    ),
-    (
-        KeyCode::Char('a'),
-        KeyModifiers::CONTROL,
-        Action::Home,
-        "ctrl+a",
-        "line start",
-    ),
-    (
-        KeyCode::Char('e'),
-        KeyModifiers::CONTROL,
-        Action::End,
-        "ctrl+e",
-        "line end",
-    ),
-    (
-        KeyCode::Char('b'),
-        KeyModifiers::CONTROL,
-        Action::Left,
-        "ctrl+b",
-        "previous character",
-    ),
-    (
-        KeyCode::Char('f'),
-        KeyModifiers::CONTROL,
-        Action::Right,
-        "ctrl+f",
-        "next character",
-    ),
-    (
-        KeyCode::Left,
-        KeyModifiers::NONE,
-        Action::Left,
-        "left",
-        "previous character",
-    ),
-    (
-        KeyCode::Right,
-        KeyModifiers::NONE,
-        Action::Right,
-        "right",
-        "next character",
-    ),
-    (
-        KeyCode::Home,
-        KeyModifiers::NONE,
-        Action::Home,
-        "home",
-        "line start",
-    ),
-    (
-        KeyCode::End,
-        KeyModifiers::NONE,
-        Action::End,
-        "end",
-        "line end",
-    ),
-    (
-        KeyCode::Char('u'),
-        KeyModifiers::CONTROL,
-        Action::KillBefore,
-        "ctrl+u",
-        "delete to line start",
-    ),
-    (
-        KeyCode::Char('k'),
-        KeyModifiers::CONTROL,
-        Action::KillAfter,
-        "ctrl+k",
-        "delete to line end",
-    ),
-    (
-        KeyCode::Char('w'),
-        KeyModifiers::CONTROL,
-        Action::KillWord,
-        "ctrl+w",
-        "delete previous word",
-    ),
-    (
-        KeyCode::Backspace,
-        KeyModifiers::ALT,
-        Action::KillWord,
-        "alt+backspace",
-        "delete previous word",
-    ),
-    (
-        KeyCode::Backspace,
-        KeyModifiers::NONE,
-        Action::Backspace,
-        "backspace",
-        "delete previous character",
-    ),
-    (
-        KeyCode::Delete,
-        KeyModifiers::NONE,
-        Action::Delete,
-        "delete",
-        "delete next character",
-    ),
-];
-
-fn action(key: KeyEvent) -> Option<Action> {
-    let modifiers = if key.code == KeyCode::BackTab {
-        key.modifiers - KeyModifiers::SHIFT
-    } else {
-        key.modifiers
-    };
-    KEYS.iter()
-        .find(|(code, mods, ..)| *code == key.code && *mods == modifiers)
-        .map(|(_, _, action, ..)| *action)
-}
-
-#[derive(Clone, Copy)]
 enum Builtin {
     Help,
     Quit,
     New,
+    Resume,
+    Approvals,
+    Copy,
     Tree,
     Model,
     Reasoning,
@@ -354,6 +126,21 @@ const COMMANDS: &[(&str, &str, Builtin)] = &[
     ("quit", "leave; a running turn keeps running", Builtin::Quit),
     ("exit", "leave; a running turn keeps running", Builtin::Quit),
     ("new", "start a session in this workspace", Builtin::New),
+    (
+        "resume",
+        "pick a session to attach or open",
+        Builtin::Resume,
+    ),
+    (
+        "approvals",
+        "answer pending approvals in every session",
+        Builtin::Approvals,
+    ),
+    (
+        "copy",
+        "copy the last response to the clipboard",
+        Builtin::Copy,
+    ),
     (
         "tree",
         "browse branches and check out an earlier point",
@@ -398,6 +185,7 @@ enum Focus {
     Tree,
     Models,
     Search,
+    Sessions,
 }
 
 type Reply = oneshot::Receiver<Result<PromptResult, ClientError>>;
@@ -411,14 +199,23 @@ struct App {
     tree: Option<Tree>,
     picker: Option<Picker>,
     search: Option<Search>,
+    sessions: Option<Sessions>,
+    approvals: Option<Approvals>,
+    approval_workspaces: HashMap<SessionId, PathBuf>,
+    /// Other sessions' asks this client answered. The daemon drops an ask
+    /// from `approval/list` only when its resolution event arrives, which
+    /// can be after the resolve reply.
+    answered: HashSet<(SessionId, ToolCallId)>,
+    inbox_refresh: bool,
+    keymap: Keymap,
+    /// Terminal controls written before the next frame.
+    controls: Vec<String>,
     history: History,
     commands: Vec<CommandSpec>,
     completion: Option<Menu>,
     files: Option<FileIndex>,
     file_cwd: Option<PathBuf>,
     external_requested: bool,
-    /// Option selected in the approval: 0 allow, 1 deny.
-    choice: usize,
     /// Replies of prompts sent to the running turn.
     pending: FuturesUnordered<Reply>,
     started: Option<Instant>,
@@ -482,6 +279,9 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
         }
         if app.refresh {
             app.refresh_details().await;
+        }
+        if app.inbox_refresh {
+            app.refresh_inbox().await;
         }
         // The terminal may have reflowed since the last resize event, so the
         // rewind counts rows at the width it has now.
@@ -562,26 +362,36 @@ fn lineage(events: &[Event], head: EventId) -> Vec<Event> {
 }
 
 impl App {
-    fn new(launch: Launch, cols: usize, rows: usize) -> Self {
+    fn new(mut launch: Launch, cols: usize, rows: usize) -> Self {
+        launch.template.cwd = launch.attached.info.cwd.clone();
+        let (config, warnings) = TuiConfig::load(launch.tui_config.as_deref());
+        let mut transcript = Transcript::default();
+        transcript.set_thinking(config.thinking);
         let (history, history_error) =
             History::load(launch.history.clone(), &launch.attached.info.cwd);
         let mut editor = Editor::default();
         editor.set_history(history.workspace());
         let mut app = Self {
             launch,
-            transcript: Transcript::default(),
+            transcript,
             editor,
             focus: Focus::Composer,
             tree: None,
             picker: None,
             search: None,
+            sessions: None,
+            approvals: None,
+            approval_workspaces: HashMap::new(),
+            answered: HashSet::new(),
+            inbox_refresh: false,
+            keymap: config.keymap,
+            controls: Vec::new(),
             history,
             commands: builtin_commands(),
             completion: None,
             files: None,
             file_cwd: None,
             external_requested: false,
-            choice: 0,
             pending: FuturesUnordered::new(),
             started: None,
             steering: Vec::new(),
@@ -598,6 +408,9 @@ impl App {
             exited: false,
         };
         app.attach();
+        for warning in warnings {
+            app.note(vec![Line::default().dim(format!("  tui.toml: {warning}"))]);
+        }
         if let Some(error) = history_error {
             app.note(vec![
                 Line::default().dim(format!("  prompt history: {error}")),
@@ -664,8 +477,244 @@ impl App {
         }
         self.tree = None;
         self.picker = None;
+        self.sessions = None;
+        self.approvals = None;
+        self.inbox_refresh = false;
         self.focus = Focus::Composer;
         self.completion = None;
+    }
+
+    fn own_approvals(&self) -> Vec<Approval> {
+        let info = &self.launch.attached.info;
+        self.transcript
+            .asks()
+            .iter()
+            .filter(|ask| !self.resolved.contains(&ask.call))
+            .map(|ask| Approval {
+                pending: PendingApproval {
+                    session: info.session,
+                    call: ask.call.clone(),
+                    tool: ask.tool.clone(),
+                    action: ask.action.clone(),
+                    rule: ask.rule.clone(),
+                    taint: ask.taint,
+                    trusted: ask.trusted.unwrap_or(info.trusted),
+                },
+                cwd: Some(info.cwd.clone()),
+            })
+            .collect()
+    }
+
+    fn open_own_approvals(&mut self) {
+        let entries = self.own_approvals();
+        if entries.is_empty() {
+            return;
+        }
+        self.approvals = Some(Approvals::new(entries, false));
+        self.completion = None;
+        self.focus = Focus::Approval;
+    }
+
+    fn close_empty_approvals(&mut self) {
+        if self
+            .approvals
+            .as_ref()
+            .is_some_and(|approvals| approvals.current().is_none())
+        {
+            self.approvals = None;
+            self.focus = Focus::Composer;
+        }
+    }
+
+    async fn refresh_inbox(&mut self) {
+        self.inbox_refresh = false;
+        let pending = match self.launch.client.approvals().await {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                return;
+            }
+        };
+        let current = self.session_id();
+        if pending.iter().any(|ask| {
+            ask.session != current && !self.approval_workspaces.contains_key(&ask.session)
+        }) {
+            match self.launch.client.list(ListParams::default()).await {
+                Ok(sessions) => {
+                    self.approval_workspaces = sessions
+                        .into_iter()
+                        .map(|session| (session.session, session.cwd))
+                        .collect();
+                }
+                Err(error) => self.note(vec![
+                    Line::default().dim(format!("  approval workspaces: {error}")),
+                ]),
+            }
+        }
+        let mut entries = self.own_approvals();
+        entries.extend(
+            pending
+                .into_iter()
+                .filter(|ask| {
+                    ask.session != current
+                        && !self.answered.contains(&(ask.session, ask.call.clone()))
+                })
+                .map(|pending| {
+                    let cwd = self.approval_workspaces.get(&pending.session).cloned();
+                    Approval { pending, cwd }
+                }),
+        );
+        if let Some(approvals) = self.approvals.as_mut() {
+            approvals.replace(entries);
+        } else {
+            self.approvals = Some(Approvals::new(entries, true));
+        }
+        self.completion = None;
+        self.focus = Focus::Approval;
+        self.close_empty_approvals();
+    }
+
+    async fn open_sessions(&mut self) {
+        if !self.idle_only("/resume") {
+            return;
+        }
+        match self
+            .launch
+            .client
+            .list(ListParams {
+                cwd: Some(self.launch.attached.info.cwd.clone()),
+                running: None,
+            })
+            .await
+        {
+            Ok(sessions) => {
+                self.sessions = Some(Sessions::new(sessions, self.session_id()));
+                self.completion = None;
+                self.focus = Focus::Sessions;
+            }
+            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+        }
+    }
+
+    async fn switch_session(&mut self, attached: AttachResult) -> Result<(), Error> {
+        self.release().await?;
+        let thinking = self.transcript.thinking_display();
+        let changed_workspace = attached.info.cwd != self.launch.attached.info.cwd;
+        self.launch.template.cwd = attached.info.cwd.clone();
+        self.launch.attached = attached;
+        self.exited = false;
+        self.refresh = false;
+        self.failed = false;
+        self.started = None;
+        self.pending = FuturesUnordered::new();
+        self.transcript = Transcript::default();
+        self.transcript.set_thinking(thinking);
+        self.close_overlay();
+        self.inbox_refresh = false;
+        self.steering.clear();
+        self.queued.clear();
+        self.editor = Editor::default();
+        let error = if changed_workspace {
+            let (history, error) =
+                History::load(self.launch.history.clone(), &self.launch.attached.info.cwd);
+            self.history = history;
+            error
+        } else {
+            None
+        };
+        self.editor.set_history(self.history.workspace());
+        self.note(vec![style::rule(self.cols)]);
+        self.attach();
+        if let Some(error) = error {
+            self.note(vec![
+                Line::default().dim(format!("  prompt history: {error}")),
+            ]);
+        }
+        self.initialize_composer().await;
+        Ok(())
+    }
+
+    async fn resume(&mut self, session: SessionSummary) -> Result<(), Error> {
+        if session.session == self.session_id() {
+            self.close_overlay();
+            return Ok(());
+        }
+        if !self.idle_only("/resume") {
+            return Ok(());
+        }
+        let result = if session.head.is_some() {
+            self.launch.client.attach(session.session, None).await
+        } else {
+            self.launch
+                .client
+                .open(OpenParams {
+                    path: session.path,
+                    options: self.launch.template.options.clone(),
+                })
+                .await
+        };
+        let attached = match result {
+            Ok(attached) => attached,
+            Err(ClientError::Rpc {
+                code: RpcError::SESSION_HELD,
+                data: Some(data),
+                ..
+            }) if data.get("session").is_some() => {
+                let held: SessionId = serde_json::from_value(data["session"].clone())?;
+                self.launch.client.attach(held, None).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.switch_session(attached).await
+    }
+
+    async fn sessions_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_overlay(),
+            KeyCode::Enter => {
+                if let Some(session) = self.sessions.as_ref().and_then(Sessions::selected).cloned()
+                    && let Err(error) = self.resume(session).await
+                {
+                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                }
+            }
+            KeyCode::Tab => {
+                let all = self.sessions.as_ref().is_some_and(|picker| !picker.all);
+                let cwd = (!all).then(|| self.launch.attached.info.cwd.clone());
+                match self
+                    .launch
+                    .client
+                    .list(ListParams { cwd, running: None })
+                    .await
+                {
+                    Ok(sessions) => {
+                        if let Some(picker) = self.sessions.as_mut() {
+                            picker.replace(sessions, all);
+                        }
+                    }
+                    Err(error) => {
+                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
+                    }
+                }
+            }
+            _ => {
+                if let Some(picker) = self.sessions.as_mut() {
+                    match key.code {
+                        KeyCode::Up => picker.up(),
+                        KeyCode::Down => picker.down(),
+                        KeyCode::Backspace => picker.backspace(),
+                        KeyCode::Char(c)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            picker.input(c)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     async fn open_models(&mut self) {
@@ -811,15 +860,15 @@ impl App {
                 self.cols,
             );
         }
-        if !self.transcript.asks().is_empty() {
-            self.focus = Focus::Approval;
-        }
         if replayed > 0 {
             let note = self.transcript.note(vec![Line::default().dim(format!(
                 "  resumed · {replayed} events · {}",
                 home(&info.path)
             ))]);
             self.commit.extend(note);
+        }
+        if !self.transcript.asks().is_empty() {
+            self.open_own_approvals();
         }
     }
 
@@ -850,6 +899,22 @@ impl App {
 
     fn notify(&mut self, notification: &ClientNotification) {
         if !self.mine(notification) {
+            if let ClientNotification::ApprovalPending(pending) = notification {
+                let cwd = self.approval_workspaces.get(&pending.session).cloned();
+                let current = self.session_id();
+                if let Some(approvals) = self.approvals.as_mut()
+                    && approvals.inbox
+                {
+                    approvals.upsert(
+                        Approval {
+                            pending: pending.clone(),
+                            cwd,
+                        },
+                        current,
+                    );
+                    self.inbox_refresh = true;
+                }
+            }
             return;
         }
         let sequence = match notification {
@@ -925,11 +990,15 @@ impl App {
         }
         let now = self.transcript.asks().len();
         if now > asks && self.editor.is_empty() && self.focus == Focus::Composer {
-            self.focus = Focus::Approval;
-            self.choice = 0;
+            self.open_own_approvals();
         }
-        if now == 0 && self.focus == Focus::Approval {
-            self.focus = Focus::Composer;
+        if self.focus == Focus::Approval {
+            let entries = self.own_approvals();
+            let session = self.session_id();
+            if let Some(approvals) = self.approvals.as_mut() {
+                approvals.replace_current(entries, session);
+            }
+            self.close_empty_approvals();
         }
     }
 
@@ -963,8 +1032,20 @@ impl App {
     fn finish_turn(&mut self, outcome: Option<PromptResult>) {
         self.launch.attached.running = false;
         self.transcript.end_turn();
+        if self.focus == Focus::Approval
+            && !self
+                .approvals
+                .as_ref()
+                .is_some_and(|approvals| approvals.inbox)
+        {
+            self.close_overlay();
+        }
         if self.focus == Focus::Approval {
-            self.focus = Focus::Composer;
+            let session = self.session_id();
+            if let Some(approvals) = self.approvals.as_mut() {
+                approvals.replace_current(Vec::new(), session);
+            }
+            self.close_empty_approvals();
         }
         let elapsed = self.started.take().map_or(0, |s| {
             u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -1095,7 +1176,7 @@ impl App {
         match builtin {
             Some(Builtin::Help) => {
                 let mut lines = vec![Line::default().strong(Role::Ink, "  keys")];
-                for (_, _, _, key, description) in KEYS {
+                for (key, description) in self.keymap.help() {
                     lines.push(Line::default().ink(format!("  {key:<22}")).dim(description));
                 }
                 lines.push(Line::default().strong(Role::Ink, "  commands"));
@@ -1123,20 +1204,24 @@ impl App {
                     .client
                     .create(self.launch.template.clone())
                     .await?;
-                self.release().await?;
-                self.launch.attached = attached;
-                self.exited = false;
-                self.refresh = false;
-                self.failed = false;
-                self.started = None;
-                self.pending = FuturesUnordered::new();
-                self.transcript = Transcript::default();
-                self.close_overlay();
-                self.steering.clear();
-                self.queued.clear();
-                self.note(vec![style::rule(self.cols)]);
-                self.attach();
-                self.initialize_composer().await;
+                self.switch_session(attached).await?;
+            }
+            Some(Builtin::Resume) => self.open_sessions().await,
+            Some(Builtin::Approvals) => {
+                self.approvals = None;
+                self.refresh_inbox().await;
+                if self.approvals.is_none() {
+                    self.note(vec![Line::default().dim("  no pending approvals")]);
+                }
+            }
+            Some(Builtin::Copy) => {
+                if let Some(text) = self.transcript.last_text() {
+                    let lines = text.lines().count();
+                    self.controls.push(clipboard::osc52(text));
+                    self.note(vec![Line::default().dim(format!("  copied {lines} lines"))]);
+                } else {
+                    self.note(vec![Line::default().dim("  nothing to copy yet")]);
+                }
             }
             Some(Builtin::Tree) => {
                 if !self.idle_only("/tree") {
@@ -1257,26 +1342,55 @@ impl App {
         Ok(())
     }
 
-    async fn answer(&mut self, approved: bool) {
-        if let Some(ask) = self.transcript.asks().first() {
-            let result = self
-                .launch
-                .client
-                .resolve(self.session_id(), ask.call.clone(), approved)
-                .await;
-            match result {
-                Ok(()) => {}
-                // A client elsewhere may have answered first; the log has the answer.
-                Err(ClientError::Rpc {
-                    code: RpcError::APPROVAL_NOT_PENDING,
-                    ..
-                }) => {}
-                Err(error) => {
-                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
-                }
+    async fn answer(&mut self, choice: Choice) {
+        let Some(ask) = self
+            .approvals
+            .as_ref()
+            .and_then(Approvals::current)
+            .cloned()
+        else {
+            return;
+        };
+        let pending = ask.pending;
+        match self
+            .launch
+            .client
+            .resolve(
+                pending.session,
+                pending.call.clone(),
+                choice.approved(),
+                choice.remember(),
+            )
+            .await
+        {
+            Ok(())
+            | Err(ClientError::Rpc {
+                code: RpcError::APPROVAL_NOT_PENDING,
+                ..
+            }) => {}
+            Err(error) => {
+                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                return;
             }
         }
-        self.focus = Focus::Composer;
+        if pending.session == self.session_id() {
+            self.resolved.insert(pending.call.clone());
+        } else {
+            self.answered
+                .insert((pending.session, pending.call.clone()));
+        }
+        let inbox = self
+            .approvals
+            .as_ref()
+            .is_some_and(|approvals| approvals.inbox);
+        if let Some(approvals) = self.approvals.as_mut() {
+            approvals.remove(pending.session, &pending.call);
+        }
+        if inbox {
+            self.refresh_inbox().await;
+        } else {
+            self.close_empty_approvals();
+        }
     }
 
     fn close_tree(&mut self) {
@@ -1302,6 +1416,7 @@ impl App {
         }
         self.launch.attached.info.head = node.target;
         let mut transcript = Transcript::default();
+        transcript.set_thinking(self.transcript.thinking_display());
         for event in lineage(&self.launch.attached.events, node.target) {
             let n = ClientNotification::Event(EventParams {
                 session: self.session_id(),
@@ -1433,7 +1548,7 @@ impl App {
     }
 
     async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
-        let action = action(key);
+        let action = self.keymap.action(key);
         if matches!(action, Some(Action::Interrupt)) {
             if self.focus != Focus::Composer || self.completion.is_some() {
                 self.close_overlay();
@@ -1460,14 +1575,36 @@ impl App {
                 self.search_key(key);
                 return Ok(());
             }
+            Focus::Sessions => {
+                self.sessions_key(key).await;
+                return Ok(());
+            }
             Focus::Approval => {
-                match key.code {
-                    KeyCode::Char('1' | 'y') => self.answer(true).await,
-                    KeyCode::Char('2' | 'n') => self.answer(false).await,
-                    KeyCode::Up | KeyCode::Down => self.choice = 1 - self.choice,
-                    KeyCode::Enter => self.answer(self.choice == 0).await,
-                    KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Composer,
-                    _ => {}
+                let choice = match key.code {
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        self.approvals
+                            .as_ref()
+                            .and_then(|approvals| approvals.shortcut(c))
+                    }
+                    KeyCode::Enter => self.approvals.as_ref().and_then(Approvals::selected),
+                    KeyCode::Up | KeyCode::Down => {
+                        if let Some(approvals) = self.approvals.as_mut() {
+                            approvals.step(key.code == KeyCode::Down);
+                        }
+                        None
+                    }
+                    KeyCode::Esc | KeyCode::Tab => {
+                        self.close_overlay();
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(choice) = choice {
+                    self.answer(choice).await;
                 }
                 return Ok(());
             }
@@ -1520,10 +1657,7 @@ impl App {
                 return Ok(());
             }
             Some(Action::Complete) => {
-                if !self.transcript.asks().is_empty() {
-                    self.focus = Focus::Approval;
-                    self.choice = 0;
-                }
+                self.open_own_approvals();
                 return Ok(());
             }
             Some(Action::Search) => {
@@ -1560,6 +1694,14 @@ impl App {
                     self.transcript.note(vec![Line::default().dim(why)])
                 });
                 self.commit.extend(lines);
+                return Ok(());
+            }
+            Some(Action::Thinking) => {
+                let thinking = self.transcript.thinking_display().next();
+                self.transcript.set_thinking(thinking);
+                self.note(vec![
+                    Line::default().dim(format!("  thinking display → {}", thinking.name())),
+                ]);
                 return Ok(());
             }
             Some(Action::DeleteOrQuit) => {
@@ -1604,75 +1746,6 @@ impl App {
         }
         self.update_completion();
         Ok(())
-    }
-
-    fn approval_box(&self, cols: usize) -> Vec<Line> {
-        let Some(ask) = self.transcript.asks().first() else {
-            return Vec::new();
-        };
-        let border = if ask.tainted {
-            Role::Murex
-        } else {
-            Role::Brass
-        };
-        let inner = cols.saturating_sub(4);
-        let mut why = Line::default().dim("rule  ");
-        why = match &ask.rule {
-            Some(rule) => why.strong(Role::Ink, rule),
-            None => why.ink("none matched"),
-        };
-        if ask.tainted {
-            why = why
-                .dim(" · ")
-                .murex("◆")
-                .dim(" this branch read untrusted content");
-        }
-        let option = |i: usize, label: &str| {
-            if self.choice == i {
-                Line::default()
-                    .brass(format!("› {} ", i + 1))
-                    .strong(Role::Ink, label)
-            } else {
-                Line::default().dim(format!("  {} ", i + 1)).ink(label)
-            }
-        };
-        let mut rows = vec![
-            Line::default().strong(Role::Ink, &ask.action),
-            Line::default(),
-            why,
-            Line::default(),
-            option(0, "Allow once"),
-            option(1, "Deny"),
-        ];
-        let more = self.transcript.asks().len() - 1;
-        if more > 0 {
-            rows.push(Line::default());
-            rows.push(Line::default().dim(format!("{more} more waiting after this one")));
-        }
-        let b = |s: &str| Line::default().span(border, false, s);
-        let title = Line::default()
-            .brass("? ")
-            .ink("approval")
-            .dim(format!(" · {}", ask.tool));
-        let right = Line::default().dim("1–2 · esc later");
-        let fill = cols.saturating_sub(title.width() + right.width() + 8);
-        let mut lines = vec![
-            b("╭─ ")
-                .extend(title)
-                .ink(" ")
-                .extend(b(&"─".repeat(fill)))
-                .ink(" ")
-                .extend(right)
-                .extend(b(" ─╮"))
-                .truncate(cols),
-        ];
-        for row in rows {
-            let row = row.truncate(inner);
-            let pad = inner - row.width();
-            lines.push(b("│ ").extend(row).ink(" ".repeat(pad)).extend(b(" │")));
-        }
-        lines.push(b(&format!("╰{}╯", "─".repeat(cols.saturating_sub(2)))));
-        lines
     }
 
     fn footer(&self, cols: usize) -> Line {
@@ -1759,11 +1832,13 @@ impl App {
     fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
         let cols = self.cols;
         let mut lines = self.transcript.live(cols, self.frame);
-        if self.focus == Focus::Approval {
+        if self.focus == Focus::Approval
+            && let Some(approvals) = &self.approvals
+        {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            lines.extend(self.approval_box(cols));
+            lines.extend(approvals.render(cols, self.session_id()));
         }
         if self.focus == Focus::Tree
             && let Some(tree) = &self.tree
@@ -1826,6 +1901,11 @@ impl App {
         {
             lines.extend(picker.render(cols, overlay_rows));
         }
+        if self.focus == Focus::Sessions
+            && let Some(sessions) = &self.sessions
+        {
+            lines.extend(sessions.render(cols, overlay_rows, Timestamp::now()));
+        }
         if self.focus == Focus::Search
             && let Some(search) = &self.search
         {
@@ -1862,6 +1942,9 @@ impl App {
     }
 
     fn draw<W: std::io::Write>(&mut self, screen: &mut Screen<W>) -> std::io::Result<()> {
+        for control in self.controls.drain(..) {
+            screen.control(&control)?;
+        }
         let (live, cursor) = self.live();
         let commit = std::mem::take(&mut self.commit);
         screen.draw(&commit, &live, cursor, self.rows.saturating_sub(1))
@@ -1873,6 +1956,7 @@ mod tests {
     use serde_json::{Value, json};
     use xi_client::peer::{Incoming, Peer};
     use xi_protocol::EventKind;
+    use xi_protocol::event::{Remember, StopReason, Usage};
     use xi_protocol::methods::client::{
         Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails,
     };
@@ -1928,12 +2012,33 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeData {
+        sessions: Vec<AttachResult>,
+        summaries: Vec<SessionSummary>,
+        approvals: Vec<PendingApproval>,
+        held: bool,
+        reject_resolve: bool,
+        /// Keep answered asks in `approval/list`, as the daemon does until
+        /// the resolution event arrives.
+        lagging_inbox: bool,
+    }
+
     async fn launch(attached: AttachResult) -> (Launch, mpsc::UnboundedReceiver<(String, Value)>) {
+        launch_with(attached, FakeData::default()).await
+    }
+
+    async fn launch_with(
+        attached: AttachResult,
+        mut data: FakeData,
+    ) -> (Launch, mpsc::UnboundedReceiver<(String, Value)>) {
         let (connection, server) = tokio::io::duplex(16 * 1024);
         let (reader, writer) = tokio::io::split(server);
         let (peer, mut incoming) = Peer::spawn(reader, writer);
         let (requests, observed) = mpsc::unbounded_channel();
         let response = attached.clone();
+        data.sessions.push(response.clone());
+        data.approvals.extend(response.pending_approvals.clone());
         tokio::spawn(async move {
             while let Some(message) = incoming.recv().await {
                 if let Incoming::Request { id, method, params } = message {
@@ -1944,9 +2049,43 @@ mod tests {
                             "daemon_version": "test",
                             "capabilities": { "private": true },
                         })),
-                        "session/attach" | "session/create" => {
-                            Ok(serde_json::to_value(&response).unwrap())
+                        "session/create" => Ok(serde_json::to_value(&response).unwrap()),
+                        "session/attach" => {
+                            let session: SessionId =
+                                serde_json::from_value(params["session"].clone()).unwrap();
+                            let found = data
+                                .sessions
+                                .iter()
+                                .find(|attached| attached.info.session == session)
+                                .unwrap_or(&response);
+                            Ok(serde_json::to_value(found).unwrap())
                         }
+                        "session/open" => {
+                            let found = data
+                                .sessions
+                                .iter()
+                                .find(|attached| json!(attached.info.path) == params["path"])
+                                .unwrap_or(&response);
+                            if data.held {
+                                Err(RpcError::with_data(
+                                    RpcError::SESSION_HELD,
+                                    "session held",
+                                    json!({ "session": found.info.session }),
+                                ))
+                            } else {
+                                Ok(serde_json::to_value(found).unwrap())
+                            }
+                        }
+                        "session/list" => Ok(serde_json::to_value(
+                            data.summaries
+                                .iter()
+                                .filter(|row| {
+                                    params.get("cwd").is_none_or(|cwd| *cwd == json!(row.cwd))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap()),
+                        "approval/list" => Ok(serde_json::to_value(&data.approvals).unwrap()),
                         "session/models" => Ok(json!({
                             "current": response.info.model,
                             "reasoning": response.info.reasoning,
@@ -1975,10 +2114,33 @@ mod tests {
                             text: "finished".into(),
                         })
                         .unwrap()),
-                        "approval/resolve" => Err(RpcError::new(
-                            RpcError::APPROVAL_NOT_PENDING,
-                            "already answered",
-                        )),
+                        "approval/resolve" if data.reject_resolve => {
+                            Err(RpcError::new(RpcError::INVALID_PARAMS, "scope rejected"))
+                        }
+                        "approval/resolve" => {
+                            let before = data.approvals.len();
+                            let kept: Vec<_> = data
+                                .approvals
+                                .iter()
+                                .filter(|ask| {
+                                    json!(ask.session) != params["session"]
+                                        || json!(ask.call) != params["call"]
+                                })
+                                .cloned()
+                                .collect();
+                            let found = kept.len() < before;
+                            if !data.lagging_inbox {
+                                data.approvals = kept;
+                            }
+                            if found {
+                                Ok(Value::Null)
+                            } else {
+                                Err(RpcError::new(
+                                    RpcError::APPROVAL_NOT_PENDING,
+                                    "already answered",
+                                ))
+                            }
+                        }
                         _ => Ok(Value::Null),
                     };
                     let _ = peer.respond(id, result);
@@ -1999,6 +2161,7 @@ mod tests {
                 template,
                 attached,
                 history: None,
+                tui_config: None,
             },
             observed,
         )
@@ -2129,10 +2292,12 @@ mod tests {
             tool: "bash".into(),
             action: "run command".into(),
             rule: None,
+            taint: false,
+            trusted: true,
         };
         app.notify(&ClientNotification::ApprovalPending(pending.clone()));
         app.commit.clear();
-        app.answer(true).await;
+        app.answer(Choice::Once).await;
         assert!(app.commit.is_empty());
         app.notify(&ClientNotification::Event(EventParams {
             session: app.session_id(),
@@ -2144,6 +2309,7 @@ mod tests {
                     call: pending.call.clone(),
                     approved: true,
                     by: xi_protocol::event::Approver::User,
+                    remember: Remember::Once,
                 },
             },
         }));
@@ -2366,6 +2532,7 @@ mod tests {
         app.command("/model demo/second").await.unwrap();
         app.command("/compact").await.unwrap();
         app.command("/new").await.unwrap();
+        app.command("/resume").await.unwrap();
         assert_eq!(app.launch.attached.info.reasoning, Reasoning::Medium);
         assert_eq!(app.launch.attached.info.model.model, "script");
         while let Ok((method, _)) = requests.try_recv() {
@@ -2421,18 +2588,25 @@ mod tests {
             .map(Line::plain)
             .collect::<Vec<_>>()
             .join("\n");
-        for (code, modifiers, _, label, _) in KEYS {
-            assert!(action(KeyEvent::new(*code, *modifiers)).is_some());
-            assert!(help.contains(label));
+        for action in Action::ALL {
+            for binding in app.keymap.bindings(*action) {
+                assert_eq!(
+                    app.keymap
+                        .action(KeyEvent::new(binding.code, binding.modifiers)),
+                    Some(*action)
+                );
+                assert!(help.contains(&binding.label()));
+            }
         }
-        for later in ["/resume", "/approvals", "/settings", "/copy", "ctrl+t"] {
-            assert!(!help.contains(later));
-            assert!(
-                !app.commands
-                    .iter()
-                    .any(|command| format!("/{}", command.name) == later)
-            );
+        for implemented in ["/resume", "/approvals", "/copy", "ctrl+t"] {
+            assert!(help.contains(implemented));
         }
+        assert!(!help.contains("/settings"));
+        assert!(
+            !app.commands
+                .iter()
+                .any(|command| command.name == "settings")
+        );
     }
 
     #[tokio::test]
@@ -2457,5 +2631,549 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app.editor.text(), "read @source.rs ");
+    }
+
+    fn pending(session: SessionId) -> PendingApproval {
+        PendingApproval {
+            session,
+            call: "pending".into(),
+            tool: "bash".into(),
+            action: "exec git push".into(),
+            rule: Some("project#1".into()),
+            taint: false,
+            trusted: true,
+        }
+    }
+
+    fn summary(attached: &AttachResult, live: bool, title: &str, updated: u64) -> SessionSummary {
+        SessionSummary {
+            session: attached.info.session,
+            path: attached.info.path.clone(),
+            cwd: attached.info.cwd.clone(),
+            model: attached.info.model.clone(),
+            head: live.then_some(attached.info.head),
+            running: attached.running,
+            pending_approvals: attached.pending_approvals.len(),
+            parent_session: None,
+            started: Some(Timestamp(0)),
+            updated: Some(Timestamp(updated)),
+            title: Some(title.into()),
+        }
+    }
+
+    fn append(app: &mut App, kind: EventKind) {
+        app.notify(&ClientNotification::Event(EventParams {
+            session: app.session_id(),
+            event: Event {
+                id: EventId::generate(),
+                parent: Some(app.launch.attached.info.head),
+                at: Timestamp::now(),
+                kind,
+            },
+        }));
+    }
+
+    fn live_text(app: &App) -> String {
+        app.live()
+            .0
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn approval_option_two_remembers_the_session_scope() {
+        let mut attached = snapshot(true);
+        let ask = pending(attached.info.session);
+        attached.pending_approvals.push(ask.clone());
+        let (launch, mut requests) = launch(attached).await;
+        let mut app = App::new(launch, 120, 32);
+        let overlay = live_text(&app);
+        for label in [
+            "1 Allow once",
+            "2 Allow for this session",
+            "3 Always allow in this workspace",
+            "4 Deny",
+        ] {
+            assert!(overlay.contains(label), "{overlay}");
+        }
+        app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "approval/resolve");
+        assert_eq!(params["session"], json!(ask.session));
+        assert_eq!(params["call"], json!(ask.call));
+        assert_eq!(params["approved"], true);
+        assert_eq!(params["remember"], "session");
+        assert!(app.focus == Focus::Composer);
+    }
+
+    #[tokio::test]
+    async fn taint_approval_hides_persistent_scopes_without_renumbering_deny() {
+        let mut attached = snapshot(true);
+        let mut ask = pending(attached.info.session);
+        ask.taint = true;
+        attached.pending_approvals.push(ask);
+        let (launch, mut requests) = launch(attached).await;
+        let mut app = App::new(launch, 120, 32);
+        let overlay = live_text(&app);
+        assert!(overlay.contains("1 Allow once"));
+        assert!(overlay.contains("4 Deny"));
+        assert!(overlay.contains("tainted branch: only once or deny"));
+        assert!(!overlay.contains("2 Allow for this session"));
+        assert!(!overlay.contains("3 Always allow"));
+        for c in ['2', '3'] {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        while let Ok((method, _)) = requests.try_recv() {
+            assert_ne!(method, "approval/resolve");
+        }
+        assert!(app.focus == Focus::Approval);
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "approval/resolve");
+        assert_eq!(params["approved"], false);
+        assert!(params.get("remember").is_none());
+    }
+
+    #[tokio::test]
+    async fn untrusted_approval_hides_workspace_scope_and_uses_session_details_for_events() {
+        let mut attached = snapshot(true);
+        attached.info.trusted = false;
+        let (launch, mut requests) = launch(attached).await;
+        let mut app = App::new(launch, 120, 32);
+        append(
+            &mut app,
+            EventKind::AssistantMessage {
+                model: ModelRef {
+                    provider: "demo".into(),
+                    model: "script".into(),
+                },
+                content: vec![Block::ToolUse {
+                    id: "event-ask".into(),
+                    name: "bash".into(),
+                    input: json!({ "command": "git push" }),
+                }],
+                stop: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        );
+        append(
+            &mut app,
+            EventKind::ToolDecision {
+                call: "event-ask".into(),
+                action: "exec git push".into(),
+                decision: xi_protocol::event::Decision::Ask,
+                rule: None,
+                taint: false,
+            },
+        );
+        assert!(app.focus == Focus::Approval);
+        assert!(live_text(&app).contains("2 Allow for this session"));
+        assert!(!live_text(&app).contains("3 Always allow"));
+        app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        while let Ok((method, _)) = requests.try_recv() {
+            assert_ne!(method, "approval/resolve");
+        }
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Composer);
+        assert_eq!(app.transcript.asks().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_approval_sends_workspace_scope_and_errors_keep_the_overlay() {
+        for reject in [false, true] {
+            let mut attached = snapshot(true);
+            attached
+                .pending_approvals
+                .push(pending(attached.info.session));
+            let (launch, mut requests) = launch_with(
+                attached,
+                FakeData {
+                    reject_resolve: reject,
+                    ..FakeData::default()
+                },
+            )
+            .await;
+            let mut app = App::new(launch, 120, 32);
+            app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
+                .await
+                .unwrap();
+            let params = request(&mut requests, "approval/resolve");
+            assert_eq!(params["remember"], "workspace");
+            assert_eq!(app.focus == Focus::Approval, reject);
+            if reject {
+                assert!(
+                    app.commit
+                        .iter()
+                        .any(|line| line.plain().contains("scope rejected"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn approvals_inbox_shows_and_resolves_another_sessions_ask() {
+        let attached = snapshot(false);
+        let mut other = snapshot(true);
+        other.info.cwd = "/tmp/other-workspace".into();
+        let ask = pending(other.info.session);
+        let data = FakeData {
+            summaries: vec![summary(&other, true, "other prompt", 100)],
+            approvals: vec![ask.clone()],
+            ..FakeData::default()
+        };
+        let (launch, mut requests) = launch_with(attached, data).await;
+        let mut app = App::new(launch, 160, 32);
+        app.command("/approvals").await.unwrap();
+        request(&mut requests, "approval/list");
+        assert!(app.focus == Focus::Approval);
+        let overlay = live_text(&app);
+        assert!(overlay.contains(&format!("session {}", &other.info.session.to_string()[..8])));
+        assert!(overlay.contains("/tmp/other-workspace"));
+        assert!(!app.footer(160).plain().contains("waiting"));
+        app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "approval/resolve");
+        assert_eq!(params["session"], json!(ask.session));
+        assert_eq!(params["call"], json!(ask.call));
+        assert_eq!(params["remember"], "session");
+        request(&mut requests, "approval/list");
+        assert!(app.focus == Focus::Composer);
+    }
+
+    #[tokio::test]
+    async fn an_answered_ask_still_listed_by_the_daemon_does_not_reopen_the_inbox() {
+        let attached = snapshot(false);
+        let other = snapshot(true);
+        let ask = pending(other.info.session);
+        let data = FakeData {
+            summaries: vec![summary(&other, true, "other prompt", 100)],
+            approvals: vec![ask.clone()],
+            lagging_inbox: true,
+            ..FakeData::default()
+        };
+        let (launch, mut requests) = launch_with(attached, data).await;
+        let mut app = App::new(launch, 160, 32);
+        app.command("/approvals").await.unwrap();
+        request(&mut requests, "approval/list");
+        app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        request(&mut requests, "approval/resolve");
+        request(&mut requests, "approval/list");
+        assert!(app.focus == Focus::Composer);
+        assert!(app.approvals.is_none());
+    }
+
+    #[tokio::test]
+    async fn approvals_inbox_keeps_current_asks_before_the_daemons_oldest_first_order() {
+        let mut attached = snapshot(true);
+        let own = pending(attached.info.session);
+        attached.pending_approvals.push(own.clone());
+        let mut older = pending(SessionId::generate());
+        older.call = "older".into();
+        let mut newer = pending(SessionId::generate());
+        newer.call = "newer".into();
+        let data = FakeData {
+            approvals: vec![older.clone(), newer.clone()],
+            ..FakeData::default()
+        };
+        let (launch, mut requests) = launch_with(attached, data).await;
+        let mut app = App::new(launch, 120, 32);
+        app.command("/approvals").await.unwrap();
+        for expected in [own, older, newer] {
+            assert_eq!(
+                app.approvals
+                    .as_ref()
+                    .unwrap()
+                    .current()
+                    .unwrap()
+                    .pending
+                    .session,
+                expected.session
+            );
+            app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+                .await
+                .unwrap();
+            assert_eq!(
+                request(&mut requests, "approval/resolve")["session"],
+                json!(expected.session)
+            );
+        }
+        assert!(app.focus == Focus::Composer);
+    }
+
+    #[tokio::test]
+    async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live_rows() {
+        for live in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut attached = snapshot(false);
+            attached.info.cwd = temp.path().into();
+            let mut target = snapshot(live);
+            target.info.cwd = temp.path().into();
+            target.info.path = temp.path().join("target.jsonl");
+            if live {
+                target.pending_approvals.push(pending(target.info.session));
+                target.partial = vec![Block::Text {
+                    text: "target in flight".into(),
+                }];
+            }
+            let row = summary(&target, live, "target prompt", 200);
+            let data = FakeData {
+                sessions: vec![target.clone()],
+                summaries: vec![row],
+                ..FakeData::default()
+            };
+            let (launch, mut requests) = launch_with(attached, data).await;
+            let mut app = App::new(launch, 160, 32);
+            app.command("/resume").await.unwrap();
+            assert!(app.focus == Focus::Sessions);
+            let params = request(&mut requests, "session/list");
+            assert_eq!(params["cwd"], json!(temp.path()));
+            assert!(params.get("running").is_none());
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            let params = request(&mut requests, "session/list");
+            assert!(params.get("cwd").is_none());
+            assert!(live_text(&app).contains("all workspaces"));
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            if live {
+                let params = request(&mut requests, "session/attach");
+                assert_eq!(params["session"], json!(target.info.session));
+                assert!(params.get("since").is_none());
+                assert!(app.running());
+                assert!(app.focus == Focus::Approval);
+                assert_eq!(app.transcript.asks().len(), 1);
+                assert!(live_text(&app).contains("target in flight"));
+            } else {
+                let params = request(&mut requests, "session/open");
+                assert_eq!(params["path"], json!(target.info.path));
+                assert!(!app.running());
+                assert!(app.focus == Focus::Composer);
+            }
+            assert_eq!(app.session_id(), target.info.session);
+            assert_eq!(app.launch.template.cwd, target.info.cwd);
+            assert!(app.editor.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_session_held_by_a_worker_attaches_and_updates_the_new_session_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let mut target = snapshot(true);
+        target.info.cwd = other.clone();
+        target.info.path = other.join("saved.jsonl");
+        let data = FakeData {
+            sessions: vec![target.clone()],
+            summaries: vec![summary(&target, false, "held prompt", 200)],
+            held: true,
+            ..FakeData::default()
+        };
+        let (launch, mut requests) = launch_with(snapshot(false), data).await;
+        let mut app = App::new(launch, 120, 32);
+        app.command("/resume").await.unwrap();
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        request(&mut requests, "session/open");
+        assert_eq!(
+            request(&mut requests, "session/attach")["session"],
+            json!(target.info.session)
+        );
+        assert_eq!(app.launch.template.cwd, other);
+        assert_eq!(app.file_cwd.as_ref(), Some(&target.info.cwd));
+        assert!(app.running());
+    }
+
+    #[tokio::test]
+    async fn resume_hides_children_filters_titles_and_workspaces_and_closes_on_current() {
+        let attached = snapshot(false);
+        let mut older = snapshot(false);
+        older.info.cwd = "/tmp/OTHER-workspace".into();
+        let child = snapshot(false);
+        let mut child_row = summary(&child, true, "hidden child", 300);
+        child_row.parent_session = Some(attached.info.session);
+        let data = FakeData {
+            summaries: vec![
+                summary(&attached, true, "Current prompt", 200),
+                summary(&older, false, "Older prompt", 100),
+                child_row,
+            ],
+            ..FakeData::default()
+        };
+        let (launch, mut requests) = launch_with(attached, data).await;
+        let mut app = App::new(launch, 160, 32);
+        app.command("/resume").await.unwrap();
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!live_text(&app).contains("hidden child"));
+        assert!(live_text(&app).contains("● Current prompt"));
+        for c in "other-workspace".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            app.sessions.as_ref().unwrap().selected().unwrap().session,
+            older.info.session
+        );
+        assert!(!live_text(&app).contains("Current prompt"));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.command("/resume").await.unwrap();
+        while requests.try_recv().is_ok() {}
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Composer);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn custom_keymap_changes_dispatch_help_and_initial_thinking() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tui.toml");
+        std::fs::write(
+            &path,
+            "[keys]\nsearch = \"ctrl+y\"\n[display]\nthinking = \"full\"\n",
+        )
+        .unwrap();
+        let (mut launch, _) = launch(snapshot(false)).await;
+        launch.tui_config = Some(path);
+        let mut app = App::new(launch, 120, 32);
+        assert_eq!(
+            app.transcript.thinking_display(),
+            transcript::Thinking::Full
+        );
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Composer);
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Search);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.commit.clear();
+        app.command("/help").await.unwrap();
+        let help = app
+            .commit
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(help.contains("ctrl+y"));
+        assert!(!help.contains("ctrl+r"));
+    }
+
+    #[tokio::test]
+    async fn config_warnings_are_dim_notes_and_ctrl_t_cycles_thinking_display() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tui.toml");
+        std::fs::write(&path, "[keys]\nunknown_action = \"ctrl+y\"\n").unwrap();
+        let (mut launch, _) = launch(snapshot(false)).await;
+        launch.tui_config = Some(path);
+        let mut app = App::new(launch, 120, 32);
+        assert_eq!(
+            app.commit
+                .iter()
+                .filter(|line| line.plain().contains("tui.toml:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.transcript.thinking_display(),
+            transcript::Thinking::First
+        );
+        for expected in [
+            transcript::Thinking::Hidden,
+            transcript::Thinking::Full,
+            transcript::Thinking::First,
+        ] {
+            app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+            assert_eq!(app.transcript.thinking_display(), expected);
+            assert!(app.commit.iter().any(|line| {
+                line.plain()
+                    .contains(&format!("thinking display → {}", expected.name()))
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_queues_osc52_until_the_next_draw_on_the_frame_writer() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 120, 32);
+        app.command("/copy").await.unwrap();
+        assert!(app.controls.is_empty());
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain().contains("nothing to copy yet"))
+        );
+        append(
+            &mut app,
+            EventKind::AssistantMessage {
+                model: ModelRef {
+                    provider: "demo".into(),
+                    model: "script".into(),
+                },
+                content: vec![Block::Text {
+                    text: "  hello\nworld  ".into(),
+                }],
+                stop: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+        app.command("/copy").await.unwrap();
+        let sequence = "\x1b]52;c;aGVsbG8Kd29ybGQ=\x07";
+        assert_eq!(app.controls, vec![sequence]);
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain().contains("copied 2 lines"))
+        );
+        let mut output = Vec::new();
+        {
+            let mut screen = Screen::new(&mut output, false, 120);
+            app.draw(&mut screen).unwrap();
+        }
+        assert!(output.starts_with(sequence.as_bytes()));
+        assert!(app.controls.is_empty());
+        assert!(String::from_utf8(output).unwrap().contains("\x1b[?2026h"));
+    }
+
+    #[tokio::test]
+    async fn startup_resume_uses_the_attached_workspace_for_new_sessions() {
+        let (mut launch, _) = launch(snapshot(false)).await;
+        launch.template.cwd = "/tmp/original-workspace".into();
+        let app = App::new(launch, 120, 32);
+        assert_eq!(app.launch.template.cwd, app.launch.attached.info.cwd);
     }
 }

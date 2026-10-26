@@ -79,6 +79,9 @@ pub enum EventKind {
         /// The rule that decided, as `layer#index`. Absent when no rule matched.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
+        /// Whether branch taint changed an allow into an ask.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        taint: bool,
     },
     /// Answer to an [`Decision::Ask`].
     ApprovalResolved {
@@ -88,6 +91,9 @@ pub enum EventKind {
         approved: bool,
         /// Who answered.
         by: Approver,
+        /// How long an approved answer applies.
+        #[serde(default, skip_serializing_if = "Remember::is_once")]
+        remember: Remember,
     },
     /// Output of a tool call.
     ToolResult {
@@ -202,6 +208,27 @@ pub enum Decision {
     Deny,
 }
 
+/// How long an approval applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Remember {
+    /// Apply only to this call.
+    #[default]
+    Once,
+    /// Remember on this session branch.
+    Session,
+    /// Also save an allow rule in the trusted workspace.
+    Workspace,
+}
+
+impl Remember {
+    /// Whether the approval applies only to this call.
+    #[must_use]
+    pub fn is_once(&self) -> bool {
+        *self == Self::Once
+    }
+}
+
 /// Who resolved an approval.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -264,5 +291,63 @@ mod tests {
         });
         assert_eq!(serde_json::to_value(&event).unwrap(), wire);
         assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), event);
+    }
+    #[test]
+    fn approval_scopes_and_legacy_events_wire_shapes() {
+        for (remember, name) in [
+            (Remember::Once, "once"),
+            (Remember::Session, "session"),
+            (Remember::Workspace, "workspace"),
+        ] {
+            assert_eq!(serde_json::to_value(remember).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<Remember>(json!(name)).unwrap(),
+                remember
+            );
+            let event = EventKind::ApprovalResolved {
+                call: "call".into(),
+                approved: true,
+                by: Approver::User,
+                remember,
+            };
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(wire.get("remember").is_none(), remember.is_once());
+            assert_eq!(serde_json::from_value::<EventKind>(wire).unwrap(), event);
+        }
+        let old = json!({
+            "type": "approval_resolved", "call": "call", "approved": true,
+            "by": {"kind": "user"},
+        });
+        let event: EventKind = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            event,
+            EventKind::ApprovalResolved {
+                remember: Remember::Once,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(event).unwrap(), old);
+        let old = json!({
+            "type": "tool_decision", "call": "call", "action": "tool read",
+            "decision": "ask",
+        });
+        let event: EventKind = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            event,
+            EventKind::ToolDecision { taint: false, .. }
+        ));
+        assert_eq!(serde_json::to_value(event).unwrap(), old);
+        let event = EventKind::ToolDecision {
+            call: "call".into(),
+            action: "net example.org".into(),
+            decision: Decision::Ask,
+            rule: None,
+            taint: true,
+        };
+        assert_eq!(serde_json::to_value(&event).unwrap()["taint"], true);
+        assert_eq!(
+            serde_json::from_value::<EventKind>(serde_json::to_value(&event).unwrap()).unwrap(),
+            event,
+        );
     }
 }

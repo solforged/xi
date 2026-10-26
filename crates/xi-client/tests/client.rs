@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use xi_client::client::{Client, ClientError, ClientNotification};
 use xi_client::peer::{Incoming, Peer, PeerError};
 use xi_protocol::content::Block;
-use xi_protocol::event::{Event, EventKind, ModelRef};
+use xi_protocol::event::{Event, EventKind, ModelRef, Remember};
 use xi_protocol::ids::{EventId, SessionId, Timestamp};
 use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::*;
@@ -158,6 +158,8 @@ async fn initializes_first_and_sends_typed_create_prompt_and_approval_requests()
         tool: "bash".into(),
         action: "git status".into(),
         rule: Some("user#1".into()),
+        taint: false,
+        trusted: true,
     };
     exchange!(
         client.approvals(),
@@ -168,14 +170,15 @@ async fn initializes_first_and_sends_typed_create_prompt_and_approval_requests()
         vec![pending.clone()]
     );
     exchange!(
-        client.resolve(session, pending.call.clone(), true),
+        client.resolve(session, pending.call.clone(), true, Remember::Session),
         ApprovalResolve,
         &daemon,
         &mut incoming,
         ResolveParams {
             session,
             call: pending.call,
-            approved: true
+            approved: true,
+            remember: Remember::Session,
         },
         ()
     );
@@ -231,6 +234,9 @@ async fn routes_remaining_typed_requests() {
         running: true,
         pending_approvals: 1,
         parent_session: None,
+        started: Some(Timestamp(1)),
+        updated: Some(Timestamp(2)),
+        title: Some("first prompt".into()),
     };
     exchange!(
         client.list(filters.clone()),
@@ -498,6 +504,8 @@ async fn notifications_are_typed_and_unknown_methods_are_ignored() {
         tool: "bash".into(),
         action: "git status".into(),
         rule: None,
+        taint: true,
+        trusted: false,
     };
     daemon
         .notify_value("unknown/notification", json!({"anything": true}))

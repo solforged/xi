@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::content::{Block, ToolOutput};
-use crate::event::{Event, ModelRef, Usage};
-use crate::ids::{EventId, SessionId, ToolCallId};
+use crate::event::{Event, ModelRef, Remember, Usage};
+use crate::ids::{EventId, SessionId, Timestamp, ToolCallId};
 use crate::model::{ModelInfo, Reasoning};
 use crate::rpc::{NotificationMethod, RequestMethod};
 
@@ -334,6 +334,15 @@ pub mod client {
         /// Parent session for a child session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub parent_session: Option<SessionId>,
+        /// Timestamp of the session root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub started: Option<Timestamp>,
+        /// Log modification time in milliseconds since the epoch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub updated: Option<Timestamp>,
+        /// First non-blank line of the first user message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub title: Option<String>,
     }
 
     /// Parameters for [`SessionSetModel`].
@@ -401,6 +410,12 @@ pub mod client {
         /// Matched policy rule, when present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub rule: Option<String>,
+        /// Whether branch taint caused this ask.
+        #[serde(default)]
+        pub taint: bool,
+        /// Whether the session workspace is trusted.
+        #[serde(default)]
+        pub trusted: bool,
     }
 
     /// Result of [`DaemonStatus`].
@@ -535,6 +550,9 @@ pub mod client {
         pub call: ToolCallId,
         /// Whether the call may run.
         pub approved: bool,
+        /// How long an approved answer applies.
+        #[serde(default, skip_serializing_if = "Remember::is_once")]
+        pub remember: Remember,
     }
 
     /// Parameters for [`EventAppended`].
@@ -1030,6 +1048,8 @@ mod tests {
                 tool: "bash".into(),
                 action: "git status".into(),
                 rule: Some("user#1".into()),
+                taint: true,
+                trusted: true,
             }],
         };
         let wire = json!({
@@ -1049,6 +1069,7 @@ mod tests {
             "pending_approvals": [{
                 "session": session, "call": "call-1", "tool": "bash",
                 "action": "git status", "rule": "user#1",
+                "taint": true, "trusted": true,
             }],
         });
         assert_eq!(serde_json::to_value(&result).unwrap(), wire);
@@ -1179,6 +1200,57 @@ mod tests {
                 "attempt": 0,
                 "sequence": 0,
             }),
+        );
+    }
+    #[test]
+    fn approval_and_session_metadata_are_backward_compatible() {
+        use crate::Remember;
+
+        let session = SessionId::generate();
+        let old = json!({"session": session, "call": "call", "approved": true});
+        let params: ResolveParams = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(params.remember, Remember::Once);
+        assert_eq!(serde_json::to_value(&params).unwrap(), old);
+        let remembered = ResolveParams {
+            remember: Remember::Session,
+            ..params
+        };
+        assert_eq!(
+            serde_json::to_value(remembered).unwrap()["remember"],
+            "session"
+        );
+        let pending: PendingApproval = serde_json::from_value(json!({
+            "session": session, "call": "call", "tool": "read", "action": "tool read",
+        }))
+        .unwrap();
+        assert!(!pending.taint);
+        assert!(!pending.trusted);
+        let wire = serde_json::to_value(pending).unwrap();
+        assert_eq!(wire["taint"], false);
+        assert_eq!(wire["trusted"], false);
+        let old = json!({
+            "session": session, "path": "/session.jsonl", "cwd": "/work",
+            "model": {"provider": "test", "model": "test"},
+            "running": false, "pending_approvals": 0,
+        });
+        let summary: SessionSummary = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(summary.started, None);
+        assert_eq!(summary.updated, None);
+        assert_eq!(summary.title, None);
+        assert_eq!(serde_json::to_value(&summary).unwrap(), old);
+        let enriched = SessionSummary {
+            started: Some(Timestamp(1)),
+            updated: Some(Timestamp(2)),
+            title: Some("hello".into()),
+            ..summary
+        };
+        let wire = serde_json::to_value(&enriched).unwrap();
+        assert_eq!(wire["started"], 1);
+        assert_eq!(wire["updated"], 2);
+        assert_eq!(wire["title"], "hello");
+        assert_eq!(
+            serde_json::from_value::<SessionSummary>(wire).unwrap(),
+            enriched
         );
     }
 }

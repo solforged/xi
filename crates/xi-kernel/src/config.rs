@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -580,6 +581,44 @@ impl Config {
         serde_json::from_slice(&output.stdout)
             .map_err(|e| fail(format!("expected a JSON object of strings or nulls: {e}")))
     }
+}
+
+/// Appends one exact allow rule without rewriting existing local settings.
+pub(crate) fn append_workspace_allow(
+    workspace: &Path,
+    action: ActionKind,
+    subject: &str,
+) -> Result<()> {
+    let directory = workspace.join(".xi");
+    std::fs::create_dir_all(&directory)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(directory.join("config.local.toml"))?;
+    let separator = if file.metadata()?.len() == 0 {
+        ""
+    } else {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] == b'\n' { "" } else { "\n" }
+    };
+    let action = match action {
+        ActionKind::Read => "read",
+        ActionKind::Write => "write",
+        ActionKind::Exec => "exec",
+        ActionKind::Net => "net",
+        ActionKind::Tool => "tool",
+    };
+    // Policy globs treat `\` as an escape, which `globset::escape` leaves alone.
+    let pattern = toml::Value::String(globset::escape(subject).replace('\\', "\\\\"));
+    let text = format!(
+        "{separator}\n[[rule]]\neffect = \"allow\"\naction = \"{action}\"\npattern = {pattern}\nwhen = \"always\"\n"
+    );
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn comparison_path(path: &Path) -> PathBuf {

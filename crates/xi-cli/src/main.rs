@@ -283,6 +283,7 @@ async fn run(cli: Cli) -> Result<u8> {
         template,
         attached,
         history: Some(paths.state.join("prompts.jsonl")),
+        tui_config: Some(paths.config.join("tui.toml")),
     };
     if !cli.plain && xi_tui::available() {
         xi_tui::run(launch).await?;
