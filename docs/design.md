@@ -141,9 +141,12 @@ Client → daemon requests:
 | `session/checkout` | `{session, event}` → null | Route to the worker; move the head to an earlier event to branch. Idle only. |
 | `session/compact` | `{session}` → `{head, tokens_before}` | Route to the worker; summarize older context at an idle prompt. |
 | `session/set_model` | `{session, model}` → null | Idle only; record `model_changed`. |
+| `session/set_reasoning` | `{session, reasoning}` → null | Idle only; record `reasoning_changed` when the level changes. Reopening a log restores the last level on the head's lineage. Models without reasoning keep the setting and ignore it. |
+| `session/models` | `{session}` → `{current, reasoning, models: [{model, info, available}]}` | Route to the worker; list the session's model registry with `ModelInfo`. `available` is false when the provider's credential is missing. No credential value is ever returned. |
+| `session/commands` | `{session}` → `[{name, description}]` | Route to the worker; list the session's extension slash commands for completion. |
 | `session/command` | `{session, name, args}` → command result or null | Route an extension slash command to the worker. The result is the extension protocol's `CommandResult`; null means an unknown command. |
 | `approval/list` | `{}` → `[{session, call, tool, action, rule}]` | Return pending asks across all sessions. |
-| `approval/resolve` | `{session, call, approved}` → null | Route the answer to the owning worker; the first answer wins. |
+| `approval/resolve` | `{session, call, approved, remember?}` → null | Route the answer to the owning worker; the first answer wins. `remember` is `once` (default), `session` or `workspace`; see [Terminal client](#terminal-client). |
 | `daemon/status` | `{}` → `{version, pid, uptime_secs, workers, clients, leases}` | Return daemon status. Each lease entry is `{endpoint, concurrency, active, waiting}`. |
 | `daemon/shutdown` | `{when: "idle" \| "now"}` → null | `idle` exits when there are no workers; `now` cancels running turns, closes workers and kills any still present after five seconds. |
 
@@ -159,7 +162,7 @@ Client → daemon requests:
 | `max_turns` | Optional integer, absent means 200 | Turn limit (`--max-turns`). |
 | `approval` | `ApprovalPolicy`: `client` (default), `allow`, or `deny` | `client` waits for a client approval; `allow` and `deny` resolve asks headlessly. |
 
-The attach result is `{info, events, partial, running, pending_approvals, stream_sequence}` for create, open and attach. `info` is `SessionDetails`: `{session, path, head, cwd, trusted, model, model_info?, parent_session?}`. Saved sessions without a live worker have no `head` in `session/list`. The daemon guarantees at-least-once event delivery between an attach result and subsequent `event/appended` notifications, so clients deduplicate events by id. Stream notifications can also arrive twice, because the daemon subscribes a connection before asking the worker for its snapshot; `stream_sequence` is the last stream sequence included in `partial`, and clients drop `stream/delta` and `stream/reset` notifications at or below it. A sequence of 0 means unsequenced and is always applied. The prompt result's `failed`, `cancelled` and `text` fields come from the kernel's `TurnOutcome` and default on deserialization to false, false and an empty string.
+The attach result is `{info, events, partial, running, pending_approvals, stream_sequence}` for create, open and attach. `info` is `SessionDetails`: `{session, path, head, cwd, trusted, model, reasoning, model_info?, parent_session?}`. Saved sessions without a live worker have no `head` in `session/list`. The daemon guarantees at-least-once event delivery between an attach result and subsequent `event/appended` notifications, so clients deduplicate events by id. Stream notifications can also arrive twice, because the daemon subscribes a connection before asking the worker for its snapshot; `stream_sequence` is the last stream sequence included in `partial`, and clients drop `stream/delta` and `stream/reset` notifications at or below it. A sequence of 0 means unsequenced and is always applied. The prompt result's `failed`, `cancelled` and `text` fields come from the kernel's `TurnOutcome` and default on deserialization to false, false and an empty string.
 
 Daemon → client notifications go only to connections attached to that session, except where noted:
 
@@ -185,7 +188,7 @@ On the daemon ↔ worker link, the first request must be `worker/start`. Its res
 | `model/lease` | Worker → daemon request | `{endpoint}` → null | Wait for permission to make a model request. |
 | `model/release` | Worker → daemon notification | `{endpoint}` | Release a granted lease. |
 
-After startup, the daemon forwards `session/attach`, `session/close`, `session/prompt`, `session/cancel`, `session/checkout`, `session/compact`, `session/set_model`, `session/command` and `approval/resolve` unchanged. A worker's attach response is a snapshot, not a subscription; the daemon owns client subscriptions. Workers send `event/appended`, `stream/delta` and `stream/reset` notifications to the daemon. Before each model request a worker requests a lease for the endpoint and waits for a grant. It releases the lease when the response ends, fails or is cancelled. Leases are FIFO per endpoint; retries of the same request keep the lease, and worker exit releases its leases implicitly.
+After startup, the daemon forwards `session/attach`, `session/close`, `session/prompt`, `session/cancel`, `session/checkout`, `session/compact`, `session/set_model`, `session/set_reasoning`, `session/models`, `session/commands`, `session/command` and `approval/resolve` unchanged. A worker's attach response is a snapshot, not a subscription; the daemon owns client subscriptions. Workers send `event/appended`, `stream/delta` and `stream/reset` notifications to the daemon. Before each model request a worker requests a lease for the endpoint and waits for a grant. It releases the lease when the response ends, fails or is cancelled. Leases are FIFO per endpoint; retries of the same request keep the lease, and worker exit releases its leases implicitly.
 
 Errors use the JSON-RPC server range; `data` carries structured detail:
 
@@ -269,6 +272,94 @@ The same provider and model summarize the older prefix, including any previous s
 
 The summary is the first user-side content after the unchanged system prompt. The log supplies retained events before descendants, so reopening or branching rebuilds the same context. An extension `compact` hook can supply the summary instead, which skips the model call and records `usage: None`.
 
+### Terminal client
+
+`xi-tui` is the daily interface: a daemon client that commits finished output to the terminal's native scrollback and redraws only a live region below it. The live region holds the streaming turn, any open overlay, the composer and a one-line footer. Everything about a session goes through the protocol. The client owns only local state: prompt history, key bindings, display preferences and edits to the user's global config file.
+
+The surface below is the target for daily use, including developing xi with xi. [Roadmap](roadmap.md#terminal-client) tracks which parts exist.
+
+#### Keys
+
+Composer keys are unique. Keys inside an overlay apply only while it has focus.
+
+| Key | Action |
+|---|---|
+| `enter` | Send. During a turn, steer. With a completion menu open, accept the selection. |
+| `alt+enter` | Queue a follow-up for after the turn. |
+| `shift+enter`, `ctrl+j` | New line. |
+| `esc` | Close a menu or overlay; otherwise cancel the running turn. |
+| `ctrl+c` | Close an overlay, else cancel the turn, else clear the composer, else quit. |
+| `ctrl+d` | Quit when the composer is empty and no turn runs; otherwise delete forward. |
+| `up`, `down` | Move in an open menu; otherwise walk this workspace's history while the composer has one line. |
+| `tab` | Accept a completion; otherwise open pending approvals. |
+| `ctrl+r` | Search prompt history. |
+| `ctrl+g` | Edit the prompt in the external editor. |
+| `alt+m` | Open the model picker. |
+| `shift+tab` | Cycle reasoning: off, low, medium, high. |
+| `ctrl+o` | Expand the newest collapsed result; repeat to walk back. |
+| `ctrl+t` | Cycle thinking display: full, first line, hidden. |
+| Editing | `ctrl+a`/`ctrl+e` line start and end, `ctrl+b`/`ctrl+f` and arrows by character, `ctrl+w` and `alt+backspace` delete a word, `ctrl+u`/`ctrl+k` delete to line start and end. |
+
+Alt keys need the terminal to send Option as Meta on macOS; every alt binding also has a slash command. `[keys]` in `$XDG_CONFIG_HOME/xi/tui.toml` maps action names to key strings, and `/help` lists the effective bindings from the same table the client dispatches on.
+
+#### Commands
+
+| Command | Action |
+|---|---|
+| `/help`, `/hotkeys` | Show keys and commands. |
+| `/quit`, `/exit` | Leave. A running turn keeps running in its worker. |
+| `/new` | Start a session in the same workspace. |
+| `/resume` | Open the session picker. |
+| `/tree` | Open the branch overlay and check out an earlier point. |
+| `/model [PROVIDER/MODEL]` | Switch model; without an argument, open the model picker. |
+| `/reasoning [off\|low\|medium\|high]` | Set reasoning; without an argument, show it. |
+| `/compact` | Summarize older context now. |
+| `/approvals` | Open the approvals inbox for all sessions. |
+| `/settings` | Open the settings view. |
+| `/copy` | Copy the last response through OSC 52, which also works over SSH. |
+| `/name args` | Any other name runs an extension command through `session/command`; an unknown name points to `/help`. |
+
+Built-in names are reserved, so an extension cannot shadow them. Model, reasoning, compaction and `/new` are idle only; during a turn the client says so instead of queueing the change.
+
+#### Composer
+
+- History: every submitted prompt is appended to `$XDG_STATE_HOME/xi/prompts.jsonl` as `{cwd, text}`, keeping the newest 5,000. `up` walks prompts from the current workspace. `ctrl+r` searches all of them, current workspace first; `enter` puts the match in the composer and `esc` restores the draft. Line mode keeps its own history file.
+- Completion: `/` at the start of the first line opens a menu of built-in and extension commands with their descriptions. `@` at the start of a word opens a menu of workspace files from a gitignore-aware walk, fuzzy matched on the path with a preference for the file name. Accepting inserts `@relative/path` followed by a space. The mention stays plain text: the model reads the file with its tools, and nothing is inlined.
+- External editor: `ctrl+g` writes the composer text to a temporary file and runs `$VISUAL`, else `$EDITOR`, else `vi`, through `sh -c` so quoted editor commands work. A zero exit replaces the composer text without its trailing newline; any other exit leaves the composer unchanged.
+
+#### Overlays
+
+| Overlay | Opens with | Contents and keys |
+|---|---|---|
+| Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider: id, context window, a reasoning mark and price per million input and output tokens. Models without credentials are dimmed with the way to add one. Typing filters, `enter` selects, `esc` closes. |
+| History search | `ctrl+r` | The query and the newest match; `ctrl+r` again moves to older matches. |
+| Session picker | `/resume` | `session/list` for this workspace, `tab` for all workspaces: name or first prompt, model, age, running and pending-approval marks. `enter` attaches to a live session or opens a saved one. |
+| Approvals | `tab`, `/approvals` | One ask at a time with its action and rule. `1`/`y` allows once, `2` allows for this session, `3` always allows in this workspace, `4`/`n` denies. Across sessions, the inbox comes from `approval/list` and `approval/pending`. |
+| Tree | `/tree` | Branch points of the session; `enter` checks out, `esc` closes. |
+| Settings | `/settings` | See below. |
+
+Approval scopes: `remember = session` makes the worker allow the same tool and exact action for the rest of the session; the `approval_resolved` event records the scope, so reopening the log restores the grant. `remember = workspace` also appends an allow `[[rule]]` for that exact action to `<workspace>/.xi/config.local.toml`; it is offered only in a trusted workspace. Neither scope is offered for an ask that taint caused, because taint asks exist to stop exfiltration after untrusted input.
+
+#### Settings view
+
+Each row shows the effective value and the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted.
+
+| Row | Scope | Change |
+|---|---|---|
+| Model, reasoning | Session | Protocol methods; `ctrl+s` also saves the value as the global default. |
+| Thinking display | Client | `tui.toml`. |
+| Automatic compaction, trigger, kept tail | Global default | Global `config.toml`. |
+| Tools, including `hashline` | Global default | Global `config.toml`. |
+| Approval mode for new sessions | Global default | Global `config.toml`. |
+| Sandbox roots, trust, daemon idle timeout | Read only | `e` opens the file in the external editor. |
+
+The client edits the global `config.toml` with a format-preserving TOML writer, so comments and ordering survive. A running worker keeps the config it started with; new sessions read the change. Provider sections, `[[model]]` and `[[rule]]` stay file-only.
+
+#### Footer and rendering
+
+The footer shows workspace, model, reasoning, context use, cache hit rate, cost when pricing is known, trust, taint and waiting approvals. Context, taint, approvals and trust never drop; the rest drop in a fixed order as the terminal narrows. Reasoning shows as `think low`, `think med` or `think high`, and as `no think` for models without reasoning.
+
+Tool results show a headline and at most three lines; `ctrl+o` expands the rest. `edit` results render as a diff of the replaced and new text. Thinking blocks follow the thinking display setting. Images show as a placeholder.
 
 ## Security model
 
@@ -421,7 +512,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 | `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler, socket activation, unit installation and private-instance mode. | Implemented |
 | `xi-cli` | The `xi` binary: daemon-backed line mode and TUI launch, private-instance headless `-p`, client-protocol `serve`, `trust`, `daemon`, `daemon install`/`uninstall` and internal `worker`. | Implemented |
 | `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |
-| `xi-tui` | Daemon client: scrollback commits, a live region, `ctrl+o` full results and a `/tree` checkout overlay. | Implemented |
+| `xi-tui` | Daemon client: scrollback commits, a live region, `ctrl+o` full results, a `/tree` checkout overlay and the [terminal client](#terminal-client) surface. | Implemented; terminal client surface in progress |
 | `sdk/typescript` | Zero-dependency extension SDK and full-duplex NDJSON peer. | Implemented |
 
 ## Build order
@@ -433,6 +524,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 5. Protocol types for the handshake, attach, list, approvals inbox, stream reset and error codes; the worker entry point over a pipe; `xi-daemon` with private-instance mode; `xi -p` and the benchmark on the private instance (benchmark argv unchanged). Done.
 6. The per-user daemon: socket, peer-uid check, lock-based startup, idle exit, launchd and systemd units, `notify` and `approval_timeout`. Done.
 7. `xi-tui` as a daemon client; scheduler leases. Done.
+8. The [terminal client](#terminal-client) surface for daily use, in five slices: model and reasoning; sessions and approvals; composer; rendering and keys; settings. In progress.
 
 What comes next, and how features and sandbox work proceed side by side, is in [roadmap.md](roadmap.md).
 
