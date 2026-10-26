@@ -43,7 +43,7 @@ Interactive steering in line mode is missing (the RPC path queues prompts alread
 | Item | Why |
 |---|---|
 | Egress proxy and in-namespace forwarder | Tools and extensions have no network at all today; `fetch`, package installs and `git push` need it. Extensions that declare `net` refuse to start until it exists. |
-| Frontier-model runs | Benchmark measurements so far use local models. ChatGPT-plan models (`chatgpt/gpt-6.1-sol` after `xi login chatgpt`) now run live but have not been benchmarked. The Anthropic adapter passes mocked transcripts only; there is no API key on these machines. |
+| Harder tasks for frontier models | `gpt-6.1-sol` passes every hard task in every arm (36/36; see [Frontier model](#frontier-model)), so the suite can no longer rank harnesses or features on a frontier model. The Anthropic adapter passes mocked transcripts only; there is no API key on these machines. |
 | Credentials from the keychain | Only env vars and 0600 files work now. |
 | Extension package pinning | Packages load from configured directories; the content-hash lockfile is not built. |
 | PID namespace (Linux) | Other processes' command lines are visible in `/proc`. |
@@ -62,7 +62,7 @@ From a read-only survey of `~/src/oh-my-pi` (31 tools, a loop of about 115 KB in
 
 ## Benchmark results
 
-All runs on 2026-10-26 with `xi-bench` (see [bench/README.md](../bench/README.md)), three trials per arm and task unless noted. Models are local llama.cpp servers on amarna's RTX PRO 6000: Qwen 3.8 27B (Q8), Gemma 4 12B (Q8) and Ornith 1.5 35B-A3B (Q4). Counts and tokens are per-run medians. Raw records are in `~/xi-bench-2026-10-26` on amarna.
+All runs on 2026-10-26 with `xi-bench` (see [bench/README.md](../bench/README.md)), three trials per arm and task unless noted. Models are local llama.cpp servers on amarna's RTX PRO 6000: Qwen 3.8 27B (Q8), Gemma 4 12B (Q8) and Ornith 1.5 35B-A3B (Q4), except in [Frontier model](#frontier-model). Counts and tokens are per-run medians. Raw records are in `~/xi-bench-2026-10-26` on amarna.
 
 ### Suite baseline
 
@@ -82,6 +82,29 @@ The four harder tasks, `xi` against `omp`, Qwen 3.8 on the single-slot 256k serv
 - The harder tasks separate runs: both arms pass 8/12, against 15/15 on the starter suite.
 - xi matches omp's pass rate at under half the wall time and a fraction of the cached prompt tokens on every task.
 - Three trials per cell cannot rank the two harnesses on pass rate; that needs more trials or a frontier model.
+
+### Frontier model
+
+The four harder tasks on `gpt-6.1-sol` through a ChatGPT plan, at medium reasoning: xi at 9d71600 (`chatgpt/…`) and omp 18.12.6 (`openai-codex/…`), on hyperion. One runner per task ran concurrently on the same account; within a task the arms alternated order. Raw records are in `~/xi-bench-2026-10-26-gpt` on hyperion.
+
+| Arm | Pass | Median wall | Median calls | Median tool calls | Median tokens (input / output / cache read) | Edit failures |
+|---|---:|---:|---:|---:|---:|---:|
+| `xi` | 12/12 | 76 s | 15.5 | 14.5 | 14,122 / 2,593 / 54,208 | 4% (2/52) |
+| `xi-hashline` | 12/12 | 73 s | 17.5 | 16.5 | 16,858 / 2,512 / 58,432 | 0% (0/55) |
+| `omp` | 12/12 | 103 s | 13 | 26 | 19,824 / 3,951 / 182,336 | 9% (2/23) |
+
+| Task | `xi` wall | `xi-hashline` wall | `omp` wall |
+|---|---:|---:|---:|
+| `invoice-rounding` | 112 s | 100 s | 125 s |
+| `long-context-catalog` | 98 s | 82 s | 81 s |
+| `parallel-kernels` | 57 s | 71 s | 137 s |
+| `revision-store` | 68 s | 61 s | 89 s |
+
+- Every run passed. On a frontier model the hard suite measures cost and speed, not success.
+- xi was faster than omp on three tasks and used about 70% fewer cache-read tokens and a third less output. omp was faster on `long-context-catalog`.
+- omp made fewer model calls but nearly twice the tool calls. The ChatGPT backend's Lite request shape requires `parallel_tool_calls: false`, so xi gets one tool call per response there.
+- `hashline` made no edit errors in 55 edits; exact replacement failed 2 of 52, both in one run where the model repeated a stale snippet. Anchors failed 23% to 93% of edits on the local models, and pass rate and time are equal here, so exact replacement stays the default.
+- Compaction and subagent arms were not run on this model.
 
 ### Edit format
 
