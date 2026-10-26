@@ -271,7 +271,7 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 - Tools: `read`, `edit`, `write`, `bash`, `search`. `edit` replaces exact text, including whitespace and indentation. Read first and include enough surrounding lines to make the match unique, unless replacing all occurrences. The opt-in `hashline` tool edits by line and content hash, rejecting stale anchors. Read and search output uses `LINE|text` by default and `LINE:HH|text` when `hashline` is active. Children inherit the parent's output format, even if their tool subset omits `hashline`. Large outputs are truncated in context and spilled to a file the model can read.
 - Context files: `AGENTS.md` and Agent Skills.
 - System prompt: under 1k tokens, static.
-- Compaction: user-visible; produces a structured summary (goal, decisions, touched files, open work).
+- Compaction: automatic compaction off; a context overflow always compacts once and retries. The summary is structured (goal, decisions, touched files, open work) and visible as a `compaction` event.
 - TUI: differential rendering into the terminal's native scrollback.
 - Config: one TOML format, layered global, project, local.
 
@@ -288,7 +288,7 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 | `xi-tools` | `read`, exact-string `edit`, `write`, `bash`, `search`, plus opt-in `hashline` edits. | Implemented |
 | `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server and sandboxed extension host. | Implemented |
 | `xi-cli` | The `xi` binary: line mode, headless `-p`, `serve`, `trust`. | Implemented |
-| `xi-bench` | Runs xi and omp arms on a task suite and reports metrics. | Implemented |
+| `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |
 | `xi-tui` | Terminal client. | Planned |
 | `sdk/typescript` | Zero-dependency extension SDK and full-duplex NDJSON peer. | Implemented |
 
@@ -297,6 +297,7 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 1. `xi-sandbox` on Linux and macOS. Done.
 2. `xi-provider`, `xi-kernel`, `xi-tools` and a line-mode client: the first usable agent. Done.
 3. `xi-bench`, so features are added on measurements. Done.
+4. Harder tasks, the edit-format decision, compaction, the extension host with the TypeScript SDK, and subagents as a package. Done.
 
 What comes next, and how features and sandbox work proceed side by side, is in [roadmap.md](roadmap.md).
 
