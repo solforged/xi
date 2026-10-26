@@ -27,3 +27,24 @@ fn tmp_is_private_to_the_session() {
         "inside\n"
     );
 }
+
+#[test]
+fn readable_roots_under_host_tmp_keep_their_path_and_stay_read_only() {
+    let fixture = Fixture::new();
+    let shared = tempfile::tempdir_in("/tmp").unwrap();
+    let file = shared.path().join("config");
+    std::fs::write(&file, "kept\n").unwrap();
+    let mut spec = fixture.spec();
+    spec.readable.push(shared.path().to_owned());
+    let output = sh(
+        &spec,
+        &format!(
+            "cat {0} && ! echo changed > {0} && ! touch {1}/new",
+            file.display(),
+            shared.path().display()
+        ),
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "kept\n");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept\n");
+}

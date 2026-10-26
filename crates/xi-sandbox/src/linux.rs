@@ -251,21 +251,39 @@ fn bind_read_only(path: &Path) -> Result<(), Error> {
     .map_err(setup(step()))
 }
 
-/// Mounts the session tmp at `/tmp`. Writable roots under the host `/tmp`
-/// are first bound into the session tmp at the same relative path, so they
-/// keep their paths.
+/// Mounts the session tmp at `/tmp`. Writable and readable roots under the
+/// host `/tmp` are first bound into the session tmp at the same relative
+/// path, so they keep their paths. Bound readable roots are remounted
+/// read-only: inside the session tmp, Landlock's write rule for the tmp
+/// would otherwise cover them.
 fn mount_tmp(spec: &Spec) -> Result<(), Error> {
     let host_tmp = Path::new("/tmp");
-    for root in &spec.writable {
+    let roots = spec.writable.iter().map(|root| (root, true));
+    let roots = roots.chain(spec.readable.iter().map(|root| (root, false)));
+    for (root, writable) in roots {
         if *root == spec.tmp {
             continue;
         }
         let Ok(relative) = root.strip_prefix(host_tmp) else {
             continue;
         };
+        if relative.as_os_str().is_empty() || !root.exists() {
+            continue;
+        }
         let target: PathBuf = spec.tmp.join(relative);
         let step = || format!("expose {} under /tmp", root.display());
-        fs::create_dir_all(&target).map_err(setup(step()))?;
+        if root.is_dir() {
+            fs::create_dir_all(&target).map_err(setup(step()))?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(setup(step()))?;
+            }
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&target)
+                .map_err(setup(step()))?;
+        }
         mount(
             Some(root.as_path()),
             &target,
@@ -274,6 +292,9 @@ fn mount_tmp(spec: &Spec) -> Result<(), Error> {
             None::<&str>,
         )
         .map_err(setup(step()))?;
+        if !writable && !spec.writable.iter().any(|w| root.starts_with(w)) {
+            bind_read_only(&target)?;
+        }
     }
     mount(
         Some(spec.tmp.as_path()),
