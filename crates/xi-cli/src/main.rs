@@ -223,6 +223,14 @@ async fn run(cli: Cli) -> Result<u8> {
             )?;
             continue;
         }
+        if line == "/compact" {
+            match session.compact(None).await {
+                Ok(result) => eprintln!("Compacted {} estimated tokens.", result.tokens_before),
+                Err(error) => eprintln!("xi: {error}"),
+            }
+            while notifications.try_recv().is_ok() {}
+            continue;
+        }
         if let Some(model) = line.strip_prefix("/model ") {
             match parse_model(model.trim()) {
                 Ok(model) => {
@@ -235,7 +243,7 @@ async fn run(cli: Cli) -> Result<u8> {
             continue;
         }
         if line.starts_with('/') {
-            eprintln!("Commands: /quit, /new, /model PROVIDER/MODEL");
+            eprintln!("Commands: /quit, /new, /compact, /model PROVIDER/MODEL");
             continue;
         }
         match turn(
@@ -340,6 +348,9 @@ fn display(notification: Notification, session: &Session, render: Render) -> Res
                     first,
                     text.lines().count()
                 );
+            }
+            EventKind::Compaction { tokens_before, .. } => {
+                println!("\nCompacted {tokens_before} estimated tokens.");
             }
             EventKind::ToolDecision {
                 call,
