@@ -196,7 +196,7 @@ enum Command {
     },
     Started {
         worker: u64,
-        result: Result<AttachResult, RpcError>,
+        result: Result<Box<AttachResult>, RpcError>,
     },
     Forwarded {
         client: Option<u64>,
@@ -352,7 +352,7 @@ impl Router {
                 }
             }
             Command::Spawned { worker, process } => self.spawned(worker, process),
-            Command::Started { worker, result } => self.worker_started(worker, result),
+            Command::Started { worker, result } => self.worker_started(worker, result.map(|a| *a)),
             Command::Forwarded {
                 client,
                 id,
@@ -767,6 +767,7 @@ impl Router {
             let result = peer
                 .request::<WorkerStart>(&start.params)
                 .await
+                .map(Box::new)
                 .map_err(peer_error);
             let _ = commands.send(Command::Started {
                 worker: key,
