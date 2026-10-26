@@ -348,17 +348,7 @@ fn parse_metrics(kind: Kind, sessions: &Path, logs: &Path, wall_ms: f64) -> Resu
             BufReader::new(File::open(logs.join("agent.stdout.jsonl"))?),
             wall_ms,
         )?,
-        Kind::Xi => {
-            let files: Vec<_> = fs::read_dir(sessions)?
-                .collect::<std::io::Result<Vec<_>>>()?
-                .into_iter()
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-                .collect();
-            if files.len() != 1 {
-                return Err(format!("expected one xi session JSONL, found {}", files.len()).into());
-            }
-            metrics::parse_xi(BufReader::new(File::open(files[0].path())?), wall_ms)?
-        }
+        Kind::Xi => metrics::parse_xi(sessions, wall_ms)?,
     };
     if metrics.model_calls == 0 && metrics.turn_failures == 0 {
         return Err("no model responses or turn failures in event stream".into());
@@ -427,7 +417,16 @@ async fn run_one(
     let argv: Vec<_> = arm
         .argv
         .iter()
-        .map(|value| expand(value, &task.spec.prompt, &workspace, &sessions, model))
+        .map(|value| {
+            expand(
+                value,
+                &task.spec.prompt,
+                &workspace,
+                &sessions,
+                model,
+                &arm.directory,
+            )
+        })
         .collect();
     let env = arm
         .env
@@ -435,7 +434,14 @@ async fn run_one(
         .map(|(key, value)| {
             (
                 key.clone(),
-                expand(value, &task.spec.prompt, &workspace, &sessions, model),
+                expand(
+                    value,
+                    &task.spec.prompt,
+                    &workspace,
+                    &sessions,
+                    model,
+                    &arm.directory,
+                ),
             )
         })
         .collect();

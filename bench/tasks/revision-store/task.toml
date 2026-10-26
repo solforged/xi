@@ -1,0 +1,5 @@
+prompt = "Repair the revisioned store across its modules according to SPEC.md. Preserve its public API. Transactions, historical reads, prefix scans, watch ranges and compaction must agree on revision/tombstone semantics and atomic failure. Run cargo test --offline --quiet. Do not edit tests, SPEC.md, Cargo.toml or .gitignore."
+check = ["cargo", "test", "--offline", "--quiet"]
+timeout_seconds = 600
+protected_paths = ["tests", "SPEC.md", "Cargo.toml", ".gitignore"]
+tags = ["rust", "cross-cutting", "multi-file"]

@@ -25,6 +25,8 @@ pub(crate) struct Arm {
     pub argv: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub directory: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,7 +125,12 @@ pub(crate) fn load_tasks(root: &Path, names: &[String]) -> Result<Vec<Task>> {
 }
 
 pub(crate) fn load_arms(path: &Path, names: &[String]) -> Result<Vec<Arm>> {
-    let config: Arms = toml::from_str(&fs::read_to_string(path)?)?;
+    let path = path.canonicalize()?;
+    let mut config: Arms = toml::from_str(&fs::read_to_string(&path)?)?;
+    let directory = path.parent().ok_or("arms file has no parent directory")?;
+    for arm in &mut config.arm {
+        arm.directory = directory.to_owned();
+    }
     let mut seen = BTreeSet::new();
     for arm in &config.arm {
         if !valid_name(&arm.name)
@@ -158,6 +165,7 @@ pub(crate) fn expand(
     workspace: &Path,
     session_dir: &Path,
     model: &str,
+    arms_dir: &Path,
 ) -> String {
     // A single pass keeps placeholders inside the prompt literal.
     let mut output = String::with_capacity(template.len());
@@ -173,6 +181,7 @@ pub(crate) fn expand(
             "{workspace}" => Some(workspace.to_string_lossy()),
             "{session_dir}" => Some(session_dir.to_string_lossy()),
             "{model}" => Some(model.into()),
+            "{arms_dir}" => Some(arms_dir.to_string_lossy()),
             _ => None,
         };
         if let Some(value) = replacement {
@@ -198,7 +207,8 @@ mod tests {
                 "keep {model}; 'literal'",
                 Path::new("a"),
                 Path::new("b"),
-                "x"
+                "x",
+                Path::new("/arms"),
             ),
             "keep {model}; 'literal'"
         );
@@ -208,9 +218,25 @@ mod tests {
                 "",
                 Path::new("has spaces"),
                 Path::new("b"),
-                "x"
+                "x",
+                Path::new("/arms"),
             ),
             "has spaces/{unknown}/{"
+        );
+    }
+
+    #[test]
+    fn expansion_resolves_arms_directory_without_a_shell() {
+        assert_eq!(
+            expand(
+                "{arms_dir}/configs/compact.toml",
+                "",
+                Path::new("workspace"),
+                Path::new("sessions"),
+                "model",
+                Path::new("/bench with spaces"),
+            ),
+            "/bench with spaces/configs/compact.toml"
         );
     }
 }

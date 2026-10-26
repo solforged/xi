@@ -1,0 +1,5 @@
+prompt = "Implement SPEC.md: configurable invoice rounding end to end through model, config, CSV parser, aggregation, JSON output and CLI. Preserve defaults, exact arithmetic and caller Decimal context. Run python3 -m unittest discover -s tests. Do not edit tests, SPEC.md or .gitignore."
+check = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+timeout_seconds = 600
+protected_paths = ["tests", "SPEC.md", ".gitignore"]
+tags = ["python", "multi-step"]

@@ -1,0 +1,125 @@
+--- a/ledger/model.py
++++ b/ledger/model.py
+@@ -10,3 +10,5 @@
+ @dataclass(frozen=True)
+ class Options:
+     precision: int = 2
++    rounding: str = 'even'
++    scope: str = 'line'
+--- a/ledger/config.py
++++ b/ledger/config.py
+@@ -1,7 +1,17 @@
++from dataclasses import asdict
+ from .model import Options
+ 
+ def load(mapping):
+-    return Options(precision=mapping.get('precision', 2))
++    if set(mapping) - {'precision','rounding','scope'}:
++        raise ValueError('unknown option')
++    options = Options(**mapping)
++    if type(options.precision) is not int or not 0 <= options.precision <= 6:
++        raise ValueError('invalid precision')
++    if options.rounding not in ('even','away') or options.scope not in ('line','invoice'):
++        raise ValueError('invalid rounding or scope')
++    return options
+ 
+ def override(options, *, precision=None, rounding=None, scope=None):
+-    return Options(precision=precision or options.precision)
++    values = asdict(options)
++    values.update({key:value for key,value in {'precision':precision,'rounding':rounding,'scope':scope}.items() if value is not None})
++    return load(values)
+--- a/ledger/parser.py
++++ b/ledger/parser.py
+@@ -1,7 +1,24 @@
+-from decimal import Decimal
++import csv
++import re
++from decimal import Decimal, InvalidOperation
+ from .model import Entry
+ 
+ def parse(lines):
+-    for line in lines:
+-        invoice, currency, amount = line.rstrip('\n').split(',')
+-        yield Entry(invoice, currency, Decimal(amount))
++    reader = csv.reader(lines, strict=True)
++    while True:
++        try:
++            row = next(reader)
++        except StopIteration:
++            return
++        except csv.Error as error:
++            raise ValueError(f'line {reader.line_num}: invalid CSV') from error
++        if not row or (len(row)==1 and not row[0].strip()):
++            continue
++        try:
++            invoice, currency, amount = (value.strip() for value in row)
++            value = Decimal(amount)
++            if not invoice or not re.fullmatch('[A-Z]{3}',currency) or not value.is_finite():
++                raise ValueError('invalid field')
++        except (ValueError, InvalidOperation) as error:
++            raise ValueError(f'line {reader.line_num}: invalid row') from error
++        yield Entry(invoice,currency,value)
+--- a/ledger/aggregate.py
++++ b/ledger/aggregate.py
+@@ -1,8 +1,20 @@
+-from decimal import Decimal
++from decimal import Decimal, localcontext, ROUND_HALF_EVEN, ROUND_HALF_UP
+ 
+ def totals(entries, options):
++    # Integer coefficients keep grouping exact, independently of Decimal context.
++    scale = 20
++    groups = {}
++    for index, entry in enumerate(entries):
++        sign, digits, exponent = entry.amount.as_tuple()
++        coefficient = int(''.join(map(str,digits))) * (-1 if sign else 1)
++        coefficient *= 10 ** (scale + exponent)
++        key = (entry.invoice if options.scope == 'invoice' else index, entry.currency)
++        groups[key] = groups.get(key,0) + coefficient
++    divisor = 10 ** (scale-options.precision)
+     result = {}
+-    quantum = Decimal(10) ** -options.precision
+-    for entry in entries:
+-        result[entry.currency] = result.get(entry.currency, Decimal(0)) + entry.amount.quantize(quantum)
+-    return result
++    for (_,currency), amount in groups.items():
++        whole, rem = divmod(abs(amount),divisor)
++        if rem*2 > divisor or (rem*2 == divisor and (options.rounding == 'away' or whole % 2)):
++            whole += 1
++        result[currency] = result.get(currency,0) + (-whole if amount < 0 else whole)
++    return {currency: Decimal((int(value < 0), tuple(map(int,str(abs(value)))), -options.precision)) for currency,value in result.items()}
+--- a/ledger/output.py
++++ b/ledger/output.py
+@@ -1,4 +1,14 @@
+ import json
++from decimal import Decimal, localcontext, ROUND_HALF_EVEN, ROUND_HALF_UP
+ 
+ def render(totals, options):
+-    return json.dumps({key: float(value) for key, value in totals.items()})
++    values = {}
++    for currency, amount in sorted(totals.items()):
++        with localcontext() as ctx:
++            ctx.prec = max(100,len(amount.as_tuple().digits)+abs(amount.as_tuple().exponent)+10)
++            ctx.rounding = ROUND_HALF_EVEN if options.rounding == 'even' else ROUND_HALF_UP
++            value = amount.quantize(Decimal((0,(1,),-options.precision)))
++            if not value:
++                value = abs(value)
++            values[currency] = format(value, f'.{options.precision}f')
++    return json.dumps(values)
+--- a/ledger/cli.py
++++ b/ledger/cli.py
+@@ -10,12 +10,14 @@
+     parser.add_argument('input')
+     parser.add_argument('--config')
+     parser.add_argument('--precision', type=int)
++    parser.add_argument('--rounding', choices=['even','away'])
++    parser.add_argument('--scope', choices=['line','invoice'])
+     args = parser.parse_args(argv)
+     mapping = {}
+     if args.config:
+         with open(args.config) as stream:
+             mapping = json.load(stream)
+-    options = override(load(mapping), precision=args.precision)
++    options = override(load(mapping), precision=args.precision, rounding=args.rounding, scope=args.scope)
+     with open(args.input) as stream:
+         result = totals(parse(stream), options)
+     print(render(result, options))

@@ -1,0 +1,4 @@
+{"id":"00000000-0000-7000-8000-000000000031","at":1200,"type":"session_started","session":"00000000-0000-7000-8000-000000000030","parent_session":"00000000-0000-7000-8000-000000000010","cwd":"/workspace","model":{"provider":"fixture","model":"test"},"xi_version":"0.0.0"}
+{"id":"00000000-0000-7000-8000-000000000032","parent":"00000000-0000-7000-8000-000000000031","at":1250,"type":"assistant_message","model":{"provider":"fixture","model":"test"},"content":[{"type":"tool_use","id":"shared","name":"edit","input":{}}],"stop":"tool_use","usage":{"input":23,"output":2}}
+{"id":"00000000-0000-7000-8000-000000000033","parent":"00000000-0000-7000-8000-000000000032","at":1400,"type":"tool_decision","call":"shared","action":"tool edit","decision":"allow"}
+{"id":"00000000-0000-7000-8000-000000000034","parent":"00000000-0000-7000-8000-000000000033","at":1550,"type":"tool_result","call":"shared","content":[{"type":"text","text":"stale anchor"}],"is_error":true}

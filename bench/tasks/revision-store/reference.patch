@@ -1,0 +1,99 @@
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -19,6 +19,6 @@
+     pub fn floor(&self) -> u64 { self.floor }
+     pub fn retained_versions(&self) -> usize { self.history.values().map(Vec::len).sum() }
+     pub(crate) fn valid(&self, at: u64) -> Result<(), Error> {
+-        if at > self.revision { Err(Error::InvalidRevision) } else { Ok(()) }
++        if at < self.floor || at > self.revision { Err(Error::InvalidRevision) } else { Ok(()) }
+     }
+ }
+--- a/src/write.rs
++++ b/src/write.rs
+@@ -1,16 +1,20 @@
+ use crate::{Store, Op, Error};
+ use crate::model::Version;
++use std::collections::BTreeSet;
+ impl Store {
+     pub fn apply(&mut self, expected: Option<u64>, operations: &[Op]) -> Result<u64, Error> {
++        if expected.is_some_and(|revision| revision != self.revision) { return Err(Error::Conflict); }
++        let mut keys=BTreeSet::new();
++        for operation in operations {
++            let key=match operation { Op::Put(key,_) | Op::Delete(key) => key };
++            if !keys.insert(key) { return Err(Error::DuplicateKey); }
++        }
++        if operations.is_empty() { return Ok(self.revision); }
+         self.revision += 1;
+         for operation in operations {
+-            let (key, value) = match operation {
+-                Op::Put(key, value) => (key, Some(value.clone())),
+-                Op::Delete(key) => (key, None),
+-            };
+-            self.history.entry(key.clone()).or_default().push(Version { revision: self.revision, value });
++            let (key,value)=match operation { Op::Put(key,value)=>(key,Some(value.clone())), Op::Delete(key)=>(key,None) };
++            self.history.entry(key.clone()).or_default().push(Version{revision:self.revision,value});
+         }
+-        if expected.is_some_and(|revision| revision != self.revision - 1) { return Err(Error::Conflict); }
+         Ok(self.revision)
+     }
+ }
+--- a/src/read.rs
++++ b/src/read.rs
+@@ -2,6 +2,6 @@
+ impl Store {
+     pub fn get(&self, key: &str, at: u64) -> Result<Option<&str>, Error> {
+         self.valid(at)?;
+-        Ok(self.history.get(key).and_then(|versions| versions.iter().find(|version| version.revision <= at)).and_then(|version| version.value.as_deref()))
++        Ok(self.history.get(key).and_then(|versions| versions.iter().rev().find(|version| version.revision <= at)).and_then(|version| version.value.as_deref()))
+     }
+ }
+--- a/src/scan.rs
++++ b/src/scan.rs
+@@ -1,7 +1,11 @@
+ use crate::{Store, Error};
+ impl Store {
+-    pub fn scan(&self, prefix: &str, at: u64) -> Result<Vec<(String, String)>, Error> {
++    pub fn scan(&self, prefix: &str, at: u64) -> Result<Vec<(String,String)>,Error> {
+         self.valid(at)?;
+-        Ok(self.history.iter().filter(|(key,_)| key.contains(prefix)).filter_map(|(key,versions)| versions.last().and_then(|version| version.value.as_ref()).map(|value|(key.clone(),value.clone()))).collect())
++        let mut result=Vec::new();
++        for key in self.history.keys().filter(|key|key.starts_with(prefix)) {
++            if let Some(value)=self.get(key,at)? { result.push((key.clone(),value.to_owned())); }
++        }
++        Ok(result)
+     }
+ }
+--- a/src/watch.rs
++++ b/src/watch.rs
+@@ -1,7 +1,11 @@
+ use crate::{Store, Change, Error};
+ impl Store {
+-    pub fn changes(&self, after: u64, through: u64) -> Result<Vec<Change>, Error> {
++    pub fn changes(&self, after:u64, through:u64)->Result<Vec<Change>,Error> {
++        self.valid(after)?;
+         self.valid(through)?;
+-        Ok(self.history.iter().flat_map(|(key,versions)| versions.iter().filter(move |version| version.revision >= after && version.revision <= through).map(|version| Change { revision:version.revision, key:key.clone(), value:version.value.clone() })).collect())
++        if after>through { return Err(Error::InvalidRevision); }
++        let mut changes:Vec<_>=self.history.iter().flat_map(|(key,versions)| versions.iter().filter(move |version| version.revision>after && version.revision<=through).map(|version| Change{revision:version.revision,key:key.clone(),value:version.value.clone()})).collect();
++        changes.sort_by(|a,b| (a.revision,&a.key).cmp(&(b.revision,&b.key)));
++        Ok(changes)
+     }
+ }
+--- a/src/compact.rs
++++ b/src/compact.rs
+@@ -1,9 +1,12 @@
+ use crate::{Store, Error};
+ impl Store {
+-    pub fn compact(&mut self, floor: u64) -> Result<(), Error> {
++    pub fn compact(&mut self, floor:u64)->Result<(),Error> {
+         self.valid(floor)?;
+-        for versions in self.history.values_mut() { versions.retain(|version| version.revision >= floor); }
+-        self.floor = floor;
++        for versions in self.history.values_mut() {
++            let split=versions.partition_point(|version|version.revision<=floor);
++            if split>1 { versions.drain(..split-1); }
++        }
++        self.floor=floor;
+         Ok(())
+     }
+ }

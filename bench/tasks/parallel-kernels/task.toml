@@ -1,0 +1,5 @@
+prompt = "Repair all five independent packages according to SPEC.md: csvstream, overlay, waves, pointer and retry. Each has its own failing tests and no dependency on another package. Work may be split by package. Run python3 -m unittest discover -s tests. Do not edit tests, SPEC.md or .gitignore."
+check = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+timeout_seconds = 900
+protected_paths = ["tests", "SPEC.md", ".gitignore"]
+tags = ["python", "parallel"]
