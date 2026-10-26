@@ -131,6 +131,8 @@ fn append_instructions(prompt: &mut String, path: &Path) -> Result<()> {
 
 /// Converts a branch context, completing interrupted tool batches in memory.
 /// Audit-only events never interrupt the grouping of tool results.
+/// The summary is the first user-side content after the static system prompt.
+/// `xi-session` supplies the retained tail before post-compaction descendants.
 #[must_use]
 pub fn messages(context: xi_session::Context<'_>) -> Vec<Message> {
     let mut messages = Vec::new();

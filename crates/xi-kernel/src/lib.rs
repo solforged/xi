@@ -10,6 +10,7 @@
 //! all tool results have been persisted. Cancellation retains unconsumed
 //! steering for the next prompt. Transport closure explicitly rejects it.
 
+pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod server;
@@ -574,19 +575,8 @@ impl Session {
             if state.backend.is_none() {
                 state.backend = Some(Backend::connect(&state.config)?.into());
             }
-            let backend = state.backend.as_ref().expect("connected backend");
-            let request = Request {
-                model: state.config.model.model.clone(),
-                system: state.system.prompt.clone(),
-                messages: context::messages(state.log.context(state.head).expect("known head")),
-                tools: backend.specs.clone(),
-                max_tokens: backend.model.max_output,
-                reasoning: state.config.reasoning,
-                cache_key: Some(self.id().to_string()),
-            };
             requests += 1;
-            let provider = backend.provider.clone();
-            let response = self.stream(provider.as_ref(), &request, cancel).await;
+            let response = self.model_response(state, cancel).await;
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
@@ -661,6 +651,57 @@ impl Session {
         }
         outcome.head = state.head;
         Ok(outcome)
+    }
+
+    async fn model_response(
+        &self,
+        state: &mut State,
+        cancel: &CancellationToken,
+    ) -> Result<Response> {
+        let backend = state.backend.as_ref().expect("connected backend");
+        if state.config.compaction.enabled
+            && compaction::estimate(state)
+                >= state
+                    .config
+                    .compaction
+                    .trigger(backend.model.context_window)
+        {
+            self.compact_at_boundary(state, cancel, None).await?;
+        }
+        let mut overflow_compacted = false;
+        loop {
+            let backend = state.backend.as_ref().expect("connected backend");
+            let request = Request {
+                model: state.config.model.model.clone(),
+                system: state.system.prompt.clone(),
+                messages: context::messages(state.log.context(state.head).expect("known head")),
+                tools: backend.specs.clone(),
+                max_tokens: backend.model.max_output,
+                reasoning: state.config.reasoning,
+                cache_key: Some(self.id().to_string()),
+            };
+            let response = self
+                .stream(backend.provider.as_ref(), &request, cancel)
+                .await;
+            match response {
+                Err(error)
+                    if error.kind == xi_provider::ErrorKind::ContextOverflow
+                        && state.config.compaction.enabled
+                        && !overflow_compacted =>
+                {
+                    overflow_compacted = true;
+                    if self
+                        .compact_at_boundary(state, cancel, None)
+                        .await?
+                        .is_none()
+                        && !cancel.is_cancelled()
+                    {
+                        return Err(error.into());
+                    }
+                }
+                result => return result.map_err(Into::into),
+            }
+        }
     }
 
     async fn stream(

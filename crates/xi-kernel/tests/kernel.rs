@@ -920,3 +920,458 @@ async fn denied_tool_names_the_deciding_rule() {
     assert!(info.events.iter().any(|event| matches!(&event.kind, EventKind::ToolDecision { decision: Decision::Deny, rule: Some(rule), .. } if rule == &expected)));
     assert!(info.events.iter().any(|event| matches!(&event.kind, EventKind::ToolResult { output, .. } if output.content.iter().any(|block| matches!(block, OutputBlock::Text { text } if text.contains("denied by policy") && text.contains(&expected))))));
 }
+
+fn assistant(content: Vec<Block>, usage: Usage) -> EventKind {
+    EventKind::AssistantMessage {
+        model: ModelRef {
+            provider: "test".into(),
+            model: "test".into(),
+        },
+        content,
+        stop: StopReason::EndTurn,
+        usage,
+    }
+}
+
+fn seeded_session(
+    fixture: &Fixture,
+    script: Arc<Script>,
+    events: Vec<EventKind>,
+    compaction: xi_kernel::compaction::Config,
+) -> (Session, tokio::sync::mpsc::UnboundedReceiver<Notification>) {
+    let mut log = xi_session::SessionLog::create(
+        fixture.workspace.join("seed.jsonl"),
+        EventKind::SessionStarted {
+            session: xi_protocol::SessionId::generate(),
+            cwd: fixture.workspace.clone(),
+            model: ModelRef {
+                provider: "test".into(),
+                model: "test".into(),
+            },
+            xi_version: "test".into(),
+            parent_session: None,
+        },
+    )
+    .unwrap();
+    let mut head = log.root().id;
+    for event in events {
+        head = log.append(head, event).unwrap().id;
+    }
+    let mut config = fixture.config();
+    config.compaction = compaction;
+    let bus = EventBus::default();
+    let rx = bus.subscribe();
+    let session = Session::from_log(
+        log,
+        config,
+        bus,
+        opts(),
+        Some(Backend {
+            provider: script,
+            model: model(),
+            tools: vec![Arc::new(FakeTool { gate: None })],
+        }),
+    )
+    .unwrap();
+    (session, rx)
+}
+
+#[test]
+fn compaction_defaults_layering_and_keep_clamp() {
+    let fixture = Fixture::new();
+    let config = fixture.config().compaction;
+    assert!(!config.enabled);
+    assert_eq!(config.trigger_tokens, None);
+    assert_eq!(config.trigger(10_000), 8_000);
+    assert_eq!(config.keep_recent_tokens, 20_000);
+    assert_eq!(config.keep(10_000), 4_000);
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "[compaction]\nenabled=true\ntrigger_tokens=24000\nkeep_recent_tokens=20000\n",
+    );
+    let extra = fixture.workspace.join("extra.toml");
+    write(&extra, "[compaction]\ntrigger_tokens=8000\n");
+    let config = Config::load(fixture.paths.clone(), &fixture.workspace, &[extra])
+        .unwrap()
+        .compaction;
+    assert!(config.enabled);
+    assert_eq!(config.keep_recent_tokens, 20_000);
+    assert_eq!(config.keep(100_000), 4_000);
+    write(
+        &fixture.workspace.join(".xi/config.toml"),
+        "[compaction]\nenabled=false\nkeep_recent_tokens=3\n",
+    );
+    assert!(
+        fixture.config().compaction.enabled,
+        "untrusted layer ignored"
+    );
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    assert!(!fixture.config().compaction.enabled);
+    assert_eq!(fixture.config().compaction.keep_recent_tokens, 3);
+}
+
+#[tokio::test]
+async fn compaction_triggers_at_threshold_using_all_usage_fields_and_new_characters() {
+    for output in [98, 99] {
+        let fixture = Fixture::new();
+        let triggered = output == 99;
+        let script = Script::new(if triggered {
+            vec![Step::Reply(done()), Step::Reply(done())]
+        } else {
+            vec![Step::Reply(done())]
+        });
+        let (session, mut rx) = seeded_session(
+            &fixture,
+            script.clone(),
+            vec![
+                EventKind::UserMessage {
+                    content: input(&"old ".repeat(100)),
+                },
+                assistant(
+                    input("old answer"),
+                    Usage {
+                        input: 600,
+                        cache_read: 200,
+                        cache_write: 100,
+                        output,
+                    },
+                ),
+            ],
+            xi_kernel::compaction::Config {
+                enabled: true,
+                trigger_tokens: Some(1_000),
+                keep_recent_tokens: 2,
+            },
+        );
+        assert!(!session.prompt(input("next")).await.unwrap().failed);
+        let info = session.info().await;
+        let compactions: Vec<_> = info
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Compaction { .. }))
+            .collect();
+        assert_eq!(compactions.len(), usize::from(triggered));
+        let requests = script.requests.lock().unwrap();
+        assert_eq!(requests.len(), if triggered { 2 } else { 1 });
+        if triggered {
+            assert!(matches!(
+                compactions[0].kind,
+                EventKind::Compaction {
+                    tokens_before: 1_000,
+                    kept: Some(kept),
+                    usage: Some(_),
+                    ..
+                } if kept == info.events[3].id
+            ));
+            assert!(requests[0].tools.is_empty());
+            assert_eq!(requests[0].system, requests[1].system);
+            assert_eq!(requests[1].messages[0], Message::User(input("done")));
+            assert_eq!(requests[1].messages[1], Message::User(input("next")));
+            assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(
+                |event| matches!(event, Notification::Event(params) if params.event == *compactions[0])
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn compaction_keeps_an_oversized_tool_batch_whole_and_override_skips_provider() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![Step::Reply(done())]);
+    let result = |id: &str| EventKind::ToolResult {
+        call: id.into(),
+        output: ToolOutput {
+            content: vec![OutputBlock::Text {
+                text: "result ".repeat(80),
+            }],
+            is_error: false,
+            untrusted: false,
+        },
+        spill: None,
+    };
+    let (session, _) = seeded_session(
+        &fixture,
+        script.clone(),
+        vec![
+            EventKind::UserMessage {
+                content: input("older work"),
+            },
+            assistant(
+                vec![call("a", "fake", json!({})), call("b", "fake", json!({}))],
+                Usage::default(),
+            ),
+            result("a"),
+            EventKind::Tainted {
+                call: None,
+                reason: "audit".into(),
+            },
+            result("b"),
+        ],
+        xi_kernel::compaction::Config {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        },
+    );
+    let before = session.info().await;
+    let compact = session
+        .compact(Some("supplied summary".into()))
+        .await
+        .unwrap();
+    let info = session.info().await;
+    assert_eq!(compact.head, info.head);
+    assert!(matches!(
+        info.events.last().unwrap().kind,
+        EventKind::Compaction {
+            kept: Some(kept),
+            usage: None,
+            ..
+        } if kept == before.events[2].id
+    ));
+    assert!(script.requests.lock().unwrap().is_empty());
+    session.prompt(input("next")).await.unwrap();
+    let requests = script.requests.lock().unwrap();
+    let messages = &requests[0].messages;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0], Message::User(input("supplied summary")));
+    let Message::ToolResults(results) = &messages[2] else {
+        panic!("missing retained results")
+    };
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| !result.output.is_error));
+}
+
+#[tokio::test]
+async fn summary_includes_previous_summary_and_resume_rebuilds_identical_context() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![Step::Reply(done()), Step::Reply(done())]);
+    let (session, _) = seeded_session(
+        &fixture,
+        script.clone(),
+        vec![
+            EventKind::UserMessage {
+                content: input("ancient text"),
+            },
+            EventKind::Compaction {
+                summary: "previous summary".into(),
+                tokens_before: 800,
+                kept: None,
+                usage: None,
+            },
+            EventKind::UserMessage {
+                content: input("work since previous summary"),
+            },
+            assistant(input("tail"), Usage::default()),
+        ],
+        xi_kernel::compaction::Config {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        },
+    );
+    session.compact(None).await.unwrap();
+    let compacted = session.info().await;
+    assert!(!session.prompt(input("continue")).await.unwrap().failed);
+    let resumed_at = session.info().await;
+    drop(session);
+    let expected = {
+        let script_requests = script.requests.lock().unwrap();
+        assert_eq!(script_requests.len(), 2);
+        let summary = &script_requests[0];
+        assert!(summary.tools.is_empty());
+        assert_eq!(
+            summary.messages[0],
+            Message::User(input("previous summary"))
+        );
+        assert_eq!(
+            summary.messages[1],
+            Message::User(input("work since previous summary"))
+        );
+        assert_eq!(summary.messages.len(), 3, "tail excluded, prompt appended");
+        script_requests[1].clone()
+    };
+    let log = xi_session::SessionLog::open(resumed_at.path).unwrap();
+    let resume_script = Script::new(vec![Step::Reply(done())]);
+    let resumed = Session::from_log(
+        log,
+        fixture.config(),
+        EventBus::default(),
+        opts(),
+        Some(Backend {
+            provider: resume_script.clone(),
+            model: model(),
+            tools: vec![Arc::new(FakeTool { gate: None })],
+        }),
+    )
+    .unwrap();
+    resumed.checkout(compacted.head).await.unwrap();
+    resumed.prompt(input("continue")).await.unwrap();
+    assert_eq!(resume_script.requests.lock().unwrap()[0], expected);
+}
+
+#[tokio::test]
+async fn overflow_compacts_and_retries_once_only_when_enabled() {
+    for (enabled, second_overflow) in [(true, false), (true, true), (false, false)] {
+        let fixture = Fixture::new();
+        let overflow = || Step::Fail(Error::new(ErrorKind::ContextOverflow, "context full"));
+        let mut steps = vec![overflow()];
+        if enabled {
+            steps.push(Step::Reply(done()));
+            steps.push(if second_overflow {
+                overflow()
+            } else {
+                Step::Reply(done())
+            });
+        }
+        let script = Script::new(steps);
+        let (session, _) = seeded_session(
+            &fixture,
+            script.clone(),
+            vec![EventKind::UserMessage {
+                content: input("older context"),
+            }],
+            xi_kernel::compaction::Config {
+                enabled,
+                trigger_tokens: Some(100_000),
+                keep_recent_tokens: 1,
+            },
+        );
+        let outcome = session.prompt(input("next")).await.unwrap();
+        assert_eq!(outcome.failed, !enabled || second_overflow);
+        let info = session.info().await;
+        let count = info
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Compaction { .. }))
+            .count();
+        assert_eq!(count, usize::from(enabled));
+        let requests = script.requests.lock().unwrap();
+        assert_eq!(requests.len(), if enabled { 3 } else { 1 });
+        if enabled {
+            assert!(requests[1].tools.is_empty());
+            assert!(!requests[2].tools.is_empty());
+            assert_eq!(requests[2].messages[0], Message::User(input("done")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn manual_compaction_rejects_dangling_calls_without_appending() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![]);
+    let (session, _) = seeded_session(
+        &fixture,
+        script,
+        vec![
+            EventKind::UserMessage {
+                content: input("old context"),
+            },
+            assistant(
+                vec![call("unfinished", "fake", json!({}))],
+                Usage::default(),
+            ),
+        ],
+        xi_kernel::compaction::Config {
+            keep_recent_tokens: 0,
+            ..Default::default()
+        },
+    );
+    let before = session.info().await;
+    let error = session.compact(Some("summary".into())).await.unwrap_err();
+    assert!(error.to_string().contains("pending tool calls"));
+    assert_eq!(session.info().await.events, before.events);
+}
+
+#[tokio::test]
+async fn cancelled_summary_preserves_context_and_does_not_emit_partial_assistant() {
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let script = Script::new(vec![Step::Wait(gate.clone())]);
+    let (session, mut rx) = seeded_session(
+        &fixture,
+        script,
+        vec![EventKind::UserMessage {
+            content: input("old context"),
+        }],
+        xi_kernel::compaction::Config {
+            keep_recent_tokens: 0,
+            ..Default::default()
+        },
+    );
+    let before = session.info().await;
+    let task = {
+        let session = session.clone();
+        tokio::spawn(async move { session.compact(None).await })
+    };
+    gate.entered.notified().await;
+    session.cancel();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(session.info().await.events, before.events);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn compaction_runs_after_tool_results_and_resets_old_usage_estimates() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![
+        Step::Reply(Response {
+            content: vec![call("a", "fake", json!({}))],
+            stop: StopReason::ToolUse,
+            usage: Usage {
+                input: 1_000,
+                ..Usage::default()
+            },
+        }),
+        Step::Reply(done()),
+        batch(vec![call("b", "fake", json!({}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, _) = seeded_session(
+        &fixture,
+        script.clone(),
+        vec![EventKind::UserMessage {
+            content: input(&"old ".repeat(100)),
+        }],
+        xi_kernel::compaction::Config {
+            enabled: true,
+            trigger_tokens: Some(1_000),
+            keep_recent_tokens: 10,
+        },
+    );
+    let outcome = session.prompt(input("work")).await.unwrap();
+    assert!(!outcome.failed);
+    let info = session.info().await;
+    let compactions: Vec<_> = info
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.kind, EventKind::Compaction { .. }))
+        .collect();
+    assert_eq!(compactions.len(), 1);
+    assert!(matches!(
+        &info.events[compactions[0].0 - 1].kind,
+        EventKind::ToolResult { call, .. } if call.0 == "a"
+    ));
+    let requests = script.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[1].tools.is_empty());
+    assert_eq!(requests[2].messages[0], Message::User(input("done")));
+    assert_eq!(requests[3].messages[0], Message::User(input("done")));
+    assert_eq!(requests[0].system, requests[3].system);
+}
+
+#[tokio::test]
+async fn compaction_without_an_older_prefix_is_a_noop() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![Step::Reply(done())]);
+    let (session, _) = seeded_session(
+        &fixture,
+        script.clone(),
+        vec![],
+        xi_kernel::compaction::Config {
+            enabled: true,
+            trigger_tokens: Some(1),
+            keep_recent_tokens: 20_000,
+        },
+    );
+    assert!(session.compact(None).await.is_err());
+    assert!(script.requests.lock().unwrap().is_empty());
+}

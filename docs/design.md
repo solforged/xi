@@ -68,7 +68,7 @@ A session is an append-only JSONL file. Every line is one event with an id, an o
 - Every other event names a parent that appears earlier in the file.
 - Branching means appending a child to an older event. Nothing is rewritten.
 - The path from the root to any event is a complete conversation.
-- A `compaction` event summarizes its ancestors. Context for a leaf is the latest compaction summary on its path plus the events after it. The summarized events stay in the file.
+- A `compaction` event summarizes older ancestors. Context for a leaf is the latest summary, the ancestor tail named by `kept`, then the events after compaction. The summarized events stay in the file.
 
 Durability: each append is written as one buffer and synced before it is acknowledged. An unterminated final line can only come from an append that was never acknowledged, so opening a session truncates it. A malformed complete line is corruption and fails the open with its line number.
 
@@ -88,6 +88,7 @@ Client methods:
 | `session/prompt` | client → kernel | Run a turn; returns the new head when the turn ends. |
 | `session/cancel` | client → kernel | Stop the running turn. |
 | `session/checkout` | client → kernel | Move the head to an earlier event to branch. |
+| `session/compact` | client → kernel | Summarize older context at an idle prompt. |
 | `approval/resolve` | client → kernel | Answer an `ask` decision. |
 | `event/appended` | kernel → client | Every persisted event. |
 | `stream/delta` | kernel → client | Streaming model output; not persisted. |
@@ -136,6 +137,19 @@ Packages are pinned by content hash in a lockfile. Install never runs package sc
 The provider layer converts between xi content blocks and each provider's wire format. Conversion is lossless: thinking signatures, redacted thinking and provider-specific blocks round-trip through `thinking` and `opaque` blocks. Model metadata (context window, pricing, capabilities) comes from a registry file, not code.
 
 Context is built to keep the cached prefix stable: the system prompt has no timestamps or dynamic state, history is append-only, and compaction is the only operation that changes the prefix.
+
+### Compaction
+
+Compaction is off by default. Enable it with `[compaction] enabled = true`. `trigger_tokens` defaults to 80% of the selected model's context window. `keep_recent_tokens` defaults to 20,000 and is capped at half the effective trigger, leaving room for the summary and new work. `/compact` in line mode and `session/compact` over RPC work at an idle prompt even when automatic compaction is off.
+
+Before each model request, the kernel estimates context size from the latest assistant's input, cache-read, cache-write and output usage, plus one token per four characters appended since. Before the first response, and after compaction until new usage arrives, it estimates the static prompt, tool schemas, summary and retained conversation by characters instead. Usage from before compaction is never reused for the smaller prefix.
+
+At or above the trigger, the kernel keeps the earliest message-boundary suffix that fits the recent-token budget. If the newest message or tool batch alone exceeds the budget, it stays whole. The boundary never crosses an outstanding tool call; compaction runs only between requests, after the tool batch. If there is no older message to summarize, automatic compaction does nothing and manual compaction reports that fact. A context-overflow response causes one compaction and one retry when enabled. A second overflow fails the request.
+
+The same provider and model summarize the older prefix, including any previous summary, with no tools. The short `crates/xi-kernel/src/compact.md` prompt requests the goal and constraints, decisions, files and facts, commands and results, current state, open questions and next steps. The finished summary is appended and broadcast as a `compaction` event with the estimate, retained boundary and summary-request usage. Cancellation or an incomplete summary does not replace context.
+
+The summary is the first user-side content after the unchanged system prompt. The log supplies retained events before descendants, so reopening or branching rebuilds the same context. `Session::compact(Option<String>)` and the internal boundary operation accept a supplied summary; this skips the model call and records `usage: None`. The extension compact hook can use that seam.
+
 
 ## Security model
 

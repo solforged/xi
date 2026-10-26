@@ -115,6 +115,7 @@ struct FileConfig {
     reasoning: Option<Reasoning>,
     tools: Option<Vec<String>>,
     sandbox: Option<SandboxLayer>,
+    compaction: Option<crate::compaction::Layer>,
     #[serde(default)]
     provider: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -148,6 +149,8 @@ pub struct Config {
     pub tools: Vec<String>,
     /// Sandbox additions.
     pub sandbox: SandboxConfig,
+    /// Automatic context compaction and retained history budget.
+    pub compaction: crate::compaction::Config,
     /// Ordered registry layers, resolved lazily at the first model request.
     pub registries: Vec<RegistryConfig>,
     /// Compiled policy.
@@ -194,6 +197,7 @@ impl Config {
                 .map(str::to_owned)
                 .collect(),
             sandbox: SandboxConfig::default(),
+            compaction: crate::compaction::Config::default(),
             registries: Vec::new(),
             policy: Arc::new(Policy::new()),
             warnings: Vec::new(),
@@ -259,6 +263,9 @@ impl Config {
             }
             if let Some(tools) = layer.tools {
                 config.tools = tools;
+            }
+            if let Some(compaction) = layer.compaction {
+                compaction.apply(&mut config.compaction);
             }
             if let Some(sandbox) = layer.sandbox {
                 if let Some(paths) = sandbox.readable {

@@ -116,6 +116,25 @@ where
                     }
                     continue;
                 }
+                if method == "session/compact" {
+                    let session = decode::<SessionRef>(params)
+                        .and_then(|params| lookup(&sessions, params.session).cloned());
+                    match session {
+                        Ok(session) => {
+                            pending += 1;
+                            let tx = reply_tx.clone();
+                            tokio::spawn(async move {
+                                let result = match session.compact(None).await {
+                                    Ok(result) => success(id.clone().unwrap_or(Value::Null), json!(result)),
+                                    Err(error) => failure(id.clone().unwrap_or(Value::Null), -32000, error.to_string()),
+                                };
+                                let _ = tx.send(if id.is_some() { result } else { Value::Null });
+                            });
+                        }
+                        Err(error) => if let Some(id) = id { write_value(&mut writer, &failure(id, -32602, error.to_string())).await?; },
+                    }
+                    continue;
+                }
                 let result = dispatch(method, params, &mut sessions, &bus, &options).await;
                 if let Some(id) = id {
                     let reply = match result {
