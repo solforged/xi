@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -60,6 +60,7 @@ impl Daemon {
             forwards: 0,
             shutdown: None,
             exe_changed: false,
+            config_edits: Arc::new(Mutex::new(())),
         };
         tokio::spawn(actor.run(incoming, finished));
         Daemon {
@@ -263,6 +264,7 @@ struct Router {
     forwards: usize,
     shutdown: Option<ShutdownWhen>,
     exe_changed: bool,
+    config_edits: Arc<Mutex<()>>,
 }
 
 impl Router {
@@ -499,6 +501,61 @@ impl Router {
                             .and_then(encode)
                     }
                     .await;
+                    let _ = peer.respond(id, result);
+                });
+            }
+            "config/settings" => {
+                let params: SettingsParams = decode(params)?;
+                settings_paths(&params.cwd, &params.configs)?;
+                let paths = self.options.paths.clone();
+                let Some(peer) = self
+                    .clients
+                    .get(&client)
+                    .map(|connection| connection.peer.clone())
+                else {
+                    return Ok(());
+                };
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        xi_kernel::settings::report(&paths, &params.cwd, &params.configs)
+                            .map_err(internal)
+                    })
+                    .await
+                    .map_err(internal)
+                    .and_then(|result| result)
+                    .and_then(encode);
+                    let _ = peer.respond(id, result);
+                });
+            }
+            "config/set" => {
+                let params: SetSettingParams = decode(params)?;
+                settings_paths(&params.cwd, &params.configs)?;
+                let paths = self.options.paths.clone();
+                let edits = self.config_edits.clone();
+                let Some(peer) = self
+                    .clients
+                    .get(&client)
+                    .map(|connection| connection.peer.clone())
+                else {
+                    return Ok(());
+                };
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _guard = edits.lock().map_err(internal)?;
+                        xi_kernel::settings::set_global(&paths, &params.key, &params.value)
+                            .map_err(|error| match error {
+                                xi_kernel::Error::Config(message) => {
+                                    RpcError::new(RpcError::INVALID_PARAMS, message)
+                                }
+                                error => internal(error),
+                            })?;
+                        xi_kernel::settings::report(&paths, &params.cwd, &params.configs)
+                            .map_err(internal)
+                    })
+                    .await
+                    .map_err(internal)
+                    .and_then(|result| result)
+                    .and_then(encode);
                     let _ = peer.respond(id, result);
                 });
             }
@@ -1407,6 +1464,22 @@ fn grant(replies: Vec<Reply>) {
     for (peer, id) in replies {
         let _ = peer.respond(id, Ok(Value::Null));
     }
+}
+
+fn settings_paths(cwd: &Path, configs: &[PathBuf]) -> Result<(), RpcError> {
+    if !cwd.is_absolute() {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            format!("settings cwd must be absolute: {}", cwd.display()),
+        ));
+    }
+    if let Some(path) = configs.iter().find(|path| !path.is_absolute()) {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            format!("settings config path must be absolute: {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, RpcError> {

@@ -147,6 +147,8 @@ Client → daemon requests:
 | `session/command` | `{session, name, args}` → command result or null | Route an extension slash command to the worker. The result is the extension protocol's `CommandResult`; null means an unknown command. |
 | `approval/list` | `{}` → `[{session, call, tool, action, rule, taint, trusted}]` | Return pending asks across all sessions. `taint` marks an ask that taint caused; `trusted` is whether the session's workspace is trusted. Clients use both to choose which approval scopes to offer. |
 | `approval/resolve` | `{session, call, approved, remember?}` → null | Route the answer to the owning worker; the first answer wins. `remember` is `once` (default), `session` or `workspace`; see [Terminal client](#terminal-client). A scope other than `once` on a denial, on a taint ask, or `workspace` in an untrusted workspace fails with -32602 and leaves the ask pending. |
+| `config/settings` | `{cwd, configs?}` → `{files: {global, explicit?, project, local}, trusted, settings: [{key, value, source, editable, held_back?}], warnings?}` | Handled by the daemon. Report each setting's effective value for the workspace and the layer that supplied it: `{layer: "default" \| "global" \| "project" \| "local"}` or `{layer: "explicit", path}`. `held_back` names an untrusted project or local layer that set the key and was ignored. Reads the files only; nothing starts and `sandbox.env_command` does not run. |
+| `config/set` | `{cwd, configs?, key, value}` → same as `config/settings` | Handled by the daemon. Set one editable key in the global `config.toml`, or remove it with `value = null`, then report again. An unknown or read-only key, or a value of the wrong type, fails with -32602 and leaves the file unchanged. The edit keeps comments, ordering and other keys, and the file is replaced atomically. Writes from different clients are serialized. |
 | `daemon/status` | `{}` → `{version, pid, uptime_secs, workers, clients, leases}` | Return daemon status. Each lease entry is `{endpoint, concurrency, active, waiting}`. |
 | `daemon/shutdown` | `{when: "idle" \| "now"}` → null | `idle` exits when there are no workers; `now` cancels running turns, closes workers and kills any still present after five seconds. |
 
@@ -274,7 +276,7 @@ The summary is the first user-side content after the unchanged system prompt. Th
 
 ### Terminal client
 
-`xi-tui` is the daily interface: a daemon client that commits finished output to the terminal's native scrollback and redraws only a live region below it. The live region holds the streaming turn, any open overlay, the composer and a one-line footer. Everything about a session goes through the protocol. The client owns only local state: prompt history, key bindings, display preferences and edits to the user's global config file.
+`xi-tui` is the daily interface: a daemon client that commits finished output to the terminal's native scrollback and redraws only a live region below it. The live region holds the streaming turn, any open overlay, the composer and a one-line footer. Everything about a session goes through the protocol. The client owns only local state: prompt history, key bindings and display preferences. Edits to the user's global config file go through `config/set`.
 
 The surface below is the target for daily use, including developing xi with xi. [Roadmap](roadmap.md#terminal-client) tracks which parts exist.
 
@@ -353,18 +355,18 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 
 #### Settings view
 
-Each row shows the effective value and the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted.
+`/settings` opens a view of the settings that matter day to day. Each row shows the effective value and the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted. `up` and `down` move, `enter` or `space` changes the selected row, `e` opens the global `config.toml` in the external editor and reloads the view afterwards, and `esc` closes.
 
 | Row | Scope | Change |
 |---|---|---|
-| Model, reasoning | Session | Protocol methods; `ctrl+s` also saves the value as the global default. |
-| Thinking display | Client | `tui.toml`. |
-| Automatic compaction, trigger, kept tail | Global default | Global `config.toml`. |
-| Tools, including `hashline` | Global default | Global `config.toml`. |
-| Approval mode for new sessions | Global default | Global `config.toml`. |
-| Sandbox roots, trust, daemon idle timeout | Read only | `e` opens the file in the external editor. |
+| Model, reasoning | Session | `enter` opens the model picker or cycles reasoning through the protocol methods; `ctrl+s` saves the session's value as the global default. |
+| Thinking display | Client | Cycles `full`, `first`, `hidden` and saves `[display] thinking` to `tui.toml`. |
+| Approvals | Global default | Cycles the `approvals` preset `ask`, `reads`, `auto`. |
+| One row per built-in tool, including `hashline` | Global default | Toggles the tool in `tools`, keeping the order and any other names; the last tool cannot be removed. |
+| Automatic compaction, trigger, kept tail | Global default | Toggles `enabled`, or edits a token count inline; an empty trigger means 80% of the window. |
+| Sandbox roots and environment, extensions, trust, daemon idle timeout | Read only | `e` opens the file. |
 
-The client edits the global `config.toml` with a format-preserving TOML writer, so comments and ordering survive. A running worker keeps the config it started with; new sessions read the change. Provider sections, `[[model]]` and `[[rule]]` stay file-only.
+Global defaults go through `config/set`, which edits the global `config.toml` with a format-preserving TOML writer, so comments and ordering survive. `tui.toml` is edited the same way by the client. A running worker keeps the config it started with; new sessions read the change. Provider sections, `[[model]]` and `[[rule]]` stay file-only.
 
 #### Footer and rendering
 
@@ -458,11 +460,21 @@ when = "always"             # always | tainted | clean
 Evaluation:
 
 1. With no matching rule, the decision is `ask`.
-2. Layers with full authority (built-in, user, and the workspace-local file once the workspace is trusted) apply in order. The last matching rule wins.
+2. Layers with full authority (built-in, the `approvals` preset, user, and the workspace-local file once the workspace is trusted) apply in order. The last matching rule wins.
 3. Tighten-only layers (the committed project file, and the local file in an untrusted workspace) apply afterwards. A matching rule replaces the decision only when it is stricter. Their `allow` rules never take effect.
 4. If the session is tainted and the result is `allow` for egress, the decision becomes `ask`, unless the rule that allowed it was written with `when = "tainted"`.
 
 For path subjects, `*` does not cross `/`; use `**`. Path patterns are absolute; `~` is not expanded yet. Host patterns match case-insensitively.
+
+The `approvals` setting picks a preset of built-in rules that sits after the built-in layer and before the user's own rules, so any `[[rule]]` still overrides it:
+
+| Preset | Effect |
+|---|---|
+| `ask` (default) | No rules: every crossing without a rule asks. |
+| `reads` | Reads outside the sandbox are allowed, except under xi's own config, data and state directories. |
+| `auto` | Reads, writes outside the sandbox and network egress are allowed. Reads and writes under xi's own directories and writes to the workspace's protected paths (`.git/config`, `.git/hooks`, `.xi`) still ask. Taint still turns egress into an ask. |
+
+Inside the sandbox nothing is asked under any preset, so workspace edits and commands never ask. `approvals` is honored in the global file, `--config` files and the trusted local file. The committed project file cannot set it, because a preset loosens policy.
 
 ### Taint
 
@@ -506,6 +518,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 - Context files: `AGENTS.md` and Agent Skills.
 - System prompt: under 1k tokens, static.
 - Compaction: automatic compaction off; a context overflow always compacts once and retries. The summary is structured (goal, decisions, touched files, open work) and visible as a `compaction` event.
+- Approvals: preset `ask`, so every boundary crossing without a rule asks.
 - TUI: differential rendering into the terminal's native scrollback.
 - Config: one TOML format, layered global, project, local.
 
@@ -525,7 +538,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 | `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler, socket activation, unit installation and private-instance mode. | Implemented |
 | `xi-cli` | The `xi` binary: daemon-backed line mode and TUI launch, private-instance headless `-p`, client-protocol `serve`, `trust`, `daemon`, `daemon install`/`uninstall` and internal `worker`. | Implemented |
 | `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |
-| `xi-tui` | Daemon client: scrollback commits, a live region, `ctrl+o` full results, a `/tree` checkout overlay and the [terminal client](#terminal-client) surface. | Implemented; the settings view is planned |
+| `xi-tui` | Daemon client: scrollback commits, a live region, `ctrl+o` full results, a `/tree` checkout overlay and the [terminal client](#terminal-client) surface. | Implemented |
 | `sdk/typescript` | Zero-dependency extension SDK and full-duplex NDJSON peer. | Implemented |
 
 ## Build order
@@ -537,7 +550,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 5. Protocol types for the handshake, attach, list, approvals inbox, stream reset and error codes; the worker entry point over a pipe; `xi-daemon` with private-instance mode; `xi -p` and the benchmark on the private instance (benchmark argv unchanged). Done.
 6. The per-user daemon: socket, peer-uid check, lock-based startup, idle exit, launchd and systemd units, `notify` and `approval_timeout`. Done.
 7. `xi-tui` as a daemon client; scheduler leases. Done.
-8. The [terminal client](#terminal-client) surface for daily use, in five slices: model and reasoning; sessions and approvals; composer; rendering and keys; settings. Slices 1 to 4 done; settings planned.
+8. The [terminal client](#terminal-client) surface for daily use, in five slices: model and reasoning; sessions and approvals; composer; rendering and keys; settings. Done.
 
 What comes next, and how features and sandbox work proceed side by side, is in [roadmap.md](roadmap.md).
 

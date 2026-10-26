@@ -20,6 +20,7 @@ pub mod keys;
 pub mod picker;
 pub mod screen;
 pub mod sessions;
+pub mod settings;
 pub mod status;
 pub mod style;
 pub mod transcript;
@@ -42,7 +43,7 @@ use xi_protocol::event::ModelRef;
 use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::{
     AttachResult, CreateParams, EventParams, ListParams, OpenParams, PendingApproval, PromptResult,
-    SessionSummary,
+    SessionSummary, SetSettingParams, SettingsParams,
 };
 use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::RpcError;
@@ -57,6 +58,7 @@ use crate::keys::{Action, Keymap};
 use crate::picker::Picker;
 use crate::screen::Screen;
 use crate::sessions::Sessions;
+use crate::settings::Settings;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
 use crate::transcript::{SPINNER, Transcript, duration, tokens};
@@ -113,6 +115,7 @@ enum Builtin {
     New,
     Resume,
     Approvals,
+    Settings,
     Copy,
     Tree,
     Model,
@@ -136,6 +139,7 @@ const COMMANDS: &[(&str, &str, Builtin)] = &[
         "answer pending approvals in every session",
         Builtin::Approvals,
     ),
+    ("settings", "show and change settings", Builtin::Settings),
     (
         "copy",
         "copy the last response to the clipboard",
@@ -178,6 +182,15 @@ fn reasoning_name(reasoning: Reasoning) -> &'static str {
     }
 }
 
+fn next_reasoning(reasoning: Reasoning) -> Reasoning {
+    match reasoning {
+        Reasoning::Off => Reasoning::Low,
+        Reasoning::Low => Reasoning::Medium,
+        Reasoning::Medium => Reasoning::High,
+        Reasoning::High => Reasoning::Off,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Composer,
@@ -186,9 +199,15 @@ enum Focus {
     Models,
     Search,
     Sessions,
+    Settings,
 }
 
 type Reply = oneshot::Receiver<Result<PromptResult, ClientError>>;
+
+enum ExternalRequest {
+    Composer,
+    Settings(PathBuf),
+}
 
 struct App {
     launch: Launch,
@@ -201,6 +220,7 @@ struct App {
     search: Option<Search>,
     sessions: Option<Sessions>,
     approvals: Option<Approvals>,
+    settings: Option<Settings>,
     approval_workspaces: HashMap<SessionId, PathBuf>,
     /// Other sessions' asks this client answered. The daemon drops an ask
     /// from `approval/list` only when its resolution event arrives, which
@@ -215,7 +235,7 @@ struct App {
     completion: Option<Menu>,
     files: Option<FileIndex>,
     file_cwd: Option<PathBuf>,
-    external_requested: bool,
+    external_requested: Option<ExternalRequest>,
     /// Replies of prompts sent to the running turn.
     pending: FuturesUnordered<Reply>,
     started: Option<Instant>,
@@ -255,12 +275,15 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     while !app.quit {
-        if app.external_requested {
-            app.external_requested = false;
+        if let Some(request) = app.external_requested.take() {
+            let settings_file = matches!(&request, ExternalRequest::Settings(_));
             screen.finish()?;
             drop(keys);
             drop(raw.take());
-            let edited = external::edit(app.editor.text());
+            let edited = match request {
+                ExternalRequest::Composer => external::edit(app.editor.text()),
+                ExternalRequest::Settings(path) => external::edit_file(&path).map(|()| None),
+            };
             raw = Some(Raw::enter()?);
             crossterm::execute!(
                 std::io::stdout(),
@@ -268,14 +291,21 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
             )?;
             keys = EventStream::new();
-            match edited {
-                Ok(Some(text)) => app.editor.set_text(&text),
-                Ok(None) => {}
-                Err(error) => app.note(vec![
-                    Line::default().dim(format!("  external editor: {error}")),
-                ]),
+            if settings_file {
+                app.refresh_settings().await;
+                if let Err(error) = edited {
+                    app.settings_note(format!("external editor: {error}"));
+                }
+            } else {
+                match edited {
+                    Ok(Some(text)) => app.editor.set_text(&text),
+                    Ok(None) => {}
+                    Err(error) => app.note(vec![
+                        Line::default().dim(format!("  external editor: {error}")),
+                    ]),
+                }
+                app.update_completion();
             }
-            app.update_completion();
         }
         if app.refresh {
             app.refresh_details().await;
@@ -381,6 +411,7 @@ impl App {
             search: None,
             sessions: None,
             approvals: None,
+            settings: None,
             approval_workspaces: HashMap::new(),
             answered: HashSet::new(),
             inbox_refresh: false,
@@ -391,7 +422,7 @@ impl App {
             completion: None,
             files: None,
             file_cwd: None,
-            external_requested: false,
+            external_requested: None,
             pending: FuturesUnordered::new(),
             started: None,
             steering: Vec::new(),
@@ -479,6 +510,7 @@ impl App {
         self.picker = None;
         self.sessions = None;
         self.approvals = None;
+        self.settings = None;
         self.inbox_refresh = false;
         self.focus = Focus::Composer;
         self.completion = None;
@@ -714,6 +746,112 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    fn settings_params(&self) -> SettingsParams {
+        SettingsParams {
+            cwd: self.launch.template.cwd.clone(),
+            configs: self.launch.template.options.configs.clone(),
+        }
+    }
+
+    async fn open_settings(&mut self) {
+        match self.launch.client.settings(self.settings_params()).await {
+            Ok(report) => {
+                self.close_overlay();
+                self.settings = Some(Settings::new(report));
+                self.focus = Focus::Settings;
+            }
+            Err(error) => {
+                self.close_overlay();
+                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+            }
+        }
+    }
+
+    fn settings_note(&mut self, note: impl Into<String>) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.note(note);
+        }
+    }
+
+    async fn refresh_settings(&mut self) {
+        match self.launch.client.settings(self.settings_params()).await {
+            Ok(report) => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.replace(report);
+                }
+            }
+            Err(error) => self.settings_note(error.to_string()),
+        }
+    }
+
+    async fn settings_key(&mut self, key: KeyEvent) {
+        let info = &self.launch.attached.info;
+        let Some(settings) = self.settings.as_mut() else {
+            self.focus = Focus::Composer;
+            return;
+        };
+        match settings.key(key, &info.model, info.reasoning) {
+            settings::Action::None => {}
+            settings::Action::Close => self.close_overlay(),
+            settings::Action::Models => self.open_models().await,
+            settings::Action::Reasoning => {
+                self.set_reasoning(next_reasoning(self.launch.attached.info.reasoning))
+                    .await;
+            }
+            settings::Action::Thinking => {
+                let thinking = self.transcript.thinking_display().next();
+                self.transcript.set_thinking(thinking);
+                let saved = self
+                    .launch
+                    .tui_config
+                    .as_deref()
+                    .map(|path| config::save_thinking(path, thinking));
+                match saved {
+                    Some(Ok(())) => self.settings_note("saved · thinking display"),
+                    Some(Err(error)) => self.settings_note(error.to_string()),
+                    None => self.settings_note("not saved: no config path"),
+                }
+            }
+            settings::Action::Set { key, value } => {
+                let params = self.settings_params();
+                match self
+                    .launch
+                    .client
+                    .set_setting(SetSettingParams {
+                        cwd: params.cwd,
+                        configs: params.configs,
+                        key: key.into(),
+                        value,
+                    })
+                    .await
+                {
+                    Ok(report) => {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings.saved(report);
+                        }
+                    }
+                    Err(error) => self.settings_note(error.to_string()),
+                }
+            }
+            settings::Action::EditFile => {
+                if let Some(settings) = &self.settings {
+                    self.external_requested = Some(ExternalRequest::Settings(
+                        settings.report.files.global.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn close_models(&mut self) {
+        if self.settings.is_some() {
+            self.picker = None;
+            self.focus = Focus::Settings;
+        } else {
+            self.close_overlay();
         }
     }
 
@@ -1214,6 +1352,7 @@ impl App {
                     self.note(vec![Line::default().dim("  no pending approvals")]);
                 }
             }
+            Some(Builtin::Settings) => self.open_settings().await,
             Some(Builtin::Copy) => {
                 if let Some(text) = self.transcript.last_text() {
                     let lines = text.lines().count();
@@ -1484,13 +1623,13 @@ impl App {
                     self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
                 } else if self.set_model(entry.model).await {
                     self.launch.attached.info.model_info = Some(entry.info);
-                    self.close_overlay();
+                    self.close_models();
                 }
             }
             return;
         }
         if key.code == KeyCode::Esc {
-            self.close_overlay();
+            self.close_models();
             return;
         }
         if let Some(picker) = self.picker.as_mut() {
@@ -1577,6 +1716,10 @@ impl App {
             }
             Focus::Sessions => {
                 self.sessions_key(key).await;
+                return Ok(());
+            }
+            Focus::Settings => {
+                self.settings_key(key).await;
                 return Ok(());
             }
             Focus::Approval => {
@@ -1667,7 +1810,7 @@ impl App {
                 return Ok(());
             }
             Some(Action::External) => {
-                self.external_requested = true;
+                self.external_requested = Some(ExternalRequest::Composer);
                 return Ok(());
             }
             Some(Action::Models) => {
@@ -1675,12 +1818,7 @@ impl App {
                 return Ok(());
             }
             Some(Action::Reasoning) => {
-                let next = match self.launch.attached.info.reasoning {
-                    Reasoning::Off => Reasoning::Low,
-                    Reasoning::Low => Reasoning::Medium,
-                    Reasoning::Medium => Reasoning::High,
-                    Reasoning::High => Reasoning::Off,
-                };
+                let next = next_reasoning(self.launch.attached.info.reasoning);
                 self.set_reasoning(next).await;
                 return Ok(());
             }
@@ -1906,6 +2044,22 @@ impl App {
         {
             lines.extend(sessions.render(cols, overlay_rows, Timestamp::now()));
         }
+        let mut overlay_cursor = None;
+        if self.focus == Focus::Settings
+            && let Some(settings) = &self.settings
+        {
+            let info = &self.launch.attached.info;
+            let (overlay, cursor) = settings.render(
+                cols,
+                overlay_rows.saturating_sub(lines.len()),
+                &info.model,
+                info.reasoning,
+                self.transcript.thinking_display(),
+                self.launch.tui_config.as_deref(),
+            );
+            overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
+            lines.extend(overlay);
+        }
         if self.focus == Focus::Search
             && let Some(search) = &self.search
         {
@@ -1937,7 +2091,8 @@ impl App {
         let top = lines.len();
         lines.extend(composer);
         lines.push(self.footer(cols));
-        let cursor = (self.focus == Focus::Composer).then_some((top + row, col));
+        let cursor =
+            overlay_cursor.or_else(|| (self.focus == Focus::Composer).then_some((top + row, col)));
         (lines, cursor)
     }
 
@@ -1958,7 +2113,8 @@ mod tests {
     use xi_protocol::EventKind;
     use xi_protocol::event::{Remember, StopReason, Usage};
     use xi_protocol::methods::client::{
-        Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails,
+        ConfigFiles, Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails, Setting,
+        SettingLayer, SettingsReport,
     };
 
     use super::*;
@@ -2012,6 +2168,48 @@ mod tests {
         }
     }
 
+    fn settings_report() -> SettingsReport {
+        let settings = [
+            ("default_model", json!("default/model")),
+            ("reasoning", json!("low")),
+            ("approvals", json!("ask")),
+            (
+                "tools",
+                json!(["read", "edit", "write", "bash", "search", "hashline"]),
+            ),
+            ("compaction.enabled", json!(true)),
+            ("compaction.trigger_tokens", Value::Null),
+            ("compaction.keep_recent_tokens", json!(16_000)),
+            ("extensions", json!(["/tmp/extensions"])),
+            ("sandbox.readable", json!(["/tmp/notes"])),
+            ("sandbox.writable", json!(["/tmp/output"])),
+            ("sandbox.env", json!(["LANG"])),
+            ("sandbox.env_command", json!(["sh", "-c", "printenv"])),
+            ("daemon.idle_exit", json!(900)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (key, value))| Setting {
+            key: key.into(),
+            value,
+            source: SettingLayer::Default,
+            editable: index < 7,
+            held_back: None,
+        })
+        .collect();
+        SettingsReport {
+            files: ConfigFiles {
+                global: "/tmp/xi-test-config/config.toml".into(),
+                explicit: Vec::new(),
+                project: "/tmp/xi-tui-demo/.xi/config.toml".into(),
+                local: "/tmp/xi-tui-demo/.xi/config.local.toml".into(),
+            },
+            trusted: true,
+            settings,
+            warnings: Vec::new(),
+        }
+    }
+
     #[derive(Default)]
     struct FakeData {
         sessions: Vec<AttachResult>,
@@ -2019,6 +2217,9 @@ mod tests {
         approvals: Vec<PendingApproval>,
         held: bool,
         reject_resolve: bool,
+        settings: Option<SettingsReport>,
+        reject_settings: bool,
+        reject_setting: bool,
         /// Keep answered asks in `approval/list`, as the daemon does until
         /// the resolution event arrives.
         lagging_inbox: bool,
@@ -2039,6 +2240,7 @@ mod tests {
         let response = attached.clone();
         data.sessions.push(response.clone());
         data.approvals.extend(response.pending_approvals.clone());
+        let mut settings = data.settings.take().unwrap_or_else(settings_report);
         tokio::spawn(async move {
             while let Some(message) = incoming.recv().await {
                 if let Incoming::Request { id, method, params } = message {
@@ -2086,6 +2288,24 @@ mod tests {
                         )
                         .unwrap()),
                         "approval/list" => Ok(serde_json::to_value(&data.approvals).unwrap()),
+                        "config/settings" if data.reject_settings => Err(RpcError::new(
+                            RpcError::INVALID_PARAMS,
+                            "settings unavailable",
+                        )),
+                        "config/settings" => Ok(serde_json::to_value(&settings).unwrap()),
+                        "config/set" if data.reject_setting => {
+                            Err(RpcError::new(RpcError::INVALID_PARAMS, "setting rejected"))
+                        }
+                        "config/set" => {
+                            let row = settings
+                                .settings
+                                .iter_mut()
+                                .find(|row| json!(row.key) == params["key"])
+                                .unwrap();
+                            row.value = params["value"].clone();
+                            row.source = SettingLayer::Global;
+                            Ok(serde_json::to_value(&settings).unwrap())
+                        }
                         "session/models" => Ok(json!({
                             "current": response.info.model,
                             "reasoning": response.info.reasoning,
@@ -2598,15 +2818,9 @@ mod tests {
                 assert!(help.contains(&binding.label()));
             }
         }
-        for implemented in ["/resume", "/approvals", "/copy", "ctrl+t"] {
+        for implemented in ["/resume", "/approvals", "/copy", "/settings", "ctrl+t"] {
             assert!(help.contains(implemented));
         }
-        assert!(!help.contains("/settings"));
-        assert!(
-            !app.commands
-                .iter()
-                .any(|command| command.name == "settings")
-        );
     }
 
     #[tokio::test]
@@ -3167,6 +3381,381 @@ mod tests {
         assert!(output.starts_with(sequence.as_bytes()));
         assert!(app.controls.is_empty());
         assert!(String::from_utf8(output).unwrap().contains("\x1b[?2026h"));
+    }
+
+    async fn settings_down(app: &mut App, count: usize) {
+        for _ in 0..count {
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
+        let mut report = settings_report();
+        report.trusted = false;
+        report.settings[2].source = SettingLayer::Explicit {
+            path: "/tmp/extra.toml".into(),
+        };
+        report.settings[2].held_back = Some(SettingLayer::Local);
+        let (mut launch, mut requests) = launch_with(
+            snapshot(false),
+            FakeData {
+                settings: Some(report),
+                ..FakeData::default()
+            },
+        )
+        .await;
+        launch.template.options.configs = vec!["/tmp/extra.toml".into()];
+        let mut app = App::new(launch, 240, 40);
+        app.command("/settings").await.unwrap();
+        assert!(app.focus == Focus::Settings);
+        let params = request(&mut requests, "config/settings");
+        assert_eq!(params["cwd"], "/tmp/xi-tui-demo");
+        assert_eq!(params["configs"], json!(["/tmp/extra.toml"]));
+        let text = live_text(&app);
+        for expected in [
+            "settings",
+            "saved to /tmp/xi-test-config/config.toml",
+            "Model",
+            "demo/script",
+            "Reasoning",
+            "medium",
+            "session",
+            "Thinking display",
+            "Approvals",
+            "--config extra.toml",
+            "held back (untrusted)",
+            "Tool read",
+            "Tool hashline",
+            "Automatic compaction",
+            "80% of window",
+            "Kept tail",
+            "Sandbox readable",
+            "/tmp/notes",
+            "Sandbox writable",
+            "/tmp/output",
+            "Sandbox env",
+            "LANG",
+            "Sandbox env command",
+            "sh, -c, printenv",
+            "Extensions",
+            "/tmp/extensions",
+            "Trust",
+            "untrusted · xi trust",
+            "Daemon idle exit",
+            "900 seconds",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("default/model"));
+        assert!(app.commands.iter().any(|command| {
+            command.name == "settings" && command.description == "show and change settings"
+        }));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.commit.clear();
+        app.command("/help").await.unwrap();
+        assert!(app.commit.iter().any(|line| {
+            line.plain().contains("/settings") && line.plain().contains("show and change settings")
+        }));
+    }
+
+    #[tokio::test]
+    async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 180, 40);
+        app.command("/settings").await.unwrap();
+        request(&mut requests, "config/settings");
+        settings_down(&mut app, 10).await;
+        app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["cwd"], "/tmp/xi-tui-demo");
+        assert_eq!(params["key"], "compaction.enabled");
+        assert_eq!(params["value"], false);
+        let row = app
+            .settings
+            .as_ref()
+            .unwrap()
+            .report
+            .settings
+            .iter()
+            .find(|row| row.key == "compaction.enabled")
+            .unwrap();
+        assert_eq!(row.value, false);
+        assert_eq!(row.source, SettingLayer::Global);
+        assert!(live_text(&app).contains("saved · new sessions use it"));
+    }
+
+    #[tokio::test]
+    async fn settings_saves_session_model_and_reasoning_and_returns_from_picker() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 180, 40);
+        app.command("/settings").await.unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "default_model");
+        assert_eq!(params["value"], "demo/script");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Models);
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Settings);
+        assert_eq!(app.launch.attached.info.model.model, "second");
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(request(&mut requests, "config/set")["value"], "demo/second");
+        settings_down(&mut app, 1).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&mut requests, "session/set_reasoning")["reasoning"],
+            "high"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "reasoning");
+        assert_eq!(params["value"], "high");
+        assert_eq!(app.launch.attached.info.reasoning, Reasoning::High);
+    }
+
+    #[tokio::test]
+    async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_order() {
+        let mut report = settings_report();
+        report.settings[3].value = json!(["read", "custom", "edit"]);
+        let (launch, mut requests) = launch_with(
+            snapshot(false),
+            FakeData {
+                settings: Some(report),
+                ..FakeData::default()
+            },
+        )
+        .await;
+        let mut app = App::new(launch, 180, 40);
+        app.command("/settings").await.unwrap();
+        settings_down(&mut app, 4).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "tools");
+        assert_eq!(params["value"], json!(["custom", "edit"]));
+        app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&mut requests, "config/set")["value"],
+            json!(["custom", "edit", "read"])
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_refuses_to_remove_the_last_tool() {
+        let mut report = settings_report();
+        report.settings[3].value = json!(["read"]);
+        let (launch, mut requests) = launch_with(
+            snapshot(false),
+            FakeData {
+                settings: Some(report),
+                ..FakeData::default()
+            },
+        )
+        .await;
+        let mut app = App::new(launch, 180, 40);
+        app.command("/settings").await.unwrap();
+        request(&mut requests, "config/settings");
+        settings_down(&mut app, 4).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(live_text(&app).contains("cannot remove the last tool"));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn settings_cycles_approvals_and_edits_nullable_and_positive_token_counts() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 180, 40);
+        app.command("/settings").await.unwrap();
+        settings_down(&mut app, 3).await;
+        for approval in ["reads", "auto", "ask"] {
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            let params = request(&mut requests, "config/set");
+            assert_eq!(params["key"], "approvals");
+            assert_eq!(params["value"], approval);
+        }
+        settings_down(&mut app, 8).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.live().1.is_some());
+        for c in "24000".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "compaction.trigger_tokens");
+        assert_eq!(params["value"], 24_000);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(request(&mut requests, "config/set")["value"].is_null());
+        assert!(live_text(&app).contains("80% of window"));
+        settings_down(&mut app, 1).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(live_text(&app).contains("enter a positive token count"));
+        assert!(requests.try_recv().is_err());
+        for c in "8000".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "compaction.keep_recent_tokens");
+        assert_eq!(params["value"], 8_000);
+    }
+
+    #[tokio::test]
+    async fn settings_thinking_toggle_persists_but_live_toggle_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tui.toml");
+        let (mut launch, _) = launch(snapshot(false)).await;
+        launch.tui_config = Some(path.clone());
+        let mut app = App::new(launch, 180, 40);
+        app.command("/settings").await.unwrap();
+        settings_down(&mut app, 2).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.transcript.thinking_display(),
+            transcript::Thinking::Hidden
+        );
+        assert_eq!(
+            TuiConfig::load(Some(&path)).0.thinking,
+            transcript::Thinking::Hidden
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.transcript.thinking_display(),
+            transcript::Thinking::Full
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn settings_handles_missing_client_path_external_file_and_ctrl_c() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 180, 40);
+        app.editor.set_text("keep draft");
+        app.command("/settings").await.unwrap();
+        settings_down(&mut app, 2).await;
+        app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.transcript.thinking_display(),
+            transcript::Thinking::Hidden
+        );
+        assert!(live_text(&app).contains("not saved: no config path"));
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&app.external_requested, Some(ExternalRequest::Settings(path))
+            if path == Path::new("/tmp/xi-test-config/config.toml"))
+        );
+        app.external_requested = None;
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Composer);
+        assert!(!app.quit);
+        assert!(app.settings.is_none());
+        assert_eq!(app.editor.text(), "keep draft");
+    }
+
+    #[tokio::test]
+    async fn settings_errors_leave_the_composer_or_show_the_rpc_message_in_the_view() {
+        for reject_open in [true, false] {
+            let (launch, mut requests) = launch_with(
+                snapshot(false),
+                FakeData {
+                    reject_settings: reject_open,
+                    reject_setting: !reject_open,
+                    ..FakeData::default()
+                },
+            )
+            .await;
+            let mut app = App::new(launch, 180, 40);
+            app.command("/settings").await.unwrap();
+            if reject_open {
+                assert!(app.focus == Focus::Composer);
+                assert!(app.settings.is_none());
+                assert!(
+                    app.commit
+                        .iter()
+                        .any(|line| line.plain().contains("settings unavailable"))
+                );
+            } else {
+                app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                request(&mut requests, "config/set");
+                assert!(app.focus == Focus::Settings);
+                assert!(live_text(&app).contains("setting rejected"));
+                assert!(!live_text(&app).contains("saved · new sessions use it"));
+            }
+        }
     }
 
     #[tokio::test]

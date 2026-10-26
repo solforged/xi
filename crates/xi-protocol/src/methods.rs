@@ -124,6 +124,14 @@ pub mod client {
         /// Client → daemon: request shutdown.
         DaemonShutdown, "daemon/shutdown", ShutdownParams => ()
     );
+    request!(
+        /// Client → daemon: report effective settings and their layers for a workspace.
+        ConfigSettings, "config/settings", SettingsParams => SettingsReport
+    );
+    request!(
+        /// Client → daemon: change one key in the global config file.
+        ConfigSet, "config/set", SetSettingParams => SettingsReport
+    );
     notification!(
         /// Kernel → client: an event was persisted.
         EventAppended, "event/appended", EventParams
@@ -180,6 +188,93 @@ pub mod client {
     pub struct Capabilities {
         /// True for a private instance with no listener.
         pub private: bool,
+    }
+
+    /// Parameters for [`ConfigSettings`].
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct SettingsParams {
+        /// Absolute workspace directory.
+        pub cwd: PathBuf,
+        /// Extra `--config` layers, absolute.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub configs: Vec<PathBuf>,
+    }
+
+    /// Parameters for [`ConfigSet`].
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct SetSettingParams {
+        /// Absolute workspace directory.
+        pub cwd: PathBuf,
+        /// Extra `--config` layers, absolute.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub configs: Vec<PathBuf>,
+        /// Dotted key from the report, such as `compaction.enabled`.
+        pub key: String,
+        /// New value; `null` removes the key from the global file.
+        pub value: Value,
+    }
+
+    /// Effective settings, their provenance and the files that supplied them.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct SettingsReport {
+        /// Configuration files considered for this workspace.
+        pub files: ConfigFiles,
+        /// Whether the canonical workspace is trusted.
+        pub trusted: bool,
+        /// Settings in the report's fixed display order.
+        pub settings: Vec<Setting>,
+        /// Loader warnings, such as ignored keys.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<String>,
+    }
+
+    /// Configuration file locations for a workspace.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct ConfigFiles {
+        /// User-owned global config file.
+        pub global: PathBuf,
+        /// Extra `--config` files in load order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub explicit: Vec<PathBuf>,
+        /// Workspace project config file.
+        pub project: PathBuf,
+        /// Workspace local config file.
+        pub local: PathBuf,
+    }
+
+    /// One effective setting and its provenance.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct Setting {
+        /// Dotted configuration key.
+        pub key: String,
+        /// Effective value as JSON; `null` for an unset optional value.
+        pub value: Value,
+        /// The layer that supplied the effective value.
+        pub source: SettingLayer,
+        /// Whether `config/set` accepts this key.
+        pub editable: bool,
+        /// Last layer that set this key but was dropped in an untrusted workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub held_back: Option<SettingLayer>,
+    }
+
+    /// A configuration layer that supplied or held back a setting.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "layer", rename_all = "snake_case")]
+    pub enum SettingLayer {
+        /// Built-in default.
+        Default,
+        /// User-owned global config file.
+        Global,
+        /// An explicit `--config` file.
+        Explicit {
+            /// Absolute configuration file path.
+            path: PathBuf,
+        },
+        /// Workspace project config file.
+        Project,
+        /// Workspace local config file.
+        Local,
     }
 
     /// Per-invocation settings. Paths must be absolute; the worker rejects relative ones.
@@ -882,6 +977,94 @@ mod tests {
     use crate::event::{EventKind, ModelRef};
     use crate::rpc::{Notification, Request, RequestId};
     use crate::{Block, Event, EventId, SessionId, Timestamp};
+
+    #[test]
+    fn settings_requests_and_report_round_trip() {
+        let params = SettingsParams {
+            cwd: "/work".into(),
+            configs: Vec::new(),
+        };
+        let wire = json!({"cwd": "/work"});
+        assert_eq!(serde_json::to_value(&params).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<SettingsParams>(wire.clone()).unwrap(),
+            params
+        );
+        let request = Request::new::<ConfigSettings>(RequestId::Number(1), &params).unwrap();
+        assert_eq!(request.method, "config/settings");
+        assert_eq!(request.params, wire);
+
+        let params = SetSettingParams {
+            cwd: "/work".into(),
+            configs: vec!["/extra.toml".into()],
+            key: "compaction.trigger_tokens".into(),
+            value: serde_json::Value::Null,
+        };
+        let wire = json!({
+            "cwd": "/work", "configs": ["/extra.toml"],
+            "key": "compaction.trigger_tokens", "value": null,
+        });
+        assert_eq!(serde_json::to_value(&params).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<SetSettingParams>(wire.clone()).unwrap(),
+            params
+        );
+        let request = Request::new::<ConfigSet>(RequestId::Number(2), &params).unwrap();
+        assert_eq!(request.method, "config/set");
+        assert_eq!(request.params, wire);
+
+        let wire = json!({
+            "files": {
+                "global": "/config/config.toml", "explicit": ["/extra.toml"],
+                "project": "/work/.xi/config.toml", "local": "/work/.xi/config.local.toml",
+            },
+            "trusted": false,
+            "settings": [
+                {
+                    "key": "compaction.trigger_tokens", "value": null,
+                    "source": {"layer": "default"}, "editable": true,
+                },
+                {
+                    "key": "compaction.enabled", "value": false,
+                    "source": {"layer": "global"}, "editable": true,
+                },
+                {
+                    "key": "tools", "value": ["read"],
+                    "source": {"layer": "explicit", "path": "/extra.toml"}, "editable": true,
+                    "held_back": {"layer": "local"},
+                },
+                {
+                    "key": "sandbox.env", "value": [],
+                    "source": {"layer": "default"}, "editable": false,
+                    "held_back": {"layer": "project"},
+                },
+            ],
+            "warnings": ["ignored untrusted settings"],
+        });
+        let report: SettingsReport = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(report.settings[0].source, SettingLayer::Default);
+        assert_eq!(report.settings[1].source, SettingLayer::Global);
+        assert_eq!(
+            report.settings[2].source,
+            SettingLayer::Explicit {
+                path: "/extra.toml".into(),
+            }
+        );
+        assert_eq!(report.settings[2].held_back, Some(SettingLayer::Local));
+        assert_eq!(report.settings[3].held_back, Some(SettingLayer::Project));
+        assert_eq!(serde_json::to_value(&report).unwrap(), wire);
+        let minimal = json!({
+            "files": {
+                "global": "/config/config.toml",
+                "project": "/work/.xi/config.toml", "local": "/work/.xi/config.local.toml",
+            },
+            "trusted": true, "settings": [],
+        });
+        let report: SettingsReport = serde_json::from_value(minimal.clone()).unwrap();
+        assert!(report.files.explicit.is_empty());
+        assert!(report.warnings.is_empty());
+        assert_eq!(serde_json::to_value(report).unwrap(), minimal);
+    }
 
     #[test]
     fn reasoning_models_and_commands_wire_shapes() {

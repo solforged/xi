@@ -1,5 +1,6 @@
 //! Client key bindings and display settings from `tui.toml`.
 
+use std::io::{self, Write};
 use std::path::Path;
 
 use crate::keys::{Action, Binding, Keymap};
@@ -117,6 +118,58 @@ impl TuiConfig {
     }
 }
 
+/// Saves the thinking display mode while preserving other client settings.
+///
+/// Missing parent directories and files are created. Invalid TOML or a
+/// non-table `display` setting leaves the existing file untouched.
+pub fn save_thinking(path: &Path, thinking: Thinking) -> io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !document.contains_key("display") {
+        document["display"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let display = document["display"]
+        .as_table_like_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "display must be a table"))?;
+    let value = match thinking {
+        Thinking::Full => "full",
+        Thinking::First => "first",
+        Thinking::Hidden => "hidden",
+    };
+    let mut value = toml_edit::Value::from(value);
+    // Replace in place so the key keeps its leading comments.
+    match display.get_mut("thinking") {
+        Some(item) => {
+            if let Some(old) = item.as_value() {
+                *value.decor_mut() = old.decor().clone();
+            }
+            *item = toml_edit::Item::Value(value);
+        }
+        None => {
+            display.insert("thinking", toml_edit::Item::Value(value));
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        file.as_file().set_permissions(metadata.permissions())?;
+    }
+    file.write_all(document.to_string().as_bytes())?;
+    file.flush()?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 fn parse_binding(name: &str, key: &str, warnings: &mut Vec<String>) -> Option<Binding> {
     match Binding::parse(key) {
         Ok(binding) => Some(binding),
@@ -215,6 +268,47 @@ mod tests {
             assert!(warnings.is_empty());
             assert_eq!(config.thinking, Thinking::First);
             assert_eq!(config.keymap.help(), Keymap::default().help());
+        }
+    }
+
+    #[test]
+    fn saving_thinking_preserves_comments_and_unrelated_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        std::fs::write(
+            &path,
+            "# client settings\n[keys]\nsearch = 'ctrl+y' # keep binding\n\n[display]\n# keep display comment\nthinking = 'full' # keep mode comment\n",
+        )
+        .unwrap();
+        save_thinking(&path, Thinking::Hidden).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        for preserved in [
+            "# client settings",
+            "search = 'ctrl+y' # keep binding",
+            "# keep display comment",
+            "# keep mode comment",
+        ] {
+            assert!(saved.contains(preserved), "{saved}");
+        }
+        let (loaded, warnings) = TuiConfig::load(Some(&path));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(loaded.thinking, Thinking::Hidden);
+        assert_eq!(
+            loaded.keymap.bindings(Action::Search),
+            [Binding::parse("ctrl+y").unwrap()]
+        );
+    }
+
+    #[test]
+    fn saving_thinking_creates_parent_directories_and_rejects_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new/config/tui.toml");
+        save_thinking(&path, Thinking::First).unwrap();
+        assert_eq!(TuiConfig::load(Some(&path)).0.thinking, Thinking::First);
+        for invalid in ["[display", "display = false"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(save_thinking(&path, Thinking::Full).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
         }
     }
 }

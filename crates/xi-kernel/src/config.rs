@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use xi_policy::{ActionKind, Authority, Condition, Policy, RuleSpec};
 use xi_protocol::Decision;
 use xi_protocol::event::ModelRef;
+use xi_protocol::methods::client::SettingLayer;
 use xi_protocol::model::Reasoning;
 use xi_provider::{ModelEntry, ProviderConfig, Registry, RegistryConfig};
 
@@ -196,11 +197,25 @@ pub struct SandboxConfig {
     pub env_command: Vec<String>,
 }
 
+/// Built-in approval policy applied before user rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Approvals {
+    /// Ask for every boundary crossing without an explicit rule.
+    #[default]
+    Ask,
+    /// Allow reads except in xi's own directories.
+    Reads,
+    /// Allow ordinary reads, writes and clean network egress.
+    Auto,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     default_model: Option<String>,
     reasoning: Option<Reasoning>,
+    approvals: Option<Approvals>,
     tools: Option<Vec<String>>,
     extensions: Option<Vec<PathBuf>>,
     sandbox: Option<SandboxLayer>,
@@ -237,6 +252,8 @@ pub struct Config {
     pub reasoning: Reasoning,
     /// Explicit per-invocation override, which takes precedence over a saved level.
     pub reasoning_override: Option<Reasoning>,
+    /// Built-in approval policy preset.
+    pub approvals: Approvals,
     /// Enabled tool names in request order.
     pub tools: Vec<String>,
     /// Extension package directories, resolved against their config files.
@@ -253,6 +270,8 @@ pub struct Config {
     pub policy: Arc<Policy>,
     /// Ignored settings, also printed to stderr during loading.
     pub warnings: Vec<String>,
+    pub(crate) setting_sources: BTreeMap<&'static str, SettingLayer>,
+    pub(crate) held_back: BTreeMap<&'static str, SettingLayer>,
 }
 
 impl Config {
@@ -263,25 +282,7 @@ impl Config {
             return Err(Error::Config("workspace is not a directory".into()));
         }
         let trusted = paths.trust_store()?.roots.contains(&workspace);
-        let mut policy = Policy::new();
-        policy.add_layer(
-            "builtin",
-            Authority::Full,
-            &[
-                RuleSpec {
-                    effect: Decision::Allow,
-                    action: ActionKind::Tool,
-                    pattern: "*".into(),
-                    when: Condition::Always,
-                },
-                RuleSpec {
-                    effect: Decision::Allow,
-                    action: ActionKind::Exec,
-                    pattern: "**".into(),
-                    when: Condition::Always,
-                },
-            ],
-        )?;
+        let mut rule_layers = Vec::new();
         let mut config = Self {
             workspace,
             paths,
@@ -289,6 +290,7 @@ impl Config {
             model: parse_model("chatgpt/gpt-6.1-sol")?,
             reasoning: Reasoning::Medium,
             reasoning_override: None,
+            approvals: Approvals::default(),
             tools: ["read", "edit", "write", "bash", "search"]
                 .into_iter()
                 .map(str::to_owned)
@@ -300,23 +302,32 @@ impl Config {
             registries: Vec::new(),
             policy: Arc::new(Policy::new()),
             warnings: Vec::new(),
+            setting_sources: BTreeMap::new(),
+            held_back: BTreeMap::new(),
         };
         let mut layers = vec![(
             config.paths.config.join("config.toml"),
             Authority::Full,
             true,
             false,
+            SettingLayer::Global,
         )];
-        layers.extend(
-            extra
-                .iter()
-                .map(|p| (config.paths.expand(p), Authority::Full, true, true)),
-        );
+        layers.extend(extra.iter().map(|p| {
+            let path = config.paths.expand(p);
+            (
+                path.clone(),
+                Authority::Full,
+                true,
+                true,
+                SettingLayer::Explicit { path },
+            )
+        }));
         layers.push((
             config.workspace.join(".xi/config.toml"),
             Authority::TightenOnly,
             trusted,
             false,
+            SettingLayer::Project,
         ));
         layers.push((
             config.workspace.join(".xi/config.local.toml"),
@@ -327,8 +338,9 @@ impl Config {
             },
             trusted,
             false,
+            SettingLayer::Local,
         ));
-        for (index, (path, authority, settings, required)) in layers.into_iter().enumerate() {
+        for (path, authority, settings, required, source) in layers {
             let text = match std::fs::read_to_string(&path) {
                 Ok(text) => text,
                 Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -336,6 +348,22 @@ impl Config {
             };
             let mut value: toml::Value = toml::from_str(&text)
                 .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            let table = value
+                .as_table_mut()
+                .ok_or_else(|| Error::Config("config must be a table".into()))?;
+            if source == SettingLayer::Project && table.remove("approvals").is_some() {
+                let warning = format!(
+                    "{}: ignoring approvals outside user and local config",
+                    path.display()
+                );
+                eprintln!("xi: {warning}");
+                config.warnings.push(warning);
+            }
+            if !settings {
+                record_sources(table, &source, &mut config.held_back);
+            } else {
+                record_sources(table, &source, &mut config.setting_sources);
+            }
             if !settings {
                 let table = value
                     .as_table_mut()
@@ -354,7 +382,7 @@ impl Config {
                 .as_table_mut()
                 .ok_or_else(|| Error::Config("config must be a table".into()))?;
             let daemon = table.remove("daemon");
-            if index == 0 {
+            if source == SettingLayer::Global {
                 config.daemon = parse_daemon(daemon, &path)?;
             } else if daemon.is_some() {
                 let warning = format!(
@@ -364,15 +392,16 @@ impl Config {
                 eprintln!("xi: {warning}");
                 config.warnings.push(warning);
             }
-            let layer: FileConfig = value
-                .try_into()
-                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-            policy.add_layer(path.display().to_string(), authority, &layer.rule)?;
+            let layer = parse_file(value, &path)?;
+            rule_layers.push((path.display().to_string(), authority, layer.rule));
             if let Some(model) = layer.default_model {
                 config.model = parse_model(&model)?;
             }
             if let Some(reasoning) = layer.reasoning {
                 config.reasoning = reasoning;
+            }
+            if let Some(approvals) = layer.approvals {
+                config.approvals = approvals;
             }
             if let Some(tools) = layer.tools {
                 config.tools = tools;
@@ -405,6 +434,29 @@ impl Config {
                 provider: layer.provider,
                 model: layer.model,
             });
+        }
+        let mut policy = Policy::new();
+        policy.add_layer(
+            "builtin",
+            Authority::Full,
+            &[
+                RuleSpec {
+                    effect: Decision::Allow,
+                    action: ActionKind::Tool,
+                    pattern: "*".into(),
+                    when: Condition::Always,
+                },
+                RuleSpec {
+                    effect: Decision::Allow,
+                    action: ActionKind::Exec,
+                    pattern: "**".into(),
+                    when: Condition::Always,
+                },
+            ],
+        )?;
+        policy.add_layer("approvals", Authority::Full, &approval_rules(&config))?;
+        for (name, authority, rules) in rule_layers {
+            policy.add_layer(name, authority, &rules)?;
         }
         config.policy = Arc::new(policy);
         Ok(config)
@@ -581,6 +633,112 @@ impl Config {
         serde_json::from_slice(&output.stdout)
             .map_err(|e| fail(format!("expected a JSON object of strings or nulls: {e}")))
     }
+}
+
+fn record_sources(
+    table: &toml::Table,
+    source: &SettingLayer,
+    sources: &mut BTreeMap<&'static str, SettingLayer>,
+) {
+    for key in crate::settings::KEYS {
+        if key == "daemon.idle_exit" && *source != SettingLayer::Global {
+            continue;
+        }
+        let present = match key.split_once('.') {
+            Some((parent, field)) => table
+                .get(parent)
+                .and_then(toml::Value::as_table)
+                .is_some_and(|table| table.contains_key(field)),
+            None => table.contains_key(key),
+        };
+        if present {
+            sources.insert(key, source.clone());
+        }
+    }
+}
+
+fn parse_file(value: toml::Value, path: &Path) -> Result<FileConfig> {
+    value
+        .try_into()
+        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+}
+
+pub(crate) fn validate_global(text: &str, path: &Path) -> Result<()> {
+    let mut value: toml::Value =
+        toml::from_str(text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| Error::Config("config must be a table".into()))?;
+    parse_daemon(table.remove("daemon"), path)?;
+    parse_file(value, path)?;
+    Ok(())
+}
+
+fn approval_rules(config: &Config) -> Vec<RuleSpec> {
+    if config.approvals == Approvals::Ask {
+        return Vec::new();
+    }
+    let mut rules = vec![RuleSpec {
+        effect: Decision::Allow,
+        action: ActionKind::Read,
+        pattern: "**".into(),
+        when: Condition::Always,
+    }];
+    if config.approvals == Approvals::Auto {
+        rules.extend([
+            RuleSpec {
+                effect: Decision::Allow,
+                action: ActionKind::Write,
+                pattern: "**".into(),
+                when: Condition::Always,
+            },
+            RuleSpec {
+                effect: Decision::Allow,
+                action: ActionKind::Net,
+                pattern: "*".into(),
+                when: Condition::Always,
+            },
+        ]);
+    }
+    for path in [
+        &config.paths.config,
+        &config.paths.data,
+        &config.paths.state,
+    ] {
+        ask_path(&mut rules, ActionKind::Read, path, true);
+        if config.approvals == Approvals::Auto {
+            ask_path(&mut rules, ActionKind::Write, path, true);
+        }
+    }
+    if config.approvals == Approvals::Auto {
+        for (path, descendants) in [
+            (config.workspace.join(".git/config"), false),
+            (config.workspace.join(".git/hooks"), true),
+            (config.workspace.join(".xi"), true),
+        ] {
+            ask_path(&mut rules, ActionKind::Write, &path, descendants);
+        }
+    }
+    rules
+}
+
+fn ask_path(rules: &mut Vec<RuleSpec>, action: ActionKind, path: &Path, descendants: bool) {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let pattern = globset::escape(&path.to_string_lossy()).replace('\\', "\\\\");
+    if descendants {
+        rules.push(RuleSpec {
+            effect: Decision::Ask,
+            action,
+            pattern: format!("{}/**", pattern.trim_end_matches('/')),
+            when: Condition::Always,
+        });
+    }
+    rules.push(RuleSpec {
+        effect: Decision::Ask,
+        action,
+        pattern,
+        when: Condition::Always,
+    });
 }
 
 /// Appends one exact allow rule without rewriting existing local settings.
