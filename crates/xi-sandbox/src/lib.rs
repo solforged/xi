@@ -19,10 +19,17 @@
 //! - [`Network::Isolated`] gives the process a network namespace with only
 //!   loopback, so no host is reachable.
 //!
-//! Other platforms are not supported yet; the helper fails closed.
+//! On macOS the helper uses Seatbelt through `/usr/bin/sandbox-exec`.
+//! Filesystem and Unix socket access follow the same roots. Isolated
+//! networking denies all IP traffic, including loopback. The session tmp
+//! is exposed through `TMPDIR`, not mounted over `/tmp`.
+//!
+//! Other platforms fail closed.
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 
 use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
@@ -40,6 +47,7 @@ pub const EXIT_CANNOT_EXECUTE: i32 = 126;
 pub const EXIT_NOT_FOUND: i32 = 127;
 
 /// System paths readable inside the sandbox, when they exist.
+#[cfg(not(target_os = "macos"))]
 const SYSTEM_READABLE: &[&str] = &[
     "/bin",
     "/etc",
@@ -53,6 +61,36 @@ const SYSTEM_READABLE: &[&str] = &[
     "/sbin",
     "/sys",
     "/usr",
+];
+
+// Do not allow all of /System: /System/Volumes/Data exposes the home tree.
+#[cfg(target_os = "macos")]
+const SYSTEM_READABLE: &[&str] = &[
+    "/System/Library",
+    "/System/Cryptexes",
+    "/System/Developer",
+    "/System/DriverKit",
+    "/System/iOSSupport",
+    "/System/x86Support",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/Library/Apple",
+    "/Library/Frameworks",
+    "/Library/Preferences/Logging",
+    "/Library/Preferences/com.apple.dt.Xcode.plist",
+    "/Library/Developer/CommandLineTools",
+    "/Library/Developer/PrivateFrameworks",
+    "/Applications/Xcode.app",
+    "/private/etc",
+    "/etc",
+    "/private/var/db/timezone",
+    "/private/var/db/xcode_select_link",
+    "/private/var/db/dyld",
+    "/private/var/select/sh",
+    "/private/var/select/developer_dir",
+    "/var/select/developer_dir",
+    "/var/db/xcode_select_link",
 ];
 
 /// Environment variables passed through by default. Everything else is
@@ -136,7 +174,8 @@ impl Error {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Network {
-    /// A private network namespace with only loopback.
+    /// Linux: a private network namespace with only loopback.
+    /// macOS: no IP networking, including loopback inside the sandbox.
     #[default]
     Isolated,
     /// The host network, unrestricted.
@@ -153,8 +192,9 @@ pub struct Spec {
     /// Paths kept read-only even inside writable roots. A missing path is
     /// created as an empty directory first, so the sandbox cannot create it.
     pub protected: Vec<PathBuf>,
-    /// Directory mounted at `/tmp`. Writable roots under the host `/tmp`
-    /// stay reachable at their original paths.
+    /// Linux: directory mounted at `/tmp`; writable roots under the host
+    /// `/tmp` stay reachable at their original paths.
+    /// macOS: writable directory used as `TMPDIR`, without a remount.
     pub tmp: PathBuf,
     /// Working directory of the program.
     pub cwd: PathBuf,
@@ -163,6 +203,7 @@ pub struct Spec {
     /// Names of environment variables passed through from the caller.
     pub env: Vec<String>,
     /// Run even when the kernel can enforce only some Landlock restrictions.
+    /// Ignored on macOS, where Seatbelt must install the complete policy.
     pub allow_partial: bool,
 }
 
@@ -224,8 +265,8 @@ impl Spec {
 
     /// Builds a command that runs `program` inside this sandbox through the
     /// helper binary at `helper`. The environment is cleared except for
-    /// [`Self::env`], and `TMPDIR` is set to `/tmp`. Variables added to the
-    /// returned command afterwards are passed through as well.
+    /// [`Self::env`]. `TMPDIR` is `/tmp` on Linux and [`Self::tmp`] on macOS.
+    /// Variables added to the returned command afterwards pass through too.
     ///
     /// # Errors
     /// Fails if a path is relative or the spec cannot be encoded.
@@ -253,6 +294,9 @@ impl Spec {
                 command.env(name, value);
             }
         }
+        #[cfg(target_os = "macos")]
+        command.env("TMPDIR", &self.tmp);
+        #[cfg(not(target_os = "macos"))]
         command.env("TMPDIR", "/tmp");
         Ok(command)
     }
@@ -272,7 +316,9 @@ pub fn enter_and_exec(
     spec.validate()?;
     #[cfg(target_os = "linux")]
     return linux::enter_and_exec(spec, program, args);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    return macos::enter_and_exec(spec, program, args);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (program, args);
         Err(Error::Unsupported)

@@ -1,5 +1,6 @@
 //! Linux sandbox: user, mount and network namespaces plus Landlock.
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -104,10 +105,14 @@ pub(crate) fn enter_and_exec(
         rules.extend(open_rule(Path::new(SHM), AccessFs::from_all(abi), true)?);
     }
 
+    pin_protected_ancestors(spec)?;
     for path in &spec.protected {
         bind_read_only(path)?;
     }
     mount_tmp(spec)?;
+    // Binding a writable root leaves an inherited cwd on the covered mount.
+    // Re-enter through the new mount tree so relative paths see the guards.
+    std::env::set_current_dir(&spec.cwd).map_err(setup("enter sandbox working directory"))?;
     if spec.network == Network::Isolated {
         loopback_up().map_err(setup("bring up loopback"))?;
     }
@@ -172,6 +177,42 @@ fn open_rule(
         access & AccessFs::from_file(ABI_TARGET)
     };
     Ok(Some((file, access)))
+}
+
+/// Mount points cannot be renamed or unlinked. Pin the writable ancestors
+/// before protecting their children, so moving .git cannot expose a fresh
+/// unprotected .git/config at the original path.
+fn pin_protected_ancestors(spec: &Spec) -> Result<(), Error> {
+    let roots = spec
+        .writable
+        .iter()
+        .map(|path| path.canonicalize().map_err(setup("resolve writable root")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut ancestors = BTreeSet::new();
+    for path in &spec.protected {
+        let path = path
+            .canonicalize()
+            .map_err(setup("resolve protected path"))?;
+        for ancestor in path.ancestors().skip(1) {
+            if !roots.iter().any(|root| ancestor.starts_with(root)) {
+                break;
+            }
+            ancestors.insert(ancestor.to_owned());
+        }
+    }
+    // Parents sort before children. Recursive binds preserve existing
+    // submounts, including any explicitly writable nested roots.
+    for path in ancestors {
+        mount(
+            Some(path.as_path()),
+            &path,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(setup(format!("pin protected ancestor {}", path.display())))?;
+    }
+    Ok(())
 }
 
 /// Bind-mounts `path` over itself read-only. Remounting inside a user
