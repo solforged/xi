@@ -22,9 +22,11 @@ Each directory under `bench/tasks` contains:
 
 ## Arms
 
-`bench/arms.toml` has one `[[arm]]` entry per variant: unique `name`, `kind` (`xi` or `omp`), `argv`, and optional `[arm.env]`. Argument and environment-value templates support `{prompt}`, `{workspace}`, `{session_dir}`, and `{model}`. Expansion happens once, without a shell; placeholders inside the prompt remain literal. The environment otherwise inherits the invoking shell. Each command receives `PYTHONDONTWRITEBYTECODE=1` and a workspace-local `CARGO_TARGET_DIR`.
+`bench/arms.toml` has one `[[arm]]` entry per variant: unique `name`, `kind` (`xi`, `omp` or `pi`), `argv`, and optional `[arm.env]`. Argument and environment-value templates support `{prompt}`, `{workspace}`, `{session_dir}`, and `{model}`. Expansion happens once, without a shell; placeholders inside the prompt remain literal. The environment otherwise inherits the invoking shell. Each command receives `PYTHONDONTWRITEBYTECODE=1` and a workspace-local `CARGO_TARGET_DIR`.
 
 The runner writes `{session_dir}/omp.yml` with `memory.backend: off` for omp arms. The shipped omp arm disables extensions, skills, rules, title generation, and approval prompts, but retains the user's configured model/provider registry. `omp --help` v18.12.6 names the approval option `--approval-mode yolo`; this is the current equivalent of older `--yolo` invocations.
+
+The `pi` arm runs upstream pi (`pi` 1.4.0 here) with extensions, skills, prompt templates, context files, MCP and startup network activity disabled. Pi has no approval prompts. Its model must exist in pi's own registry (`pi --list-models`); the amarna llama.cpp server is not configured there, so a smoke used `openai/gpt-6-luna`. omp and pi share the `--mode json` event stream, so both use the same parser.
 
 An arm may execute arbitrary commands with the invoking user's authority. The temporary workspace is an isolation mechanism for task state, not a security sandbox. Do not use untrusted tasks or arms. The agent's stdin is closed, and on timeout or exit its process group is terminated to stop background children. A deliberately detached process can escape the process group.
 
