@@ -151,7 +151,8 @@ Threats, in order of likelihood:
 Every tool process and extension runs sandboxed. The kernel never restricts itself; it starts each process through the `xi-sandbox-exec` helper, which enters the sandbox and then execs the target. Doing the setup in a separate single-threaded process keeps it out of the unsafe window between `fork` and `exec` in the multi-threaded kernel.
 
 - Writes: the workspace and a per-session tmp directory. Linux mounts the latter at `/tmp`; workspaces under the host `/tmp` keep their paths. macOS cannot remount and instead sets `TMPDIR` to the session directory. The real `/tmp`, `/private/tmp` and `/private/var/folders` stay unwritable except for explicitly writable roots.
-- Reads: system paths plus explicitly listed roots such as toolchains. The home directory is not readable by default, so credential stores (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.netrc`) are covered without a denylist.
+- Reads: system paths, every `PATH` directory except the home directory and its ancestors, `CARGO_HOME`, `RUSTUP_HOME`, common toolchain roots (mise installs, Homebrew, Nix profiles), skills, and the session's spill and git directories. The rest of the home directory is not readable, so credential stores (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.netrc`) are covered without a denylist.
+- Git: `GIT_CONFIG_GLOBAL` points at a per-session config holding the user's name, email and global ignore patterns, with signing off. The user's own global config stays unreadable, because it can name hooks, credential helpers and signing keys that need secrets. On macOS, git also exits when its global config is unreadable.
 - Protected paths: `.git/config`, `.git/hooks` and `.xi` are read-only even inside the writable workspace. Missing ones are created empty first, so the sandbox can't create them. Hooks and repo config run code outside the sandbox the next time the user runs git, and `.xi` holds policy.
 - Environment: cleared except for an allowlist; `TMPDIR` is `/tmp` on Linux and the session tmp path on macOS.
 - Network: Linux uses a private network namespace with only loopback. macOS denies all IP networking, including connections to host localhost servers and binding in-sandbox loopback servers. `Network::Host` allows host IP networking on either platform. The only additional macOS Unix socket access is the system DNS resolver described below.
@@ -187,7 +188,7 @@ The policy is informed by [Codex's base profile](https://github.com/openai/codex
 #### Known gaps
 
 - Seatbelt and `sandbox-exec` are deprecated Apple interfaces, although still available. There is no private network namespace or `/tmp` mount on macOS, so tools must honor `TMPDIR`; isolated localhost servers cannot run. No best-effort fallback is used.
-- On macOS, git treats `EPERM` reading an unlisted `~/.config/git/config` or `~/.gitconfig` as fatal rather than ignoring it. The sandbox does not silently override Git configuration. A caller can explicitly use `GIT_CONFIG_GLOBAL=/dev/null` for a clean environment, or authorize the intended configuration roots. The kernel owns that choice.
+- On macOS, git treats `EPERM` on an unreadable `~/.config/git/config` or `~/.gitconfig` as fatal. The kernel avoids this with the session git config above; other callers of the helper must set `GIT_CONFIG_GLOBAL` themselves.
 - No PID namespace on Linux: other processes' command lines are visible in `/proc`. Their environments and memory are not, because Landlock blocks ptrace-mode access outside the sandbox.
 - No seccomp filter yet. With namespaces and Landlock in place, its remaining job would be reducing kernel attack surface (`io_uring`, `bpf`, `userfaultfd`).
 - A repository created inside the sandbox with `git init` has unprotected hooks until a later spec sees its `.git`. Hooks planted in that window persist.
@@ -254,22 +255,23 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 | `xi-protocol` | Event, content, JSON-RPC envelope, method and manifest types. | Implemented |
 | `xi-session` | Append-only session tree log with crash recovery and locking. | Implemented |
 | `xi-policy` | Policy rules, layering and taint-aware evaluation. | Implemented |
-| `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock. | Implemented (Linux) |
+| `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock, macOS Seatbelt. | Implemented |
 | `xi-sandbox` egress proxy | Kernel-side CONNECT proxy and in-namespace forwarder. | Planned |
-| `xi-sandbox` macOS | Seatbelt runner. | Planned |
-| `xi-provider` | Provider adapters and model registry. | Planned |
-| `xi-kernel` | Agent loop, context builder, extension host. | Planned |
-| `xi-tools` | Built-in tools as an in-process extension. | Planned |
+| `xi-provider` | Anthropic Messages and OpenAI-compatible Chat adapters, model registry. | Implemented (Anthropic live path untested) |
+| `xi-tools` | `read`, `edit`, `write`, `bash`, `search`, plus `replace` for edit-format comparisons. | Implemented |
+| `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server. | Implemented; extension host planned |
+| `xi-cli` | The `xi` binary: line mode, headless `-p`, `serve`, `trust`. | Implemented |
+| `xi-bench` | Runs xi and omp arms on a task suite and reports metrics. | Implemented |
 | `xi-tui` | Terminal client. | Planned |
 | `sdk/typescript` | Extension and client SDK. | Planned |
 
 ## Build order
 
-1. `xi-sandbox` on Linux, because every later milestone runs tools through it. Done.
-2. `xi-provider` for one provider, then `xi-kernel` with the loop and context builder, `xi-tools`, and a minimal line-mode client. This is the first usable agent.
-3. Extension host and the TypeScript SDK.
-4. `xi-tui`.
-5. Egress proxy and taint tracking wired into tools.
+1. `xi-sandbox` on Linux and macOS. Done.
+2. `xi-provider`, `xi-kernel`, `xi-tools` and a line-mode client: the first usable agent. Done.
+3. `xi-bench`, so features are added on measurements. Done.
+
+What comes next, and how features and sandbox work proceed side by side, is in [roadmap.md](roadmap.md).
 
 ## Open questions
 
