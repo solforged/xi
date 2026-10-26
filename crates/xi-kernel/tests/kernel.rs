@@ -482,6 +482,50 @@ fn explicit_config_order_and_sandbox_field_layering() {
 }
 
 #[test]
+fn env_command_fills_only_passed_through_variables() {
+    let fixture = Fixture::new();
+    let layer = |command: &str| {
+        let path = fixture.paths.home.join("env.toml");
+        write(
+            &path,
+            &format!("[sandbox]\nenv = ['EXTRA']\nenv_command = ['/bin/sh', '-c', '{command}']\n"),
+        );
+        let config = Config::load(fixture.paths.clone(), &fixture.workspace, &[path]).unwrap();
+        let data = &fixture.paths.data;
+        config.sandbox_spec(
+            &data.join("tmp"),
+            &data.join("spill"),
+            &[],
+            &data.join("git"),
+        )
+    };
+    let spec = layer(
+        r#"pwd >&2; printf "{\"PATH\":\"/opt/tool/bin:/usr/bin\",\"RUSTUP_TOOLCHAIN\":\"1.2.3\",\"EXTRA\":\"yes\",\"API_TOKEN\":\"secret\",\"TERM\":null}""#,
+    )
+    .unwrap();
+    assert_eq!(spec.vars["RUSTUP_TOOLCHAIN"], "1.2.3");
+    assert_eq!(spec.vars["EXTRA"], "yes");
+    assert!(
+        spec.vars["PATH"].starts_with("/opt/tool/bin:"),
+        "{}",
+        spec.vars["PATH"]
+    );
+    assert!(!spec.vars.contains_key("API_TOKEN"));
+    assert!(!spec.env.contains(&"API_TOKEN".into()));
+    assert!(
+        !spec.env.contains(&"TERM".into()),
+        "null unsets a passthrough"
+    );
+    let error = layer("echo no >&2; exit 3").unwrap_err().to_string();
+    assert!(
+        error.contains("sandbox.env_command") && error.contains("no"),
+        "{error}"
+    );
+    let error = layer("echo not json").unwrap_err().to_string();
+    assert!(error.contains("JSON object"), "{error}");
+}
+
+#[test]
 fn instructions_order_skills_frontmatter_and_workspace_trust() {
     let fixture = Fixture::new();
     write(&fixture.paths.config.join("AGENTS.md"), "GLOBAL_MARKER");
