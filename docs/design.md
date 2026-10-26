@@ -148,18 +148,42 @@ Threats, in order of likelihood:
 
 ### Sandbox
 
-Every tool process and extension runs sandboxed: Landlock and seccomp on Linux, Seatbelt on macOS.
+Every tool process and extension runs sandboxed. The kernel never restricts itself; it starts each process through the `xi-sandbox-exec` helper, which enters the sandbox and then execs the target. Doing the setup in a separate single-threaded process keeps it out of the unsafe window between `fork` and `exec` in the multi-threaded kernel.
 
-- Writes: the workspace and a per-session tmp directory.
-- Reads: the workspace, toolchains and system paths. Credential stores (`~/.ssh`, `~/.aws`, `~/.config/gh`, keychains, `.netrc`) are denied.
-- Environment: scrubbed to an allowlist.
-- Network: none, except through the kernel's egress proxy.
+- Writes: the workspace and a per-session tmp directory, which is mounted at `/tmp`. Workspaces under the host `/tmp` keep their paths.
+- Reads: system paths plus explicitly listed roots such as toolchains. The home directory is not readable by default, so credential stores (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.netrc`) are covered without a denylist.
+- Protected paths: `.git/config`, `.git/hooks` and `.xi` are read-only even inside the writable workspace. Missing ones are created empty first, so the sandbox can't create them. Hooks and repo config run code outside the sandbox the next time the user runs git, and `.xi` holds policy.
+- Environment: cleared except for an allowlist; `TMPDIR` is `/tmp`.
+- Network: a private network namespace with only loopback. `Network::Host` exists for an explicit policy decision until the egress proxy lands.
+- Terminal: the helper starts a new session, so there's no controlling terminal to push input into with `TIOCSTI`.
+
+Setup failures exit 125, an unrunnable program 126 and a missing program 127.
+
+#### Linux mechanism
+
+| Layer | What it enforces |
+|---|---|
+| User namespace | Lets an unprivileged process create the other namespaces. The user's uid and gid map to themselves. |
+| Mount namespace | Private `/tmp` and `/dev/shm`, plus read-only bind mounts for protected paths. |
+| Network namespace | No route to any host. Landlock's network rules filter by port only, so they can't express "the proxy on loopback but nothing else". |
+| Landlock (ABI 9) | Filesystem access, connecting to pathname Unix sockets (agent sockets, `docker.sock`), and signals and abstract Unix sockets outside the sandbox. Sets `no_new_privs`, which disables setuid binaries. |
+
+The helper refuses to run if the kernel enforces Landlock only partially, unless the spec sets `allow_partial`. ABI 9 shipped in Linux 7.1; older kernels can't mediate Unix socket connections.
+
+Known gaps:
+
+- No PID namespace: other processes' command lines are visible in `/proc`. Their environments and memory are not, because Landlock blocks ptrace-mode access outside the sandbox.
+- No seccomp filter yet. With namespaces and Landlock in place, its remaining job would be reducing kernel attack surface (`io_uring`, `bpf`, `userfaultfd`).
+- A repository created inside the sandbox with `git init` has unprotected hooks until a later spec sees its `.git`. Hooks planted in that window persist.
+- macOS (Seatbelt) is not implemented; the helper fails closed on every other platform.
 
 `--yolo` disables the sandbox and refuses to start unless xi detects it is inside a container or VM.
 
 ### Egress
 
 All network traffic from sandboxed processes goes through an HTTP(S) CONNECT proxy run by the kernel. The proxy sees the destination host and asks policy before connecting. Provider API calls originate in the kernel and never pass through tool processes.
+
+On Linux the proxy listens on a Unix socket in the session directory. Inside the sandbox's network namespace a small forwarder listens on loopback and relays to that socket, and `HTTP_PROXY`/`HTTPS_PROXY` point at the forwarder. The network namespace is what stops a process from connecting to any host directly.
 
 ### Policy
 
@@ -214,7 +238,9 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 | `xi-protocol` | Event, content, JSON-RPC envelope, method and manifest types. | Implemented |
 | `xi-session` | Append-only session tree log with crash recovery and locking. | Implemented |
 | `xi-policy` | Policy rules, layering and taint-aware evaluation. | Implemented |
-| `xi-sandbox` | Landlock, seccomp and Seatbelt runners; egress proxy. | Planned |
+| `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock. | Implemented (Linux) |
+| `xi-sandbox` egress proxy | Kernel-side CONNECT proxy and in-namespace forwarder. | Planned |
+| `xi-sandbox` macOS | Seatbelt runner. | Planned |
 | `xi-provider` | Provider adapters and model registry. | Planned |
 | `xi-kernel` | Agent loop, context builder, extension host. | Planned |
 | `xi-tools` | Built-in tools as an in-process extension. | Planned |
@@ -223,7 +249,7 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 
 ## Build order
 
-1. `xi-sandbox`, because every later milestone runs tools through it.
+1. `xi-sandbox` on Linux, because every later milestone runs tools through it. Done.
 2. `xi-provider` for one provider, then `xi-kernel` with the loop and context builder, `xi-tools`, and a minimal line-mode client. This is the first usable agent.
 3. Extension host and the TypeScript SDK.
 4. `xi-tui`.
