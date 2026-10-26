@@ -1211,19 +1211,19 @@ async fn summary_includes_previous_summary_and_resume_rebuilds_identical_context
 }
 
 #[tokio::test]
-async fn overflow_compacts_and_retries_once_only_when_enabled() {
-    for (enabled, second_overflow) in [(true, false), (true, true), (false, false)] {
+async fn overflow_compacts_and_retries_once_even_when_disabled() {
+    for (enabled, second_overflow) in [(true, false), (false, false), (false, true)] {
         let fixture = Fixture::new();
         let overflow = || Step::Fail(Error::new(ErrorKind::ContextOverflow, "context full"));
-        let mut steps = vec![overflow()];
-        if enabled {
-            steps.push(Step::Reply(done()));
-            steps.push(if second_overflow {
+        let steps = vec![
+            overflow(),
+            Step::Reply(done()),
+            if second_overflow {
                 overflow()
             } else {
                 Step::Reply(done())
-            });
-        }
+            },
+        ];
         let script = Script::new(steps);
         let (session, _) = seeded_session(
             &fixture,
@@ -1238,21 +1238,19 @@ async fn overflow_compacts_and_retries_once_only_when_enabled() {
             },
         );
         let outcome = session.prompt(input("next")).await.unwrap();
-        assert_eq!(outcome.failed, !enabled || second_overflow);
+        assert_eq!(outcome.failed, second_overflow);
         let info = session.info().await;
         let count = info
             .events
             .iter()
             .filter(|event| matches!(event.kind, EventKind::Compaction { .. }))
             .count();
-        assert_eq!(count, usize::from(enabled));
+        assert_eq!(count, 1);
         let requests = script.requests.lock().unwrap();
-        assert_eq!(requests.len(), if enabled { 3 } else { 1 });
-        if enabled {
-            assert!(requests[1].tools.is_empty());
-            assert!(!requests[2].tools.is_empty());
-            assert_eq!(requests[2].messages[0], Message::User(input("done")));
-        }
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].tools.is_empty());
+        assert!(!requests[2].tools.is_empty());
+        assert_eq!(requests[2].messages[0], Message::User(input("done")));
     }
 }
 
