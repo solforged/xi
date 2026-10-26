@@ -17,7 +17,7 @@ pub mod style;
 pub mod transcript;
 pub mod tree;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -117,6 +117,9 @@ struct App {
     quit: bool,
     /// Whether a prompt of the running turn was rejected.
     failed: bool,
+    /// Events `attach` replayed from the log. The bus may still deliver
+    /// some of them, appended between subscribing and attaching.
+    replayed: HashSet<EventId>,
 }
 
 /// Runs the client until the user quits.
@@ -145,6 +148,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
         commit: Vec::new(),
         quit: false,
         failed: false,
+        replayed: HashSet::new(),
     };
     app.attach().await;
     let raw = Raw::enter()?;
@@ -256,6 +260,7 @@ impl App {
         }
         self.commit.extend(header);
         let events = lineage(&info.events, info.head);
+        self.replayed = events.iter().map(|e| e.id).collect();
         let replayed = events.len().saturating_sub(1);
         for event in events {
             let n = Notification::Event(xi_protocol::methods::client::EventParams {
@@ -288,6 +293,16 @@ impl App {
     fn notify(&mut self, notification: &Notification) {
         if !self.mine(notification) {
             return;
+        }
+        if let Notification::Event(p) = notification
+            && !self.replayed.is_empty()
+        {
+            // The bus delivers in append order, so the first event not
+            // replayed means no replayed one is still to come.
+            if self.replayed.remove(&p.event.id) {
+                return;
+            }
+            self.replayed.clear();
         }
         let asks = self.transcript.asks().len();
         let lines = self.transcript.apply(notification, self.cols);
