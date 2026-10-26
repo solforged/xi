@@ -1,4 +1,4 @@
-//! Kernel events in, terminal lines out.
+//! Daemon events in, terminal lines out.
 //!
 //! [`Transcript::apply`] returns the lines a notification commits to
 //! scrollback. Everything not yet committed (streaming text and calls still
@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use serde_json::Value;
-use xi_kernel::Notification;
+use xi_client::client::ClientNotification;
 use xi_protocol::event::{Decision, ModelRef, StopReason, Usage};
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::Pricing;
@@ -369,14 +369,14 @@ impl Transcript {
     }
 
     /// Applies a notification and returns the lines it commits.
-    pub fn apply(&mut self, notification: &Notification, cols: usize) -> Vec<Line> {
+    pub fn apply(&mut self, notification: &ClientNotification, cols: usize) -> Vec<Line> {
         match notification {
-            Notification::Reset(_) => {
+            ClientNotification::Reset(_) => {
                 self.stream.clear();
                 self.thinking = false;
                 Vec::new()
             }
-            Notification::Delta(params) => {
+            ClientNotification::Delta(params) => {
                 match &params.delta {
                     Delta::Text { text } => self.stream.push_str(text),
                     Delta::Thinking { .. } => self.thinking = true,
@@ -384,7 +384,46 @@ impl Transcript {
                 }
                 Vec::new()
             }
-            Notification::Event(params) => self.event(&params.event.kind, params.event.at, cols),
+            ClientNotification::Event(params) => {
+                self.event(&params.event.kind, params.event.at, cols)
+            }
+            ClientNotification::ApprovalPending(pending) => {
+                if !self.asks.iter().any(|ask| ask.call == pending.call) {
+                    self.asks.push(Ask {
+                        call: pending.call.clone(),
+                        tool: pending.tool.clone(),
+                        action: pending.action.clone(),
+                        rule: pending.rule.clone(),
+                        tainted: self.tainted,
+                    });
+                }
+                Vec::new()
+            }
+            ClientNotification::Exited(params) => {
+                self.end_turn();
+                self.calls.clear();
+                let mut message = "  session exited".to_owned();
+                if let Some(status) = params.status {
+                    message.push_str(&format!(" · status {status}"));
+                }
+                if let Some(detail) = &params.message {
+                    message.push_str(&format!(" · {detail}"));
+                }
+                self.note(vec![Line::default().dim(message).truncate(cols)])
+            }
+        }
+    }
+
+    /// Restores in-flight assistant blocks from an attach snapshot.
+    pub fn partial(&mut self, blocks: &[Block]) {
+        self.stream.clear();
+        self.thinking = false;
+        for block in blocks {
+            match block {
+                Block::Text { text } => self.stream.push_str(text),
+                Block::Thinking { .. } | Block::RedactedThinking { .. } => self.thinking = true,
+                _ => {}
+            }
         }
     }
 
@@ -492,7 +531,11 @@ impl Transcript {
                             rule: rule.clone(),
                             tainted,
                         };
-                        self.asks.push(ask);
+                        if let Some(pending) = self.asks.iter_mut().find(|a| a.call == *call) {
+                            *pending = ask;
+                        } else {
+                            self.asks.push(ask);
+                        }
                     }
                 }
             }
@@ -790,14 +833,14 @@ fn blocks_text(content: &[Block]) -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use xi_kernel::Notification;
+    use xi_client::client::ClientNotification;
     use xi_protocol::methods::client::EventParams;
     use xi_protocol::{Event, EventId, SessionId};
 
     use super::*;
 
-    fn ev(kind: EventKind, at: u64) -> Notification {
-        Notification::Event(EventParams {
+    fn ev(kind: EventKind, at: u64) -> ClientNotification {
+        ClientNotification::Event(EventParams {
             session: SessionId::generate(),
             event: Event {
                 id: EventId::generate(),
@@ -1083,5 +1126,97 @@ mod tests {
         assert_eq!(tokens(1_250_000), "1.2M");
         assert_eq!(duration(4200), "4.2s");
         assert_eq!(duration(72_000), "1m12s");
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use xi_client::client::ClientNotification;
+    use xi_protocol::methods::client::{
+        Delta, DeltaParams, ExitedParams, PendingApproval, ResetParams,
+    };
+    use xi_protocol::{Block, SessionId};
+
+    use super::Transcript;
+
+    #[test]
+    fn reset_drops_an_earlier_attempt_and_restored_partial() {
+        let session = SessionId::generate();
+        let mut transcript = Transcript::default();
+        transcript.partial(&[
+            Block::Thinking {
+                text: "reasoning".into(),
+                signature: None,
+            },
+            Block::Text {
+                text: "old attempt".into(),
+            },
+        ]);
+        assert!(
+            transcript
+                .live(60, 0)
+                .iter()
+                .any(|line| line.plain().contains("old attempt"))
+        );
+        transcript.apply(
+            &ClientNotification::Reset(ResetParams {
+                session,
+                attempt: 1,
+            }),
+            60,
+        );
+        assert!(transcript.live(60, 0).is_empty());
+        assert!(!transcript.thinking());
+        transcript.apply(
+            &ClientNotification::Delta(DeltaParams {
+                session,
+                attempt: 1,
+                delta: Delta::Text {
+                    text: "new attempt".into(),
+                },
+            }),
+            60,
+        );
+        let live: Vec<_> = transcript
+            .live(60, 0)
+            .iter()
+            .map(crate::style::Line::plain)
+            .collect();
+        assert!(live.iter().any(|line| line.contains("new attempt")));
+        assert!(live.iter().all(|line| !line.contains("old attempt")));
+    }
+
+    #[test]
+    fn pending_approvals_deduplicate_and_exit_clears_live_state() {
+        let session = SessionId::generate();
+        let mut transcript = Transcript::default();
+        let pending = ClientNotification::ApprovalPending(PendingApproval {
+            session,
+            call: "approval".into(),
+            tool: "bash".into(),
+            action: "run command".into(),
+            rule: None,
+        });
+        transcript.apply(&pending, 60);
+        transcript.apply(&pending, 60);
+        assert_eq!(transcript.asks().len(), 1);
+        transcript.partial(&[Block::Text {
+            text: "unfinished".into(),
+        }]);
+        let lines = transcript.apply(
+            &ClientNotification::Exited(ExitedParams {
+                session,
+                status: Some(1),
+                message: Some("worker stopped".into()),
+            }),
+            60,
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.plain().contains("session exited · status 1"))
+        );
+        assert!(transcript.asks().is_empty());
+        assert!(transcript.live(60, 0).is_empty());
     }
 }

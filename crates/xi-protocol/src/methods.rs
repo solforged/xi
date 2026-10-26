@@ -423,19 +423,6 @@ pub mod client {
         pub message: Option<String>,
     }
 
-    /// An open session.
-    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-    pub struct SessionInfo {
-        /// Session identity.
-        pub session: SessionId,
-        /// Session file.
-        pub path: PathBuf,
-        /// Event the next prompt continues from.
-        pub head: EventId,
-        /// Every event in file order.
-        pub events: Vec<Event>,
-    }
-
     /// Identifies a session.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SessionRef {
@@ -453,10 +440,19 @@ pub mod client {
     }
 
     /// Result of [`SessionPrompt`].
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PromptResult {
         /// The head after the turn.
         pub head: EventId,
+        /// Whether a failure or request limit ended the turn.
+        #[serde(default)]
+        pub failed: bool,
+        /// Whether the turn was cancelled.
+        #[serde(default)]
+        pub cancelled: bool,
+        /// Text from the final assistant response only.
+        #[serde(default)]
+        pub text: String,
     }
 
     /// Result of [`SessionCompact`].
@@ -909,6 +905,29 @@ mod tests {
         assert!(empty.partial.is_empty());
         assert!(empty.pending_approvals.is_empty());
         assert_eq!(serde_json::to_value(empty).unwrap(), minimal);
+    }
+
+    #[test]
+    fn prompt_result_includes_turn_status_and_final_text() {
+        let head = EventId::generate();
+        let result = PromptResult {
+            head,
+            failed: true,
+            cancelled: false,
+            text: "final response".into(),
+        };
+        let wire = json!({
+            "head": head, "failed": true, "cancelled": false, "text": "final response",
+        });
+        assert_eq!(serde_json::to_value(&result).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<PromptResult>(wire).unwrap(),
+            result
+        );
+        let minimal: PromptResult = serde_json::from_value(json!({"head": head})).unwrap();
+        assert!(!minimal.failed);
+        assert!(!minimal.cancelled);
+        assert!(minimal.text.is_empty());
     }
 
     #[test]

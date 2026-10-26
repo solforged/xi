@@ -16,12 +16,11 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use xi_kernel::config::{Config, Paths};
-use xi_kernel::{EventBus, Session, TurnOptions};
 use xi_protocol::event::{StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
-use xi_protocol::methods::client::Delta;
+use xi_protocol::methods::client::{CreateParams, Delta};
 use xi_protocol::{Block, OutputBlock, ToolCallId, ToolOutput};
-use xi_provider::{BoxFuture, Error, Provider, Request, Response};
+use xi_provider::{BoxFuture, Error, ErrorKind, Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 struct Turn {
@@ -81,10 +80,15 @@ impl Provider for Script {
         on_delta: &'a mut (dyn FnMut(Delta) + Send),
     ) -> BoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
-            let turn = self.0.lock().unwrap().pop_front().unwrap_or(Turn {
-                text: "That's the end of the script. /new starts it again.",
-                calls: vec![],
-            });
+            let turn = self
+                .0
+                .lock()
+                .map_err(|_| Error::new(ErrorKind::Config, "demo script lock poisoned"))?
+                .pop_front()
+                .unwrap_or(Turn {
+                    text: "That's the end of the script. /new starts it again.",
+                    calls: vec![],
+                });
             on_delta(Delta::Thinking { text: "…".into() });
             tokio::time::sleep(Duration::from_millis(700)).await;
             for word in turn.text.split_inclusive(' ') {
@@ -176,7 +180,9 @@ impl Tool for Fake {
                 "search" => (300, text("policies/archive.py:8\npolicies/deleted.py:7\npolicies/shared.py:9", false, false)),
                 "read" => (200, text(&"line\n".repeat(42), false, false)),
                 "edit" => {
-                    let mut edits = self.edits.lock().unwrap();
+                    let Ok(mut edits) = self.edits.lock() else {
+                        return text("demo edit lock poisoned", true, false);
+                    };
                     *edits += 1;
                     if *edits == 1 {
                         (400, text("Stale anchors. No changes written. Fresh context:\n12a3|    key = \"archived\"", true, false))
@@ -209,42 +215,45 @@ async fn main() -> Result<(), xi_tui::Error> {
     for path in [&workspace, &paths.config, &paths.home] {
         std::fs::create_dir_all(path)?;
     }
-    let config = Config::load(paths, &workspace, &[])?;
+    let config = Config::load(paths.clone(), &workspace, &[])?;
     let model = config
         .registry()
         .model(&config.model)
         .cloned()
         .ok_or("the default model is not in the registry")?;
-    let tools: Vec<Arc<dyn Tool>> = ["bash", "read", "search", "edit", "fetch"]
-        .into_iter()
-        .map(|name| {
-            Arc::new(Fake {
-                name,
-                edits: Mutex::new(0),
-            }) as Arc<dyn Tool>
-        })
-        .collect();
-    let bus = EventBus::default();
-    let notifications = bus.subscribe();
-    let turn_options = TurnOptions::default();
-    let session = Session::create(
-        config.clone(),
-        None,
-        bus.clone(),
-        turn_options.clone(),
-        Some(xi_kernel::Backend {
-            provider: Arc::new(script()),
-            model,
-            tools,
-        }),
-    )?;
+    let spawner = xi_daemon::InProcessSpawner {
+        paths: paths.clone(),
+        backend: Some(Arc::new(move || {
+            let tools: Vec<Arc<dyn Tool>> = ["bash", "read", "search", "edit", "fetch"]
+                .into_iter()
+                .map(|name| {
+                    Arc::new(Fake {
+                        name,
+                        edits: Mutex::new(0),
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            xi_kernel::Backend {
+                provider: Arc::new(script()),
+                model: model.clone(),
+                tools,
+            }
+        })),
+    };
+    let (reader, writer) = xi_daemon::private(paths, Arc::new(spawner));
+    let (client, notifications) =
+        xi_client::client::Client::over(reader, writer, "xi-demo").await?;
+    let template = CreateParams {
+        cwd: workspace,
+        model: Some(config.model),
+        options: Default::default(),
+    };
+    let attached = client.create(template.clone()).await?;
     xi_tui::run(xi_tui::Launch {
-        session,
+        client,
         notifications,
-        bus,
-        config,
-        session_dir: None,
-        turn_options,
+        template,
+        attached,
     })
     .await
 }

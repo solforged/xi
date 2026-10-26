@@ -15,7 +15,6 @@ pub mod config;
 pub mod context;
 mod extension_session;
 pub mod extensions;
-pub mod server;
 pub mod worker;
 
 use std::collections::{HashMap, VecDeque};
@@ -28,7 +27,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
-use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, ResetParams, SessionInfo};
+use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, ResetParams};
 use xi_protocol::model::ModelInfo;
 use xi_protocol::{
     Block, Decision, EventId, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput,
@@ -278,6 +277,19 @@ struct Inner {
 #[derive(Clone)]
 pub struct Session(Arc<Inner>);
 
+/// A kernel session's durable log snapshot.
+#[derive(Clone, Debug)]
+pub struct SessionSnapshot {
+    /// Session identity.
+    pub session: SessionId,
+    /// Session file.
+    pub path: PathBuf,
+    /// Event the next prompt continues from.
+    pub head: EventId,
+    /// Every event in file order.
+    pub events: Vec<xi_protocol::Event>,
+}
+
 impl Session {
     /// Creates a timestamped log and broadcasts its root.
     pub fn create(
@@ -489,9 +501,9 @@ impl Session {
     }
 
     /// A snapshot, available when no turn holds the session log.
-    pub async fn info(&self) -> SessionInfo {
+    pub async fn info(&self) -> SessionSnapshot {
         let state = self.0.state.lock().await;
-        SessionInfo {
+        SessionSnapshot {
             session: self.id(),
             path: state.log.file_path().to_owned(),
             head: state.head,

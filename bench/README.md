@@ -35,6 +35,8 @@ The long-context count comes from the configured Qwen server's tokenizer, withou
 
 `bench/arms.toml` has one `[[arm]]` entry per variant: unique `name`, `kind` (`xi`, `omp` or `pi`), `argv`, and optional `[arm.env]`. Argument and environment-value templates support `{prompt}`, `{workspace}`, `{session_dir}`, `{model}`, and `{arms_dir}`. The last is the absolute directory containing the arms file, not the temporary workspace. Expansion happens once, without a shell; placeholders inside the prompt remain literal. The environment otherwise inherits the invoking shell. Each command receives `PYTHONDONTWRITEBYTECODE=1` and a workspace-local `CARGO_TARGET_DIR`.
 
+The xi arms run `xi -p`, which uses a private daemon instance with worker processes so arms stay isolated. Benchmark argv is unchanged.
+
 The `xi` arm uses the default exact-string `edit` tool. The `xi-hashline` arm selects `read,hashline,write,bash,search` for hash-anchored edits. Read and search output uses `LINE|text` by default and `LINE:HH|text` with `hashline`. The `omp` and `pi` arms are unchanged. Three additional arms opt into features:
 
 - `xi-compact` adds `--config {arms_dir}/configs/compact.toml`. That file enables automatic compaction with `trigger_tokens = 24000` and `keep_recent_tokens = 8000`. Automatic compaction is off by default. The kernel's default recent retention is 20,000 tokens, clamped to at most half the effective trigger; this arm explicitly uses 8,000. Compare pass rate, total usage, and compaction count on the long-context workload.

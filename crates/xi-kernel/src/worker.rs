@@ -1,6 +1,7 @@
 //! The worker side of the daemon pipe: one session per worker process.
 
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -266,6 +267,9 @@ where
                                             .map_err(|error| kernel_error(Error::Config(error)))?;
                                         Ok(Completion::Value(encode(PromptResult {
                                             head: outcome.head,
+                                            failed: outcome.failed,
+                                            cancelled: outcome.cancelled,
+                                            text: outcome.text,
                                         })?))
                                     }.await;
                                     (id, result)
@@ -401,6 +405,32 @@ fn validate_options(options: &SessionOptions) -> RpcResult<()> {
                 RpcError::INVALID_PARAMS,
                 format!("session option path must be absolute: {}", path.display()),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates invocation configuration without starting a daemon or worker.
+///
+/// For a saved session, reads its root to find the workspace without locking
+/// or modifying the log.
+pub fn validate_config(paths: &Paths, params: &WorkerStartParams) -> Result<()> {
+    match params {
+        WorkerStartParams::Create(params) => {
+            session_config(paths, &params.cwd, &params.options)?;
+        }
+        WorkerStartParams::Open(params) => {
+            let mut line = String::new();
+            std::io::BufReader::new(std::fs::File::open(&params.path)?).read_line(&mut line)?;
+            let root: Event = serde_json::from_str(&line)
+                .map_err(|error| Error::Config(format!("{}: {error}", params.path.display())))?;
+            let EventKind::SessionStarted { cwd, .. } = root.kind else {
+                return Err(Error::Config(format!(
+                    "{}: session root is not session_started",
+                    params.path.display(),
+                )));
+            };
+            session_config(paths, &cwd, &params.options)?;
         }
     }
     Ok(())

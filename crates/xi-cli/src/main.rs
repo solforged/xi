@@ -1,18 +1,23 @@
-//! The `xi` command: the terminal client, line mode, headless turns and
-//! JSON-RPC stdio.
+//! The `xi` command: daemon management, terminal clients and headless turns.
 
-use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
-use std::process::ExitCode;
+mod terminal;
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use rustyline::error::ReadlineError;
+use xi_client::client::{Client, ClientError};
+use xi_daemon::ProcessSpawner;
 use xi_kernel::config::{Paths, parse_model};
-use xi_kernel::server::Options;
-use xi_kernel::{ApprovalMode, EventBus, Notification, Session, TurnOptions, TurnOutcome};
-use xi_protocol::event::{Decision, EventKind};
-use xi_protocol::methods::client::Delta;
-use xi_protocol::{Block, OutputBlock};
+use xi_protocol::SessionId;
+use xi_protocol::methods::client::{
+    ApprovalPolicy, AttachResult, CreateParams, OpenParams, SessionOptions, ShutdownWhen,
+};
+use xi_protocol::methods::worker::WorkerStartParams;
+use xi_protocol::rpc::RpcError;
+
+use terminal::{Render, Renderer};
 
 #[derive(Parser)]
 #[command(name = "xi", version, about = "A small sandboxed coding agent")]
@@ -62,13 +67,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve JSON-RPC 2.0 over newline-delimited stdio.
+    /// Run the per-user daemon or manage its service units.
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
+    /// Serve a private daemon's JSON-RPC 2.0 over newline-delimited stdio.
     Serve,
+    /// Serve one session over the daemon's worker pipe.
+    #[command(hide = true)]
+    Worker,
     /// Trust an exact canonical workspace root.
     Trust {
         /// Directory to trust (default: workspace).
         dir: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Install and load per-user socket-activation units.
+    Install,
+    /// Unload and remove per-user socket-activation units.
+    Uninstall,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -103,15 +124,19 @@ fn positive(value: &str) -> Result<usize, String> {
 }
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() {
     let cli = Cli::parse();
-    match run(cli).await {
-        Ok(code) => ExitCode::from(code),
+    let code = match run(cli).await {
+        Ok(code) => code,
         Err(error) => {
             eprintln!("xi: {error}");
-            ExitCode::from(2)
+            2
         }
-    }
+    };
+    // Exit directly: dropping the runtime would wait for Tokio's blocking
+    // stdin reader, which never returns while the parent keeps the pipe open.
+    let _ = std::io::stdout().flush();
+    std::process::exit(i32::from(code));
 }
 
 type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
@@ -121,298 +146,177 @@ async fn run(cli: Cli) -> Result<u8> {
         return Err("-p and --resume cannot be used with a subcommand".into());
     }
     let paths = Paths::discover()?;
-    let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-    if let Some(Command::Trust { dir }) = cli.command {
-        let root = paths.trust(&dir.unwrap_or(cwd))?;
-        println!("Trusted {}", root.display());
-        return Ok(0);
-    }
-    let options = Options {
-        paths: paths.clone(),
-        configs: cli.config,
-        session_dir: cli.session_dir.map(|p| paths.expand(&p)),
-        model: cli.model.as_deref().map(parse_model).transpose()?,
-        reasoning: cli.reasoning.map(Into::into),
-        tools: cli.tools,
-        extensions: cli.extension,
-    };
-    if matches!(cli.command, Some(Command::Serve)) {
-        xi_kernel::server::serve(
-            tokio::io::BufReader::new(tokio::io::stdin()),
-            tokio::io::stdout(),
-            options,
-        )
-        .await?;
-        return Ok(0);
-    }
-    let bus = EventBus::default();
-    let mut notifications = bus.subscribe();
-    let turn_options = TurnOptions {
-        max_turns: cli.max_turns.unwrap_or(200),
-        approval: if cli.prompt.is_some() {
-            ApprovalMode::Headless(matches!(cli.on_ask, Some(OnAsk::Allow)))
-        } else {
-            ApprovalMode::Client
-        },
-        leaser: None,
-    };
-    let (mut session, config) = if let Some(path) = cli.resume {
-        let log = xi_session::SessionLog::open(paths.expand(&path))?;
-        let EventKind::SessionStarted { cwd, .. } = &log.root().kind else {
-            unreachable!("validated session")
-        };
-        let config = options.config(cwd)?;
-        let session =
-            Session::from_log(log, config.clone(), bus.clone(), turn_options.clone(), None)?;
-        if let Some(model) = &options.model {
-            session.set_model(model.clone()).await?;
-        }
-        (session, config)
-    } else {
-        let config = options.config(&cwd)?;
-        let session = Session::create(
-            config.clone(),
-            options.session_dir.as_deref(),
-            bus.clone(),
-            turn_options.clone(),
-            None,
-        )?;
-        (session, config)
-    };
-    if let Some(prompt) = cli.prompt {
-        let outcome = turn(
-            &session,
-            prompt,
-            &mut notifications,
-            if cli.json {
-                Render::Json
-            } else {
-                Render::Quiet
+    if let Some(command) = cli.command {
+        match command {
+            Command::Daemon { command } => match command {
+                None => xi_daemon::run_user_daemon(paths).await?,
+                Some(DaemonCommand::Install) => {
+                    for path in xi_daemon::units::install_units(&executable()?)? {
+                        println!("{}", path.display());
+                    }
+                }
+                Some(DaemonCommand::Uninstall) => {
+                    for path in xi_daemon::units::uninstall_units()? {
+                        println!("{}", path.display());
+                    }
+                }
             },
-        )
-        .await?;
+            Command::Worker => {
+                xi_kernel::worker::run(
+                    tokio::io::stdin(),
+                    tokio::io::stdout(),
+                    xi_kernel::worker::WorkerSetup {
+                        paths,
+                        backend: None,
+                    },
+                )
+                .await?;
+            }
+            Command::Serve => {
+                xi_daemon::serve_private(
+                    tokio::io::stdin(),
+                    tokio::io::stdout(),
+                    paths,
+                    Arc::new(ProcessSpawner {
+                        exe: executable()?,
+                        log: None,
+                    }),
+                )
+                .await;
+            }
+            Command::Trust { dir } => {
+                let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
+                let root = paths.trust(&dir.unwrap_or(cwd))?;
+                println!("Trusted {}", root.display());
+            }
+        }
+        return Ok(0);
+    }
+    let base = std::env::current_dir()?;
+    let absolute = |path: &Path| base.join(paths.expand(path));
+    let template = CreateParams {
+        cwd: cli.cwd.as_deref().map_or_else(|| base.clone(), absolute),
+        model: cli.model.as_deref().map(parse_model).transpose()?,
+        options: SessionOptions {
+            configs: cli.config.iter().map(|path| absolute(path)).collect(),
+            session_dir: cli.session_dir.as_deref().map(absolute),
+            reasoning: cli.reasoning.map(Into::into),
+            tools: cli.tools,
+            extensions: cli.extension.iter().map(|path| absolute(path)).collect(),
+            max_turns: cli.max_turns,
+            approval: if cli.prompt.is_some() {
+                match cli.on_ask {
+                    Some(OnAsk::Allow) => ApprovalPolicy::Allow,
+                    Some(OnAsk::Deny) | None => ApprovalPolicy::Deny,
+                }
+            } else {
+                ApprovalPolicy::Client
+            },
+        },
+    };
+    let resume = cli.resume.as_deref().map(absolute);
+    if let Some(prompt) = cli.prompt {
+        let start = match &resume {
+            Some(path) => WorkerStartParams::Open(OpenParams {
+                path: path.clone(),
+                options: template.options.clone(),
+            }),
+            None => WorkerStartParams::Create(template.clone()),
+        };
+        xi_kernel::worker::validate_config(&paths, &start)?;
+        let (reader, writer) = xi_daemon::private(
+            paths,
+            Arc::new(ProcessSpawner {
+                exe: executable()?,
+                log: None,
+            }),
+        );
+        let (client, mut notifications) = Client::over(reader, writer, "xi").await?;
+        let mut renderer = Renderer::new(if cli.json {
+            Render::Json
+        } else {
+            Render::Quiet
+        });
+        let outcome = async {
+            let attached = open_or_create(&client, &template, resume, false).await?;
+            renderer.attach(&attached);
+            terminal::turn(
+                &client,
+                attached.info.session,
+                prompt,
+                &mut notifications,
+                &mut renderer,
+            )
+            .await
+        }
+        .await;
+        let shutdown = client.shutdown(ShutdownWhen::Now).await;
+        // Drain until EOF so notification routing cannot lag the prompt response.
+        while let Some(notification) = notifications.recv().await {
+            renderer.display(notification, &client)?;
+        }
+        let outcome = outcome?;
+        shutdown?;
         if !cli.json && !outcome.text.is_empty() {
             println!("{}", outcome.text);
         }
-        bus.shutdown_extensions().await;
         return Ok(u8::from(outcome.failed || outcome.cancelled));
     }
+    let (client, notifications) = Client::connect(&executable()?, "xi").await?;
+    let attached = open_or_create(&client, &template, resume, true).await?;
+    let launch = xi_tui::Launch {
+        client,
+        notifications,
+        template,
+        attached,
+    };
     if !cli.plain && xi_tui::available() {
-        xi_tui::run(xi_tui::Launch {
-            session,
-            notifications,
-            bus,
-            config,
-            session_dir: options.session_dir,
-            turn_options,
-        })
-        .await?;
-        return Ok(0);
+        xi_tui::run(launch).await?;
+    } else {
+        terminal::run(launch, &paths).await?;
     }
-    std::fs::create_dir_all(&paths.state)?;
-    let history = paths.state.join("history");
-    let mut editor = rustyline::DefaultEditor::new()?;
-    if history.exists() {
-        editor.load_history(&history)?;
-    }
-    loop {
-        let (returned, line) = tokio::task::spawn_blocking(move || {
-            let line = editor.readline("xi> ");
-            (editor, line)
-        })
-        .await?;
-        editor = returned;
-        let line = match line {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
-            Err(error) => return Err(error.into()),
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        editor.add_history_entry(line)?;
-        editor.save_history(&history)?;
-        if line == "/quit" {
-            break;
-        }
-        if line == "/new" {
-            session = Session::create(
-                config.clone(),
-                options.session_dir.as_deref(),
-                bus.clone(),
-                turn_options.clone(),
-                None,
-            )?;
-            continue;
-        }
-        if line == "/compact" {
-            match session.compact().await {
-                Ok(result) => eprintln!("Compacted {} estimated tokens.", result.tokens_before),
-                Err(error) => eprintln!("xi: {error}"),
-            }
-            while notifications.try_recv().is_ok() {}
-            continue;
-        }
-        if let Some(model) = line.strip_prefix("/model ") {
-            match parse_model(model.trim()) {
-                Ok(model) => {
-                    if let Err(error) = session.set_model(model).await {
-                        eprintln!("xi: {error}");
-                    }
-                }
-                Err(error) => eprintln!("xi: {error}"),
-            }
-            continue;
-        }
-        if let Some(command) = line.strip_prefix('/') {
-            let (name, args) = command
-                .split_once(char::is_whitespace)
-                .unwrap_or((command, ""));
-            match session.command(name, args.trim()).await {
-                Ok(Some(result)) => {
-                    if let Some(message) = result.message {
-                        println!("{message}");
-                    }
-                }
-                Ok(None) => eprintln!(
-                    "Unknown command: /{name}. Commands: /quit, /new, /compact, /model PROVIDER/MODEL"
-                ),
-                Err(error) => eprintln!("xi: {error}"),
-            }
-            continue;
-        }
-        match turn(
-            &session,
-            line.to_owned(),
-            &mut notifications,
-            Render::Interactive,
-        )
-        .await
-        {
-            Ok(_) => println!(),
-            Err(error) => eprintln!("xi: {error}"),
-        }
-    }
-    editor.save_history(&history)?;
-    bus.shutdown_extensions().await;
     Ok(0)
 }
 
-#[derive(Clone, Copy)]
-enum Render {
-    Quiet,
-    Json,
-    Interactive,
+fn executable() -> std::io::Result<PathBuf> {
+    match std::env::var_os("XI_BIN") {
+        Some(path) => Ok(std::env::current_dir()?.join(path)),
+        None => std::env::current_exe(),
+    }
 }
 
-async fn turn(
-    session: &Session,
-    prompt: String,
-    notifications: &mut tokio::sync::mpsc::UnboundedReceiver<Notification>,
-    render: Render,
-) -> Result<TurnOutcome> {
-    let mut reply = session.submit(vec![Block::Text { text: prompt }]);
-    let mut interrupted = false;
-    loop {
-        tokio::select! {
-            biased;
-            Some(notification) = notifications.recv() => display(notification, session, render)?,
-            result = &mut reply => {
-                while let Ok(notification) = notifications.try_recv() { display(notification, session, render)?; }
-                return result?.map_err(Into::into);
-            }
-            result = tokio::signal::ctrl_c(), if !interrupted => { result?; interrupted = true; session.cancel(); }
+async fn open_or_create(
+    client: &Client,
+    template: &CreateParams,
+    resume: Option<PathBuf>,
+    attach_held: bool,
+) -> Result<AttachResult> {
+    let Some(path) = resume else {
+        return Ok(client.create(template.clone()).await?);
+    };
+    let result = client
+        .open(OpenParams {
+            path,
+            options: template.options.clone(),
+        })
+        .await;
+    let mut attached = match result {
+        Ok(attached) => attached,
+        Err(ClientError::Rpc {
+            code,
+            data: Some(data),
+            ..
+        }) if attach_held && code == RpcError::SESSION_HELD && data.get("session").is_some() => {
+            let session: SessionId = serde_json::from_value(data["session"].clone())?;
+            client.attach(session, None).await?
         }
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(model) = &template.model {
+        client
+            .set_model(attached.info.session, model.clone())
+            .await?;
+        attached = client.attach(attached.info.session, None).await?;
     }
-}
-
-fn display(notification: Notification, session: &Session, render: Render) -> Result<()> {
-    if matches!(render, Render::Json) {
-        println!("{}", notification.json());
-        return Ok(());
-    }
-    if let Notification::Event(params) = &notification
-        && let EventKind::TurnFailed { message } = &params.event.kind
-    {
-        eprintln!("xi: {message}");
-    }
-    if !matches!(render, Render::Interactive) {
-        return Ok(());
-    }
-    match notification {
-        Notification::Reset(_) => {}
-        Notification::Delta(params) => match params.delta {
-            Delta::Text { text } => print!("{text}"),
-            Delta::Thinking { text } => {
-                if std::io::stdout().is_terminal() {
-                    print!("\x1b[2m{text}\x1b[0m");
-                } else {
-                    print!("{text}");
-                }
-            }
-            Delta::ToolInput { .. } => {}
-        },
-        Notification::Event(params) => match params.event.kind {
-            EventKind::AssistantMessage { content, .. } => {
-                for block in content {
-                    if let Block::ToolUse { name, input, .. } = block {
-                        let args = input
-                            .get("command")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| input.to_string());
-                        println!("\n> {name}  {}", args.replace('\n', " "));
-                    }
-                }
-            }
-            EventKind::ToolResult { output, .. } => {
-                let text = output
-                    .content
-                    .iter()
-                    .filter_map(|b| {
-                        if let OutputBlock::Text { text } = b {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let first = text.lines().next().unwrap_or("");
-                println!(
-                    "{}{} [{} lines]",
-                    if output.is_error { "error: " } else { "" },
-                    first,
-                    text.lines().count()
-                );
-            }
-            EventKind::Compaction { tokens_before, .. } => {
-                println!("\nCompacted {tokens_before} estimated tokens.");
-            }
-            EventKind::ToolDecision {
-                call,
-                decision: Decision::Ask,
-                ..
-            } => {
-                let session = session.clone();
-                tokio::task::spawn_blocking(move || {
-                    match rustyline::DefaultEditor::new()
-                        .and_then(|mut editor| editor.readline("allow? [y/N] "))
-                    {
-                        Ok(answer) => {
-                            let _ = session.approve(&call, matches!(answer.trim(), "y" | "Y"));
-                        }
-                        Err(ReadlineError::Interrupted) => session.cancel(),
-                        Err(_) => {
-                            let _ = session.approve(&call, false);
-                        }
-                    }
-                });
-            }
-            _ => {}
-        },
-    }
-    std::io::stdout().flush()?;
-    Ok(())
+    Ok(attached)
 }

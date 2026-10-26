@@ -7,8 +7,7 @@
 //! between the two, because a block commits when its last event lands and
 //! the log is append-only, so scrollback never needs rewriting.
 //!
-//! The client runs the kernel in process and reads the same notifications a
-//! JSON-RPC client receives.
+//! The client attaches to a daemon session over the typed JSON-RPC connection.
 
 pub mod editor;
 pub mod screen;
@@ -29,10 +28,11 @@ use crossterm::event::{
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
-use xi_kernel::config::{Config, parse_model};
-use xi_kernel::{EventBus, Notification, Session, TurnOptions, TurnOutcome};
-use xi_protocol::model::ModelInfo;
-use xi_protocol::{Block, Event, EventId, SessionId, Timestamp};
+use xi_client::client::{Client, ClientError, ClientNotification};
+use xi_protocol::event::ModelRef;
+use xi_protocol::methods::client::{AttachResult, CreateParams, EventParams, PromptResult};
+use xi_protocol::rpc::RpcError;
+use xi_protocol::{Block, Event, EventId, SessionId, Timestamp, ToolCallId};
 
 use crate::editor::Editor;
 use crate::screen::Screen;
@@ -46,18 +46,14 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// What the client needs to run and replace sessions.
 pub struct Launch {
-    /// The session to attach to.
-    pub session: Session,
-    /// Notifications from `bus`, subscribed before `session` was created.
-    pub notifications: mpsc::UnboundedReceiver<Notification>,
-    /// The bus new sessions publish to.
-    pub bus: EventBus,
-    /// Configuration for new sessions.
-    pub config: Config,
-    /// Session directory override for new sessions.
-    pub session_dir: Option<PathBuf>,
-    /// Turn limits for new sessions.
-    pub turn_options: TurnOptions,
+    /// The initialized daemon connection.
+    pub client: Client,
+    /// Notifications from the daemon, subscribed before attaching.
+    pub notifications: mpsc::UnboundedReceiver<ClientNotification>,
+    /// Creation parameters reused by `/new`.
+    pub template: CreateParams,
+    /// The initial session snapshot.
+    pub attached: AttachResult,
 }
 
 /// Whether the client can run here: both stdin and stdout are terminals.
@@ -91,7 +87,7 @@ enum Focus {
     Tree,
 }
 
-type Reply = oneshot::Receiver<Result<TurnOutcome, String>>;
+type Reply = oneshot::Receiver<Result<PromptResult, ClientError>>;
 
 struct App {
     launch: Launch,
@@ -105,11 +101,10 @@ struct App {
     /// Replies of prompts sent to the running turn.
     pending: FuturesUnordered<Reply>,
     started: Option<Instant>,
-    /// Sent during a turn, shown until the kernel takes them in.
+    /// Sent during a turn, shown until the worker takes them in.
     steering: Vec<String>,
     /// Held until the turn ends, then sent in order.
     queued: Vec<String>,
-    model: Option<ModelInfo>,
     frame: usize,
     cols: usize,
     rows: usize,
@@ -117,9 +112,14 @@ struct App {
     quit: bool,
     /// Whether a prompt of the running turn was rejected.
     failed: bool,
-    /// Events `attach` replayed from the log. The bus may still deliver
-    /// some of them, appended between subscribing and attaching.
-    replayed: HashSet<EventId>,
+    /// Every event seen in the attach snapshot or a subsequent notification.
+    seen: HashSet<EventId>,
+    /// Calls already resolved in any recorded branch.
+    resolved: HashSet<ToolCallId>,
+    /// Whether fresh session metadata is needed after a model change.
+    refresh: bool,
+    /// Whether the worker has exited.
+    exited: bool,
 }
 
 /// Runs the client until the user quits.
@@ -130,32 +130,15 @@ struct App {
 pub async fn run(launch: Launch) -> Result<(), Error> {
     let (cols, rows) = crossterm::terminal::size()?;
     let color = std::env::var_os("NO_COLOR").is_none();
-    let mut app = App {
-        launch,
-        transcript: Transcript::default(),
-        editor: Editor::default(),
-        focus: Focus::Composer,
-        tree: None,
-        choice: 0,
-        pending: FuturesUnordered::new(),
-        started: None,
-        steering: Vec::new(),
-        queued: Vec::new(),
-        model: None,
-        frame: 0,
-        cols: usize::from(cols).max(20),
-        rows: usize::from(rows).max(4),
-        commit: Vec::new(),
-        quit: false,
-        failed: false,
-        replayed: HashSet::new(),
-    };
-    app.attach().await;
+    let mut app = App::new(launch, usize::from(cols), usize::from(rows));
     let raw = Raw::enter()?;
     let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     while !app.quit {
+        if app.refresh {
+            app.refresh_details().await;
+        }
         // The terminal may have reflowed since the last resize event, so the
         // rewind counts rows at the width it has now.
         if let Ok((c, _)) = crossterm::terminal::size() {
@@ -163,15 +146,20 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
         }
         app.draw(&mut screen)?;
         tokio::select! {
-            // Events first: the kernel publishes a turn's last events before
-            // it replies, and the done line must land after them.
+            // The worker sends a turn's last events before its reply.
             biased;
-            Some(notification) = app.launch.notifications.recv() => {
-                app.notify(&notification);
-                while let Ok(n) = app.launch.notifications.try_recv() {
-                    app.notify(&n);
+            notification = app.launch.notifications.recv() => match notification {
+                Some(notification) => {
+                    app.notify(&notification);
+                    while let Ok(n) = app.launch.notifications.try_recv() {
+                        app.notify(&n);
+                    }
                 }
-            }
+                None => {
+                    app.note(vec![Line::default().dim("  daemon connection closed")]);
+                    break;
+                }
+            },
             Some(reply) = app.pending.next(), if !app.pending.is_empty() => app.replied(reply),
             event = keys.next() => match event {
                 Some(Ok(TermEvent::Key(key))) if key.kind != KeyEventKind::Release => app.key(key).await?,
@@ -184,13 +172,18 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
             },
-            _ = tick.tick(), if app.started.is_some() => app.frame += 1,
+            _ = tick.tick(), if app.started.is_some() => {
+                app.frame += 1;
+                if app.pending.is_empty() && app.frame.is_multiple_of(8) {
+                    app.refresh_details().await;
+                }
+            },
         }
     }
     screen.draw(&std::mem::take(&mut app.commit), &[], None, app.rows)?;
     screen.finish()?;
     drop(raw);
-    app.launch.session.cancel();
+    app.release().await?;
     Ok(())
 }
 
@@ -222,23 +215,51 @@ fn lineage(events: &[Event], head: EventId) -> Vec<Event> {
 }
 
 impl App {
-    fn session_id(&self) -> SessionId {
-        self.launch.session.id()
+    fn new(launch: Launch, cols: usize, rows: usize) -> Self {
+        let mut app = Self {
+            launch,
+            transcript: Transcript::default(),
+            editor: Editor::default(),
+            focus: Focus::Composer,
+            tree: None,
+            choice: 0,
+            pending: FuturesUnordered::new(),
+            started: None,
+            steering: Vec::new(),
+            queued: Vec::new(),
+            frame: 0,
+            cols: cols.max(20),
+            rows: rows.max(4),
+            commit: Vec::new(),
+            quit: false,
+            failed: false,
+            seen: HashSet::new(),
+            resolved: HashSet::new(),
+            refresh: false,
+            exited: false,
+        };
+        app.attach();
+        app
     }
 
-    fn mine(&self, notification: &Notification) -> bool {
+    fn session_id(&self) -> SessionId {
+        self.launch.attached.info.session
+    }
+
+    fn mine(&self, notification: &ClientNotification) -> bool {
         let session = match notification {
-            Notification::Event(p) => p.session,
-            Notification::Delta(p) => p.session,
-            Notification::Reset(p) => p.session,
+            ClientNotification::Event(p) => p.session,
+            ClientNotification::Delta(p) => p.session,
+            ClientNotification::Reset(p) => p.session,
+            ClientNotification::Exited(p) => p.session,
+            ClientNotification::ApprovalPending(p) => p.session,
         };
         session == self.session_id()
     }
 
     /// Prints the header and replays the head's branch, for resumed sessions.
-    async fn attach(&mut self) {
-        let info = self.launch.session.info().await;
-        let config = &self.launch.config;
+    fn attach(&mut self) {
+        let info = &self.launch.attached.info;
         let mut header = vec![
             Line::default()
                 .brass("ξ ")
@@ -246,11 +267,11 @@ impl App {
                 .dim(format!(
                     " {} · {}",
                     env!("CARGO_PKG_VERSION"),
-                    home(&config.workspace)
+                    home(&info.cwd)
                 ))
                 .truncate(self.cols),
         ];
-        if !config.trusted {
+        if !info.trusted {
             header.push(
                 Line::default()
                     .ink("  ")
@@ -260,18 +281,47 @@ impl App {
             );
         }
         self.commit.extend(header);
-        let events = lineage(&info.events, info.head);
-        self.replayed = events.iter().map(|e| e.id).collect();
+        self.seen.clear();
+        self.launch
+            .attached
+            .events
+            .retain(|event| self.seen.insert(event.id));
+        self.resolved = self
+            .launch
+            .attached
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xi_protocol::EventKind::ApprovalResolved { call, .. }
+                | xi_protocol::EventKind::ToolResult { call, .. } => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        let events = lineage(&self.launch.attached.events, info.head);
         let replayed = events.len().saturating_sub(1);
         for event in events {
-            let n = Notification::Event(xi_protocol::methods::client::EventParams {
+            let n = ClientNotification::Event(EventParams {
                 session: info.session,
                 event,
             });
             let lines = self.transcript.apply(&n, self.cols);
             self.commit.extend(lines);
         }
-        self.transcript.end_turn();
+        if self.launch.attached.running {
+            self.started = Some(Instant::now());
+        } else {
+            self.transcript.end_turn();
+        }
+        self.transcript.partial(&self.launch.attached.partial);
+        for pending in &self.launch.attached.pending_approvals {
+            self.transcript.apply(
+                &ClientNotification::ApprovalPending(pending.clone()),
+                self.cols,
+            );
+        }
+        if !self.transcript.asks().is_empty() {
+            self.focus = Focus::Approval;
+        }
         if replayed > 0 {
             let note = self.transcript.note(vec![Line::default().dim(format!(
                 "  resumed · {replayed} events · {}",
@@ -279,38 +329,67 @@ impl App {
             ))]);
             self.commit.extend(note);
         }
-        self.refresh_model();
     }
 
-    fn refresh_model(&mut self) {
-        let model = self
-            .transcript
-            .model
-            .clone()
-            .unwrap_or_else(|| self.launch.config.model.clone());
-        self.model = self.launch.config.registry().model(&model).cloned();
+    async fn refresh_details(&mut self) {
+        self.refresh = false;
+        if self.exited {
+            return;
+        }
+        let since = self.launch.attached.events.last().map(|event| event.id);
+        match self.launch.client.attach(self.session_id(), since).await {
+            Ok(attached) => {
+                for event in attached.events {
+                    self.notify(&ClientNotification::Event(EventParams {
+                        session: attached.info.session,
+                        event,
+                    }));
+                }
+                self.launch.attached.info = attached.info;
+                self.launch.attached.running = attached.running;
+                self.refresh = false;
+                if !attached.running && self.pending.is_empty() && self.started.is_some() {
+                    self.finish_turn(None);
+                }
+            }
+            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+        }
     }
 
-    fn notify(&mut self, notification: &Notification) {
+    fn notify(&mut self, notification: &ClientNotification) {
         if !self.mine(notification) {
             return;
         }
-        if let Notification::Event(p) = notification
-            && !self.replayed.is_empty()
+        if let ClientNotification::ApprovalPending(pending) = notification
+            && self.resolved.contains(&pending.call)
         {
-            // The bus delivers in append order, so the first event not
-            // replayed means no replayed one is still to come.
-            if self.replayed.remove(&p.event.id) {
+            return;
+        }
+        if let ClientNotification::Event(p) = notification {
+            if !self.seen.insert(p.event.id) {
                 return;
             }
-            self.replayed.clear();
+            self.launch.attached.info.head = p.event.id;
+            self.launch.attached.events.push(p.event.clone());
+            match &p.event.kind {
+                xi_protocol::EventKind::ApprovalResolved { call, .. }
+                | xi_protocol::EventKind::ToolResult { call, .. } => {
+                    self.resolved.insert(call.clone());
+                }
+                _ => {}
+            }
         }
         let asks = self.transcript.asks().len();
         let lines = self.transcript.apply(notification, self.cols);
         self.commit.extend(lines);
-        if let Notification::Event(p) = notification {
-            match &p.event.kind {
+        match notification {
+            ClientNotification::Event(p) => match &p.event.kind {
                 xi_protocol::EventKind::UserMessage { content } => {
+                    if self.started.is_none() {
+                        self.started = Some(Instant::now());
+                        self.transcript.begin_turn();
+                    }
+                    self.launch.attached.running = true;
                     let text: String = content
                         .iter()
                         .filter_map(|b| match b {
@@ -322,9 +401,21 @@ impl App {
                         self.steering.remove(i);
                     }
                 }
-                xi_protocol::EventKind::ModelChanged { .. } => self.refresh_model(),
+                xi_protocol::EventKind::ModelChanged { model } => {
+                    self.launch.attached.info.model = model.clone();
+                    self.launch.attached.info.model_info = None;
+                    self.refresh = true;
+                }
                 _ => {}
+            },
+            ClientNotification::Exited(_) => {
+                self.exited = true;
+                self.launch.attached.running = false;
+                self.started = None;
+                self.steering.clear();
+                self.queued.clear();
             }
+            _ => {}
         }
         let now = self.transcript.asks().len();
         if now > asks && self.editor.is_empty() {
@@ -336,22 +427,35 @@ impl App {
         }
     }
 
-    fn replied(&mut self, reply: Result<Result<TurnOutcome, String>, oneshot::error::RecvError>) {
+    fn replied(
+        &mut self,
+        reply: Result<Result<PromptResult, ClientError>, oneshot::error::RecvError>,
+    ) {
         let outcome = match reply {
-            Ok(Ok(outcome)) => Some(outcome),
-            Ok(Err(message)) => {
+            Ok(Ok(outcome)) => {
+                // Later events may already have advanced the head beyond this turn.
+                if !self.seen.contains(&outcome.head) {
+                    self.launch.attached.info.head = outcome.head;
+                }
+                Some(outcome)
+            }
+            Ok(Err(error)) => {
                 let lines = self
                     .transcript
-                    .note(vec![Line::default().sanguine("✕ ").ink(message)]);
+                    .note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
                 self.commit.extend(lines);
                 self.failed = true;
                 None
             }
             Err(_) => None,
         };
-        if !self.pending.is_empty() {
-            return;
+        if self.pending.is_empty() {
+            self.finish_turn(outcome);
         }
+    }
+
+    fn finish_turn(&mut self, outcome: Option<PromptResult>) {
+        self.launch.attached.running = false;
         self.transcript.end_turn();
         self.focus = Focus::Composer;
         let elapsed = self.started.take().map_or(0, |s| {
@@ -372,7 +476,14 @@ impl App {
                 tokens(turn.sent()),
                 tokens(turn.output)
             ));
-            if let Some(cost) = turn.cost(self.model.as_ref().and_then(|m| m.pricing)) {
+            if let Some(cost) = turn.cost(
+                self.launch
+                    .attached
+                    .info
+                    .model_info
+                    .as_ref()
+                    .and_then(|m| m.pricing),
+            ) {
                 parts.push(format!("${cost:.2}"));
             }
         }
@@ -383,20 +494,32 @@ impl App {
         let lines = self.transcript.note(vec![line]);
         self.commit.extend(lines);
         self.steering.clear();
-        if !self.queued.is_empty() {
+        if !self.exited && !self.queued.is_empty() {
             let next = self.queued.remove(0);
             self.send(next);
         }
     }
 
     fn send(&mut self, text: String) {
+        if self.exited {
+            self.note(vec![
+                Line::default().dim("  session exited · /new starts another"),
+            ]);
+            return;
+        }
         if self.started.is_none() {
             self.started = Some(Instant::now());
             self.transcript.begin_turn();
         } else {
             self.steering.push(text.clone());
         }
-        let reply = self.launch.session.submit(vec![Block::Text { text }]);
+        self.launch.attached.running = true;
+        let client = self.launch.client.clone();
+        let session = self.session_id();
+        let (send, reply) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = send.send(client.prompt(session, vec![Block::Text { text }]).await);
+        });
         self.pending.push(reply);
     }
 
@@ -409,6 +532,50 @@ impl App {
         self.commit.extend(lines);
     }
 
+    async fn cancel(&mut self) {
+        if let Err(error) = self.launch.client.cancel(self.session_id()).await {
+            self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+        }
+    }
+
+    async fn release(&self) -> Result<(), ClientError> {
+        if self.exited {
+            return Ok(());
+        }
+        let session = self.session_id();
+        let running = match self
+            .launch
+            .client
+            .attach(
+                session,
+                self.launch.attached.events.last().map(|event| event.id),
+            )
+            .await
+        {
+            Ok(attached) => attached.running,
+            Err(ClientError::Closed) => return Ok(()),
+            Err(ClientError::Rpc {
+                code: RpcError::UNKNOWN_SESSION | RpcError::WORKER_EXITED,
+                ..
+            }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.launch.client.detach(session).await?;
+        if !running {
+            match self.launch.client.close(session).await {
+                Ok(()) => {}
+                // Another client may have started a turn or closed the worker.
+                Err(ClientError::Rpc {
+                    code:
+                        RpcError::SESSION_RUNNING | RpcError::UNKNOWN_SESSION | RpcError::WORKER_EXITED,
+                    ..
+                }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     async fn command(&mut self, line: &str) -> Result<(), Error> {
         let (name, rest) = line.split_once(' ').unwrap_or((line, ""));
         match name {
@@ -417,48 +584,63 @@ impl App {
                 Line::default().dim("  /new waits for the turn to end · esc stops it"),
             ]),
             "/new" => {
-                let session = Session::create(
-                    self.launch.config.clone(),
-                    self.launch.session_dir.as_deref(),
-                    self.launch.bus.clone(),
-                    self.launch.turn_options.clone(),
-                    None,
-                )?;
-                self.launch.session = session;
+                let attached = self
+                    .launch
+                    .client
+                    .create(self.launch.template.clone())
+                    .await?;
+                self.release().await?;
+                self.launch.attached = attached;
+                self.exited = false;
+                self.refresh = false;
+                self.failed = false;
+                self.started = None;
+                self.pending = FuturesUnordered::new();
                 self.transcript = Transcript::default();
                 self.note(vec![style::rule(self.cols)]);
-                self.attach().await;
+                self.attach();
             }
             "/tree" if self.running() => self.note(vec![
                 Line::default().dim("  /tree waits for the turn to end · esc stops it"),
             ]),
             "/tree" => {
-                let info = self.launch.session.info().await;
-                self.tree = Some(Tree::new(&info.events, info.head));
+                self.tree = Some(Tree::new(
+                    &self.launch.attached.events,
+                    self.launch.attached.info.head,
+                ));
                 self.focus = Focus::Tree;
             }
             "/model" if rest.trim().is_empty() => {
-                let model = self.model.as_ref().map_or_else(
-                    || "unknown".to_owned(),
-                    |m| format!("{}/{}", m.provider, m.id),
-                );
+                let selected = &self.launch.attached.info.model;
+                let model = format!("{}/{}", selected.provider, selected.model);
                 self.note(vec![
                     Line::default()
                         .dim(format!("  model {model} · /model PROVIDER/MODEL switches")),
                 ]);
             }
             "/model" => {
-                let result = match parse_model(rest.trim()) {
-                    Ok(model) => self
+                let result = match rest.trim().split_once('/') {
+                    Some((provider, model)) if !provider.is_empty() && !model.is_empty() => self
                         .launch
-                        .session
-                        .set_model(model)
+                        .client
+                        .set_model(
+                            self.session_id(),
+                            ModelRef {
+                                provider: provider.into(),
+                                model: model.into(),
+                            },
+                        )
                         .await
                         .map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
+                    _ => Err(format!(
+                        "invalid model {:?}; expected PROVIDER/MODEL",
+                        rest.trim()
+                    )),
                 };
                 if let Err(message) = result {
                     self.note(vec![Line::default().sanguine("✕ ").ink(message)]);
+                } else {
+                    self.refresh = true;
                 }
             }
             _ => {
@@ -511,10 +693,24 @@ impl App {
         Ok(())
     }
 
-    fn answer(&mut self, approved: bool) {
+    async fn answer(&mut self, approved: bool) {
         if let Some(ask) = self.transcript.asks().first() {
-            // A client elsewhere may have answered first; the log has the answer.
-            let _ = self.launch.session.approve(&ask.call, approved);
+            let result = self
+                .launch
+                .client
+                .resolve(self.session_id(), ask.call.clone(), approved)
+                .await;
+            match result {
+                Ok(()) => {}
+                // A client elsewhere may have answered first; the log has the answer.
+                Err(ClientError::Rpc {
+                    code: RpcError::APPROVAL_NOT_PENDING,
+                    ..
+                }) => {}
+                Err(error) => {
+                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
+                }
+            }
         }
         self.focus = Focus::Composer;
     }
@@ -531,15 +727,20 @@ impl App {
             return;
         };
         self.close_tree();
-        if let Err(error) = self.launch.session.checkout(node.target).await {
+        if let Err(error) = self
+            .launch
+            .client
+            .checkout(self.session_id(), node.target)
+            .await
+        {
             self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
             return;
         }
-        let info = self.launch.session.info().await;
+        self.launch.attached.info.head = node.target;
         let mut transcript = Transcript::default();
-        for event in lineage(&info.events, info.head) {
-            let n = Notification::Event(xi_protocol::methods::client::EventParams {
-                session: info.session,
+        for event in lineage(&self.launch.attached.events, node.target) {
+            let n = ClientNotification::Event(EventParams {
+                session: self.session_id(),
                 event,
             });
             transcript.apply(&n, self.cols);
@@ -548,7 +749,7 @@ impl App {
         transcript.session = self.transcript.session;
         transcript.keep_details(&mut self.transcript);
         self.transcript = transcript;
-        self.refresh_model();
+        self.refresh_details().await;
         let what = match &node.prompt {
             Some(prompt) => {
                 if self.editor.is_empty() {
@@ -594,7 +795,7 @@ impl App {
             if self.focus == Focus::Tree {
                 self.close_tree();
             } else if self.running() {
-                self.launch.session.cancel();
+                self.cancel().await;
             } else if !self.editor.is_empty() {
                 self.editor.clear();
             } else {
@@ -608,10 +809,10 @@ impl App {
         }
         if self.focus == Focus::Approval {
             match key.code {
-                KeyCode::Char('1' | 'y') => self.answer(true),
-                KeyCode::Char('2' | 'n') => self.answer(false),
+                KeyCode::Char('1' | 'y') => self.answer(true).await,
+                KeyCode::Char('2' | 'n') => self.answer(false).await,
                 KeyCode::Up | KeyCode::Down => self.choice = 1 - self.choice,
-                KeyCode::Enter => self.answer(self.choice == 0),
+                KeyCode::Enter => self.answer(self.choice == 0).await,
                 KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Composer,
                 _ => {}
             }
@@ -639,7 +840,7 @@ impl App {
                 self.focus = Focus::Approval;
                 self.choice = 0;
             }
-            KeyCode::Esc if running => self.launch.session.cancel(),
+            KeyCode::Esc if running => self.cancel().await,
             KeyCode::Char('d') if ctrl => {
                 if e.is_empty() && !running {
                     self.quit = true;
@@ -747,10 +948,10 @@ impl App {
 
     fn footer(&self, cols: usize) -> Line {
         let d = |s: String| Line::default().dim(s);
-        let config = &self.launch.config;
-        let workspace = home(&config.workspace);
-        let base = config
-            .workspace
+        let info = &self.launch.attached.info;
+        let workspace = home(&info.cwd);
+        let base = info
+            .cwd
             .file_name()
             .map_or_else(|| workspace.clone(), |n| n.to_string_lossy().into_owned());
         let mut segs = vec![
@@ -758,14 +959,15 @@ impl App {
                 .short(Line::default().ink(base))
                 .left(),
         ];
-        if let Some(model) = &self.model {
-            segs.push(
-                Segment::new(
-                    "model",
-                    Line::default().ink(format!("{}/{}", model.provider, model.id)),
-                )
-                .short(Line::default().ink(&model.id)),
-            );
+        let model = &info.model;
+        segs.push(
+            Segment::new(
+                "model",
+                Line::default().ink(format!("{}/{}", model.provider, model.model)),
+            )
+            .short(Line::default().ink(&model.model)),
+        );
+        if let Some(model) = &info.model_info {
             let window = model.context_window.max(1);
             segs.push(Segment::new(
                 "context",
@@ -782,13 +984,13 @@ impl App {
                 )),
             ));
         }
-        if let Some(cost) = session.cost(self.model.as_ref().and_then(|m| m.pricing)) {
+        if let Some(cost) = session.cost(info.model_info.as_ref().and_then(|m| m.pricing)) {
             segs.push(Segment::new(
                 "cost",
                 Line::default().ink(format!("${cost:.2}")),
             ));
         }
-        if !config.trusted {
+        if !info.trusted {
             segs.push(Segment::new("trust", Line::default().brass("untrusted")));
         }
         if self.transcript.tainted {
@@ -896,5 +1098,216 @@ impl App {
         let (live, cursor) = self.live();
         let commit = std::mem::take(&mut self.commit);
         screen.draw(&commit, &live, cursor, self.rows.saturating_sub(1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use xi_client::peer::{Incoming, Peer};
+    use xi_protocol::EventKind;
+    use xi_protocol::methods::client::{PendingApproval, SessionDetails};
+
+    use super::*;
+
+    fn snapshot(running: bool) -> AttachResult {
+        let session = SessionId::generate();
+        let model = ModelRef {
+            provider: "demo".into(),
+            model: "script".into(),
+        };
+        let root = Event {
+            id: EventId::generate(),
+            parent: None,
+            at: Timestamp(0),
+            kind: EventKind::SessionStarted {
+                session,
+                cwd: "/tmp/xi-tui-demo".into(),
+                model: model.clone(),
+                xi_version: "test".into(),
+                parent_session: None,
+            },
+        };
+        AttachResult {
+            info: SessionDetails {
+                session,
+                path: "/tmp/xi-tui-demo/session.jsonl".into(),
+                head: root.id,
+                cwd: "/tmp/xi-tui-demo".into(),
+                trusted: true,
+                model,
+                model_info: None,
+                parent_session: None,
+            },
+            events: vec![root],
+            partial: Vec::new(),
+            running,
+            pending_approvals: Vec::new(),
+        }
+    }
+
+    async fn launch(attached: AttachResult) -> (Launch, mpsc::UnboundedReceiver<String>) {
+        let (connection, server) = tokio::io::duplex(16 * 1024);
+        let (reader, writer) = tokio::io::split(server);
+        let (peer, mut incoming) = Peer::spawn(reader, writer);
+        let (requests, observed) = mpsc::unbounded_channel();
+        let response = attached.clone();
+        tokio::spawn(async move {
+            while let Some(message) = incoming.recv().await {
+                if let Incoming::Request { id, method, .. } = message {
+                    let _ = requests.send(method.clone());
+                    let result = match method.as_str() {
+                        "initialize" => Ok(json!({
+                            "protocol_version": xi_protocol::PROTOCOL_VERSION,
+                            "daemon_version": "test",
+                            "capabilities": { "private": true },
+                        })),
+                        "session/attach" => Ok(serde_json::to_value(&response).unwrap()),
+                        "session/prompt" => Ok(serde_json::to_value(PromptResult {
+                            head: response.info.head,
+                            failed: false,
+                            cancelled: false,
+                            text: "finished".into(),
+                        })
+                        .unwrap()),
+                        "approval/resolve" => Err(RpcError::new(
+                            RpcError::APPROVAL_NOT_PENDING,
+                            "already answered",
+                        )),
+                        _ => Ok(Value::Null),
+                    };
+                    let _ = peer.respond(id, result);
+                }
+            }
+        });
+        let (reader, writer) = tokio::io::split(connection);
+        let (client, notifications) = Client::over(reader, writer, "test-tui").await.unwrap();
+        let template = CreateParams {
+            cwd: attached.info.cwd.clone(),
+            model: Some(attached.info.model.clone()),
+            options: Default::default(),
+        };
+        (
+            Launch {
+                client,
+                notifications,
+                template,
+                attached,
+            },
+            observed,
+        )
+    }
+
+    #[tokio::test]
+    async fn attach_keeps_partial_and_deduplicates_events_after_interleaved_appends() {
+        let mut attached = snapshot(true);
+        attached.partial = vec![Block::Text {
+            text: "in flight".into(),
+        }];
+        attached.events.push(attached.events[0].clone());
+        let root = attached.events[0].clone();
+        let (launch, _) = launch(attached).await;
+        let mut app = App::new(launch, 80, 24);
+        assert_eq!(app.launch.attached.events.len(), 1);
+        assert!(
+            app.transcript
+                .live(80, 0)
+                .iter()
+                .any(|line| line.plain().contains("in flight"))
+        );
+        let event = Event {
+            id: EventId::generate(),
+            parent: Some(root.id),
+            at: Timestamp(1),
+            kind: EventKind::UserMessage {
+                content: vec![Block::Text {
+                    text: "hello".into(),
+                }],
+            },
+        };
+        app.notify(&ClientNotification::Event(EventParams {
+            session: app.session_id(),
+            event: event.clone(),
+        }));
+        let committed = app.commit.len();
+        app.notify(&ClientNotification::Event(EventParams {
+            session: app.session_id(),
+            event,
+        }));
+        app.notify(&ClientNotification::Event(EventParams {
+            session: app.session_id(),
+            event: root,
+        }));
+        assert_eq!(app.launch.attached.events.len(), 2);
+        assert_eq!(app.commit.len(), committed);
+    }
+
+    #[tokio::test]
+    async fn prompt_runs_off_the_ui_and_finishes_from_the_daemon_outcome() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 80, 24);
+        app.commit.clear();
+        app.send("hello".into());
+        assert!(app.running());
+        assert_eq!(app.pending.len(), 1);
+        let reply = app.pending.next().await.unwrap();
+        app.replied(reply);
+        assert!(!app.running());
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain().contains("done ·"))
+        );
+    }
+
+    #[tokio::test]
+    async fn approvals_resolved_elsewhere_are_not_reported_as_errors_or_revived() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 80, 24);
+        let pending = PendingApproval {
+            session: app.session_id(),
+            call: "approval".into(),
+            tool: "bash".into(),
+            action: "run command".into(),
+            rule: None,
+        };
+        app.notify(&ClientNotification::ApprovalPending(pending.clone()));
+        app.commit.clear();
+        app.answer(true).await;
+        assert!(app.commit.is_empty());
+        app.notify(&ClientNotification::Event(EventParams {
+            session: app.session_id(),
+            event: Event {
+                id: EventId::generate(),
+                parent: Some(app.launch.attached.info.head),
+                at: Timestamp(1),
+                kind: EventKind::ApprovalResolved {
+                    call: pending.call.clone(),
+                    approved: true,
+                    by: xi_protocol::event::Approver::User,
+                },
+            },
+        }));
+        app.notify(&ClientNotification::ApprovalPending(pending));
+        assert!(app.transcript.asks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaving_detaches_and_only_closes_an_idle_worker() {
+        for running in [false, true] {
+            let (launch, mut requests) = launch(snapshot(running)).await;
+            let app = App::new(launch, 80, 24);
+            app.release().await.unwrap();
+            let mut methods = Vec::new();
+            while let Ok(method) = requests.try_recv() {
+                methods.push(method);
+            }
+            assert!(methods.iter().any(|method| method == "session/detach"));
+            assert_eq!(
+                methods.iter().any(|method| method == "session/close"),
+                !running
+            );
+            assert!(methods.iter().all(|method| method != "session/cancel"));
+        }
     }
 }
