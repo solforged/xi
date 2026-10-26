@@ -1156,6 +1156,7 @@ async fn stubborn_workers_are_killed_and_closing_sessions_are_not_live() {
                         stream_sequence: 0,
                         running: false,
                         pending_approvals: Vec::new(),
+                        children: Vec::new(),
                     },
                     answers_close,
                     closes,
