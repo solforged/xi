@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+xi-kernel = { path = "crates/xi-kernel" }
 xi-policy = { path = "crates/xi-policy" }
 xi-protocol = { path = "crates/xi-protocol" }
 xi-provider = { path = "crates/xi-provider" }
