@@ -13,6 +13,8 @@ use crate::Result;
 pub(crate) enum Kind {
     Xi,
     Omp,
+    /// Upstream pi. Its `--mode json` stream is the one omp inherited.
+    Pi,
 }
 
 #[derive(Debug, Deserialize)]

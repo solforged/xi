@@ -135,6 +135,8 @@ pub(crate) fn parse_xi(reader: impl BufRead, wall_ms: f64) -> Result<Metrics> {
     Ok(acc.finish(wall_ms))
 }
 
+/// Parses timestamped `--mode json` stdout from omp or pi; omp kept pi's
+/// event stream.
 pub(crate) fn parse_omp(reader: impl BufRead, wall_ms: f64) -> Result<Metrics> {
     let mut acc = Accumulator::default();
     for (index, line) in reader.lines().enumerate() {

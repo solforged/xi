@@ -344,7 +344,7 @@ async fn verify_task(task: &Task) -> Result<(Outcome, Outcome)> {
 
 fn parse_metrics(kind: Kind, sessions: &Path, logs: &Path, wall_ms: f64) -> Result<Metrics> {
     let metrics = match kind {
-        Kind::Omp => metrics::parse_omp(
+        Kind::Omp | Kind::Pi => metrics::parse_omp(
             BufReader::new(File::open(logs.join("agent.stdout.jsonl"))?),
             wall_ms,
         )?,

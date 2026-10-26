@@ -15,3 +15,9 @@ name = "omp"
 kind = "omp"
 argv = ["omp", "-p", "--mode", "json", "--model", "{model}", "--thinking", "medium", "--no-extensions", "--no-skills", "--no-rules", "--no-title", "--approval-mode", "yolo", "--config", "{session_dir}/omp.yml", "--session-dir", "{session_dir}", "{prompt}"]
 [arm.env]
+
+[[arm]]
+name = "pi"
+kind = "pi"
+argv = ["pi", "-p", "--mode", "json", "--model", "{model}", "--thinking", "medium", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-mcp", "--offline", "--session-dir", "{session_dir}", "{prompt}"]
+[arm.env]
