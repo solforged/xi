@@ -5,9 +5,9 @@ argv = ["xi", "--json", "--on-ask", "deny", "--model", "{model}", "--session-dir
 [arm.env]
 
 [[arm]]
-name = "xi-replace"
+name = "xi-hashline"
 kind = "xi"
-argv = ["xi", "--json", "--on-ask", "deny", "--tools", "read,replace,write,bash,search", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "-p", "{prompt}"]
+argv = ["xi", "--json", "--on-ask", "deny", "--tools", "read,hashline,write,bash,search", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "-p", "{prompt}"]
 [arm.env]
 
 [[arm]]

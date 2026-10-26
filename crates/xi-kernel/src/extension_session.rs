@@ -80,14 +80,14 @@ impl Session {
                 parent
                     .specs
                     .iter()
-                    .filter(|s| xi_tools::by_name(&s.name).is_some())
+                    .filter(|s| xi_tools::is_builtin(&s.name))
                     .map(|s| s.name.clone())
                     .collect()
             });
             let mut tools = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for name in &names {
-                if xi_tools::by_name(name).is_none() || !parent.tools.contains_key(name) {
+                if !xi_tools::is_builtin(name) || !parent.tools.contains_key(name) {
                     return Err(Error::Config(format!(
                         "child tool {name} is not one of the parent's built-in tools"
                     )));

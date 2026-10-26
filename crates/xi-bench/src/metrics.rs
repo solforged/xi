@@ -81,7 +81,7 @@ impl Accumulator {
         if self
             .names
             .get(id)
-            .is_some_and(|name| matches!(name.as_str(), "edit" | "replace"))
+            .is_some_and(|name| matches!(name.as_str(), "edit" | "hashline"))
             && let Some(error) = error
         {
             self.metrics.edit_results += 1;
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!((metrics.edit_results, metrics.edit_failures), (1, 1));
         assert_eq!(metrics.tool_calls["task"], 1);
         assert_eq!(metrics.tool_calls["read"], 1);
-        assert_eq!(metrics.tool_calls["edit"], 1);
+        assert_eq!(metrics.tool_calls["hashline"], 1);
     }
 
     #[test]
@@ -394,7 +394,7 @@ mod tests {
         let events = [
             serde_json::json!({"type":"tool_execution_start", "toolCallId":"a", "toolName":"edit"}),
             serde_json::json!({"type":"tool_execution_end", "toolCallId":"a", "isError":true}),
-            serde_json::json!({"type":"tool_execution_start", "toolCallId":"b", "toolName":"replace"}),
+            serde_json::json!({"type":"tool_execution_start", "toolCallId":"b", "toolName":"hashline"}),
             serde_json::json!({"type":"tool_execution_end", "toolCallId":"b"}),
         ];
         let lines = events

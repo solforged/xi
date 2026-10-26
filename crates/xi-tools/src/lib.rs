@@ -6,17 +6,20 @@
 //!
 //! - `read` and `search` read in-process; paths under the sandbox's readable
 //!   or writable roots are inside, anything else is a [`Crossing::Read`].
-//! - `write` and `edit` write in-process; paths under a writable root and
+//! - `write`, `edit` and `hashline` write in-process; paths under a writable root and
 //!   not under a protected path are inside, anything else is a
 //!   [`Crossing::Write`]. Paths are resolved through symlinks first, so a
 //!   link cannot smuggle a write out of the workspace.
 //! - `bash` runs through `xi-sandbox-exec`, and every command is a
 //!   [`Crossing::Exec`] so policy can deny specific command lines.
 //!
-//! `read` and `search` return `LINE:HH|text` anchors, where `HH` is the
-//! leading byte of xxh3-64. `edit` validates all anchors against one snapshot
-//! before writing. Offsets for `read` are one-based. Shell output is merged
-//! at the pipe, bounded in memory, and spilled before it can grow unbounded.
+//! `edit` replaces exact text. `read` and `search` return `LINE|text` by
+//! default. With `hashline` enabled, they return `LINE:HH|text` anchors,
+//! where `HH` is the leading byte of xxh3-64. `hashline` validates all
+//! anchors against one snapshot before writing. Child sessions retain
+//! their parent's read/search format when they clone its tools.
+//! Offsets for `read` are one-based. Shell output is merged at the pipe,
+//! bounded in memory, and spilled before it can grow unbounded.
 
 mod bash;
 mod files;
@@ -104,25 +107,30 @@ pub trait Tool: Send + Sync {
 /// The default toolset: `read`, `edit`, `write`, `bash` and `search`.
 #[must_use]
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
-    ["read", "edit", "write", "bash", "search"]
-        .into_iter()
-        .map(|name| by_name(name).expect("built-in tool"))
+    toolset(&["read", "edit", "write", "bash", "search"]).expect("built-in tools")
+}
+
+/// Builds tools in request order, with anchors only when `hashline` is enabled.
+///
+/// # Errors
+/// Returns an error for an unknown tool name.
+pub fn toolset(names: &[impl AsRef<str>]) -> Result<Vec<Arc<dyn Tool>>, String> {
+    let anchors = names.iter().any(|name| name.as_ref() == "hashline");
+    names
+        .iter()
+        .map(|name| {
+            let name = name.as_ref();
+            Kind::named(name, anchors)
+                .map(|kind| Arc::new(kind) as Arc<dyn Tool>)
+                .ok_or_else(|| format!("unknown tool {name}"))
+        })
         .collect()
 }
 
-/// A built-in tool by name, including ones not in the default set.
+/// Whether a name identifies a built-in tool, including opt-in tools.
 #[must_use]
-pub fn by_name(name: &str) -> Option<Arc<dyn Tool>> {
-    let kind = match name {
-        "read" => Kind::Read,
-        "edit" => Kind::Edit,
-        "write" => Kind::Write,
-        "bash" => Kind::Bash,
-        "search" => Kind::Search,
-        "replace" => Kind::Replace,
-        _ => return None,
-    };
-    Some(Arc::new(kind))
+pub fn is_builtin(name: &str) -> bool {
+    Kind::named(name, false).is_some()
 }
 
 /// Truncates `text` to `ctx.output_limit` bytes for context. When it is
@@ -136,26 +144,44 @@ pub fn truncate(call: &ToolCallId, text: String, ctx: &Context) -> (String, Opti
 
 #[derive(Clone, Copy)]
 enum Kind {
-    Read,
+    Read { anchors: bool },
     Edit,
     Write,
     Bash,
-    Search,
-    Replace,
+    Search { anchors: bool },
+    Hashline,
+}
+
+impl Kind {
+    fn named(name: &str, anchors: bool) -> Option<Self> {
+        Some(match name {
+            "read" => Self::Read { anchors },
+            "edit" => Self::Edit,
+            "write" => Self::Write,
+            "bash" => Self::Bash,
+            "search" => Self::Search { anchors },
+            "hashline" => Self::Hashline,
+            _ => return None,
+        })
+    }
 }
 
 impl Tool for Kind {
     fn spec(&self) -> ToolSpec {
         use serde_json::json;
         let (name, description, properties, required) = match self {
-            Self::Read => (
+            Self::Read { anchors } => (
                 "read",
-                "Read text as LINE:HH|content anchors, list directories, or view images. offset is a 1-based line (default 1), limit defaults to 2000. Long lines are clipped.",
+                if *anchors {
+                    "Read text as LINE:HH|text anchors, list directories, or view images. offset is a 1-based line (default 1), limit defaults to 2000. Long lines are clipped."
+                } else {
+                    "Read text as LINE|text, list directories, or view images. offset is a 1-based line (default 1), limit defaults to 2000. Long lines are clipped."
+                },
                 json!({"path":{"type":"string"}, "offset":{"type":"integer","minimum":1}, "limit":{"type":"integer","minimum":1}}),
                 vec!["path"],
             ),
-            Self::Edit => (
-                "edit",
+            Self::Hashline => (
+                "hashline",
                 "Edit using read/search anchors from the current file. Replace inclusive start..end (end defaults to start), or insert after an anchor (\"0\" inserts at top). lines is an array of new lines; [] deletes. Anchors must match, edits cannot overlap. Preserves line endings.",
                 json!({"path":{"type":"string"}, "edits":{"type":"array","minItems":1,"items":{"oneOf":[
                     {"type":"object","properties":{"start":{"type":"string"},"end":{"type":"string"},"lines":{"type":"array","items":{"type":"string"}}},"required":["start","lines"],"additionalProperties":false},
@@ -165,7 +191,7 @@ impl Tool for Kind {
             ),
             Self::Write => (
                 "write",
-                "Create or overwrite a UTF-8 text file. Creates missing parent directories. Returns byte and line counts. Prefer edit for existing files.",
+                "Create or overwrite a UTF-8 text file. Creates missing parent directories. Returns byte and line counts. Prefer an editing tool for existing files.",
                 json!({"path":{"type":"string"}, "content":{"type":"string"}}),
                 vec!["path", "content"],
             ),
@@ -175,15 +201,19 @@ impl Tool for Kind {
                 json!({"command":{"type":"string"}, "timeout":{"type":"integer","minimum":1,"maximum":600}}),
                 vec!["command"],
             ),
-            Self::Search => (
+            Self::Search { anchors } => (
                 "search",
-                "Search a regex and return file paths with LINE:HH|text anchors. Without pattern, glob is required and matching files are listed. Respects ignore files and skips hidden files. path defaults to the workspace; limit defaults to 200. Paths are workspace-relative.",
+                if *anchors {
+                    "Search a regex and return file paths with LINE:HH|text anchors. Without pattern, glob is required and matching files are listed. Respects ignore files and skips hidden files. path defaults to the workspace; limit defaults to 200. Paths are workspace-relative."
+                } else {
+                    "Search a regex and return file paths with LINE|text. Without pattern, glob is required and matching files are listed. Respects ignore files and skips hidden files. path defaults to the workspace; limit defaults to 200. Paths are workspace-relative."
+                },
                 json!({"pattern":{"type":"string"}, "path":{"type":"string"}, "glob":{"type":"string"}, "ignore_case":{"type":"boolean"}, "limit":{"type":"integer","minimum":1}}),
                 vec![],
             ),
-            Self::Replace => (
-                "replace",
-                "Replace an exact string in a text file. old must occur exactly once unless all is true. Empty old is invalid.",
+            Self::Edit => (
+                "edit",
+                "Replace exact text in a file. Read the file first. old must match exactly, including whitespace and indentation. Include enough surrounding lines to be unique: old must occur once unless all is true. Empty old is invalid.",
                 json!({"path":{"type":"string"}, "old":{"type":"string"}, "new":{"type":"string"}, "all":{"type":"boolean"}}),
                 vec!["path", "old", "new"],
             ),
@@ -197,11 +227,11 @@ impl Tool for Kind {
 
     fn crossings(&self, input: &Value, ctx: &Context) -> Result<Vec<Crossing>, String> {
         let (path, write) = match self {
-            Self::Read => (files::read_input(input)?.path, false),
-            Self::Edit => (files::edit_input(input)?.path, true),
+            Self::Read { .. } => (files::read_input(input)?.path, false),
+            Self::Hashline => (files::hashline_input(input)?.path, true),
             Self::Write => (files::write_input(input)?.path, true),
-            Self::Replace => (files::replace_input(input)?.path, true),
-            Self::Search => (search::input(input)?.path, false),
+            Self::Edit => (files::edit_input(input)?.path, true),
+            Self::Search { .. } => (search::input(input)?.path, false),
             Self::Bash => return Ok(vec![Crossing::Exec(bash::input(input)?.command)]),
         };
         paths::crossings(&path, write, ctx)
@@ -227,11 +257,11 @@ impl Tool for Kind {
             let call_owned = call.clone();
             let context = ctx.clone();
             let result = tokio::task::spawn_blocking(move || match kind {
-                Self::Read => files::read(&call_owned, &input, &context),
-                Self::Edit => files::edit(&call_owned, &input, &context),
+                Self::Read { anchors } => files::read(&call_owned, &input, &context, anchors),
+                Self::Hashline => files::hashline(&call_owned, &input, &context),
                 Self::Write => files::write(&call_owned, &input, &context),
-                Self::Search => search::run(&call_owned, &input, &context),
-                Self::Replace => files::replace(&call_owned, &input, &context),
+                Self::Search { anchors } => search::run(&call_owned, &input, &context, anchors),
+                Self::Edit => files::edit(&call_owned, &input, &context),
                 Self::Bash => unreachable!(),
             })
             .await;

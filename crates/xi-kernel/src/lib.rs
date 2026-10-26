@@ -161,13 +161,7 @@ impl Backend {
             ))
         })?;
         let provider = registry.connect(&config.model)?;
-        let tools = config
-            .tools
-            .iter()
-            .map(|name| {
-                xi_tools::by_name(name).ok_or_else(|| Error::Config(format!("unknown tool {name}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let tools = xi_tools::toolset(&config.tools).map_err(Error::Config)?;
         Ok(Self {
             provider,
             model,

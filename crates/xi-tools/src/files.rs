@@ -44,15 +44,15 @@ pub(crate) fn write_input(input: &Value) -> Result<WriteInput, String> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ReplaceInput {
+pub(crate) struct EditInput {
     pub(crate) path: String,
     old: String,
     new: String,
     #[serde(default)]
     all: bool,
 }
-pub(crate) fn replace_input(input: &Value) -> Result<ReplaceInput, String> {
-    let input: ReplaceInput = parse(input)?;
+pub(crate) fn edit_input(input: &Value) -> Result<EditInput, String> {
+    let input: EditInput = parse(input)?;
     if input.old.is_empty() {
         return Err("old must not be empty".into());
     }
@@ -61,7 +61,7 @@ pub(crate) fn replace_input(input: &Value) -> Result<ReplaceInput, String> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EditInput {
+pub(crate) struct HashlineInput {
     pub(crate) path: String,
     edits: Vec<Edit>,
 }
@@ -115,8 +115,8 @@ impl Anchor {
     }
 }
 
-pub(crate) fn edit_input(input: &Value) -> Result<EditInput, String> {
-    let input: EditInput = parse(input)?;
+pub(crate) fn hashline_input(input: &Value) -> Result<HashlineInput, String> {
+    let input: HashlineInput = parse(input)?;
     if input.edits.is_empty() {
         return Err("edits must not be empty".into());
     }
@@ -148,15 +148,19 @@ fn hash(text: &str) -> u8 {
     (xxh3_64(text.as_bytes()) >> 56) as u8
 }
 
-pub(crate) fn anchored(out: &mut String, number: usize, text: &str) {
+pub(crate) fn numbered(out: &mut String, number: usize, text: &str, anchors: bool) {
     let end = text
         .char_indices()
         .nth(2000)
         .map_or(text.len(), |(index, _)| index);
+    if anchors {
+        write!(out, "{number}:{:02x}", hash(text)).expect("writing String");
+    } else {
+        write!(out, "{number}").expect("writing String");
+    }
     writeln!(
         out,
-        "{number}:{:02x}|{}{}",
-        hash(text),
+        "|{}{}",
         &text[..end],
         if end < text.len() {
             " [line truncated at 2000 chars]"
@@ -206,7 +210,12 @@ fn image_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn read(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ran, String> {
+pub(crate) fn read(
+    call: &ToolCallId,
+    input: &Value,
+    ctx: &Context,
+    anchors: bool,
+) -> Result<Ran, String> {
     let input = read_input(input)?;
     let path = paths::resolve(&input.path, ctx)?;
     let meta =
@@ -271,7 +280,7 @@ pub(crate) fn read(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ra
         } else {
             line
         };
-        anchored(&mut out, number, line);
+        numbered(&mut out, number, line, anchors);
     }
     if truncated {
         writeln!(
@@ -307,8 +316,8 @@ pub(crate) fn write(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<R
     ))
 }
 
-pub(crate) fn replace(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ran, String> {
-    let input = replace_input(input)?;
+pub(crate) fn edit(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ran, String> {
+    let input = edit_input(input)?;
     let path = paths::resolve(&input.path, ctx)?;
     let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let count = text.matches(&input.old).count();
@@ -339,8 +348,8 @@ struct Operation<'a> {
     lines: &'a [String],
 }
 
-pub(crate) fn edit(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ran, String> {
-    let input = edit_input(input)?;
+pub(crate) fn hashline(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ran, String> {
+    let input = hashline_input(input)?;
     let path = paths::resolve(&input.path, ctx)?;
     let original = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let before = lines(&original);
@@ -456,7 +465,7 @@ pub(crate) fn edit(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ra
 
 fn context(out: &mut String, lines: &[Line<'_>], start: usize, end: usize) {
     for (index, line) in lines.iter().enumerate().take(end).skip(start) {
-        anchored(out, index + 1, line.text);
+        numbered(out, index + 1, line.text, true);
     }
 }
 
