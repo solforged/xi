@@ -1,33 +1,23 @@
-//! Blocking external-editor handoff for composer drafts.
+//! Blocking external-editor handoff for composer drafts and config files.
 
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, ExitStatus};
 
 /// Edits a temporary copy of `text` with `$VISUAL`, then `$EDITOR`, then `vi`.
 /// The editor command is interpreted by `sh`, with the file passed separately
 /// as `$1`. A zero exit returns its contents without one trailing newline;
 /// any other exit returns `None`. The caller must suspend terminal raw mode.
 pub fn edit(text: &str) -> io::Result<Option<String>> {
-    let editor = env::var_os("VISUAL")
-        .filter(|value| !value.is_empty())
-        .or_else(|| env::var_os("EDITOR").filter(|value| !value.is_empty()))
-        .unwrap_or_else(|| "vi".into());
     let mut file = tempfile::Builder::new()
         .prefix("xi-prompt-")
         .suffix(".txt")
         .tempfile()?;
     file.write_all(text.as_bytes())?;
     file.flush()?;
-    let mut script = editor;
-    script.push(" \"$1\"");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("xi")
-        .arg(file.path())
-        .status()?;
+    let status = run(file.path())?;
     if !status.success() {
         return Ok(None);
     }
@@ -39,6 +29,39 @@ pub fn edit(text: &str) -> io::Result<Option<String>> {
         }
     }
     Ok(Some(edited))
+}
+
+/// Opens a file with `$VISUAL`, then `$EDITOR`, then `vi`.
+///
+/// The file path is passed separately to `sh`, and missing parent directories
+/// are created. The caller must suspend terminal raw mode.
+pub fn edit_file(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let status = run(path)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("editor exited with {status}")))
+    }
+}
+
+fn run(path: &Path) -> io::Result<ExitStatus> {
+    let mut script = env::var_os("VISUAL")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("EDITOR").filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| "vi".into());
+    script.push(" \"$1\"");
+    Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("xi")
+        .arg(path)
+        .status()
 }
 
 #[cfg(test)]
@@ -109,5 +132,43 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    fn edit_file_passes_the_exact_path_and_creates_its_parent() {
+        const CHILD: &str = "XI_TUI_EXTERNAL_FILE_TEST_CHILD";
+        if let Some(path) = env::var_os(CHILD) {
+            edit_file(Path::new(&path)).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new config directory/config file.toml");
+        let script = dir.path().join("fake file editor.sh");
+        fs::write(
+            &script,
+            "printf '# edited\\napprovals = \"reads\"\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "external::tests::edit_file_passes_the_exact_path_and_creates_its_parent",
+                "--nocapture",
+            ])
+            .env(CHILD, &path)
+            .env("VISUAL", format!("sh '{}'", script.display()))
+            .env("EDITOR", "exit 9")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# edited\napprovals = \"reads\"\n"
+        );
     }
 }

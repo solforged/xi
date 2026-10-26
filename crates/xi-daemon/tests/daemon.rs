@@ -361,6 +361,115 @@ async fn relative_create_and_open_paths_are_rejected_before_starting_workers() {
     stop(&peer, &daemon).await;
 }
 
+#[tokio::test]
+async fn config_set_preserves_comments_and_reports_global_source() {
+    let fixture = Fixture::new();
+    let global = fixture.paths.config.join("config.toml");
+    std::fs::write(
+        &global,
+        "# keep this comment\n[compaction]\nenabled = true\n",
+    )
+    .unwrap();
+    let daemon = fixture.daemon(vec![], false);
+    let (peer, _) = connection(&daemon);
+    initialize(&peer).await;
+    let report = request::<ConfigSettings>(
+        &peer,
+        &SettingsParams {
+            cwd: fixture.cwd.clone(),
+            configs: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.files.global, global);
+    let setting = report
+        .settings
+        .iter()
+        .find(|setting| setting.key == "compaction.enabled")
+        .unwrap();
+    assert_eq!(setting.value, json!(true));
+    assert_eq!(setting.source, SettingLayer::Global);
+
+    let mut params = SetSettingParams {
+        cwd: fixture.cwd.clone(),
+        configs: Vec::new(),
+        key: "compaction.enabled".into(),
+        value: json!(false),
+    };
+    let report = request::<ConfigSet>(&peer, &params).await.unwrap();
+    let setting = report
+        .settings
+        .iter()
+        .find(|setting| setting.key == "compaction.enabled")
+        .unwrap();
+    assert_eq!(setting.value, json!(false));
+    assert_eq!(setting.source, SettingLayer::Global);
+    let saved = std::fs::read_to_string(&global).unwrap();
+    assert!(saved.contains("# keep this comment"));
+    assert!(saved.contains("enabled = false"));
+    params.value = json!("not a boolean");
+    match request::<ConfigSet>(&peer, &params).await {
+        Err(PeerError::Rpc(error)) => {
+            assert_eq!(error.code, RpcError::INVALID_PARAMS);
+            assert!(error.message.contains("compaction.enabled"));
+        }
+        result => panic!("expected invalid params, got {result:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&global).unwrap(), saved);
+    assert_eq!(
+        request::<DaemonStatus>(&peer, &()).await.unwrap().workers,
+        0
+    );
+    stop(&peer, &daemon).await;
+}
+
+#[tokio::test]
+async fn relative_settings_paths_are_rejected_before_editing_config() {
+    let fixture = Fixture::new();
+    let global = fixture.paths.config.join("config.toml");
+    let original = "# do not edit\n[compaction]\nenabled = true\n";
+    std::fs::write(&global, original).unwrap();
+    let daemon = fixture.daemon(vec![], false);
+    let (peer, _) = connection(&daemon);
+    initialize(&peer).await;
+    for (cwd, configs) in [
+        (".".into(), Vec::new()),
+        (fixture.cwd.clone(), vec!["extra.toml".into()]),
+    ] {
+        assert_eq!(
+            error_code(
+                request::<ConfigSettings>(
+                    &peer,
+                    &SettingsParams {
+                        cwd: cwd.clone(),
+                        configs: configs.clone(),
+                    },
+                )
+                .await,
+            ),
+            RpcError::INVALID_PARAMS
+        );
+        assert_eq!(
+            error_code(
+                request::<ConfigSet>(
+                    &peer,
+                    &SetSettingParams {
+                        cwd,
+                        configs,
+                        key: "compaction.enabled".into(),
+                        value: json!(false),
+                    },
+                )
+                .await,
+            ),
+            RpcError::INVALID_PARAMS
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&global).unwrap(), original);
+    stop(&peer, &daemon).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn back_to_back_prompt_and_cancel_always_cancel_the_turn() {
     let fixture = Fixture::new();

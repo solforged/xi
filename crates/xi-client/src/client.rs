@@ -184,6 +184,16 @@ impl Client {
         self.request::<SessionList>(&p).await
     }
 
+    /// Reports effective settings and their configuration layers for a workspace.
+    pub async fn settings(&self, p: SettingsParams) -> Result<SettingsReport, ClientError> {
+        self.request::<ConfigSettings>(&p).await
+    }
+
+    /// Sets or removes a global setting and reports the resulting effective settings.
+    pub async fn set_setting(&self, p: SetSettingParams) -> Result<SettingsReport, ClientError> {
+        self.request::<ConfigSet>(&p).await
+    }
+
     /// Closes a session's idle worker.
     pub async fn close(&self, session: SessionId) -> Result<(), ClientError> {
         self.request::<SessionClose>(&SessionRef { session }).await

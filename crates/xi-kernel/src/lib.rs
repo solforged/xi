@@ -15,6 +15,7 @@ pub mod config;
 pub mod context;
 mod extension_session;
 pub mod extensions;
+pub mod settings;
 pub mod worker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -36,6 +37,7 @@ use xi_provider::{Provider, Request, Response};
 use xi_session::SessionLog;
 use xi_tools::{Crossing, Tool};
 
+pub use config::Approvals;
 use config::Config;
 use context::SystemContext;
 
