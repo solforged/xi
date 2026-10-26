@@ -24,7 +24,7 @@ pub struct PackageManifest {
     pub capabilities: Capabilities,
 }
 
-/// Sandbox grants for an extension. Paths and hosts are globs.
+/// Sandbox grants for an extension. Filesystem entries are literal roots.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Capabilities {
@@ -36,8 +36,6 @@ pub struct Capabilities {
     pub net: Vec<String>,
     /// Environment variables passed through from the kernel's environment.
     pub env: Vec<String>,
-    /// Whether the extension may spawn subprocesses.
-    pub exec: bool,
     /// Whether the extension may run child sessions through `agent/run`.
     pub subagents: bool,
 }

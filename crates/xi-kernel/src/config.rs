@@ -114,6 +114,7 @@ struct FileConfig {
     default_model: Option<String>,
     reasoning: Option<Reasoning>,
     tools: Option<Vec<String>>,
+    extensions: Option<Vec<PathBuf>>,
     sandbox: Option<SandboxLayer>,
     compaction: Option<crate::compaction::Layer>,
     #[serde(default)]
@@ -147,6 +148,8 @@ pub struct Config {
     pub reasoning: Reasoning,
     /// Enabled tool names in request order.
     pub tools: Vec<String>,
+    /// Extension package directories, resolved against their config files.
+    pub extensions: Vec<PathBuf>,
     /// Sandbox additions.
     pub sandbox: SandboxConfig,
     /// Automatic context compaction and retained history budget.
@@ -198,6 +201,7 @@ impl Config {
                 .collect(),
             sandbox: SandboxConfig::default(),
             compaction: crate::compaction::Config::default(),
+            extensions: Vec::new(),
             registries: Vec::new(),
             policy: Arc::new(Policy::new()),
             warnings: Vec::new(),
@@ -266,6 +270,13 @@ impl Config {
             }
             if let Some(compaction) = layer.compaction {
                 compaction.apply(&mut config.compaction);
+            }
+            if let Some(extensions) = layer.extensions {
+                let base = path.parent().expect("config file has a parent");
+                config.extensions = extensions
+                    .iter()
+                    .map(|entry| base.join(config.paths.expand(entry)))
+                    .collect();
             }
             if let Some(sandbox) = layer.sandbox {
                 if let Some(paths) = sandbox.readable {

@@ -30,6 +30,9 @@ struct Cli {
     /// Additional full-authority configuration layer; repeatable.
     #[arg(long, global = true)]
     config: Vec<PathBuf>,
+    /// Load an extension package directory; repeatable.
+    #[arg(long, global = true)]
+    extension: Vec<PathBuf>,
     /// Replace the active toolset.
     #[arg(long, value_delimiter = ',', global = true)]
     tools: Option<Vec<String>>,
@@ -127,6 +130,7 @@ async fn run(cli: Cli) -> Result<u8> {
         model: cli.model.as_deref().map(parse_model).transpose()?,
         reasoning: cli.reasoning.map(Into::into),
         tools: cli.tools,
+        extensions: cli.extension,
     };
     if matches!(cli.command, Some(Command::Serve)) {
         xi_kernel::server::serve(
@@ -184,6 +188,7 @@ async fn run(cli: Cli) -> Result<u8> {
         if !cli.json && !outcome.text.is_empty() {
             println!("{}", outcome.text);
         }
+        bus.shutdown_extensions().await;
         return Ok(u8::from(outcome.failed || outcome.cancelled));
     }
     std::fs::create_dir_all(&paths.state)?;
@@ -224,7 +229,7 @@ async fn run(cli: Cli) -> Result<u8> {
             continue;
         }
         if line == "/compact" {
-            match session.compact(None).await {
+            match session.compact().await {
                 Ok(result) => eprintln!("Compacted {} estimated tokens.", result.tokens_before),
                 Err(error) => eprintln!("xi: {error}"),
             }
@@ -242,8 +247,21 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             continue;
         }
-        if line.starts_with('/') {
-            eprintln!("Commands: /quit, /new, /compact, /model PROVIDER/MODEL");
+        if let Some(command) = line.strip_prefix('/') {
+            let (name, args) = command
+                .split_once(char::is_whitespace)
+                .unwrap_or((command, ""));
+            match session.command(name, args.trim()).await {
+                Ok(Some(result)) => {
+                    if let Some(message) = result.message {
+                        println!("{message}");
+                    }
+                }
+                Ok(None) => eprintln!(
+                    "Unknown command: /{name}. Commands: /quit, /new, /compact, /model PROVIDER/MODEL"
+                ),
+                Err(error) => eprintln!("xi: {error}"),
+            }
             continue;
         }
         match turn(
@@ -259,6 +277,7 @@ async fn run(cli: Cli) -> Result<u8> {
         }
     }
     editor.save_history(&history)?;
+    bus.shutdown_extensions().await;
     Ok(0)
 }
 

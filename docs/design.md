@@ -105,32 +105,45 @@ Extension methods:
 | `command/run` | kernel → extension | Run a slash command. |
 | `shutdown` | kernel → extension | Ask the extension to exit. |
 | `session/append_custom` | extension → kernel | Persist extension state as a `custom` event. |
+| `agent/run` | extension → kernel | Run a linked child session with a reduced built-in toolset. Requires `subagents`. |
 | `log` | extension → kernel | Diagnostic output. |
 
-Hook points in protocol version 0: `pre_tool` (continue, deny, or rewrite the input), `post_tool` (continue or replace the output), `turn_end` (observe only). Compaction and pre-model hooks wait until the context builder exists, so their payloads match real data.
+Hook points in protocol version 0: `pre_tool` (continue, deny, or rewrite the input), `post_tool` (continue or replace the output), `turn_end` (observe only), and `compact` (continue or supply a summary). Hooks run in registration order. The host rejects outcomes that do not match their hook point. Rewritten input goes through policy before execution. Replacement output cannot clear a prior untrusted flag.
 
 ### Extensions
 
 An extension is a package with a static manifest and an executable:
 
 ```toml
-name = "web"
+name = "subagents"
 version = "0.1.0"
-run = ["bun", "run", "index.ts"]
+run = ["node", "index.ts"]
 
 [capabilities]
-net = ["*.wikipedia.org"]
-fs_read = []
+subagents = true
+net = []
+fs_read = ["../../sdk/typescript"]
 fs_write = []
 env = []
-exec = false
 ```
 
-Capabilities live in the static manifest because the kernel needs them to build the sandbox before the process starts. What the extension registers (tools, hooks, commands) comes from `initialize`, so extensions can register dynamically and hot-reload by restarting.
+Capabilities live in the static manifest because the kernel builds the sandbox before starting the process. `fs_read` and `fs_write` are literal existing roots, resolved relative to the package directory; glob syntax is rejected. The package and system/runtime roots are readable. Only declared write roots and a private temporary directory are writable. Workspace and user sandbox additions are not implicitly granted to extensions. `env` adds names to the baseline runtime environment allowlist. Network is isolated. A nonempty `net` list fails with an error naming the missing egress proxy, rather than granting host networking.
 
-The built-in tools are an extension compiled into the binary and spoken to over the same protocol. If the API can't express a built-in, the API is wrong.
+There is no `exec` capability. Forked processes inherit the same OS sandbox, which is the enforceable boundary. A separate boolean would imply a restriction the host cannot reliably enforce.
 
-Packages are pinned by content hash in a lockfile. Install never runs package scripts.
+Load packages with `extensions = ["~/path/to/package"]` in a config file, or repeat `--extension DIR` on the CLI. Each config layer replaces the previous package list; CLI entries append. Config-relative paths resolve against the config file directory, and CLI-relative paths against the process directory. Project and local package settings are ignored until the workspace is trusted.
+
+One extension supervisor belongs to the kernel's event bus. It starts packages lazily and caches processes by canonical package root and workspace. Each session keeps its own ordered catalog. `initialize` supplies tools, hooks and slash commands. Tools follow built-ins in the model catalog, cross `ActionKind::Tool` policy, and preserve output taint. Duplicate tool, command or package names fail startup. `/name args` in line mode dispatches `command/run`; built-in command names are reserved.
+
+Stdio carries full-duplex NDJSON JSON-RPC. A reader routes responses independently from extension requests, so several `agent/run` requests can run while `tool/invoke` is pending. The turn owner services `session/append_custom` without reacquiring its session lock. Every extension has a stderr and diagnostic log beside the first session that loaded it. Crashes are logged and leave registered tools returning errors. Normal CLI/server exit sends `shutdown`, closes the connection, terminates descendants and reaps the process. Turn cancellation cancels child sessions and retires the active extension process group; later calls fail until the kernel restarts. The SDK also accepts `$/cancelRequest` for cooperative `AbortSignal` handling.
+
+`agent/run` requires `subagents = true`. Children have fresh logs in the parent's session directory with `parent_session` set, the same workspace and sandbox configuration, and only a requested subset of the parent's built-ins. Unknown or extension tool names fail. Children never load extensions. Approval asks are recorded and denied headlessly. The result contains the final text, failure flag and usage summed across child requests. Children share files, so callers must assign disjoint edit scopes.
+
+The compact hook seam is `Extensions::compact(session, tokens_before, previous_summary, cancel) -> Result<Option<String>>`. `Session::extension_summary` wraps it with callback servicing; the locked variant is available to the compaction implementation. `None` keeps kernel-generated summarization. The last supplied summary wins.
+
+The [TypeScript SDK](../sdk/typescript/README.md) runs under Node 26 or Bun without dependencies or a build step. `extensions/subagents` is the optional `task` package: one to eight concurrent self-contained prompts, defaulting to read, edit, write, bash and search. Output stays in input order and marks failures.
+
+Built-ins currently implement the same tool schema and policy contract in-process; they do not run over an extension pipe. Content-hash package pinning and hot reload remain unimplemented. Install never runs package scripts.
 
 ### Providers
 
@@ -273,11 +286,11 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 | `xi-sandbox` egress proxy | Kernel-side CONNECT proxy and in-namespace forwarder. | Planned |
 | `xi-provider` | Anthropic Messages and OpenAI-compatible Chat adapters, model registry. | Implemented (Anthropic live path untested) |
 | `xi-tools` | `read`, `edit`, `write`, `bash`, `search`, plus `replace` for edit-format comparisons. | Implemented |
-| `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server. | Implemented; extension host planned |
+| `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server and sandboxed extension host. | Implemented |
 | `xi-cli` | The `xi` binary: line mode, headless `-p`, `serve`, `trust`. | Implemented |
 | `xi-bench` | Runs xi and omp arms on a task suite and reports metrics. | Implemented |
 | `xi-tui` | Terminal client. | Planned |
-| `sdk/typescript` | Extension and client SDK. | Planned |
+| `sdk/typescript` | Zero-dependency extension SDK and full-duplex NDJSON peer. | Implemented |
 
 ## Build order
 

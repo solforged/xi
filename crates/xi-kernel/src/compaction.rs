@@ -140,11 +140,9 @@ pub(crate) fn estimate(state: &State) -> u64 {
     // Usage from a retained pre-compaction assistant describes the old request,
     // not the new prefix. Until the next response, estimate the rebuilt context.
     let context = state.log.context(state.head).expect("known head");
-    let backend = state.backend.as_ref().expect("connected backend");
     let fixed = chars(&state.system.prompt)
-        + backend
-            .specs
-            .iter()
+        + state
+            .tool_specs()
             .map(|spec| {
                 chars(&spec.name) + chars(&spec.description) + value_chars(&spec.input_schema)
             })
@@ -201,8 +199,7 @@ fn kept_start(events: &[&Event], budget: u64) -> Result<usize> {
 
 impl Session {
     /// Compacts an idle session, even when automatic compaction is disabled.
-    /// A supplied summary skips the provider call and records no summary usage.
-    pub async fn compact(&self, summary_override: Option<String>) -> Result<CompactResult> {
+    pub async fn compact(&self) -> Result<CompactResult> {
         let mut state = self
             .0
             .state
@@ -219,7 +216,7 @@ impl Session {
         if state.backend.is_none() {
             state.backend = Some(Backend::connect(&state.config)?.into());
         }
-        self.compact_at_boundary(&mut state, &cancel, summary_override)
+        self.compact_at_boundary(&mut state, &cancel)
             .await?
             .ok_or_else(|| {
                 Error::Config(
@@ -234,31 +231,41 @@ impl Session {
     }
 
     /// The caller holds the session state between complete model/tool batches.
+    /// A `compact` extension hook may supply the summary, which skips the
+    /// provider request and records no summary usage.
     pub(crate) async fn compact_at_boundary(
         &self,
         state: &mut State,
         cancel: &CancellationToken,
-        summary_override: Option<String>,
     ) -> Result<Option<CompactResult>> {
         let tokens_before = estimate(state);
-        let mut history = state.log.context(state.head).expect("known head");
-        let backend = state.backend.as_ref().expect("connected backend");
-        let start = kept_start(
-            &history.events,
-            state.config.compaction.keep(backend.model.context_window),
-        )?;
-        if !history.events[..start].iter().any(|event| {
-            matches!(
-                event.kind,
-                EventKind::UserMessage { .. } | EventKind::AssistantMessage { .. }
-            )
-        }) {
-            return Ok(None);
-        }
-        let kept = history.events.get(start).map(|event| event.id);
-        let (summary, usage) = if let Some(summary) = summary_override {
+        let (start, kept, previous_summary) = {
+            let history = state.log.context(state.head).expect("known head");
+            let backend = state.backend.as_ref().expect("connected backend");
+            let start = kept_start(
+                &history.events,
+                state.config.compaction.keep(backend.model.context_window),
+            )?;
+            if !history.events[..start].iter().any(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::UserMessage { .. } | EventKind::AssistantMessage { .. }
+                )
+            }) {
+                return Ok(None);
+            }
+            let kept = history.events.get(start).map(|event| event.id);
+            (start, kept, history.summary.map(str::to_owned))
+        };
+        let hook_summary = self
+            .extension_summary_locked(state, tokens_before, previous_summary, cancel)
+            .await?;
+        let (summary, usage) = if let Some(summary) = hook_summary {
             (summary, None)
         } else {
+            // Hooks may have appended custom events at the head; the kept
+            // boundary is unchanged because they come after it.
+            let mut history = state.log.context(state.head).expect("known head");
             history.events.truncate(start);
             let mut messages = context::messages(history);
             messages.push(Message::User(vec![Block::Text {
