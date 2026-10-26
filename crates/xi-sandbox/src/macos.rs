@@ -131,6 +131,14 @@ fn profile(spec: &Spec, helper: &Path) -> Result<String, Error> {
         .unwrap();
         metadata.extend(path.ancestors().map(Path::to_owned));
     }
+    // A path written through a root-level link such as /tmp -> private/tmp
+    // resolves only if the link itself is readable. That reveals its text
+    // and nothing beneath it; the target keeps its own rules.
+    for (link, target) in root_links()? {
+        if readable.iter().any(|root| root.starts_with(&target)) {
+            writeln!(policy, "(allow file-read* (literal {}))", quote(&link)?).unwrap();
+        }
+    }
     // Allow only this executable, not its containing build or home directory.
     writeln!(
         policy,
@@ -194,6 +202,20 @@ fn profile(spec: &Spec, helper: &Path) -> Result<String, Error> {
 fn canonicalize(path: &Path) -> Result<PathBuf, Error> {
     path.canonicalize()
         .map_err(setup(format!("resolve {}", path.display())))
+}
+
+/// Symlinks directly under `/`, with their resolved targets.
+fn root_links() -> Result<Vec<(PathBuf, PathBuf)>, Error> {
+    let mut links = Vec::new();
+    for entry in std::fs::read_dir("/").map_err(setup("list /"))? {
+        let entry = entry.map_err(setup("list /"))?;
+        if entry.file_type().is_ok_and(|kind| kind.is_symlink())
+            && let Ok(target) = entry.path().canonicalize()
+        {
+            links.push((entry.path(), target));
+        }
+    }
+    Ok(links)
 }
 
 /// JSON's quoted strings also escape the SBPL string delimiters. Reject
