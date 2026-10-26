@@ -17,8 +17,8 @@
 //! timeout and a 120-second read/idle timeout, and have no total timeout.
 //! Anthropic caches the system, final tool definition and final history block.
 //! Current Claude models use adaptive thinking and effort; older models use
-//! token budgets. Models that cannot disable thinking clamp [`Reasoning::Off`]
-//! to their lowest effort (Sonnet 5.5 also disables up-front thinking).
+//! token budgets. A model's `reasoning` list names the levels it accepts;
+//! requests at any other level fail before they are sent.
 //! Built-in prices are base, standard-tier USD per million tokens, not
 //! long-context premiums. Config layers can replace all built-in metadata.
 //!
@@ -215,10 +215,6 @@ pub struct Compat {
     /// `true`; the ChatGPT backend rejects it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_limit: Option<bool>,
-    /// The effort Responses requests send when reasoning is off, for models
-    /// that can't turn it off. Default `off`, sent as `none`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_off: Option<Reasoning>,
     /// A header that carries the session's prompt-cache key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_header: Option<String>,
@@ -235,7 +231,6 @@ impl Compat {
     pub fn or(&self, base: &Self) -> Self {
         Self {
             output_limit: self.output_limit.or(base.output_limit),
-            reasoning_off: self.reasoning_off.or(base.reasoning_off),
             session_header: self
                 .session_header
                 .clone()

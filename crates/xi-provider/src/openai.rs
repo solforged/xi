@@ -74,7 +74,7 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
         "max_tokens"
     }] = request.max_tokens.into();
     if reasoning {
-        body["reasoning_effort"] = crate::anthropic::effort(request.reasoning).into();
+        body["reasoning_effort"] = effort(request.reasoning).into();
     }
     if request.reasoning == Reasoning::Off {
         body["chat_template_kwargs"] = json!({"enable_thinking": false});
@@ -88,6 +88,14 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
         body["prompt_cache_key"] = key.clone().into();
     }
     Ok(body)
+}
+
+/// The OpenAI effort for a level: `none` for off, otherwise its name.
+pub(crate) fn effort(reasoning: Reasoning) -> &'static str {
+    match reasoning {
+        Reasoning::Off => "none",
+        level => level.name(),
+    }
 }
 
 fn image(media_type: &str, data: &str) -> Value {

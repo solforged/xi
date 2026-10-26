@@ -1100,7 +1100,7 @@ mod tests {
                     id: "m".into(),
                     context_window: 1000,
                     max_output: 100,
-                    reasoning: true,
+                    reasoning: vec![Reasoning::Low, Reasoning::High],
                     pricing: None,
                 },
                 available: false,
@@ -1112,7 +1112,7 @@ mod tests {
                 "model": {"provider": "test", "model": "m"},
                 "info": {
                     "provider": "test", "id": "m", "context_window": 1000,
-                    "max_output": 100, "reasoning": true,
+                    "max_output": 100, "reasoning": ["low", "high"],
                 },
                 "available": false,
             }],

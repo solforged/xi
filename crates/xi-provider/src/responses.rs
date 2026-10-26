@@ -16,7 +16,7 @@ use crate::sse::Events;
 use crate::transport::{Shape, decode};
 use crate::*;
 
-pub(crate) fn body(request: &Request, shape: &Shape) -> Result<Value, Error> {
+pub(crate) fn body(request: &Request, shape: &Shape, reasoning: bool) -> Result<Value, Error> {
     let tools: Vec<Value> = request
         .tools
         .iter()
@@ -79,12 +79,11 @@ pub(crate) fn body(request: &Request, shape: &Shape) -> Result<Value, Error> {
     if !shape.lite && !tools.is_empty() {
         body["tools"] = tools.into();
     }
-    if shape.reasoning {
+    if reasoning {
+        let effort = crate::openai::effort(request.reasoning);
         let mut reasoning = match request.reasoning {
-            Reasoning::Off => {
-                json!({"effort": crate::anthropic::effort(shape.reasoning_off)})
-            }
-            depth => json!({"effort": crate::anthropic::effort(depth), "summary": "auto"}),
+            Reasoning::Off => json!({"effort": effort}),
+            _ => json!({"effort": effort, "summary": "auto"}),
         };
         if shape.lite {
             reasoning["context"] = "all_turns".into();

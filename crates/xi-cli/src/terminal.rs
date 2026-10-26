@@ -379,34 +379,36 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
             }
             if line == "/reasoning" {
                 match client.models(session).await {
-                    Ok(result) => println!(
-                        "Reasoning: {}",
-                        match result.reasoning {
-                            Reasoning::Off => "off",
-                            Reasoning::Low => "low",
-                            Reasoning::Medium => "medium",
-                            Reasoning::High => "high",
+                    Ok(result) => {
+                        let current = result.models.iter().find(|entry| entry.model == result.current);
+                        match current.map(|entry| &entry.info) {
+                            Some(info) if info.reasoning.is_empty() => {
+                                println!("{} does not reason", info.id);
+                            }
+                            Some(info) => {
+                                let levels: Vec<_> =
+                                    info.reasoning.iter().map(|level| level.name()).collect();
+                                println!(
+                                    "Reasoning: {} (accepts {})",
+                                    info.resolve(result.reasoning),
+                                    levels.join(", ")
+                                );
+                            }
+                            None => println!("Reasoning: {}", result.reasoning),
                         }
-                    ),
+                    }
                     Err(error) => eprintln!("xi: {error}"),
                 }
                 continue;
             }
             if let Some(level) = line.strip_prefix("/reasoning ") {
-                let reasoning = match level.trim() {
-                    "off" => Some(Reasoning::Off),
-                    "low" => Some(Reasoning::Low),
-                    "medium" => Some(Reasoning::Medium),
-                    "high" => Some(Reasoning::High),
-                    _ => None,
-                };
-                match reasoning {
-                    Some(reasoning) => {
+                match level.trim().parse::<Reasoning>() {
+                    Ok(reasoning) => {
                         if let Err(error) = client.set_reasoning(session, reasoning).await {
                             eprintln!("xi: {error}");
                         }
                     }
-                    None => eprintln!("xi: usage: /reasoning [off|low|medium|high]"),
+                    Err(error) => eprintln!("xi: {error}"),
                 }
                 continue;
             }
@@ -421,7 +423,7 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                         }
                     }
                     Ok(None) => eprintln!(
-                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /model PROVIDER/MODEL, /reasoning [off|low|medium|high]"
+                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /model PROVIDER/MODEL, /reasoning [LEVEL]"
                     ),
                     Err(error) => eprintln!("xi: {error}"),
                 }

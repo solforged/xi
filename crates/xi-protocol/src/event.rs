@@ -259,12 +259,12 @@ mod tests {
 
     #[test]
     fn reasoning_changed_wire_shape() {
-        let event = EventKind::ReasoningChanged {
-            reasoning: Reasoning::High,
-        };
-        let wire = json!({"type": "reasoning_changed", "reasoning": "high"});
-        assert_eq!(serde_json::to_value(&event).unwrap(), wire);
-        assert_eq!(serde_json::from_value::<EventKind>(wire).unwrap(), event);
+        for (reasoning, name) in [(Reasoning::High, "high"), (Reasoning::XHigh, "xhigh")] {
+            let event = EventKind::ReasoningChanged { reasoning };
+            let wire = json!({"type": "reasoning_changed", "reasoning": name});
+            assert_eq!(serde_json::to_value(&event).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<EventKind>(wire).unwrap(), event);
+        }
     }
 
     #[test]

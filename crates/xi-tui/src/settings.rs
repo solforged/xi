@@ -193,7 +193,7 @@ impl Settings {
                 },
                 Row::Reasoning => Action::Set {
                     key: "reasoning",
-                    value: Value::String(crate::reasoning_name(reasoning).into()),
+                    value: Value::String(reasoning.name().into()),
                 },
                 _ => Action::None,
             };
@@ -277,7 +277,7 @@ impl Settings {
             Row::Reasoning => {
                 return (
                     "Reasoning".into(),
-                    crate::reasoning_name(reasoning).into(),
+                    reasoning.name().into(),
                     "session".into(),
                 );
             }

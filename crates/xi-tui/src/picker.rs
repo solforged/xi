@@ -140,7 +140,7 @@ impl Picker {
                 entry.model.model,
                 window(entry.info.context_window)
             );
-            if entry.info.reasoning {
+            if !entry.info.reasoning.is_empty() {
                 label.push_str(" · think");
             }
             if let Some(pricing) = entry.info.pricing {
@@ -205,7 +205,7 @@ mod tests {
                 id: id.into(),
                 context_window: 1_000_000,
                 max_output: 4_096,
-                reasoning: true,
+                reasoning: vec![Reasoning::Low, Reasoning::Medium, Reasoning::High],
                 pricing: None,
             },
             available,

@@ -57,7 +57,7 @@ async fn signed_thinking_unknown_blocks_tools_usage_and_request_round_trip() {
         &server,
         Api::AnthropicMessages,
         "claude-sonnet-4-6",
-        true,
+        &Reasoning::ALL,
         Auth::File(key.path().into()),
     );
     let mut request = request();
@@ -239,10 +239,10 @@ async fn thinking_modes_budgets_and_cache_only_on_last_tool() {
         ),
         (
             "claude-opus-5-5",
-            Reasoning::Off,
+            Reasoning::Max,
             8192,
             json!({"type":"adaptive","display":"summarized"}),
-            Some("low"),
+            Some("max"),
         ),
         (
             "claude-sonnet-5-5",
@@ -266,6 +266,20 @@ async fn thinking_modes_budgets_and_cache_only_on_last_tool() {
             None,
         ),
         (
+            "claude-opus-4-7",
+            Reasoning::XHigh,
+            8192,
+            json!({"type":"adaptive"}),
+            Some("xhigh"),
+        ),
+        (
+            "claude-sonnet-4-5",
+            Reasoning::XHigh,
+            65536,
+            json!({"type":"enabled","budget_tokens":32768}),
+            None,
+        ),
+        (
             "claude-sonnet-4-5",
             Reasoning::Low,
             8192,
@@ -275,7 +289,13 @@ async fn thinking_modes_budgets_and_cache_only_on_last_tool() {
     ] {
         let server = MockServer::start().await;
         mock(&server, Api::AnthropicMessages, anthropic_text("end_turn")).await;
-        let provider = provider(&server, Api::AnthropicMessages, model, true, Auth::None);
+        let provider = provider(
+            &server,
+            Api::AnthropicMessages,
+            model,
+            &Reasoning::ALL,
+            Auth::None,
+        );
         let mut request = request();
         request.model = model.into();
         request.reasoning = reasoning;
@@ -311,7 +331,7 @@ async fn known_blocks_with_extra_fields_remain_lossless() {
         &server,
         Api::AnthropicMessages,
         "test-model",
-        false,
+        &[],
         Auth::None,
     );
     let mut request = request();

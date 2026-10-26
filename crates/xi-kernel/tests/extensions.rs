@@ -160,7 +160,7 @@ impl Fixture {
                     id: "test".into(),
                     context_window: 8192,
                     max_output: 1024,
-                    reasoning: false,
+                    reasoning: Vec::new(),
                     pricing: None,
                 },
                 tools,
