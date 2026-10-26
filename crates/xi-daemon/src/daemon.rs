@@ -59,7 +59,6 @@ impl Daemon {
             idle_since: Instant::now(),
             forwards: 0,
             shutdown: None,
-            shutdown_deadline: None,
             exe_changed: false,
         };
         tokio::spawn(actor.run(incoming, finished));
@@ -147,10 +146,28 @@ struct Worker {
     path: Option<PathBuf>,
     buffered: Vec<(String, Value)>,
     tools: HashMap<ToolCallId, String>,
+    approval: ApprovalPolicy,
     turns: usize,
     idle_since: Instant,
     closing: bool,
+    close_deadline: Option<Instant>,
     close_replies: Vec<(u64, RequestId)>,
+}
+
+impl Worker {
+    fn begin_close(&mut self, key: u64, commands: &mpsc::UnboundedSender<Command>) {
+        self.closing = true;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        self.close_deadline = Some(deadline);
+        let commands = commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let _ = commands.send(Command::CloseExpired {
+                worker: key,
+                deadline,
+            });
+        });
+    }
 }
 
 enum Command {
@@ -188,6 +205,10 @@ enum Command {
     Exited {
         worker: u64,
         status: Option<i32>,
+    },
+    CloseExpired {
+        worker: u64,
+        deadline: Instant,
     },
     ExecutableChanged,
 }
@@ -229,7 +250,6 @@ struct Router {
     idle_since: Instant,
     forwards: usize,
     shutdown: Option<ShutdownWhen>,
-    shutdown_deadline: Option<Instant>,
     exe_changed: bool,
 }
 
@@ -331,6 +351,17 @@ impl Router {
             }
             Command::WorkerCall { worker, call } => self.worker_call(worker, call),
             Command::Exited { worker, status } => self.worker_exited(worker, status),
+            Command::CloseExpired { worker, deadline } => {
+                if let Some(worker) = self.workers.get_mut(&worker)
+                    && worker.close_deadline == Some(deadline)
+                {
+                    worker.close_deadline = None;
+                    if let Some(kill) = worker.kill.take() {
+                        kill();
+                    }
+                    worker.peer.close();
+                }
+            }
             Command::ExecutableChanged => self.exe_changed = true,
         }
     }
@@ -562,9 +593,14 @@ impl Router {
                 path: start.path,
                 buffered: Vec::new(),
                 tools: HashMap::new(),
+                approval: match &start.params {
+                    WorkerStartParams::Create(params) => params.options.approval,
+                    WorkerStartParams::Open(params) => params.options.approval,
+                },
                 turns: 0,
                 idle_since: Instant::now(),
                 closing: false,
+                close_deadline: None,
                 close_replies: Vec::new(),
             },
         );
@@ -619,7 +655,7 @@ impl Router {
             return;
         };
         match result {
-            Ok(result) => {
+            Ok(mut result) => {
                 worker.path = result
                     .info
                     .path
@@ -634,9 +670,13 @@ impl Router {
                 if let Some(connection) = self.clients.get_mut(&client) {
                     connection.attached.insert(result.info.session);
                 }
-                for pending in &result.pending_approvals {
-                    self.inbox
-                        .insert((pending.session, pending.call.clone()), pending.clone());
+                if worker.approval == ApprovalPolicy::Client {
+                    for pending in &result.pending_approvals {
+                        self.inbox
+                            .insert((pending.session, pending.call.clone()), pending.clone());
+                    }
+                } else {
+                    result.pending_approvals.clear();
                 }
                 self.respond(client, request, encode(result));
                 for (method, params) in buffered {
@@ -671,7 +711,7 @@ impl Router {
             worker.turns += 1;
         }
         if method == "session/close" {
-            worker.closing = true;
+            worker.begin_close(key, &self.commands);
         }
         self.forwards += 1;
         let peer = worker.peer.clone();
@@ -744,7 +784,12 @@ impl Router {
                 }
             }
             if method == "session/close" {
-                worker.closing = result.is_ok();
+                if result.is_ok() {
+                    worker.begin_close(key, &self.commands);
+                } else if worker.kill.is_some() && self.shutdown != Some(ShutdownWhen::Now) {
+                    worker.closing = false;
+                    worker.close_deadline = None;
+                }
                 if result.is_ok() {
                     if let (Some(client), Some(id)) = (client, id.as_ref()) {
                         worker.close_replies.push((client, id.clone()));
@@ -843,7 +888,7 @@ impl Router {
                     action,
                     decision: Decision::Ask,
                     rule,
-                } => {
+                } if worker.approval == ApprovalPolicy::Client => {
                     let approval = PendingApproval {
                         session,
                         call: call.clone(),
@@ -922,15 +967,18 @@ impl Router {
         }
         self.shutdown = Some(when);
         if when == ShutdownWhen::Now {
-            self.shutdown_deadline = Some(Instant::now() + Duration::from_secs(5));
             let workers: Vec<_> = self
                 .workers
-                .iter()
+                .iter_mut()
                 .filter_map(|(key, worker)| {
                     worker
                         .info
                         .as_ref()
-                        .map(|info| (*key, info.session, worker.peer.clone()))
+                        .map(|info| (info.session, worker.peer.clone()))
+                        .map(|(session, peer)| {
+                            worker.begin_close(*key, &self.commands);
+                            (*key, session, peer)
+                        })
                 })
                 .collect();
             for (key, session, peer) in workers {
@@ -975,18 +1023,6 @@ impl Router {
     }
 
     fn tick(&mut self, idle: Duration) {
-        if self
-            .shutdown_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.shutdown_deadline = None;
-            for worker in self.workers.values_mut() {
-                if let Some(kill) = worker.kill.take() {
-                    kill();
-                }
-                worker.peer.close();
-            }
-        }
         if self.shutdown != Some(ShutdownWhen::Now) {
             let expired: Vec<_> = self
                 .workers
@@ -1027,7 +1063,8 @@ impl Router {
 
     fn worker_id(&self, session: SessionId) -> Option<u64> {
         self.workers.iter().find_map(|(id, worker)| {
-            (worker.info.as_ref().map(|info| info.session) == Some(session)).then_some(*id)
+            (!worker.closing && worker.info.as_ref().map(|info| info.session) == Some(session))
+                .then_some(*id)
         })
     }
 
@@ -1052,13 +1089,16 @@ impl Router {
                     path: info.path.clone(),
                     cwd: info.cwd.clone(),
                     model: info.model.clone(),
-                    head: Some(info.head),
-                    running: worker.turns > 0,
-                    pending_approvals: self
-                        .inbox
-                        .keys()
-                        .filter(|(session, _)| *session == info.session)
-                        .count(),
+                    head: (!worker.closing).then_some(info.head),
+                    running: !worker.closing && worker.turns > 0,
+                    pending_approvals: if worker.closing {
+                        0
+                    } else {
+                        self.inbox
+                            .keys()
+                            .filter(|(session, _)| *session == info.session)
+                            .count()
+                    },
                     parent_session: info.parent_session,
                 })
             })

@@ -13,12 +13,14 @@ futures.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
-xi-kernel.workspace = true
+xi-client.workspace = true
 xi-protocol.workspace = true
-xi-provider.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+xi-daemon.workspace = true
+xi-kernel.workspace = true
+xi-provider.workspace = true
 xi-tools.workspace = true
 
 [lints]

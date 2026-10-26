@@ -141,7 +141,12 @@ async fn initializes_first_and_sends_typed_create_prompt_and_approval_requests()
         &daemon,
         &mut incoming,
         PromptParams { session, content },
-        PromptResult { head }
+        PromptResult {
+            head,
+            failed: false,
+            cancelled: false,
+            text: "done".into(),
+        }
     );
     let pending = PendingApproval {
         session,

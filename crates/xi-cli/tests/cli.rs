@@ -1,6 +1,6 @@
 //! Executable smoke tests that do not require a provider or sandbox helper.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
@@ -24,10 +24,22 @@ fn help_and_config_errors_have_documented_exit_status() {
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("--max-turns"));
     assert!(help.contains("--on-ask"));
+    assert!(help.contains("daemon"));
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("worker"))
+    );
+    let install_help = command(dir.path())
+        .args(["daemon", "install", "--help"])
+        .output()
+        .unwrap();
+    assert!(install_help.status.success());
     let invalid = dir.path().join("invalid.toml");
     std::fs::write(&invalid, "reasoning = 'impossible'").unwrap();
     let error = command(dir.path())
         .args(["--config", invalid.to_str().unwrap(), "-p", "hello"])
+        .env("XI_BIN", dir.path().join("must-not-start"))
         .output()
         .unwrap();
     assert_eq!(error.status.code(), Some(2));
@@ -36,6 +48,8 @@ fn help_and_config_errors_have_documented_exit_status() {
             .unwrap()
             .contains("invalid.toml")
     );
+    assert!(!dir.path().join("data/xi/sessions").exists());
+    assert!(!dir.path().join("state/xi").exists());
     let usage = command(dir.path())
         .args(["-p", "hello", "--max-turns", "0"])
         .output()
@@ -81,19 +95,52 @@ fn serve_creates_a_durable_session_over_stdio_without_model_access() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut messages = Vec::new();
     writeln!(
         stdin,
         "{}",
-        json!({"jsonrpc":"2.0", "id":1, "method":"session/create", "params":{"cwd":workspace}})
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocol_version": xi_protocol::PROTOCOL_VERSION,
+                "client": {"name": "cli-test", "version": "0"},
+            },
+        })
     )
     .unwrap();
+    read_until(&mut stdout, &mut messages, |message| message["id"] == 1);
+    assert_eq!(
+        messages.last().unwrap()["result"]["capabilities"]["private"],
+        true,
+    );
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0", "id":2, "method":"session/create", "params":{"cwd":workspace}})
+    )
+    .unwrap();
+    read_until(&mut stdout, &mut messages, |message| message["id"] == 2);
+    let reply = messages.iter().find(|message| message["id"] == 2).unwrap();
+    let result = &reply["result"];
+    let events = result["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "session_started");
+    assert!(!result["running"].as_bool().unwrap());
+    let path = result["info"]["path"].as_str().unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
     writeln!(stdin, "{{bad-json").unwrap();
+    read_until(&mut stdout, &mut messages, |message| {
+        message["error"]["code"] == -32700
+    });
     writeln!(
         stdin,
         "{}",
-        json!({"jsonrpc":"2.0", "id":2, "method":"not/a/method"})
+        json!({"jsonrpc":"2.0", "id":3, "method":"not/a/method"})
     )
     .unwrap();
+    read_until(&mut stdout, &mut messages, |message| message["id"] == 3);
+    assert_eq!(messages.last().unwrap()["error"]["code"], -32601);
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -101,22 +148,17 @@ fn serve_creates_a_durable_session_over_stdio_without_model_access() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let messages: Vec<Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(messages[0]["method"], "event/appended");
-    assert_eq!(messages[0]["params"]["event"]["type"], "session_started");
-    let reply = messages.iter().find(|m| m["id"] == 1).unwrap();
-    let result = &reply["result"];
-    assert_eq!(result["events"].as_array().unwrap().len(), 1);
-    let path = result["path"].as_str().unwrap();
-    assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
-    assert!(messages.iter().any(|m| m["error"]["code"] == -32700));
-    assert!(
-        messages
-            .iter()
-            .any(|m| m["id"] == 2 && m["error"]["code"] == -32601)
-    );
+}
+
+fn read_until(reader: &mut impl BufRead, messages: &mut Vec<Value>, done: impl Fn(&Value) -> bool) {
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0, "unexpected EOF");
+        let message = serde_json::from_str(&line).unwrap();
+        let finished = done(&message);
+        messages.push(message);
+        if finished {
+            break;
+        }
+    }
 }

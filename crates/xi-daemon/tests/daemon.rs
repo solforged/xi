@@ -7,16 +7,16 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use xi_client::peer::{Incoming, Peer, PeerError};
-use xi_daemon::{Daemon, DaemonOptions, InProcessSpawner, Spawner};
+use xi_daemon::{Daemon, DaemonOptions, InProcessSpawner, Spawner, WorkerProcess};
 use xi_kernel::Backend;
 use xi_kernel::config::{DaemonSettings, Paths};
-use xi_protocol::event::{StopReason, Usage};
+use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::methods::client::*;
 use xi_protocol::model::ModelInfo;
 use xi_protocol::rpc::{RequestMethod, RpcError};
-use xi_protocol::{Block, EventKind, SessionId};
+use xi_protocol::{Block, EventId, EventKind, SessionId};
 use xi_provider::{Provider, Request, Response};
 
 struct Script(Mutex<VecDeque<Response>>);
@@ -104,6 +104,65 @@ impl Fixture {
             model: None,
             options: SessionOptions::default(),
         }
+    }
+}
+
+struct StubbornSpawner {
+    session: AttachResult,
+    answers_close: bool,
+    closes: mpsc::UnboundedSender<tokio::time::Instant>,
+    kills: mpsc::UnboundedSender<tokio::time::Instant>,
+}
+
+impl Spawner for StubbornSpawner {
+    fn spawn(&self) -> BoxFuture<'_, std::io::Result<WorkerProcess>> {
+        Box::pin(async move {
+            let (daemon, worker) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let (worker_reader, worker_writer) = tokio::io::split(worker);
+            let (peer, mut incoming) = Peer::spawn(worker_reader, worker_writer);
+            let (kill, mut killed) = oneshot::channel();
+            let session = self.session.clone();
+            let answers_close = self.answers_close;
+            let closes = self.closes.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut killed => {
+                            peer.close();
+                            return None;
+                        }
+                        Some(Incoming::Request { id, method, .. }) = incoming.recv() => {
+                            let result = match method.as_str() {
+                                "worker/start" | "session/attach" => {
+                                    serde_json::to_value(&session).unwrap()
+                                }
+                                "session/close" => {
+                                    let _ = closes.send(tokio::time::Instant::now());
+                                    if !answers_close {
+                                        continue;
+                                    }
+                                    Value::Null
+                                }
+                                "session/cancel" => Value::Null,
+                                _ => panic!("unexpected worker request {method}"),
+                            };
+                            peer.respond(id, Ok(result)).unwrap();
+                        }
+                    }
+                }
+            });
+            let kills = self.kills.clone();
+            Ok(WorkerProcess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                exited: Box::pin(async move { task.await.unwrap() }),
+                kill: Box::new(move || {
+                    let _ = kills.send(tokio::time::Instant::now());
+                    let _ = kill.send(());
+                }),
+            })
+        })
     }
 }
 
@@ -417,6 +476,75 @@ async fn asks_enter_inbox_broadcast_and_resolve_once() {
 }
 
 #[tokio::test]
+async fn headless_asks_do_not_enter_inbox_or_broadcast() {
+    for approval in [ApprovalPolicy::Deny, ApprovalPolicy::Allow] {
+        let fixture = Fixture::new();
+        let call = Response {
+            content: vec![Block::ToolUse {
+                id: "outside-read".into(),
+                name: "read".into(),
+                input: json!({ "path": fixture.outside }),
+            }],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+        };
+        let daemon = fixture.daemon(vec![call, done()], true);
+        let (peer, mut events) = connection(&daemon);
+        initialize(&peer).await;
+        let mut create = fixture.create();
+        create.options.approval = approval;
+        let session = request::<SessionCreate>(&peer, &create)
+            .await
+            .unwrap()
+            .info
+            .session;
+        prompt(&peer, session).await;
+        assert!(
+            request::<ApprovalList>(&peer, &())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let sessions = request::<SessionList>(&peer, &ListParams::default())
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].pending_approvals, 0);
+
+        // Attach is a wire-order barrier after all events from the completed turn.
+        let attached = request::<SessionAttach>(
+            &peer,
+            &AttachParams {
+                session,
+                since: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(attached.events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ToolDecision {
+                decision: xi_protocol::Decision::Ask,
+                ..
+            }
+        )));
+        assert!(attached.events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ApprovalResolved {
+                by: xi_protocol::event::Approver::Headless,
+                ..
+            }
+        )));
+        assert!(attached.pending_approvals.is_empty());
+        while let Ok(event) = events.try_recv() {
+            if let Incoming::Notification { method, .. } = event {
+                assert_ne!(method, "approval/pending");
+            }
+        }
+        stop(&peer, &daemon).await;
+    }
+}
+
+#[tokio::test]
 async fn worker_exit_notifies_attached_clients_and_running_list_watchers() {
     let fixture = Fixture::new();
     let daemon = fixture.daemon(vec![], false);
@@ -582,4 +710,148 @@ async fn detached_idle_worker_closes_without_exiting_connected_daemon() {
         0
     );
     stop(&peer, &daemon).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stubborn_workers_are_killed_and_closing_sessions_are_not_live() {
+    for answers_close in [true, false] {
+        for close_path in ["explicit", "idle", "shutdown"] {
+            // Keep filesystem work from auto-advancing the paused clock.
+            let clock = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            let fixture = Fixture::new();
+            let session = SessionId::generate();
+            let (closes, mut closed) = mpsc::unbounded_channel();
+            let (kills, mut killed) = mpsc::unbounded_channel();
+            let daemon = Daemon::new(DaemonOptions {
+                settings: DaemonSettings {
+                    idle_exit: 1,
+                    ..DaemonSettings::default()
+                },
+                paths: fixture.paths.clone(),
+                spawner: Arc::new(StubbornSpawner {
+                    session: AttachResult {
+                        info: SessionDetails {
+                            session,
+                            path: fixture.cwd.join("session.jsonl"),
+                            head: EventId::generate(),
+                            cwd: fixture.cwd.clone(),
+                            trusted: true,
+                            model: ModelRef {
+                                provider: "test".into(),
+                                model: "test".into(),
+                            },
+                            model_info: None,
+                            parent_session: None,
+                        },
+                        events: Vec::new(),
+                        partial: Vec::new(),
+                        running: false,
+                        pending_approvals: Vec::new(),
+                    },
+                    answers_close,
+                    closes,
+                    kills,
+                }),
+                private: false,
+            });
+            let (peer, mut events) = connection(&daemon);
+            initialize(&peer).await;
+            request::<SessionCreate>(&peer, &fixture.create())
+                .await
+                .unwrap();
+            request::<SessionList>(
+                &peer,
+                &ListParams {
+                    cwd: None,
+                    running: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+            let close_request = match close_path {
+                "explicit" => {
+                    let peer = peer.clone();
+                    Some(tokio::spawn(async move {
+                        request::<SessionClose>(&peer, &SessionRef { session }).await
+                    }))
+                }
+                "idle" => {
+                    request::<SessionDetach>(&peer, &SessionRef { session })
+                        .await
+                        .unwrap();
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    None
+                }
+                "shutdown" => {
+                    request::<DaemonShutdown>(
+                        &peer,
+                        &ShutdownParams {
+                            when: ShutdownWhen::Now,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    None
+                }
+                _ => unreachable!(),
+            };
+            let close_sent = closed.recv().await.unwrap();
+            assert!(killed.try_recv().is_err());
+            let listed = request::<SessionList>(&peer, &ListParams::default())
+                .await
+                .unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].session, session);
+            assert_eq!(listed[0].head, None);
+            assert!(!listed[0].running);
+            assert_eq!(listed[0].pending_approvals, 0);
+            assert_eq!(
+                error_code(
+                    request::<SessionAttach>(
+                        &peer,
+                        &AttachParams {
+                            session,
+                            since: None,
+                        },
+                    )
+                    .await,
+                ),
+                RpcError::UNKNOWN_SESSION
+            );
+            tokio::time::advance(Duration::from_secs(4)).await;
+            assert!(killed.try_recv().is_err());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            clock.abort();
+            let killed_at = tokio::time::timeout(Duration::from_secs(1), killed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(killed_at.duration_since(close_sent) <= Duration::from_secs(5));
+            let exited: ExitedParams =
+                serde_json::from_value(notification(&mut events, "session/exited").await).unwrap();
+            assert_eq!(exited.session, session);
+            assert_eq!(exited.status, None);
+            if let Some(close_request) = close_request {
+                let result = close_request.await.unwrap();
+                if answers_close {
+                    result.unwrap();
+                } else {
+                    assert_eq!(error_code(result), RpcError::WORKER_EXITED);
+                }
+            }
+            if close_path == "shutdown" {
+                daemon.finished().await;
+            } else {
+                assert_eq!(
+                    request::<DaemonStatus>(&peer, &()).await.unwrap().workers,
+                    0
+                );
+                stop(&peer, &daemon).await;
+            }
+        }
+    }
 }

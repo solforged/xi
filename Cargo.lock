@@ -2480,10 +2480,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "xi-client",
+ "xi-daemon",
  "xi-kernel",
  "xi-protocol",
- "xi-provider",
- "xi-session",
  "xi-tui",
 ]
 
@@ -2637,6 +2637,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-width",
+ "xi-client",
+ "xi-daemon",
  "xi-kernel",
  "xi-protocol",
  "xi-provider",
