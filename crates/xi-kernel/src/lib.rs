@@ -308,7 +308,10 @@ impl Session {
         std::fs::create_dir_all(&tmp)?;
         let spill = spill.canonicalize()?;
         let tmp = tmp.canonicalize()?;
-        let sandbox = config.sandbox_spec(&tmp, &spill, &system.skill_roots)?;
+        let git = log.file_path().with_extension("git");
+        config::write_sandbox_git(&git, &config.paths)?;
+        let git = git.canonicalize()?;
+        let sandbox = config.sandbox_spec(&tmp, &spill, &system.skill_roots, &git)?;
         let helper = std::env::var_os("XI_SANDBOX_EXEC")
             .map(PathBuf::from)
             .unwrap_or(std::env::current_exe()?.with_file_name("xi-sandbox-exec"));

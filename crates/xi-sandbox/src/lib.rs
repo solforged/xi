@@ -31,6 +31,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -202,6 +203,9 @@ pub struct Spec {
     pub network: Network,
     /// Names of environment variables passed through from the caller.
     pub env: Vec<String>,
+    /// Variables set to fixed values, applied after the passthrough list.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
     /// Run even when the kernel can enforce only some Landlock restrictions.
     /// Ignored on macOS, where Seatbelt must install the complete policy.
     pub allow_partial: bool,
@@ -236,6 +240,7 @@ impl Spec {
             cwd: workspace,
             network: Network::Isolated,
             env: DEFAULT_ENV.iter().map(|&name| name.to_owned()).collect(),
+            vars: BTreeMap::new(),
             allow_partial: false,
         }
     }
@@ -265,8 +270,9 @@ impl Spec {
 
     /// Builds a command that runs `program` inside this sandbox through the
     /// helper binary at `helper`. The environment is cleared except for
-    /// [`Self::env`]. `TMPDIR` is `/tmp` on Linux and [`Self::tmp`] on macOS.
-    /// Variables added to the returned command afterwards pass through too.
+    /// [`Self::env`], then [`Self::vars`] are set. `TMPDIR` is `/tmp` on
+    /// Linux and [`Self::tmp`] on macOS. Variables added to the returned
+    /// command afterwards pass through too.
     ///
     /// # Errors
     /// Fails if a path is relative or the spec cannot be encoded.
@@ -294,6 +300,7 @@ impl Spec {
                 command.env(name, value);
             }
         }
+        command.envs(&self.vars);
         #[cfg(target_os = "macos")]
         command.env("TMPDIR", &self.tmp);
         #[cfg(not(target_os = "macos"))]

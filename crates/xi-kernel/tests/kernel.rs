@@ -468,8 +468,9 @@ fn explicit_config_order_and_sandbox_field_layering() {
     assert_eq!(config.model.provider, "two");
     let tmp = fixture.workspace.join("tmp");
     let spill = fixture.paths.data.join("spill");
+    let git = fixture.paths.data.join("git");
     let spec = config
-        .sandbox_spec(&tmp, &spill, &[fixture.paths.config.join("skills")])
+        .sandbox_spec(&tmp, &spill, &[fixture.paths.config.join("skills")], &git)
         .unwrap();
     assert!(spec.readable.contains(&fixture.paths.home.join(".cargo")));
     assert!(spec.readable.contains(&spill));
