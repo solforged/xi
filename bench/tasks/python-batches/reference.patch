@@ -1,0 +1,43 @@
+diff --git a/batches.py b/batches.py
+--- a/batches.py
++++ b/batches.py
+@@ -1,8 +1,12 @@
+-def chunks(items, size):
+-    """Yield lists of at most size items, preserving input order."""
+-    batch = []
+-    for item in items:
+-        batch.append(item)
+-        if len(batch) == size:
+-            yield batch
+-            batch = []
++def chunks(items, size):
++    """Yield lists of at most size items, preserving input order."""
++    if size <= 0:
++        raise ValueError("size must be positive")
++    batch = []
++    for item in items:
++        batch.append(item)
++        if len(batch) == size:
++            yield batch
++            batch = []
++    if batch:
++        yield batch
+diff --git a/measures.py b/measures.py
+--- a/measures.py
++++ b/measures.py
+@@ -1,4 +1,11 @@
+-def weighted_mean(pairs):
+-    """Average (value, nonnegative weight) pairs; require positive total weight."""
+-    pairs = list(pairs)
+-    return sum(value * weight for value, weight in pairs) / len(pairs)
++def weighted_mean(pairs):
++    """Average (value, nonnegative weight) pairs; require positive total weight."""
++    numerator = denominator = 0
++    for value, weight in pairs:
++        if weight < 0:
++            raise ValueError("negative weight")
++        numerator += value * weight
++        denominator += weight
++    if denominator == 0:
++        raise ValueError("positive total weight required")
++    return numerator / denominator

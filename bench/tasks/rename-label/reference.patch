@@ -1,0 +1,32 @@
+diff --git a/labels.py b/labels.py
+--- a/labels.py
++++ b/labels.py
+@@ -1,3 +1,3 @@
+-def render_label(name, count):
+-    """Render a stripped name and count without changing name casing."""
+-    return f"{name.strip() or '(unnamed)'}: {count}"
++def format_label(name, count):
++    """Render a stripped name and count without changing name casing."""
++    return f"{name.strip() or '(unnamed)'}: {count}"
+diff --git a/report.py b/report.py
+--- a/report.py
++++ b/report.py
+@@ -1,9 +1,9 @@
+-from labels import render_label
+-
+-
+-def report(rows):
+-    return "\n".join(render_label(name, count) for name, count in rows)
+-
+-
+-def total_line(count):
+-    return render_label("Total", count)
++from labels import format_label
++
++
++def report(rows):
++    return "\n".join(format_label(name, count) for name, count in rows)
++
++
++def total_line(count):
++    return format_label("Total", count)

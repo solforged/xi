@@ -1,0 +1,52 @@
+diff --git a/registry.py b/registry.py
+--- a/registry.py
++++ b/registry.py
+@@ -1,20 +1,20 @@
+-from importlib import import_module
+-
+-POLICIES = {
+-    "all": "visible",
+-    "archived-only": "active",
+-    "active-only": "active",
+-    "deleted-only": "deleted",
+-    "favorites": "favorite",
+-    "drafts": "draft",
+-    "published": "published",
+-    "shared": "shared",
+-    "private": "private",
+-    "large": "large",
+-    "small": "small",
+-    "tagged": "tagged",
+-}
+-
+-
+-def select_policy(mode):
+-    return import_module("policies." + POLICIES[mode]).include
++from importlib import import_module
++
++POLICIES = {
++    "all": "visible",
++    "archived-only": "archive",
++    "active-only": "active",
++    "deleted-only": "deleted",
++    "favorites": "favorite",
++    "drafts": "draft",
++    "published": "published",
++    "shared": "shared",
++    "private": "private",
++    "large": "large",
++    "small": "small",
++    "tagged": "tagged",
++}
++
++
++def select_policy(mode):
++    return import_module("policies." + POLICIES[mode]).include
+diff --git a/policies/archive.py b/policies/archive.py
+--- a/policies/archive.py
++++ b/policies/archive.py
+@@ -1,2 +1,2 @@
+-def include(document):
+-    return document["archived"]
++def include(document):
++    return document["archived"] and not document["deleted"]

@@ -1,0 +1,20 @@
+diff --git a/response_cache.py b/response_cache.py
+--- a/response_cache.py
++++ b/response_cache.py
+@@ -1,7 +1,9 @@
+-from urllib.parse import urlsplit, urlunsplit
+-
+-
+-def cache_key(method, url):
+-    """Build a method/URL key; fragments never reach the server."""
+-    parts = urlsplit(url)
+-    return method.upper(), urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
++from urllib.parse import urlsplit, urlunsplit
++
++
++def cache_key(method, url):
++    """Build a method/URL key; fragments never reach the server."""
++    parts = urlsplit(url)
++    userinfo, separator, hostport = parts.netloc.rpartition("@")
++    netloc = userinfo + separator + hostport.lower()
++    return method.upper(), urlunsplit((parts.scheme.lower(), netloc, parts.path, parts.query, ""))
