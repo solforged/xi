@@ -548,12 +548,12 @@ impl Transcript {
                 let mut lines = vec![head.dim("─".repeat(fill)).truncate(cols)];
                 let (rows, hidden) = digest(summary);
                 for (label, text) in rows {
-                    lines.push(
-                        Line::default()
-                            .dim(format!("  {label:<9} "))
-                            .ink(text)
-                            .truncate(cols),
-                    );
+                    let lead = if label.is_empty() {
+                        "  ".to_owned()
+                    } else {
+                        format!("  {label:<9} ")
+                    };
+                    lines.push(Line::default().dim(lead).ink(text).truncate(cols));
                 }
                 if hidden > 0 {
                     lines.push(
@@ -690,6 +690,24 @@ impl Transcript {
     }
 }
 
+/// Splits a summary line into a heading and any text after it on the same
+/// line. Models write the kernel's headings as `## Decisions`, `**Decisions**`
+/// or `- **Decisions**: text`.
+fn heading(line: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = line.strip_prefix('#') {
+        return Some((rest.trim_start_matches('#').trim(), ""));
+    }
+    let item = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line);
+    let (name, rest) = item.strip_prefix("**")?.split_once("**")?;
+    Some((
+        name.trim_end_matches(':').trim(),
+        rest.trim_start_matches(':').trim(),
+    ))
+}
+
 /// Rows that stand for a compaction summary: the first entry under each of
 /// the kernel's headings that says where the work stands, with a short
 /// label, and how many lines the digest leaves out. A summary without those
@@ -712,20 +730,33 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
     let mut rows = Vec::new();
     let mut label = None;
     for line in &lines {
-        let heading = line.trim_start_matches('#').trim_matches('*').trim();
-        if line.starts_with('#') || (line.starts_with("**") && line.ends_with("**")) {
-            let lower = heading.to_lowercase();
-            label = LABELS
+        // A heading is a `#` line or a bold lead naming one of the kernel's
+        // sections; bold words inside an entry are not.
+        let found = heading(line).and_then(|(name, rest)| {
+            let lower = name.to_lowercase();
+            let known = LABELS
                 .iter()
                 .find(|(prefix, _)| lower.starts_with(prefix))
                 .map(|(_, l)| *l);
-            continue;
-        }
+            (line.starts_with('#') || known.is_some()).then_some((known, rest))
+        });
+        let text = match found {
+            Some((known, rest)) => {
+                label = known;
+                if rest.is_empty() {
+                    continue;
+                }
+                rest
+            }
+            None => line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line),
+        };
         if let Some(l) = label.take()
             && rows.len() < ROWS
         {
-            let text = line.trim_start_matches(['-', '*', ' ']).to_owned();
-            rows.push((l, text));
+            rows.push((l, text.to_owned()));
         }
     }
     if rows.is_empty() {
@@ -1020,6 +1051,24 @@ mod tests {
         // The divider already ended in a blank row, so no gap comes first.
         assert!(full[0].ends_with("full summary · 12 lines"), "{full:?}");
         assert_eq!(full[1], "  └ ## User goal and constraints");
+    }
+
+    #[test]
+    fn digest_reads_bold_lead_headings_and_ignores_bold_inside_entries() {
+        let summary = "- **User goal and constraints**: Fix it.\n\n- **Decisions**:\n  - **Kept** the API.\n\n- **Files read or changed, with paths and key facts**:\n  - `src/lib.rs`: edited.\n\n- **Commands run and results**:\n  - `cargo test`: ok\n\n- **Current state**: All tests pass.\n";
+        let (rows, hidden) = digest(summary);
+        assert_eq!(
+            rows,
+            [
+                ("goal", "Fix it.".to_owned()),
+                ("decided", "**Kept** the API.".to_owned()),
+                ("touched", "`src/lib.rs`: edited.".to_owned()),
+                ("state", "All tests pass.".to_owned()),
+            ]
+        );
+        assert_eq!(hidden, 4);
+        let (rows, _) = digest("An extension's own summary.\nSecond line.");
+        assert_eq!(rows[0], ("", "An extension's own summary.".to_owned()));
     }
 
     #[test]
