@@ -18,7 +18,7 @@ pub mod rpc;
 pub mod runtime;
 
 pub use content::{Block, OutputBlock, ToolOutput};
-pub use event::{Decision, Event, EventKind};
+pub use event::{Decision, Event, EventKind, Remember};
 pub use ids::{EventId, ExtensionId, SessionId, Timestamp, ToolCallId};
 
 /// Protocol version spoken by this crate. Version 0 makes no compatibility promises.

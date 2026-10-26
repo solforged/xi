@@ -14,7 +14,7 @@ use xi_client::peer::{Incoming, Peer, PeerError};
 use xi_kernel::Backend;
 use xi_kernel::config::Paths;
 use xi_kernel::worker::{WorkerSetup, run};
-use xi_protocol::event::{ModelRef, StopReason, Usage};
+use xi_protocol::event::{ModelRef, Remember, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::{
     ApprovalResolve, AttachParams, AttachResult, CreateParams, Delta, DeltaParams, EventParams,
@@ -875,6 +875,7 @@ async fn attach_partial_and_cancel_stay_responsive_during_prompt() {
                 session,
                 call: "unknown".into(),
                 approved: true,
+                remember: Remember::Once,
             },
         )
         .await,
@@ -1445,10 +1446,32 @@ async fn attach_mirrors_pending_approvals_and_resolve_stays_responsive() {
     assert_eq!(snapshot.pending_approvals[0].session, session);
     assert_eq!(snapshot.pending_approvals[0].call, ToolCallId::from("ask"));
     assert_eq!(snapshot.pending_approvals[0].tool, "fake");
+    assert!(!snapshot.pending_approvals[0].taint);
+    assert!(!snapshot.pending_approvals[0].trusted);
+    let invalid = xi_protocol::methods::client::ResolveParams {
+        session,
+        call: "ask".into(),
+        approved: false,
+        remember: Remember::Session,
+    };
+    assert_code(
+        request::<ApprovalResolve>(&harness.peer, &invalid).await,
+        RpcError::INVALID_PARAMS,
+    );
+    let untrusted = xi_protocol::methods::client::ResolveParams {
+        approved: true,
+        remember: Remember::Workspace,
+        ..invalid
+    };
+    assert_code(
+        request::<ApprovalResolve>(&harness.peer, &untrusted).await,
+        RpcError::INVALID_PARAMS,
+    );
     let resolve = xi_protocol::methods::client::ResolveParams {
         session,
         call: "ask".into(),
         approved: true,
+        remember: Remember::Session,
     };
     request::<ApprovalResolve>(&harness.peer, &resolve)
         .await
@@ -1478,7 +1501,11 @@ async fn attach_mirrors_pending_approvals_and_resolve_stays_responsive() {
     assert!(snapshot.pending_approvals.is_empty());
     assert!(snapshot.events.iter().any(|event| matches!(
         event.kind,
-        EventKind::ApprovalResolved { approved: true, .. }
+        EventKind::ApprovalResolved {
+            approved: true,
+            remember: Remember::Session,
+            ..
+        }
     )));
     assert!(
         snapshot

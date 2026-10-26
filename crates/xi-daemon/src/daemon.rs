@@ -1,10 +1,10 @@
 //! Client routing, worker supervision and the daemon's session index.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,7 +17,7 @@ use xi_kernel::config::{DaemonSettings, Paths, sessions_root};
 use xi_protocol::event::EventKind;
 use xi_protocol::methods::{client::*, worker::*};
 use xi_protocol::rpc::{RequestId, RpcError};
-use xi_protocol::{Block, Decision, Event, EventId, SessionId, ToolCallId};
+use xi_protocol::{Block, Decision, Event, EventId, SessionId, Timestamp, ToolCallId};
 
 use crate::scheduler::Scheduler;
 use crate::spawn::{Spawner, WorkerProcess};
@@ -255,7 +255,7 @@ struct Router {
     clients: HashMap<u64, Connection>,
     workers: HashMap<u64, Worker>,
     starts: HashMap<u64, Start>,
-    inbox: HashMap<(SessionId, ToolCallId), PendingApproval>,
+    inbox: HashMap<(SessionId, ToolCallId), (Timestamp, PendingApproval)>,
     scheduler: Scheduler<Reply>,
     next_id: u64,
     started: Instant,
@@ -505,8 +505,19 @@ impl Router {
             "approval/list" => {
                 decode::<()>(params)?;
                 let mut approvals: Vec<_> = self.inbox.values().cloned().collect();
-                approvals.sort_by(|a, b| (a.session, &a.call).cmp(&(b.session, &b.call)));
-                self.respond(client, id, encode(approvals));
+                approvals.sort_by(|(at, a), (bt, b)| {
+                    (at, a.session, &a.call).cmp(&(bt, b.session, &b.call))
+                });
+                self.respond(
+                    client,
+                    id,
+                    encode(
+                        approvals
+                            .into_iter()
+                            .map(|(_, approval)| approval)
+                            .collect::<Vec<_>>(),
+                    ),
+                );
             }
             "daemon/status" => {
                 decode::<()>(params)?;
@@ -732,8 +743,14 @@ impl Router {
                 }
                 if worker.approval == ApprovalPolicy::Client {
                     for pending in &result.pending_approvals {
-                        self.inbox
-                            .insert((pending.session, pending.call.clone()), pending.clone());
+                        let at = result.events.iter().find_map(|event| {
+                            matches!(&event.kind, EventKind::ToolDecision { call, .. } if call == &pending.call)
+                                .then_some(event.at)
+                        }).unwrap_or(Timestamp(0));
+                        self.inbox.insert(
+                            (pending.session, pending.call.clone()),
+                            (at, pending.clone()),
+                        );
                     }
                 } else {
                     result.pending_approvals.clear();
@@ -953,6 +970,7 @@ impl Router {
                     action,
                     decision: Decision::Ask,
                     rule,
+                    taint,
                 } if worker.approval == ApprovalPolicy::Client => {
                     let approval = PendingApproval {
                         session,
@@ -960,10 +978,12 @@ impl Router {
                         tool: worker.tools.get(call).cloned().unwrap_or_default(),
                         action: action.clone(),
                         rule: rule.clone(),
+                        taint: *taint,
+                        trusted: worker.info.as_ref().is_some_and(|info| info.trusted),
                     };
                     if self
                         .inbox
-                        .insert((session, call.clone()), approval.clone())
+                        .insert((session, call.clone()), (event.event.at, approval.clone()))
                         .is_none()
                     {
                         pending = Some(approval);
@@ -1196,6 +1216,7 @@ impl Router {
             .values()
             .filter_map(|worker| {
                 let info = worker.info.as_ref()?;
+                let metadata = log_metadata(&info.path);
                 Some(SessionSummary {
                     session: info.session,
                     path: info.path.clone(),
@@ -1212,6 +1233,9 @@ impl Router {
                             .count()
                     },
                     parent_session: info.parent_session,
+                    started: metadata.root.as_ref().map(|root| root.at),
+                    updated: metadata.updated,
+                    title: metadata.title,
                 })
             })
             .collect()
@@ -1273,15 +1297,8 @@ fn list_sessions(
                 {
                     continue;
                 }
-                let file = match std::fs::File::open(&path) {
-                    Ok(file) => file,
-                    Err(_) => continue,
-                };
-                let mut first = String::new();
-                if BufReader::new(file).read_line(&mut first).is_err() {
-                    continue;
-                }
-                let Ok(event) = serde_json::from_str::<Event>(&first) else {
+                let metadata = log_metadata(&path);
+                let Some(event) = metadata.root else {
                     continue;
                 };
                 if let EventKind::SessionStarted {
@@ -1302,6 +1319,9 @@ fn list_sessions(
                         running: false,
                         pending_approvals: 0,
                         parent_session,
+                        started: Some(event.at),
+                        updated: metadata.updated,
+                        title: metadata.title,
                     });
                 }
             }
@@ -1313,8 +1333,74 @@ fn list_sessions(
                 .running
                 .is_none_or(|running| running == session.running)
     });
-    live.sort_by_key(|session| session.session);
+    live.sort_by(|a, b| {
+        b.updated
+            .cmp(&a.updated)
+            .then_with(|| a.session.cmp(&b.session))
+    });
     Ok(live)
+}
+
+#[derive(Default)]
+struct LogMetadata {
+    root: Option<Event>,
+    updated: Option<Timestamp>,
+    title: Option<String>,
+}
+
+fn log_metadata(path: &Path) -> LogMetadata {
+    let mut metadata = LogMetadata::default();
+    let Ok(file) = std::fs::File::open(path) else {
+        return metadata;
+    };
+    metadata.updated = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .map(Timestamp);
+    let mut reader = BufReader::new(file.take(64 * 1024));
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || !line.ends_with('\n') {
+        return metadata;
+    }
+    let Ok(root) = serde_json::from_str::<Event>(&line) else {
+        return metadata;
+    };
+    if !matches!(root.kind, EventKind::SessionStarted { .. }) {
+        return metadata;
+    }
+    metadata.root = Some(root);
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).is_err() || !line.ends_with('\n') {
+            break;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&line) else {
+            break;
+        };
+        if let EventKind::UserMessage { content } = event.kind {
+            let text: String = content
+                .into_iter()
+                .filter_map(|block| match block {
+                    Block::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect();
+            if let Some(first) = text.lines().find(|line| !line.trim().is_empty()) {
+                let first = first.trim();
+                let mut chars = first.chars();
+                let mut title: String = chars.by_ref().take(80).collect();
+                if chars.next().is_some() {
+                    title.push('…');
+                }
+                metadata.title = Some(title);
+            }
+            break;
+        }
+    }
+    metadata
 }
 
 fn grant(replies: Vec<Reply>) {
@@ -1350,5 +1436,119 @@ fn peer_error(error: PeerError) -> RpcError {
         PeerError::Rpc(error) => error,
         PeerError::Closed => worker_exited(),
         PeerError::Json(error) => internal(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(session: SessionId) -> Event {
+        Event {
+            id: EventId::generate(),
+            parent: None,
+            at: Timestamp(11),
+            kind: EventKind::SessionStarted {
+                session,
+                cwd: "/work".into(),
+                model: xi_protocol::event::ModelRef {
+                    provider: "test".into(),
+                    model: "test".into(),
+                },
+                xi_version: "test".into(),
+                parent_session: None,
+            },
+        }
+    }
+
+    #[test]
+    fn metadata_scans_are_bounded_and_malformed_lines_are_not_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.jsonl");
+        let root = root(SessionId::generate());
+        let first = format!("{}\n", serde_json::to_string(&root).unwrap());
+        let prompt = Event {
+            id: EventId::generate(),
+            parent: Some(root.id),
+            at: Timestamp(12),
+            kind: EventKind::UserMessage {
+                content: vec![Block::Text {
+                    text: "title".into(),
+                }],
+            },
+        };
+        let last = format!("{}\n", serde_json::to_string(&prompt).unwrap());
+        let padding = Event {
+            id: EventId::generate(),
+            parent: Some(root.id),
+            at: Timestamp(12),
+            kind: EventKind::Custom {
+                extension: "test".into(),
+                kind: "large".into(),
+                data: json!("x".repeat(64 * 1024)),
+            },
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{first}{}\n{last}",
+                serde_json::to_string(&padding).unwrap()
+            ),
+        )
+        .unwrap();
+        let metadata = log_metadata(&path);
+        assert_eq!(
+            metadata.root.as_ref().map(|event| event.at),
+            Some(Timestamp(11))
+        );
+        assert!(metadata.updated.is_some());
+        assert_eq!(metadata.title, None);
+        std::fs::write(&path, format!("{first}not json\n{last}")).unwrap();
+        let metadata = log_metadata(&path);
+        assert_eq!(
+            metadata.root.as_ref().map(|event| event.at),
+            Some(Timestamp(11))
+        );
+        assert_eq!(metadata.title, None);
+        std::fs::write(&path, "not json\n").unwrap();
+        assert!(log_metadata(&path).root.is_none());
+        let missing = log_metadata(&directory.path().join("missing"));
+        assert!(missing.root.is_none());
+        assert!(missing.updated.is_none());
+        assert!(missing.title.is_none());
+    }
+
+    #[test]
+    fn saved_sessions_with_equal_mtimes_are_sorted_by_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut sessions = [SessionId::generate(), SessionId::generate()];
+        sessions.sort();
+        for (index, session) in sessions.iter().rev().enumerate() {
+            let path = workspace.join(format!("{index}.jsonl"));
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&root(*session)).unwrap()),
+            )
+            .unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(100))
+                .unwrap();
+        }
+        let listed = list_sessions(directory.path(), Vec::new(), ListParams::default()).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|summary| summary.session)
+                .collect::<Vec<_>>(),
+            sessions
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|summary| summary.updated == Some(Timestamp(100_000)))
+        );
     }
 }

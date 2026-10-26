@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 use xi_client::client::ClientNotification;
-use xi_protocol::event::{Decision, ModelRef, StopReason, Usage};
+use xi_protocol::event::{Decision, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::Pricing;
 use xi_protocol::{Block, EventKind, OutputBlock, Timestamp, ToolCallId, ToolOutput};
@@ -24,6 +24,85 @@ pub const SPINNER: [&str; 8] = ["┤", "┘", "┴", "└", "├", "┌", "┬",
 const RESULT_LINES: usize = 3;
 /// Streaming rows kept in the live region.
 const STREAM_ROWS: usize = 6;
+/// Diff rows shown before the rest is kept for ctrl+o.
+const DIFF_ROWS: usize = 8;
+
+/// How visible model reasoning is displayed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Thinking {
+    /// Show all reasoning text.
+    Full,
+    /// Show the first committed line or newest live line.
+    #[default]
+    First,
+    /// Hide reasoning text without hiding the activity indicator.
+    Hidden,
+}
+
+impl Thinking {
+    /// Cycles full, first line, hidden, then full again.
+    #[must_use]
+    pub fn next(self) -> Thinking {
+        match self {
+            Self::Full => Self::First,
+            Self::First => Self::Hidden,
+            Self::Hidden => Self::Full,
+        }
+    }
+
+    /// The name shown in display-setting notes.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::First => "first line",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    fn rows(self, text: &str, cols: usize, live: bool) -> Vec<Line> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        match self {
+            Self::Hidden => Vec::new(),
+            Self::Full => {
+                let rows = wrap(text, cols.saturating_sub(4));
+                let skip = if live {
+                    rows.len().saturating_sub(STREAM_ROWS)
+                } else {
+                    0
+                };
+                rows[skip..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        let lead = if i == 0 { "  ∴ " } else { "    " };
+                        Line::default().dim(lead).dim(row).truncate(cols)
+                    })
+                    .collect()
+            }
+            Self::First => {
+                let mut rows = text.lines();
+                let row = if live {
+                    rows.rfind(|line| !line.trim().is_empty())
+                } else {
+                    rows.find(|line| !line.trim().is_empty())
+                };
+                let Some(row) = row else { return Vec::new() };
+                let more = !live && rows.next().is_some();
+                let line = Line::default().dim("  ∴ ").dim(row);
+                vec![if more {
+                    line.truncate(cols.saturating_sub(9))
+                        .dim(" · ctrl+t")
+                        .truncate(cols)
+                } else {
+                    line.truncate(cols)
+                }]
+            }
+        }
+    }
+}
 
 /// An ask waiting on you.
 #[derive(Clone, Debug)]
@@ -36,19 +115,23 @@ pub struct Ask {
     pub action: String,
     /// The rule that matched, as `layer#index`.
     pub rule: Option<String>,
-    /// Whether the branch was tainted when it asked.
-    pub tainted: bool,
+    /// Whether taint caused this ask.
+    pub taint: bool,
+    /// Workspace trust supplied by a pending-approval notification.
+    pub trusted: Option<bool>,
 }
 
 struct Call {
     id: ToolCallId,
     name: String,
     arg: String,
+    input: Value,
     since: Option<Instant>,
     decided_at: Option<Timestamp>,
     decision: Option<Decision>,
     rule: Option<String>,
     approved: Option<bool>,
+    remember: Remember,
     result: Option<(ToolOutput, Option<std::path::PathBuf>, Timestamp)>,
 }
 
@@ -112,6 +195,10 @@ pub struct Transcript {
     stream: String,
     thinking: bool,
     asks: Vec<Ask>,
+    stream_thinking: String,
+    redacted_thinking: bool,
+    thinking_display: Thinking,
+    last_text: Option<String>,
     /// Whether the head's branch has read untrusted content.
     pub tainted: bool,
     /// Usage across the session.
@@ -217,6 +304,24 @@ fn text_of(output: &ToolOutput) -> String {
         .join("\n")
 }
 
+struct Diff<'a> {
+    rows: Vec<(Role, &'a str)>,
+    added: usize,
+    removed: Option<usize>,
+}
+
+fn diff_line(role: Role, text: &str, cols: usize) -> Line {
+    let lead = match role {
+        Role::Sanguine => "  - ",
+        Role::Verdigris => "  + ",
+        _ => "    ",
+    };
+    Line::default()
+        .span(role, false, lead)
+        .span(role, false, text)
+        .truncate(cols)
+}
+
 impl Call {
     fn mark(&self) -> Line {
         let Some((output, ..)) = &self.result else {
@@ -241,24 +346,100 @@ impl Call {
         }
     }
 
+    fn diff(&self) -> Option<Diff<'_>> {
+        match self.name.as_str() {
+            "edit" => {
+                let old: Vec<_> = self.input.get("old")?.as_str()?.lines().collect();
+                let new: Vec<_> = self.input.get("new")?.as_str()?.lines().collect();
+                let common_start = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+                let common_end = old[common_start..]
+                    .iter()
+                    .rev()
+                    .zip(new[common_start..].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let old_end = old.len() - common_end;
+                let new_end = new.len() - common_end;
+                let mut rows = Vec::new();
+                if common_start > 0 {
+                    rows.push((Role::Dim, old[common_start - 1]));
+                }
+                rows.extend(
+                    old[common_start..old_end]
+                        .iter()
+                        .map(|line| (Role::Sanguine, *line)),
+                );
+                rows.extend(
+                    new[common_start..new_end]
+                        .iter()
+                        .map(|line| (Role::Verdigris, *line)),
+                );
+                if common_end > 0 {
+                    rows.push((Role::Dim, old[old_end]));
+                }
+                Some(Diff {
+                    rows,
+                    added: new_end - common_start,
+                    removed: Some(old_end - common_start),
+                })
+            }
+            "hashline" => {
+                let mut rows = Vec::new();
+                for edit in self.input.get("edits")?.as_array()? {
+                    for line in edit.get("lines")?.as_array()? {
+                        rows.push((Role::Verdigris, line.as_str()?));
+                    }
+                }
+                Some(Diff {
+                    added: rows.len(),
+                    removed: None,
+                    rows,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// The block the call commits, and its whole result when the block cut
     /// lines from it.
     fn committed(&self, cols: usize) -> (Vec<Line>, Option<Detail>) {
         let Some((output, spill, at)) = &self.result else {
             return (Vec::new(), None);
         };
-        let text = text_of(output);
+        let diff = if output.is_error { None } else { self.diff() };
+        let text = if diff.is_some() {
+            String::new()
+        } else {
+            text_of(output)
+        };
         let count = text.lines().count();
         let mut meta = Vec::new();
+        if let Some(diff) = &diff {
+            meta.push(match diff.removed {
+                Some(removed) => format!("+{} −{removed}", diff.added),
+                None => format!("+{}", diff.added),
+            });
+        }
         match (self.decision, self.approved) {
-            (Some(Decision::Ask), Some(true)) => meta.push("allowed by you".to_owned()),
+            (Some(Decision::Ask), Some(true)) => meta.push(
+                match self.remember {
+                    Remember::Once => "allowed by you",
+                    Remember::Session => "allowed for this session",
+                    Remember::Workspace => "always allowed here",
+                }
+                .to_owned(),
+            ),
             (Some(Decision::Ask), Some(false)) => meta.push("denied by you".to_owned()),
             (Some(Decision::Deny), _) => meta.push("denied".to_owned()),
             _ => {}
         }
         // Built-in rules allow ordinary work; only rules someone wrote are news.
         if let Some(rule) = self.rule.as_ref().filter(|r| !r.starts_with("builtin#")) {
-            meta.push(rule.clone());
+            meta.push(if rule == "session" {
+                "allowed for this session".to_owned()
+            } else {
+                rule.clone()
+            });
         }
         let quiet = !output.is_error && matches!(self.name.as_str(), "read" | "search");
         if quiet {
@@ -280,6 +461,43 @@ impl Call {
             Line::default().span(role, false, meta.join(" · ")),
             cols,
         )];
+        if let Some(diff) = diff {
+            lines.extend(
+                diff.rows
+                    .iter()
+                    .take(DIFF_ROWS)
+                    .map(|(role, row)| diff_line(*role, row, cols)),
+            );
+            let hidden = diff.rows.len().saturating_sub(DIFF_ROWS);
+            if hidden > 0 {
+                lines.push(
+                    Line::default()
+                        .dim(format!("    … {hidden} more lines · ctrl+o"))
+                        .truncate(cols),
+                );
+                let mut text = String::new();
+                for (role, row) in diff.rows {
+                    text.push_str(match role {
+                        Role::Sanguine => "- ",
+                        Role::Verdigris => "+ ",
+                        _ => "  ",
+                    });
+                    text.push_str(row);
+                    text.push('\n');
+                }
+                return (
+                    lines,
+                    Some(Detail {
+                        head: self.head(self.mark()),
+                        what: "full diff",
+                        text,
+                        error: false,
+                        spill: spill.clone(),
+                    }),
+                );
+            }
+            return (lines, None);
+        }
         if quiet {
             return (lines, None);
         }
@@ -341,6 +559,23 @@ impl Transcript {
         self.thinking && self.stream.is_empty()
     }
 
+    /// Sets the thinking display for future committed output and the live region.
+    pub fn set_thinking(&mut self, thinking: Thinking) {
+        self.thinking_display = thinking;
+    }
+
+    /// The current thinking display.
+    #[must_use]
+    pub fn thinking_display(&self) -> Thinking {
+        self.thinking_display
+    }
+
+    /// Trimmed text of the newest applied assistant message with non-blank text.
+    #[must_use]
+    pub fn last_text(&self) -> Option<&str> {
+        self.last_text.as_deref()
+    }
+
     /// Starts counting a new turn.
     pub fn begin_turn(&mut self) {
         self.turn = Totals::default();
@@ -374,12 +609,17 @@ impl Transcript {
             ClientNotification::Reset(_) => {
                 self.stream.clear();
                 self.thinking = false;
+                self.stream_thinking.clear();
+                self.redacted_thinking = false;
                 Vec::new()
             }
             ClientNotification::Delta(params) => {
                 match &params.delta {
                     Delta::Text { text } => self.stream.push_str(text),
-                    Delta::Thinking { .. } => self.thinking = true,
+                    Delta::Thinking { text } => {
+                        self.thinking = true;
+                        self.stream_thinking.push_str(text);
+                    }
                     Delta::ToolInput { .. } => {}
                 }
                 Vec::new()
@@ -388,14 +628,18 @@ impl Transcript {
                 self.event(&params.event.kind, params.event.at, cols)
             }
             ClientNotification::ApprovalPending(pending) => {
-                if !self.asks.iter().any(|ask| ask.call == pending.call) {
-                    self.asks.push(Ask {
-                        call: pending.call.clone(),
-                        tool: pending.tool.clone(),
-                        action: pending.action.clone(),
-                        rule: pending.rule.clone(),
-                        tainted: self.tainted,
-                    });
+                let ask = Ask {
+                    call: pending.call.clone(),
+                    tool: pending.tool.clone(),
+                    action: pending.action.clone(),
+                    rule: pending.rule.clone(),
+                    taint: pending.taint,
+                    trusted: Some(pending.trusted),
+                };
+                if let Some(existing) = self.asks.iter_mut().find(|a| a.call == pending.call) {
+                    *existing = ask;
+                } else {
+                    self.asks.push(ask);
                 }
                 Vec::new()
             }
@@ -418,10 +662,22 @@ impl Transcript {
     pub fn partial(&mut self, blocks: &[Block]) {
         self.stream.clear();
         self.thinking = false;
+        self.stream_thinking.clear();
+        self.redacted_thinking = false;
         for block in blocks {
             match block {
                 Block::Text { text } => self.stream.push_str(text),
-                Block::Thinking { .. } | Block::RedactedThinking { .. } => self.thinking = true,
+                Block::Thinking { text, .. } => {
+                    self.thinking = true;
+                    if !self.stream_thinking.is_empty() {
+                        self.stream_thinking.push('\n');
+                    }
+                    self.stream_thinking.push_str(text);
+                }
+                Block::RedactedThinking { .. } => {
+                    self.thinking = true;
+                    self.redacted_thinking = true;
+                }
                 _ => {}
             }
         }
@@ -477,12 +733,42 @@ impl Transcript {
             } => {
                 self.stream.clear();
                 self.thinking = false;
+                self.stream_thinking.clear();
+                self.redacted_thinking = false;
+                let text = content
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.trim().is_empty() {
+                    self.last_text = Some(text.trim().to_owned());
+                }
                 self.session.add(*usage);
                 self.turn.add(*usage);
                 let context = usage.input + usage.cache_read + usage.cache_write + usage.output;
                 // A cancelled request reports nothing; keep the last real size.
                 if context > 0 {
                     self.context = context;
+                }
+                for block in content {
+                    let lines = match block {
+                        Block::Thinking { text, .. } => {
+                            self.thinking_display.rows(text, cols, false)
+                        }
+                        Block::RedactedThinking { .. }
+                            if self.thinking_display != Thinking::Hidden =>
+                        {
+                            vec![Line::default().dim("  ∴ redacted thinking").truncate(cols)]
+                        }
+                        _ => Vec::new(),
+                    };
+                    if !lines.is_empty() {
+                        self.gap(&mut out);
+                        self.push(&mut out, lines);
+                    }
                 }
                 for block in content {
                     match block {
@@ -501,11 +787,13 @@ impl Transcript {
                             id: id.clone(),
                             name: name.clone(),
                             arg: headline_arg(name, input, self.workspace.as_deref()),
+                            input: input.clone(),
                             since: Some(Instant::now()),
                             decided_at: None,
                             decision: None,
                             rule: None,
                             approved: None,
+                            remember: Remember::Once,
                             result: None,
                         }),
                         _ => {}
@@ -525,8 +813,8 @@ impl Transcript {
                 action,
                 decision,
                 rule,
+                taint,
             } => {
-                let tainted = self.tainted;
                 if let Some(c) = self.call(call) {
                     c.decision = Some(*decision);
                     c.rule.clone_from(rule);
@@ -538,7 +826,8 @@ impl Transcript {
                             tool: c.name.clone(),
                             action: action.clone(),
                             rule: rule.clone(),
-                            tainted,
+                            taint: *taint,
+                            trusted: None,
                         };
                         if let Some(pending) = self.asks.iter_mut().find(|a| a.call == *call) {
                             *pending = ask;
@@ -548,10 +837,16 @@ impl Transcript {
                     }
                 }
             }
-            EventKind::ApprovalResolved { call, approved, .. } => {
+            EventKind::ApprovalResolved {
+                call,
+                approved,
+                remember,
+                ..
+            } => {
                 self.asks.retain(|a| &a.call != call);
                 if let Some(c) = self.call(call) {
                     c.approved = Some(*approved);
+                    c.remember = *remember;
                     c.since = Some(Instant::now());
                 }
             }
@@ -662,21 +957,43 @@ impl Transcript {
             Line::default().dim(format!("{} · {count} lines", detail.what)),
             cols,
         )];
-        for (i, row) in wrap(&detail.text, cols.saturating_sub(4))
-            .into_iter()
-            .enumerate()
-        {
-            let lead = if i == 0 {
-                Line::default().dim("  └ ")
-            } else {
-                Line::default().ink("    ")
-            };
-            let body = if detail.error && i == 0 {
-                Line::default().sanguine(row)
-            } else {
-                Line::default().ink(row)
-            };
-            lines.push(lead.extend(body));
+        if detail.what == "full diff" {
+            for row in detail.text.lines() {
+                let (role, body) = if let Some(body) = row.strip_prefix("- ") {
+                    (Role::Sanguine, body)
+                } else if let Some(body) = row.strip_prefix("+ ") {
+                    (Role::Verdigris, body)
+                } else {
+                    (Role::Dim, row.strip_prefix("  ").unwrap_or(row))
+                };
+                for (i, row) in wrap(body, cols.saturating_sub(4)).into_iter().enumerate() {
+                    lines.push(if i == 0 {
+                        diff_line(role, &row, cols)
+                    } else {
+                        Line::default()
+                            .span(role, false, "    ")
+                            .span(role, false, row)
+                            .truncate(cols)
+                    });
+                }
+            }
+        } else {
+            for (i, row) in wrap(&detail.text, cols.saturating_sub(4))
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if i == 0 {
+                    Line::default().dim("  └ ")
+                } else {
+                    Line::default().ink("    ")
+                };
+                let body = if detail.error && i == 0 {
+                    Line::default().sanguine(row)
+                } else {
+                    Line::default().ink(row)
+                };
+                lines.push(lead.extend(body));
+            }
         }
         if let Some(path) = &detail.spill {
             lines.push(
@@ -704,6 +1021,8 @@ impl Transcript {
     pub fn end_turn(&mut self) {
         self.stream.clear();
         self.thinking = false;
+        self.stream_thinking.clear();
+        self.redacted_thinking = false;
         self.asks.clear();
     }
 
@@ -719,6 +1038,15 @@ impl Transcript {
             }
             lines.push(Line::default());
         }
+        if self.thinking() {
+            lines.extend(
+                self.thinking_display
+                    .rows(&self.stream_thinking, cols, true),
+            );
+            if self.redacted_thinking && self.thinking_display != Thinking::Hidden {
+                lines.push(Line::default().dim("  ∴ redacted thinking").truncate(cols));
+            }
+        }
         for call in &self.calls {
             let waiting = call.decision == Some(Decision::Ask) && call.approved.is_none();
             let (mark, meta) = if waiting {
@@ -733,6 +1061,9 @@ impl Transcript {
                     u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)
                 });
                 let meta = match call.rule.as_ref().filter(|r| !r.starts_with("builtin#")) {
+                    Some(rule) if rule == "session" => {
+                        format!("allowed for this session · {}", duration(elapsed))
+                    }
                     Some(rule) => format!("{rule} · {}", duration(elapsed)),
                     None => duration(elapsed),
                 };
@@ -903,6 +1234,7 @@ mod tests {
             action: "exec pytest".into(),
             decision,
             rule: rule.map(Into::into),
+            taint: false,
         }
     }
 
@@ -967,7 +1299,8 @@ mod tests {
         );
         t.apply(&ev(decide("a", Decision::Ask, Some("user#2")), 0), 60);
         assert_eq!(t.asks().len(), 1);
-        assert!(t.asks()[0].tainted);
+        assert!(!t.asks()[0].taint);
+        assert_eq!(t.asks()[0].trusted, None);
         assert!(plain(&t.live(60, 0))[0].ends_with("waiting on you"));
         t.apply(
             &ev(
@@ -975,6 +1308,7 @@ mod tests {
                     call: "a".into(),
                     approved: false,
                     by: xi_protocol::event::Approver::User,
+                    remember: Remember::Once,
                 },
                 0,
             ),
@@ -1129,6 +1463,489 @@ mod tests {
     }
 
     #[test]
+    fn thinking_modes_commit_before_text_and_preserve_display_selection() {
+        for mode in [Thinking::Full, Thinking::First, Thinking::Hidden] {
+            let mut t = Transcript::default();
+            t.set_thinking(mode);
+            assert_eq!(t.thinking_display(), mode);
+            let rows = t.apply(
+                &ev(
+                    assistant(vec![
+                        Block::Text {
+                            text: "answer".into(),
+                        },
+                        Block::Thinking {
+                            text: "first thought\nsecond thought".into(),
+                            signature: None,
+                        },
+                    ]),
+                    0,
+                ),
+                60,
+            );
+            let text = plain(&rows);
+            let answer = text.iter().position(|line| line == "  answer").unwrap();
+            match mode {
+                Thinking::Full => {
+                    let first = text
+                        .iter()
+                        .position(|line| line == "  ∴ first thought")
+                        .unwrap();
+                    assert!(first < answer);
+                    assert_eq!(text[first + 1], "    second thought");
+                    assert!(rows[first].0.iter().all(|span| span.role == Role::Dim));
+                    assert!(rows[first + 1].0.iter().all(|span| span.role == Role::Dim));
+                }
+                Thinking::First => {
+                    let first = text
+                        .iter()
+                        .position(|line| line == "  ∴ first thought · ctrl+t")
+                        .unwrap();
+                    assert!(first < answer);
+                    assert!(text.iter().all(|line| !line.contains("second thought")));
+                }
+                Thinking::Hidden => assert!(text.iter().all(|line| !line.contains("thought"))),
+            }
+        }
+        assert_eq!(Thinking::Full.next(), Thinking::First);
+        assert_eq!(Thinking::First.next(), Thinking::Hidden);
+        assert_eq!(Thinking::Hidden.next(), Thinking::Full);
+        assert_eq!(Thinking::Full.name(), "full");
+        assert_eq!(Thinking::First.name(), "first line");
+        assert_eq!(Thinking::Hidden.name(), "hidden");
+    }
+
+    #[test]
+    fn committed_thinking_wraps_or_truncates_and_redacted_respects_modes() {
+        let text = "abcdefghijklmnopqrstuvwxyz\nsecond";
+        let mut t = Transcript::default();
+        t.set_thinking(Thinking::Full);
+        let rows = t.apply(
+            &ev(
+                assistant(vec![Block::Thinking {
+                    text: text.into(),
+                    signature: None,
+                }]),
+                0,
+            ),
+            16,
+        );
+        assert!(rows.iter().all(|line| line.width() <= 16));
+        assert!(rows.len() > 3);
+        t.set_thinking(Thinking::First);
+        let rows = t.apply(
+            &ev(
+                assistant(vec![Block::Thinking {
+                    text: format!("\n{text}"),
+                    signature: None,
+                }]),
+                0,
+            ),
+            24,
+        );
+        assert!(rows.iter().all(|line| line.width() <= 24));
+        assert!(plain(&rows).iter().any(|line| line.ends_with(" · ctrl+t")));
+        assert!(plain(&rows).iter().all(|line| !line.contains("second")));
+        for mode in [Thinking::Full, Thinking::First, Thinking::Hidden] {
+            t.set_thinking(mode);
+            let rows = t.apply(
+                &ev(
+                    assistant(vec![Block::RedactedThinking {
+                        data: "opaque".into(),
+                    }]),
+                    0,
+                ),
+                60,
+            );
+            assert_eq!(
+                plain(&rows)
+                    .iter()
+                    .any(|line| line == "  ∴ redacted thinking"),
+                mode != Thinking::Hidden,
+            );
+        }
+    }
+
+    #[test]
+    fn live_thinking_keeps_deltas_and_switches_modes_without_losing_text() {
+        use xi_protocol::methods::client::{DeltaParams, ResetParams};
+
+        let mut t = Transcript::default();
+        let session = SessionId::generate();
+        for text in ["one\ntwo\nthree\nfour\n", "five\nsix\nseven\neight\n\n"] {
+            t.apply(
+                &ClientNotification::Delta(DeltaParams {
+                    session,
+                    attempt: 0,
+                    sequence: 0,
+                    delta: Delta::Thinking { text: text.into() },
+                }),
+                60,
+            );
+        }
+        assert!(t.thinking());
+        assert_eq!(plain(&t.live(60, 0)), ["  ∴ eight"]);
+        t.set_thinking(Thinking::Full);
+        let full = t.live(60, 0);
+        assert_eq!(full.len(), STREAM_ROWS);
+        assert!(
+            full.iter()
+                .all(|line| line.0.iter().all(|span| span.role == Role::Dim))
+        );
+        assert!(
+            plain(&full)
+                .iter()
+                .all(|line| !line.contains("one") && !line.contains("two"))
+        );
+        assert!(plain(&full).iter().any(|line| line.contains("eight")));
+        t.set_thinking(Thinking::Hidden);
+        assert!(t.live(60, 0).is_empty());
+        assert!(t.thinking());
+        t.set_thinking(Thinking::First);
+        assert_eq!(plain(&t.live(60, 0)), ["  ∴ eight"]);
+        t.apply(
+            &ClientNotification::Delta(DeltaParams {
+                session,
+                attempt: 0,
+                sequence: 0,
+                delta: Delta::Text {
+                    text: "answer starts".into(),
+                },
+            }),
+            60,
+        );
+        assert!(!t.thinking());
+        assert!(
+            plain(&t.live(60, 0))
+                .iter()
+                .all(|line| !line.contains("eight"))
+        );
+        t.apply(
+            &ClientNotification::Reset(ResetParams {
+                session,
+                attempt: 1,
+                sequence: 0,
+            }),
+            60,
+        );
+        assert!(t.live(60, 0).is_empty());
+        t.partial(&[Block::Thinking {
+            text: "restored thought".into(),
+            signature: None,
+        }]);
+        assert_eq!(plain(&t.live(60, 0)), ["  ∴ restored thought"]);
+        t.apply(&ev(assistant(Vec::new()), 0), 60);
+        assert!(t.live(60, 0).is_empty());
+        assert!(!t.thinking());
+    }
+
+    #[test]
+    fn successful_edit_shows_changed_rows_counts_and_one_context_line_each_side() {
+        let mut t = Transcript::default();
+        t.apply(
+            &ev(
+                assistant(vec![use_(
+                    "edit",
+                    "edit",
+                    json!({
+                        "path": "source.rs",
+                        "old": "skip before\nbefore\nold one\nold two\nafter\nskip after\n",
+                        "new": "skip before\nbefore\nnew one\nafter\nskip after\n",
+                    }),
+                )]),
+                0,
+            ),
+            100,
+        );
+        t.apply(&ev(decide("edit", Decision::Allow, Some("user#1")), 0), 100);
+        let rows = t.apply(&ev(result("edit", "replaced text", false), 100), 100);
+        let text = plain(&rows);
+        assert!(text[0].starts_with("● edit source.rs"));
+        assert!(text[0].ends_with("+1 −2 · user#1 · 0.1s"), "{text:?}");
+        assert_eq!(
+            text[1..],
+            [
+                "    before",
+                "  - old one",
+                "  - old two",
+                "  + new one",
+                "    after"
+            ]
+        );
+        assert!(rows[1].0.iter().all(|span| span.role == Role::Dim));
+        assert!(rows[2].0.iter().all(|span| span.role == Role::Sanguine));
+        assert!(rows[4].0.iter().all(|span| span.role == Role::Verdigris));
+        assert!(!t.collapsed());
+    }
+
+    #[test]
+    fn edit_diff_caps_eight_rows_and_expands_the_whole_diff() {
+        let mut t = Transcript::default();
+        let old = (0..6)
+            .map(|n| format!("old {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..6)
+            .map(|n| format!("new {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        t.apply(
+            &ev(
+                assistant(vec![use_(
+                    "edit",
+                    "edit",
+                    json!({
+                        "path": "source.rs", "old": old, "new": new,
+                    }),
+                )]),
+                0,
+            ),
+            80,
+        );
+        let rows = plain(&t.apply(&ev(result("edit", "replaced", false), 0), 80));
+        assert_eq!(rows.len(), 10);
+        assert!(rows[0].ends_with("+6 −6"));
+        assert_eq!(rows[8], "  + new 1");
+        assert_eq!(rows[9], "    … 4 more lines · ctrl+o");
+        assert_eq!(t.details[0].what, "full diff");
+        assert!(t.details[0].text.starts_with("- old 0\n"));
+        let full = plain(&t.expand(80).unwrap());
+        assert!(
+            full.iter()
+                .any(|line| line.ends_with("full diff · 12 lines"))
+        );
+        assert!(full.iter().any(|line| line == "  + new 5"));
+        assert_eq!(
+            full.iter().filter(|line| line.starts_with("  - ")).count(),
+            6
+        );
+        assert_eq!(
+            full.iter().filter(|line| line.starts_with("  + ")).count(),
+            6
+        );
+    }
+
+    #[test]
+    fn diff_rows_truncate_and_failed_edits_keep_error_output() {
+        let mut t = Transcript::default();
+        t.apply(
+            &ev(
+                assistant(vec![use_(
+                    "edit",
+                    "edit",
+                    json!({
+                        "path": "x", "old": "a long removed line", "new": "a long added line",
+                    }),
+                )]),
+                0,
+            ),
+            12,
+        );
+        let rows = t.apply(&ev(result("edit", "replaced", false), 0), 12);
+        assert!(rows.iter().all(|line| line.width() <= 12));
+        assert!(rows[1].plain().ends_with('…'));
+        t.apply(
+            &ev(
+                assistant(vec![use_(
+                    "error",
+                    "edit",
+                    json!({
+                        "path": "x", "old": "old", "new": "new",
+                    }),
+                )]),
+                0,
+            ),
+            80,
+        );
+        let rows = plain(&t.apply(&ev(result("error", "old text did not match", true), 0), 80));
+        assert!(rows[0].starts_with("✕ edit x"));
+        assert!(!rows[0].contains("+1"));
+        assert_eq!(rows[1], "  └ old text did not match");
+    }
+
+    #[test]
+    fn hashline_renders_each_edits_lines_as_additions() {
+        let mut t = Transcript::default();
+        t.apply(
+            &ev(
+                assistant(vec![use_(
+                    "hash",
+                    "hashline",
+                    json!({
+                        "path": "source.rs",
+                        "edits": [
+                            { "start": "1:aa", "lines": ["one", "two"] },
+                            { "after": "2:bb", "lines": ["three"] },
+                        ],
+                    }),
+                )]),
+                0,
+            ),
+            80,
+        );
+        let rows = t.apply(&ev(result("hash", "updated", false), 0), 80);
+        let text = plain(&rows);
+        assert!(text[0].ends_with("+3"));
+        assert_eq!(text[1..], ["  + one", "  + two", "  + three"]);
+        assert!(
+            rows[1..]
+                .iter()
+                .all(|line| line.0.iter().all(|span| span.role == Role::Verdigris))
+        );
+    }
+
+    #[test]
+    fn resolved_ask_meta_names_each_scope_and_denial() {
+        for (approved, remember, expected) in [
+            (true, Remember::Once, "allowed by you"),
+            (true, Remember::Session, "allowed for this session"),
+            (true, Remember::Workspace, "always allowed here"),
+            (false, Remember::Once, "denied by you"),
+        ] {
+            let mut t = Transcript::default();
+            t.apply(
+                &ev(
+                    assistant(vec![use_("a", "bash", json!({"command": "test"}))]),
+                    0,
+                ),
+                100,
+            );
+            t.apply(&ev(decide("a", Decision::Ask, None), 0), 100);
+            t.apply(
+                &ev(
+                    EventKind::ApprovalResolved {
+                        call: "a".into(),
+                        approved,
+                        by: xi_protocol::event::Approver::User,
+                        remember,
+                    },
+                    0,
+                ),
+                100,
+            );
+            let rows = plain(&t.apply(&ev(result("a", "done", !approved), 0), 100));
+            assert!(rows[0].contains(expected), "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn session_rule_is_described_in_live_and_committed_meta() {
+        let mut t = Transcript::default();
+        t.apply(
+            &ev(
+                assistant(vec![use_("a", "bash", json!({"command": "test"}))]),
+                0,
+            ),
+            100,
+        );
+        t.apply(&ev(decide("a", Decision::Allow, Some("session")), 0), 100);
+        assert!(plain(&t.live(100, 0))[0].contains("allowed for this session"));
+        let rows = plain(&t.apply(&ev(result("a", "done", false), 0), 100));
+        assert!(rows[0].ends_with("allowed for this session · 0.0s"));
+    }
+
+    #[test]
+    fn asks_take_taint_from_decision_and_trust_from_notifications() {
+        use xi_protocol::methods::client::PendingApproval;
+
+        let mut t = Transcript::default();
+        t.apply(
+            &ev(
+                assistant(vec![use_("a", "bash", json!({"command": "test"}))]),
+                0,
+            ),
+            80,
+        );
+        t.apply(
+            &ev(
+                EventKind::ToolDecision {
+                    call: "a".into(),
+                    action: "exec test".into(),
+                    decision: Decision::Ask,
+                    rule: None,
+                    taint: true,
+                },
+                0,
+            ),
+            80,
+        );
+        assert!(t.asks()[0].taint);
+        assert_eq!(t.asks()[0].trusted, None);
+        let pending = ClientNotification::ApprovalPending(PendingApproval {
+            session: SessionId::generate(),
+            call: "a".into(),
+            tool: "bash".into(),
+            action: "exec test".into(),
+            rule: None,
+            taint: true,
+            trusted: false,
+        });
+        t.apply(&pending, 80);
+        assert_eq!(t.asks().len(), 1);
+        assert_eq!(t.asks()[0].trusted, Some(false));
+    }
+
+    #[test]
+    fn last_text_is_the_latest_nonblank_assistant_text_not_stream_or_tool_output() {
+        use xi_protocol::methods::client::DeltaParams;
+
+        let mut t = Transcript::default();
+        assert_eq!(t.last_text(), None);
+        t.apply(
+            &ev(
+                assistant(vec![Block::Text {
+                    text: "  first response  ".into(),
+                }]),
+                0,
+            ),
+            80,
+        );
+        assert_eq!(t.last_text(), Some("first response"));
+        t.apply(
+            &ev(
+                assistant(vec![
+                    Block::Text { text: " \n".into() },
+                    Block::Thinking {
+                        text: "not an answer".into(),
+                        signature: None,
+                    },
+                    use_("a", "bash", json!({"command": "test"})),
+                ]),
+                0,
+            ),
+            80,
+        );
+        t.apply(&ev(result("a", "tool output", false), 0), 80);
+        t.apply(
+            &ClientNotification::Delta(DeltaParams {
+                session: SessionId::generate(),
+                attempt: 0,
+                sequence: 0,
+                delta: Delta::Text {
+                    text: "unfinished".into(),
+                },
+            }),
+            80,
+        );
+        assert_eq!(t.last_text(), Some("first response"));
+        t.apply(
+            &ev(
+                assistant(vec![
+                    Block::Text {
+                        text: "\nnew".into(),
+                    },
+                    Block::Text {
+                        text: "response\n ".into(),
+                    },
+                ]),
+                0,
+            ),
+            80,
+        );
+        assert_eq!(t.last_text(), Some("new\nresponse"));
+    }
+
+    #[test]
     fn numbers_read_like_apparatus() {
         assert_eq!(tokens(950), "950");
         assert_eq!(tokens(14_200), "14.2k");
@@ -1207,10 +2024,14 @@ mod client_tests {
             tool: "bash".into(),
             action: "run command".into(),
             rule: None,
+            taint: true,
+            trusted: true,
         });
         transcript.apply(&pending, 60);
         transcript.apply(&pending, 60);
         assert_eq!(transcript.asks().len(), 1);
+        assert!(transcript.asks()[0].taint);
+        assert_eq!(transcript.asks()[0].trusted, Some(true));
         transcript.partial(&[Block::Text {
             text: "unfinished".into(),
         }]);

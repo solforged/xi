@@ -2546,6 +2546,7 @@ name = "xi-kernel"
 version = "0.0.0"
 dependencies = [
  "futures",
+ "globset",
  "nix",
  "serde",
  "serde_json",
@@ -2654,6 +2655,7 @@ dependencies = [
 name = "xi-tui"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "crossterm",
  "futures",
  "ignore",
@@ -2661,6 +2663,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "unicode-width",
  "xi-client",
  "xi-daemon",

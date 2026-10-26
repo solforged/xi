@@ -7,7 +7,7 @@ use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
 use xi_client::client::{Client, ClientError, ClientNotification};
 use xi_kernel::config::{Paths, parse_model};
-use xi_protocol::event::{Decision, EventKind};
+use xi_protocol::event::{Decision, EventKind, Remember};
 use xi_protocol::methods::client::{AttachResult, Delta, PromptResult};
 use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::RpcError;
@@ -207,7 +207,9 @@ impl Renderer {
                 answer => {
                     let approved =
                         matches!(answer, Ok(Ok(answer)) if matches!(answer.trim(), "y" | "Y"));
-                    client.resolve(session, call, approved).await
+                    client
+                        .resolve(session, call, approved, Remember::Once)
+                        .await
                 }
             };
             if let Err(error) = result {
@@ -312,7 +314,7 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                 match line {
                     Ok(answer) => {
                         if let Err(error) = client
-                            .resolve(session, call, matches!(answer.trim(), "y" | "Y"))
+                            .resolve(session, call, matches!(answer.trim(), "y" | "Y"), Remember::Once)
                             .await
                         {
                             eprintln!("xi: {error}");
@@ -320,7 +322,7 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                     }
                     Err(ReadlineError::Interrupted) => client.cancel(session).await?,
                     Err(ReadlineError::Eof) => {
-                        client.resolve(session, call, false).await?;
+                        client.resolve(session, call, false, Remember::Once).await?;
                         break;
                     }
                     Err(error) => return Err(error.into()),

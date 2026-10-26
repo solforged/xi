@@ -11,7 +11,7 @@ use tokio::sync::{Notify, Semaphore};
 use xi_kernel::config::{Config, DaemonSettings, Paths, daemon_settings, sessions_root};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Leaser, Notification, Session, TurnOptions};
 use xi_policy::{Action, Taint};
-use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
+use xi_protocol::event::{Approver, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::{ModelInfo, Reasoning};
@@ -145,8 +145,10 @@ impl Tool for FakeTool {
         if input.get("invalid").is_some() {
             return Err("invalid input".into());
         }
-        if input.get("net").is_some() {
-            Ok(vec![Crossing::Net("example.org".into())])
+        if let Some(net) = input.get("net") {
+            Ok(vec![Crossing::Net(
+                net.as_str().unwrap_or("example.org").into(),
+            )])
         } else {
             Ok(vec![Crossing::Exec("test command".into())])
         }
@@ -852,8 +854,14 @@ async fn approvals_resolve_both_ways_and_record_user() {
                 break;
             }
         }
-        session.approve(&"ask".into(), approved).unwrap();
-        assert!(session.approve(&"ask".into(), approved).is_err());
+        session
+            .approve(&"ask".into(), approved, Remember::Once)
+            .unwrap();
+        assert!(
+            session
+                .approve(&"ask".into(), approved, Remember::Once)
+                .is_err()
+        );
         reply.await.unwrap().unwrap();
         let info = session.info().await;
         assert!(info.events.iter().any(|e| matches!(e.kind, EventKind::ApprovalResolved { approved: value, by: Approver::User, .. } if value == approved)));
@@ -1879,7 +1887,7 @@ async fn cancelled_ask_is_resolved_before_its_cancelled_result() {
     session.cancel();
     assert!(reply.await.unwrap().unwrap().cancelled);
     assert!(matches!(
-        session.approve(&call, true),
+        session.approve(&call, true, Remember::Once),
         Err(xi_kernel::Error::NotPending)
     ));
     let info = session.info().await;
@@ -1893,6 +1901,7 @@ async fn cancelled_ask_is_resolved_before_its_cancelled_result() {
                     call: actual,
                     approved: false,
                     by: Approver::Cancelled,
+                    remember: Remember::Once,
                 } if actual == &call
             )
         })
@@ -1924,7 +1933,7 @@ async fn client_approval_timeout_records_a_timeout_denial() {
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(!reply.await.unwrap().unwrap().failed);
     assert!(matches!(
-        session.approve(&call, true),
+        session.approve(&call, true, Remember::Once),
         Err(xi_kernel::Error::NotPending)
     ));
     let info = session.info().await;
@@ -1938,6 +1947,7 @@ async fn client_approval_timeout_records_a_timeout_denial() {
                     call: actual,
                     approved: false,
                     by: Approver::Timeout,
+                    remember: Remember::Once,
                 } if actual == &call
             )
         })
@@ -1983,17 +1993,20 @@ async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
             action: "net example.org".into(),
             decision: Decision::Ask,
             rule: None,
+            taint: false,
         },
         EventKind::ToolDecision {
             call: "resolved".into(),
             action: "net example.org".into(),
             decision: Decision::Ask,
             rule: None,
+            taint: false,
         },
         EventKind::ApprovalResolved {
             call: "resolved".into(),
             approved: true,
             by: Approver::User,
+            remember: Remember::Once,
         },
         EventKind::ToolResult {
             call: "finished".into(),
@@ -2029,6 +2042,7 @@ async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
             call,
             approved: false,
             by: Approver::Interrupted,
+            remember: Remember::Once,
         } if call.0 == "asked"
     ));
     for (event, expected) in repaired[1..].iter().zip(["asked", "resolved", "undecided"]) {
@@ -2250,4 +2264,324 @@ async fn stopping_requests_aborts_an_inflight_model_and_releases_its_lease() {
         &session.info().await.events.last().unwrap().kind,
         EventKind::TurnFailed { message } if message == "daemon connection lost"
     ));
+}
+
+#[tokio::test]
+async fn session_grant_skips_the_same_action_and_survives_reopen() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![
+        batch(vec![call("first", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+        batch(vec![call("second", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("first ask"));
+    let asked = wait_for_ask(&mut rx).await;
+    session.approve(&asked, true, Remember::Session).unwrap();
+    reply.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), session.prompt(input("same action")))
+        .await
+        .unwrap()
+        .unwrap();
+    let info = session.info().await;
+    assert!(info.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolDecision { call, decision: Decision::Allow, rule: Some(rule), taint: false, .. }
+            if call.0 == "second" && rule == "session"
+    )));
+    assert!(info.events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::ApprovalResolved {
+            approved: true,
+            remember: Remember::Session,
+            ..
+        }
+    )));
+    session.wait_idle().await;
+    drop(session);
+    let script = Script::new(vec![
+        batch(vec![call("reopened", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+    ]);
+    let resumed = Session::from_log(
+        xi_session::SessionLog::open(&info.path).unwrap(),
+        fixture.config(),
+        EventBus::default(),
+        TurnOptions::default(),
+        Some(Backend {
+            provider: script,
+            model: model(),
+            tools: vec![Arc::new(FakeTool { gate: None })],
+        }),
+    )
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        resumed.prompt(input("after reopen")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(resumed.info().await.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolDecision { call, decision: Decision::Allow, rule: Some(rule), .. }
+            if call.0 == "reopened" && rule == "session"
+    )));
+}
+
+#[tokio::test]
+async fn session_grants_do_not_cross_a_checkout_branch() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![
+        batch(vec![call("first", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+        batch(vec![call("sibling", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let root = session.info().await.events[0].id;
+    let reply = session.submit(input("grant branch"));
+    let call = wait_for_ask(&mut rx).await;
+    session.approve(&call, true, Remember::Session).unwrap();
+    reply.await.unwrap().unwrap();
+    session.checkout(root).await.unwrap();
+    let reply = session.submit(input("sibling branch"));
+    let call = wait_for_ask(&mut rx).await;
+    assert_eq!(call.0, "sibling");
+    session.approve(&call, false, Remember::Once).unwrap();
+    reply.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn remembered_scopes_reject_taint_asks_without_consuming_them() {
+    let fixture = Fixture::new();
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "[[rule]]\naction='net'\npattern='**'\neffect='allow'\n",
+    );
+    let script = Script::new(vec![
+        batch(vec![
+            call("ingest", "fake", json!({"untrusted": true})),
+            call("taint-ask", "fake", json!({"net": true})),
+        ]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("tainted branch"));
+    let call = wait_for_ask(&mut rx).await;
+    for remember in [Remember::Session, Remember::Workspace] {
+        assert!(matches!(
+            session.approve(&call, true, remember),
+            Err(xi_kernel::Error::InvalidRemember(_))
+        ));
+    }
+    session.approve(&call, true, Remember::Once).unwrap();
+    reply.await.unwrap().unwrap();
+    assert!(session.info().await.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolDecision { call, decision: Decision::Ask, taint: true, .. }
+            if call.0 == "taint-ask"
+    )));
+}
+
+#[tokio::test]
+async fn remembered_denials_and_untrusted_workspace_scopes_leave_the_ask_pending() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![
+        batch(vec![call("ask", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("ask"));
+    let call = wait_for_ask(&mut rx).await;
+    for (approved, remember) in [
+        (false, Remember::Session),
+        (false, Remember::Workspace),
+        (true, Remember::Workspace),
+    ] {
+        assert!(matches!(
+            session.approve(&call, approved, remember),
+            Err(xi_kernel::Error::InvalidRemember(_))
+        ));
+    }
+    assert!(!fixture.workspace.join(".xi/config.local.toml").exists());
+    session.approve(&call, false, Remember::Once).unwrap();
+    reply.await.unwrap().unwrap();
+    assert!(session.info().await.events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::ApprovalResolved {
+            approved: false,
+            remember: Remember::Once,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn workspace_grant_appends_an_exact_rule_and_fresh_sessions_use_policy() {
+    let fixture = Fixture::new();
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    let local = fixture.workspace.join(".xi/config.local.toml");
+    let original = "default_model = 'test/test' # keep this comment";
+    write(&local, original);
+    let subject = "host[1]*?\"\\\n.example";
+    let script = Script::new(vec![
+        batch(vec![call("workspace", "fake", json!({"net": subject}))]),
+        Step::Reply(done()),
+        batch(vec![call("same-session", "fake", json!({"net": subject}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("remember here"));
+    let asked = wait_for_ask(&mut rx).await;
+    session.approve(&asked, true, Remember::Workspace).unwrap();
+    reply.await.unwrap().unwrap();
+    let text = std::fs::read_to_string(&local).unwrap();
+    assert!(text.starts_with(&format!("{original}\n")));
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    let rule = &value["rule"][0];
+    assert_eq!(rule["effect"].as_str(), Some("allow"));
+    assert_eq!(rule["action"].as_str(), Some("net"));
+    assert_eq!(
+        rule["pattern"].as_str(),
+        Some(globset::escape(subject).replace('\\', "\\\\").as_str())
+    );
+    assert_eq!(rule["when"].as_str(), Some("always"));
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        session.prompt(input("same session")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(session.info().await.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolDecision { call, decision: Decision::Allow, rule: Some(rule), .. }
+            if call.0 == "same-session" && rule == "session"
+    )));
+    let config = fixture.config();
+    assert_eq!(
+        config
+            .policy
+            .evaluate(Action::Net { host: subject }, Taint::Clean)
+            .decision,
+        Decision::Allow
+    );
+    assert_eq!(
+        config
+            .policy
+            .evaluate(
+                Action::Net {
+                    host: "host11anything.example"
+                },
+                Taint::Clean
+            )
+            .decision,
+        Decision::Ask
+    );
+    let script = Script::new(vec![
+        batch(vec![call("fresh", "fake", json!({"net": subject}))]),
+        Step::Reply(done()),
+    ]);
+    let (fresh, _) = fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    tokio::time::timeout(Duration::from_secs(2), fresh.prompt(input("fresh session")))
+        .await
+        .unwrap()
+        .unwrap();
+    let info = fresh.info().await;
+    // The written rule allows the net crossing, so the strictest decision is
+    // the tool's own allow and nothing asks.
+    assert!(info.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolDecision { call, decision: Decision::Allow, .. } if call.0 == "fresh"
+    )));
+    assert!(
+        !info
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ApprovalResolved { .. }))
+    );
+}
+
+#[tokio::test]
+async fn workspace_rule_write_failure_keeps_the_ask_pending() {
+    let fixture = Fixture::new();
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    let script = Script::new(vec![
+        batch(vec![call("ask", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("ask"));
+    let call = wait_for_ask(&mut rx).await;
+    std::fs::create_dir_all(fixture.workspace.join(".xi/config.local.toml")).unwrap();
+    assert!(matches!(
+        session.approve(&call, true, Remember::Workspace),
+        Err(xi_kernel::Error::Io(_))
+    ));
+    session.approve(&call, true, Remember::Once).unwrap();
+    reply.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_clean_network_grant_cannot_bypass_taint_on_a_later_ask() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![
+        batch(vec![call("clean", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+        batch(vec![
+            call("ingest", "fake", json!({"untrusted": true})),
+            call("dirty", "fake", json!({"net": true})),
+        ]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("clean grant"));
+    let call = wait_for_ask(&mut rx).await;
+    session.approve(&call, true, Remember::Session).unwrap();
+    reply.await.unwrap().unwrap();
+    let reply = session.submit(input("tainted branch"));
+    let call = wait_for_ask(&mut rx).await;
+    assert_eq!(call.0, "dirty");
+    session.approve(&call, false, Remember::Once).unwrap();
+    reply.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn workspace_grants_create_a_missing_local_config() {
+    let fixture = Fixture::new();
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    let script = Script::new(vec![
+        batch(vec![call("ask", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("remember here"));
+    let call = wait_for_ask(&mut rx).await;
+    session.approve(&call, true, Remember::Workspace).unwrap();
+    reply.await.unwrap().unwrap();
+    let config = fixture.config();
+    assert!(fixture.workspace.join(".xi/config.local.toml").is_file());
+    assert_eq!(
+        config
+            .policy
+            .evaluate(
+                Action::Net {
+                    host: "example.org"
+                },
+                Taint::Clean
+            )
+            .decision,
+        Decision::Allow,
+    );
 }

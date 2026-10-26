@@ -134,7 +134,7 @@ Client → daemon requests:
 | `session/open` | `{path, options}` → attach result | Spawn a worker for an existing log. If a live worker holds the same canonical path, fail with -32005 and return its session id so the client can attach instead. |
 | `session/attach` | `{session, since?}` → `{info, events, partial, running, pending_approvals, stream_sequence}` | Subscribe the connection to the session's notifications. `since` is the last event id the client already has; `events` contains the events after it on disk, or the whole log without `since`. `partial` contains in-flight assistant blocks not yet persisted. |
 | `session/detach` | `{session}` → null | Unsubscribe; the turn keeps running. |
-| `session/list` | `{cwd?, running?}` → `[{session, path, cwd, model, head, running, pending_approvals, parent_session}]` | List live sessions and sessions found in the session directories; read root lines only. `running` is the worker's own turn state, so a steering prompt left queued after a cancel does not count. |
+| `session/list` | `{cwd?, running?}` → `[{session, path, cwd, model, head, running, pending_approvals, parent_session, started?, updated?, title?}]` | List live sessions and sessions found in the session directories, newest `updated` first. `started` is the root event's time, `updated` the log file's modification time, and `title` the first line of the first user prompt, cut to 80 characters. Each log is read from the root line up to its first user prompt, at most 64 KiB; a log that cannot be read leaves these fields absent. `running` is the worker's own turn state, so a steering prompt left queued after a cancel does not count. |
 | `session/close` | `{session}` → null | Stop the worker; fail while a turn runs. Steering prompts left queued after a cancel are rejected with an error. |
 | `session/prompt` | `{session, content}` → `{head, failed, cancelled, text}` | Route to the worker; run a turn and return its outcome when it ends. `text` is the final assistant response text. |
 | `session/cancel` | `{session}` → null | Route to the worker; stop the running turn. |
@@ -145,8 +145,8 @@ Client → daemon requests:
 | `session/models` | `{session}` → `{current, reasoning, models: [{model, info, available}]}` | Route to the worker; list the session's model registry with `ModelInfo`. `available` is false when the provider's credential is missing. No credential value is ever returned. |
 | `session/commands` | `{session}` → `[{name, description}]` | Route to the worker; list the session's extension slash commands for completion. |
 | `session/command` | `{session, name, args}` → command result or null | Route an extension slash command to the worker. The result is the extension protocol's `CommandResult`; null means an unknown command. |
-| `approval/list` | `{}` → `[{session, call, tool, action, rule}]` | Return pending asks across all sessions. |
-| `approval/resolve` | `{session, call, approved, remember?}` → null | Route the answer to the owning worker; the first answer wins. `remember` is `once` (default), `session` or `workspace`; see [Terminal client](#terminal-client). |
+| `approval/list` | `{}` → `[{session, call, tool, action, rule, taint, trusted}]` | Return pending asks across all sessions. `taint` marks an ask that taint caused; `trusted` is whether the session's workspace is trusted. Clients use both to choose which approval scopes to offer. |
+| `approval/resolve` | `{session, call, approved, remember?}` → null | Route the answer to the owning worker; the first answer wins. `remember` is `once` (default), `session` or `workspace`; see [Terminal client](#terminal-client). A scope other than `once` on a denial, on a taint ask, or `workspace` in an untrusted workspace fails with -32602 and leaves the ask pending. |
 | `daemon/status` | `{}` → `{version, pid, uptime_secs, workers, clients, leases}` | Return daemon status. Each lease entry is `{endpoint, concurrency, active, waiting}`. |
 | `daemon/shutdown` | `{when: "idle" \| "now"}` → null | `idle` exits when there are no workers; `now` cancels running turns, closes workers and kills any still present after five seconds. |
 
@@ -172,7 +172,7 @@ Daemon → client notifications go only to connections attached to that session,
 | `stream/delta` | `{session, delta, attempt, sequence}` | Attached clients; streaming model output, not persisted. `attempt` is an integer starting at 0. `sequence` comes from one counter per worker shared with `stream/reset`. |
 | `stream/reset` | `{session, attempt, sequence}` | Attached clients; sent before a retried model request. Clients drop partial text from earlier attempts so retries do not duplicate text. |
 | `session/exited` | `{session, status?, message?}` | Attached clients and any client that called `session/list` with `running = true`; reports worker exit. |
-| `approval/pending` | `{session, call, tool, action, rule}` | Every initialized connection, not just attached ones; updates the approvals inbox. |
+| `approval/pending` | `{session, call, tool, action, rule, taint, trusted}` | Every initialized connection, not just attached ones; updates the approvals inbox. |
 
 Approvals are events, not blocking requests. The worker remains the authority for its asks; the decision is a `tool_decision` event with `decision = ask`. The daemon exposes one inbox through `approval/list` and routes `approval/resolve` to the owning worker. The first answer wins; later answers fail with -32006. The resolution lands in the log.
 
@@ -300,7 +300,18 @@ Composer keys are unique. Keys inside an overlay apply only while it has focus.
 | `ctrl+t` | Cycle thinking display: full, first line, hidden. |
 | Editing | `ctrl+a`/`ctrl+e` line start and end, `ctrl+b`/`ctrl+f` and arrows by character, `ctrl+w` and `alt+backspace` delete a word, `ctrl+u`/`ctrl+k` delete to line start and end. |
 
-Alt keys need the terminal to send Option as Meta on macOS; every alt binding also has a slash command. `[keys]` in `$XDG_CONFIG_HOME/xi/tui.toml` maps action names to key strings, and `/help` lists the effective bindings from the same table the client dispatches on.
+Alt keys need the terminal to send Option as Meta on macOS; every alt binding also has a slash command. `/help` lists the effective bindings from the same table the client dispatches on. `$XDG_CONFIG_HOME/xi/tui.toml` holds client settings:
+
+```toml
+[keys]
+search = "ctrl+r"                          # a key string or an array; replaces the action's defaults
+kill_word = ["ctrl+w", "alt+backspace"]
+
+[display]
+thinking = "first"                         # full | first | hidden
+```
+
+Action names are the snake_case names `/help` shows. A key string is `[ctrl+][alt+][shift+]KEY`, where `KEY` is one character or `enter`, `tab`, `esc`, `backspace`, `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `space` or `f1` to `f12`. A key bound to a new action leaves the action that had it by default. Unknown actions, keys and values are reported once at startup and skipped; the client always starts.
 
 #### Commands
 
@@ -333,12 +344,12 @@ Built-in names are reserved, so an extension cannot shadow them. Model, reasonin
 |---|---|---|
 | Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider: id, context window, a reasoning mark and price per million input and output tokens. Models without credentials are dimmed with the way to add one. Typing filters, `enter` selects, `esc` closes. |
 | History search | `ctrl+r` | The query and the newest match; `ctrl+r` again moves to older matches. |
-| Session picker | `/resume` | `session/list` for this workspace, `tab` for all workspaces: name or first prompt, model, age, running and pending-approval marks. `enter` attaches to a live session or opens a saved one. |
-| Approvals | `tab`, `/approvals` | One ask at a time with its action and rule. `1`/`y` allows once, `2` allows for this session, `3` always allows in this workspace, `4`/`n` denies. Across sessions, the inbox comes from `approval/list` and `approval/pending`. |
+| Session picker | `/resume` | `session/list` for this workspace, `tab` for all workspaces with a workspace column: first prompt, model, age, running and pending-approval marks, newest first. Child sessions are hidden. Typing filters on prompt and workspace. `enter` attaches to a live session or opens a saved one, and attaches instead when another worker already holds the log. Idle only. |
+| Approvals | `tab`, `/approvals` | One ask at a time with its action and rule. `1`/`y` allows once, `2` allows for this session, `3` always allows in this workspace, `4`/`n` denies; `up`, `down` and `enter` choose too. Scopes that do not apply are hidden and their keys do nothing. `tab` shows this session's asks. `/approvals` shows the inbox from `approval/list`: this session's asks first, then other sessions' oldest first, each labeled with its session and workspace. |
 | Tree | `/tree` | Branch points of the session; `enter` checks out, `esc` closes. |
 | Settings | `/settings` | See below. |
 
-Approval scopes: `remember = session` makes the worker allow the same tool and exact action for the rest of the session; the `approval_resolved` event records the scope, so reopening the log restores the grant. `remember = workspace` also appends an allow `[[rule]]` for that exact action to `<workspace>/.xi/config.local.toml`; it is offered only in a trusted workspace. Neither scope is offered for an ask that taint caused, because taint asks exist to stop exfiltration after untrusted input.
+Approval scopes: `remember = session` makes the worker allow the same tool and exact action without asking again; the decision records `rule = "session"`. The `approval_resolved` event records the scope, and grants come from the head's lineage like taint: reopening the log restores them, and checking out an earlier point drops the grants recorded after it. `remember = workspace` also appends an allow `[[rule]]` for that exact action, with the subject glob-escaped, to `<workspace>/.xi/config.local.toml`; it is offered only in a trusted workspace, the running session relies on its session grant, and new sessions read the rule. Neither scope is offered for an ask that taint caused, because taint asks exist to stop exfiltration after untrusted input, and a session grant never allows egress on a tainted branch.
 
 #### Settings view
 
@@ -359,7 +370,7 @@ The client edits the global `config.toml` with a format-preserving TOML writer, 
 
 The footer shows workspace, model, reasoning, context use, cache hit rate, cost when pricing is known, trust, taint and waiting approvals. Context, taint, approvals and trust never drop. As the terminal narrows, segments first switch to their short forms, such as the workspace's last path component, and then drop in a fixed order: sandbox, cache, branch, reasoning, cost, workspace, model. Reasoning shows as `think off`, `think low`, `think med` or `think high`, and as `no think` for models without reasoning.
 
-Tool results show a headline and at most three lines; `ctrl+o` expands the rest. `edit` results render as a diff of the replaced and new text. Thinking blocks follow the thinking display setting. Images show as a placeholder.
+Tool results show a headline and at most three lines; `ctrl+o` expands the rest. A successful `edit` renders as a diff instead: the lines shared by the start and end of the old and new text are cut to one line of context on each side, then the removed and added lines, at most eight rows, with `+N −M` in the headline; `hashline` edits show their added lines. Thinking blocks follow the thinking display setting, `first` by default: `full` shows the whole text dimmed, `first` its first line, and `hidden` nothing; streaming thinking follows the same setting in the live region. `ctrl+t` changes it for output from then on. Images show as a placeholder.
 
 ## Security model
 
@@ -512,7 +523,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 | `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler, socket activation, unit installation and private-instance mode. | Implemented |
 | `xi-cli` | The `xi` binary: daemon-backed line mode and TUI launch, private-instance headless `-p`, client-protocol `serve`, `trust`, `daemon`, `daemon install`/`uninstall` and internal `worker`. | Implemented |
 | `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |
-| `xi-tui` | Daemon client: scrollback commits, a live region, `ctrl+o` full results, a `/tree` checkout overlay and the [terminal client](#terminal-client) surface. | Implemented; terminal client surface in progress |
+| `xi-tui` | Daemon client: scrollback commits, a live region, `ctrl+o` full results, a `/tree` checkout overlay and the [terminal client](#terminal-client) surface. | Implemented; the settings view is planned |
 | `sdk/typescript` | Zero-dependency extension SDK and full-duplex NDJSON peer. | Implemented |
 
 ## Build order
@@ -524,7 +535,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 5. Protocol types for the handshake, attach, list, approvals inbox, stream reset and error codes; the worker entry point over a pipe; `xi-daemon` with private-instance mode; `xi -p` and the benchmark on the private instance (benchmark argv unchanged). Done.
 6. The per-user daemon: socket, peer-uid check, lock-based startup, idle exit, launchd and systemd units, `notify` and `approval_timeout`. Done.
 7. `xi-tui` as a daemon client; scheduler leases. Done.
-8. The [terminal client](#terminal-client) surface for daily use, in five slices: model and reasoning; sessions and approvals; composer; rendering and keys; settings. In progress.
+8. The [terminal client](#terminal-client) surface for daily use, in five slices: model and reasoning; sessions and approvals; composer; rendering and keys; settings. Slices 1 to 4 done; settings planned.
 
 What comes next, and how features and sandbox work proceed side by side, is in [roadmap.md](roadmap.md).
 

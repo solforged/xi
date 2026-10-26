@@ -255,6 +255,7 @@ async fn main() -> Result<(), xi_tui::Error> {
         template,
         attached,
         history: None,
+        tui_config: None,
     })
     .await
 }

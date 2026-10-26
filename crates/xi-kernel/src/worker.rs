@@ -125,6 +125,7 @@ impl Mirror {
                 action,
                 decision: Decision::Ask,
                 rule,
+                taint,
             } => {
                 if !self.pending.iter().any(|pending| pending.call == *call) {
                     self.pending.push(PendingApproval {
@@ -133,6 +134,8 @@ impl Mirror {
                         tool: self.tools.get(call).cloned().unwrap_or_default(),
                         action: action.clone(),
                         rule: rule.clone(),
+                        taint: *taint,
+                        trusted: self.info.trusted,
                     });
                 }
             }
@@ -638,7 +641,7 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
             let params: ResolveParams = decode(params)?;
             check_session(&session, params.session)?;
             session
-                .approve(&params.call, params.approved)
+                .approve(&params.call, params.approved, params.remember)
                 .map_err(kernel_error)?;
             Value::Null
         }
@@ -716,6 +719,7 @@ fn kernel_error(error: Error) -> RpcError {
     let code = match &error {
         Error::Running => RpcError::SESSION_RUNNING,
         Error::NotPending => RpcError::APPROVAL_NOT_PENDING,
+        Error::InvalidRemember(_) => RpcError::INVALID_PARAMS,
         Error::Session(xi_session::Error::Locked(_)) => RpcError::SESSION_HELD,
         _ => RpcError::INTERNAL_ERROR,
     };
