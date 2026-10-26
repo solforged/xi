@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use xi_policy::{ActionKind, Authority, Condition, Policy, RuleSpec};
 use xi_protocol::Decision;
 use xi_protocol::event::ModelRef;
-use xi_provider::{ModelInfo, ProviderConfig, Reasoning, Registry, RegistryConfig};
+use xi_protocol::model::{ModelInfo, Reasoning};
+use xi_provider::{ProviderConfig, Registry, RegistryConfig};
 
 use crate::{Error, Result};
 
@@ -94,6 +95,78 @@ struct TrustStore {
     roots: Vec<PathBuf>,
 }
 
+/// `[daemon]` settings, honoured only from the global user config file.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonSettings {
+    /// Seconds without clients or work before the daemon exits.
+    pub idle_exit: u64,
+    /// Notification command argv, receiving a pending approval as JSON on stdin.
+    pub notify: Option<Vec<String>>,
+    /// Seconds before an unanswered client approval is denied.
+    pub approval_timeout: Option<u64>,
+    /// Per-endpoint model request concurrency limits.
+    pub limit: Vec<Limit>,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            idle_exit: 600,
+            notify: None,
+            approval_timeout: None,
+            limit: Vec::new(),
+        }
+    }
+}
+
+/// A positive model request concurrency limit for one endpoint.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limit {
+    /// Provider base URL to limit.
+    pub endpoint: String,
+    /// Maximum simultaneous requests, at least one.
+    pub concurrency: usize,
+}
+
+/// Reads only the global config file's `[daemon]` table, defaulting when absent.
+pub fn daemon_settings(paths: &Paths) -> Result<DaemonSettings> {
+    let path = paths.config.join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DaemonSettings::default());
+        }
+        Err(e) => return Err(Error::Config(format!("{}: {e}", path.display()))),
+    };
+    let mut table: toml::Table =
+        toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    parse_daemon(table.remove("daemon"), &path)
+}
+
+fn parse_daemon(value: Option<toml::Value>, path: &Path) -> Result<DaemonSettings> {
+    let settings: DaemonSettings = match value {
+        Some(value) => value
+            .try_into()
+            .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?,
+        None => DaemonSettings::default(),
+    };
+    if let Some(limit) = settings.limit.iter().find(|limit| limit.concurrency == 0) {
+        return Err(Error::Config(format!(
+            "{}: daemon.limit concurrency must be at least 1 for endpoint {}",
+            path.display(),
+            limit.endpoint
+        )));
+    }
+    Ok(settings)
+}
+
+/// Root holding the per-workspace session directories.
+pub fn sessions_root(paths: &Paths) -> PathBuf {
+    paths.data.join("sessions")
+}
+
 /// Extra sandbox roots and environment variable names.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,11 +236,13 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     /// Automatic context compaction and retained history budget.
     pub compaction: crate::compaction::Config,
+    /// Daemon settings from the global user config file only.
+    pub daemon: DaemonSettings,
     /// Ordered registry layers, resolved lazily at the first model request.
     pub registries: Vec<RegistryConfig>,
     /// Compiled policy.
     pub policy: Arc<Policy>,
-    /// Ignored untrusted settings, also printed to stderr during loading.
+    /// Ignored settings, also printed to stderr during loading.
     pub warnings: Vec<String>,
 }
 
@@ -210,6 +285,7 @@ impl Config {
                 .collect(),
             sandbox: SandboxConfig::default(),
             compaction: crate::compaction::Config::default(),
+            daemon: DaemonSettings::default(),
             extensions: Vec::new(),
             registries: Vec::new(),
             policy: Arc::new(Policy::new()),
@@ -242,7 +318,7 @@ impl Config {
             trusted,
             false,
         ));
-        for (path, authority, settings, required) in layers {
+        for (index, (path, authority, settings, required)) in layers.into_iter().enumerate() {
             let text = match std::fs::read_to_string(&path) {
                 Ok(text) => text,
                 Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -263,6 +339,20 @@ impl Config {
                     config.warnings.push(warning);
                 }
                 table.retain(|key, _| key == "rule");
+            }
+            let table = value
+                .as_table_mut()
+                .ok_or_else(|| Error::Config("config must be a table".into()))?;
+            let daemon = table.remove("daemon");
+            if index == 0 {
+                config.daemon = parse_daemon(daemon, &path)?;
+            } else if daemon.is_some() {
+                let warning = format!(
+                    "{}: ignoring daemon settings outside global user config",
+                    path.display()
+                );
+                eprintln!("xi: {warning}");
+                config.warnings.push(warning);
             }
             let layer: FileConfig = value
                 .try_into()
@@ -325,7 +415,7 @@ impl Config {
             .workspace
             .to_string_lossy()
             .replace(['/', '\\', ':'], "_");
-        self.paths.data.join("sessions").join(slug)
+        sessions_root(&self.paths).join(slug)
     }
 
     /// Constructs the per-session sandbox and validates its paths. `git` is
@@ -440,6 +530,18 @@ impl Config {
             git.join("config").to_string_lossy().into_owned(),
         );
         spec.validate().map_err(|e| Error::Config(e.to_string()))?;
+        if let Ok(dir) = xi_protocol::runtime::dir() {
+            let runtime = comparison_path(&dir);
+            for root in spec.readable.iter().chain(&spec.writable) {
+                if runtime.starts_with(comparison_path(root)) {
+                    return Err(Error::Config(format!(
+                        "runtime directory {} is inside sandbox root {}",
+                        dir.display(),
+                        root.display()
+                    )));
+                }
+            }
+        }
         Ok(spec)
     }
 
@@ -467,6 +569,35 @@ impl Config {
         serde_json::from_slice(&output.stdout)
             .map_err(|e| fail(format!("expected a JSON object of strings or nulls: {e}")))
     }
+}
+
+fn comparison_path(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_owned(), |cwd| cwd.join(path))
+    };
+    // A runtime directory may not exist yet beneath a symlinked ancestor.
+    let resolved = absolute.ancestors().skip(1).find_map(|ancestor| {
+        let root = ancestor.canonicalize().ok()?;
+        let suffix = absolute.strip_prefix(ancestor).ok()?;
+        Some(root.join(suffix))
+    });
+    let absolute = resolved.unwrap_or(absolute);
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// The SDK path and the directories xcrun's shims in /usr/bin point to, or

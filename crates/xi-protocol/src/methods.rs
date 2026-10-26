@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::content::{Block, ToolOutput};
 use crate::event::{Event, ModelRef, Usage};
 use crate::ids::{EventId, SessionId, ToolCallId};
+use crate::model::{ModelInfo, Reasoning};
 use crate::rpc::{NotificationMethod, RequestMethod};
 
 macro_rules! request {
@@ -37,17 +38,21 @@ macro_rules! notification {
     };
 }
 
-/// Methods between a client (TUI, editor, SDK) and the kernel.
+/// Methods between a client (TUI, editor, SDK) and the daemon.
 pub mod client {
     use super::*;
 
     request!(
+        /// Client → daemon: negotiate the protocol version.
+        Initialize, "initialize", InitializeParams => InitializeResult
+    );
+    request!(
         /// Client → kernel: start a new session.
-        SessionCreate, "session/create", CreateParams => SessionInfo
+        SessionCreate, "session/create", CreateParams => AttachResult
     );
     request!(
         /// Client → kernel: resume a session file.
-        SessionOpen, "session/open", OpenParams => SessionInfo
+        SessionOpen, "session/open", OpenParams => AttachResult
     );
     request!(
         /// Client → kernel: run a turn from the current head. Resolves when
@@ -71,6 +76,42 @@ pub mod client {
         /// Client → kernel: summarise older context now, at an idle prompt.
         SessionCompact, "session/compact", SessionRef => CompactResult
     );
+    request!(
+        /// Client → daemon: attach to a live session and replay its events.
+        SessionAttach, "session/attach", AttachParams => AttachResult
+    );
+    request!(
+        /// Client → daemon: stop receiving a session's events.
+        SessionDetach, "session/detach", SessionRef => ()
+    );
+    request!(
+        /// Client → daemon: list live and saved sessions.
+        SessionList, "session/list", ListParams => Vec<SessionSummary>
+    );
+    request!(
+        /// Client → daemon: close an idle session's worker.
+        SessionClose, "session/close", SessionRef => ()
+    );
+    request!(
+        /// Client → daemon: select a session's model.
+        SessionSetModel, "session/set_model", SetModelParams => ()
+    );
+    request!(
+        /// Client → daemon: run an extension slash command.
+        SessionCommand, "session/command", SessionCommandParams => Option<super::extension::CommandResult>
+    );
+    request!(
+        /// Client → daemon: list unresolved approvals.
+        ApprovalList, "approval/list", () => Vec<PendingApproval>
+    );
+    request!(
+        /// Client → daemon: inspect daemon and scheduler state.
+        DaemonStatus, "daemon/status", () => StatusResult
+    );
+    request!(
+        /// Client → daemon: request shutdown.
+        DaemonShutdown, "daemon/shutdown", ShutdownParams => ()
+    );
     notification!(
         /// Kernel → client: an event was persisted.
         EventAppended, "event/appended", EventParams
@@ -80,6 +121,93 @@ pub mod client {
         /// complete message arrives later as an event.
         StreamDelta, "stream/delta", DeltaParams
     );
+    notification!(
+        /// Daemon → client: discard partial output from the previous attempt.
+        StreamReset, "stream/reset", ResetParams
+    );
+    notification!(
+        /// Daemon → client: a session's worker exited.
+        SessionExited, "session/exited", ExitedParams
+    );
+    notification!(
+        /// Daemon → client: a call needs approval.
+        ApprovalPending, "approval/pending", PendingApproval
+    );
+
+    /// Parameters for [`Initialize`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct InitializeParams {
+        /// The client's [`crate::PROTOCOL_VERSION`].
+        pub protocol_version: u32,
+        /// Client identity.
+        pub client: ClientInfo,
+    }
+
+    /// Identifies a client application.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ClientInfo {
+        /// Application name.
+        pub name: String,
+        /// Application version.
+        pub version: String,
+    }
+
+    /// Result of [`Initialize`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct InitializeResult {
+        /// The daemon's [`crate::PROTOCOL_VERSION`].
+        pub protocol_version: u32,
+        /// Daemon binary version.
+        pub daemon_version: String,
+        /// Available daemon capabilities.
+        pub capabilities: Capabilities,
+    }
+
+    /// Capabilities of the connected daemon.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Capabilities {
+        /// True for a private instance with no listener.
+        pub private: bool,
+    }
+
+    /// Per-invocation settings. Paths must be absolute; the worker rejects relative ones.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SessionOptions {
+        /// Extra full-authority config layers (`--config`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub configs: Vec<PathBuf>,
+        /// Session directory override (`--session-dir`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_dir: Option<PathBuf>,
+        /// Reasoning depth override (`--reasoning`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning: Option<Reasoning>,
+        /// Enabled tools override (`--tools`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tools: Option<Vec<String>>,
+        /// Extra extension directories (`--extension`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub extensions: Vec<PathBuf>,
+        /// Turn limit override (`--max-turns`); absent means 200.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_turns: Option<usize>,
+        /// How unresolved asks are handled.
+        #[serde(default)]
+        pub approval: ApprovalPolicy,
+    }
+
+    /// Approval behaviour for a session invocation.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ApprovalPolicy {
+        /// Ask an attached client.
+        #[default]
+        Client,
+        /// Approve asks without a client.
+        Allow,
+        /// Deny asks without a client.
+        Deny,
+    }
 
     /// Parameters for [`SessionCreate`].
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +217,9 @@ pub mod client {
         /// Model to start with; the configured default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model: Option<ModelRef>,
+        /// Per-invocation settings.
+        #[serde(default)]
+        pub options: SessionOptions,
     }
 
     /// Parameters for [`SessionOpen`].
@@ -96,6 +227,200 @@ pub mod client {
     pub struct OpenParams {
         /// Session file.
         pub path: PathBuf,
+        /// Per-invocation settings.
+        #[serde(default)]
+        pub options: SessionOptions,
+    }
+
+    /// Parameters for [`SessionAttach`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AttachParams {
+        /// Session to attach.
+        pub session: SessionId,
+        /// Replay only events after this event; absent replays the whole log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub since: Option<EventId>,
+    }
+
+    /// Session snapshot returned when attaching, creating or opening.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct AttachResult {
+        /// Session metadata.
+        pub info: SessionDetails,
+        /// Events after `since` in file order, or the whole log without it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub events: Vec<Event>,
+        /// In-flight assistant blocks of the current attempt.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub partial: Vec<Block>,
+        /// Whether a turn is running.
+        pub running: bool,
+        /// Calls awaiting approval.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub pending_approvals: Vec<PendingApproval>,
+    }
+
+    /// Metadata for a live session.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct SessionDetails {
+        /// Session identity.
+        pub session: SessionId,
+        /// Session file.
+        pub path: PathBuf,
+        /// Event the next prompt continues from.
+        pub head: EventId,
+        /// Workspace root.
+        pub cwd: PathBuf,
+        /// Whether the workspace is trusted.
+        pub trusted: bool,
+        /// Selected model.
+        pub model: ModelRef,
+        /// Registry metadata for the selected model, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model_info: Option<ModelInfo>,
+        /// Parent session for a child session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_session: Option<SessionId>,
+    }
+
+    /// Filters for [`SessionList`].
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ListParams {
+        /// Match this workspace root exactly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cwd: Option<PathBuf>,
+        /// Match sessions whose turn-running state equals this value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub running: Option<bool>,
+    }
+
+    /// A live or saved session in the daemon index.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SessionSummary {
+        /// Session identity.
+        pub session: SessionId,
+        /// Session file.
+        pub path: PathBuf,
+        /// Workspace root.
+        pub cwd: PathBuf,
+        /// Selected model.
+        pub model: ModelRef,
+        /// Current head, absent when no worker has the session open.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub head: Option<EventId>,
+        /// Whether a turn is running.
+        pub running: bool,
+        /// Number of calls awaiting approval.
+        pub pending_approvals: usize,
+        /// Parent session for a child session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_session: Option<SessionId>,
+    }
+
+    /// Parameters for [`SessionSetModel`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SetModelParams {
+        /// Session to update.
+        pub session: SessionId,
+        /// Model to select.
+        pub model: ModelRef,
+    }
+
+    /// Parameters for [`SessionCommand`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SessionCommandParams {
+        /// Session receiving the command.
+        pub session: SessionId,
+        /// Command name without the slash.
+        pub name: String,
+        /// Raw command arguments.
+        pub args: String,
+    }
+
+    /// A tool call awaiting approval.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PendingApproval {
+        /// Session containing the call.
+        pub session: SessionId,
+        /// Call awaiting approval.
+        pub call: ToolCallId,
+        /// Tool name.
+        pub tool: String,
+        /// Human-readable action.
+        pub action: String,
+        /// Matched policy rule, when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rule: Option<String>,
+    }
+
+    /// Result of [`DaemonStatus`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StatusResult {
+        /// Daemon binary version.
+        pub version: String,
+        /// Daemon process id.
+        pub pid: u32,
+        /// Seconds since startup.
+        pub uptime_secs: u64,
+        /// Live worker count.
+        pub workers: usize,
+        /// Connected client count.
+        pub clients: usize,
+        /// Model endpoint scheduler state.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub leases: Vec<LeaseStatus>,
+    }
+
+    /// Scheduler state for one model endpoint.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct LeaseStatus {
+        /// Provider endpoint.
+        pub endpoint: String,
+        /// Configured concurrency limit.
+        pub concurrency: usize,
+        /// Active lease count.
+        pub active: usize,
+        /// Waiting lease count.
+        pub waiting: usize,
+    }
+
+    /// Parameters for [`DaemonShutdown`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ShutdownParams {
+        /// When to stop.
+        pub when: ShutdownWhen,
+    }
+
+    /// Timing of a daemon shutdown.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ShutdownWhen {
+        /// Stop once no workers remain.
+        Idle,
+        /// Cancel and close all workers, then stop.
+        Now,
+    }
+
+    /// Parameters for [`StreamReset`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ResetParams {
+        /// Session whose partial output must be discarded.
+        pub session: SessionId,
+        /// New model request attempt number.
+        pub attempt: u32,
+    }
+
+    /// Parameters for [`SessionExited`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ExitedParams {
+        /// Session whose worker exited.
+        pub session: SessionId,
+        /// Process exit code, absent when unknown or killed by signal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<i32>,
+        /// Explanation of the exit, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub message: Option<String>,
     }
 
     /// An open session.
@@ -179,6 +504,9 @@ pub mod client {
         pub session: SessionId,
         /// The increment.
         pub delta: Delta,
+        /// Model request attempt, starting at zero.
+        #[serde(default)]
+        pub attempt: u32,
     }
 
     /// An increment of streaming model output.
@@ -202,6 +530,42 @@ pub mod client {
             /// Appended JSON text.
             partial_json: String,
         },
+    }
+}
+
+/// Internal methods between the daemon and a session worker.
+pub mod worker {
+    use super::client::{AttachResult, CreateParams, OpenParams};
+    use super::*;
+
+    request!(
+        /// Daemon → worker: start one session; the result signals readiness.
+        WorkerStart, "worker/start", WorkerStartParams => AttachResult
+    );
+    request!(
+        /// Worker → daemon: wait for permission to request a model endpoint.
+        ModelLease, "model/lease", LeaseParams => ()
+    );
+    notification!(
+        /// Worker → daemon: release a model endpoint lease.
+        ModelRelease, "model/release", LeaseParams
+    );
+
+    /// Session startup mode and parameters.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "mode", rename_all = "snake_case")]
+    pub enum WorkerStartParams {
+        /// Create a new session.
+        Create(CreateParams),
+        /// Open an existing session.
+        Open(OpenParams),
+    }
+
+    /// Identifies the endpoint whose model lease is acquired or released.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct LeaseParams {
+        /// Provider endpoint.
+        pub endpoint: String,
     }
 }
 
@@ -436,5 +800,196 @@ pub mod extension {
         Warn,
         /// A failure.
         Error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::client::*;
+    use super::worker::*;
+    use crate::event::{EventKind, ModelRef};
+    use crate::rpc::{Notification, Request, RequestId};
+    use crate::{Block, Event, EventId, SessionId, Timestamp};
+
+    #[test]
+    fn initialize_params_wire_shape() {
+        let params = InitializeParams {
+            protocol_version: crate::PROTOCOL_VERSION,
+            client: ClientInfo {
+                name: "xi-tui".into(),
+                version: "1.2.3".into(),
+            },
+        };
+        let wire = json!({
+            "protocol_version": 0,
+            "client": {"name": "xi-tui", "version": "1.2.3"},
+        });
+        assert_eq!(serde_json::to_value(&params).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<InitializeParams>(wire.clone()).unwrap(),
+            params
+        );
+        assert_eq!(
+            serde_json::to_value(
+                Request::new::<Initialize>(RequestId::Number(1), &params).unwrap()
+            )
+            .unwrap(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": wire}),
+        );
+    }
+
+    #[test]
+    fn attach_result_wire_shape() {
+        let session = SessionId::generate();
+        let head = EventId::generate();
+        let model = ModelRef {
+            provider: "test".into(),
+            model: "model".into(),
+        };
+        let result = AttachResult {
+            info: SessionDetails {
+                session,
+                path: "/sessions/test.jsonl".into(),
+                head,
+                cwd: "/work".into(),
+                trusted: true,
+                model,
+                model_info: None,
+                parent_session: None,
+            },
+            events: vec![Event {
+                id: head,
+                parent: None,
+                at: Timestamp(7),
+                kind: EventKind::UserMessage {
+                    content: vec![Block::Text {
+                        text: "hello".into(),
+                    }],
+                },
+            }],
+            partial: vec![Block::Text {
+                text: "answer".into(),
+            }],
+            running: true,
+            pending_approvals: vec![PendingApproval {
+                session,
+                call: "call-1".into(),
+                tool: "bash".into(),
+                action: "git status".into(),
+                rule: Some("user#1".into()),
+            }],
+        };
+        let wire = json!({
+            "info": {
+                "session": session, "path": "/sessions/test.jsonl", "head": head,
+                "cwd": "/work", "trusted": true,
+                "model": {"provider": "test", "model": "model"},
+            },
+            "events": [{
+                "id": head, "at": 7, "type": "user_message",
+                "content": [{"type": "text", "text": "hello"}],
+            }],
+            "partial": [{"type": "text", "text": "answer"}],
+            "running": true,
+            "pending_approvals": [{
+                "session": session, "call": "call-1", "tool": "bash",
+                "action": "git status", "rule": "user#1",
+            }],
+        });
+        assert_eq!(serde_json::to_value(&result).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<AttachResult>(wire).unwrap(),
+            result
+        );
+        let minimal = json!({"info": result.info, "running": false});
+        let empty: AttachResult = serde_json::from_value(minimal.clone()).unwrap();
+        assert!(empty.events.is_empty());
+        assert!(empty.partial.is_empty());
+        assert!(empty.pending_approvals.is_empty());
+        assert_eq!(serde_json::to_value(empty).unwrap(), minimal);
+    }
+
+    #[test]
+    fn session_options_default_from_empty_object() {
+        let options: SessionOptions = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(options, SessionOptions::default());
+        assert_eq!(options.approval, ApprovalPolicy::Client);
+        assert_eq!(
+            serde_json::to_value(options).unwrap(),
+            json!({"approval": "client"})
+        );
+        let create: CreateParams = serde_json::from_value(json!({"cwd": "/work"})).unwrap();
+        assert_eq!(create.options, SessionOptions::default());
+        let open: OpenParams =
+            serde_json::from_value(json!({"path": "/sessions/test.jsonl"})).unwrap();
+        assert_eq!(open.options, SessionOptions::default());
+    }
+
+    #[test]
+    fn worker_start_params_are_internally_tagged() {
+        let create = WorkerStartParams::Create(CreateParams {
+            cwd: "/work".into(),
+            model: None,
+            options: SessionOptions::default(),
+        });
+        let create_wire = json!({
+            "mode": "create", "cwd": "/work", "options": {"approval": "client"},
+        });
+        assert_eq!(serde_json::to_value(&create).unwrap(), create_wire);
+        assert_eq!(
+            serde_json::from_value::<WorkerStartParams>(create_wire).unwrap(),
+            create
+        );
+        let open = WorkerStartParams::Open(OpenParams {
+            path: "/sessions/test.jsonl".into(),
+            options: SessionOptions::default(),
+        });
+        let open_wire = json!({
+            "mode": "open", "path": "/sessions/test.jsonl",
+            "options": {"approval": "client"},
+        });
+        assert_eq!(serde_json::to_value(&open).unwrap(), open_wire);
+        assert_eq!(
+            serde_json::from_value::<WorkerStartParams>(open_wire).unwrap(),
+            open
+        );
+    }
+
+    #[test]
+    fn reset_params_wire_shape() {
+        let params = ResetParams {
+            session: SessionId::generate(),
+            attempt: 2,
+        };
+        let wire = json!({"session": params.session, "attempt": 2});
+        assert_eq!(serde_json::to_value(&params).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<ResetParams>(wire.clone()).unwrap(),
+            params
+        );
+        assert_eq!(
+            serde_json::to_value(Notification::new::<StreamReset>(&params).unwrap()).unwrap(),
+            json!({"jsonrpc": "2.0", "method": "stream/reset", "params": wire}),
+        );
+    }
+
+    #[test]
+    fn delta_params_without_attempt_defaults_to_zero() {
+        let session = SessionId::generate();
+        let wire = json!({
+            "session": session, "delta": {"type": "text", "text": "hello"},
+        });
+        let params: DeltaParams = serde_json::from_value(wire).unwrap();
+        assert_eq!(params.session, session);
+        assert_eq!(params.attempt, 0);
+        assert_eq!(
+            serde_json::to_value(params).unwrap(),
+            json!({
+                "session": session, "delta": {"type": "text", "text": "hello"},
+                "attempt": 0,
+            }),
+        );
     }
 }

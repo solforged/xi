@@ -8,14 +8,15 @@ use std::time::Duration;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::{Notify, Semaphore};
-use xi_kernel::config::{Config, Paths};
+use xi_kernel::config::{Config, DaemonSettings, Paths, daemon_settings, sessions_root};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Notification, Session, TurnOptions};
 use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
+use xi_protocol::model::ModelInfo;
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, ToolCallId, ToolOutput};
-use xi_provider::{BoxFuture, Error, ErrorKind, Message, ModelInfo, Provider, Request, Response};
+use xi_provider::{BoxFuture, Error, ErrorKind, Message, Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 struct Gate {
@@ -394,7 +395,7 @@ fn trust_gates_settings_but_project_policy_only_tightens() {
     );
     let config = fixture.config();
     assert_eq!(config.model.provider, "global");
-    assert_eq!(config.reasoning, xi_provider::Reasoning::Low);
+    assert_eq!(config.reasoning, xi_protocol::model::Reasoning::Low);
     assert_eq!(config.warnings.len(), 2);
     assert_eq!(
         config
@@ -427,7 +428,7 @@ fn trust_gates_settings_but_project_policy_only_tightens() {
     let config = fixture.config();
     assert!(config.trusted);
     assert_eq!(config.model.provider, "project");
-    assert_eq!(config.reasoning, xi_provider::Reasoning::High);
+    assert_eq!(config.reasoning, xi_protocol::model::Reasoning::High);
     assert_eq!(
         config
             .policy
@@ -479,6 +480,204 @@ fn explicit_config_order_and_sandbox_field_layering() {
     assert!(spec.readable.contains(&spill));
     assert!(spec.env.contains(&"SECOND".into()));
     assert!(!spec.env.contains(&"FIRST".into()));
+}
+
+#[test]
+fn daemon_defaults_and_global_settings() {
+    let fixture = Fixture::new();
+    let defaults = daemon_settings(&fixture.paths).unwrap();
+    assert_eq!(defaults, DaemonSettings::default());
+    assert_eq!(defaults.idle_exit, 600);
+    assert_eq!(defaults.notify, None);
+    assert_eq!(defaults.approval_timeout, None);
+    assert!(defaults.limit.is_empty());
+    assert_eq!(fixture.config().daemon, defaults);
+    assert_eq!(
+        sessions_root(&fixture.paths),
+        fixture.paths.data.join("sessions")
+    );
+    assert_eq!(
+        fixture.config().session_dir().parent(),
+        Some(sessions_root(&fixture.paths).as_path())
+    );
+
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "default_model='global/model'\n[daemon]\nidle_exit=42\nnotify=['notify', '--json']\napproval_timeout=17\n[[daemon.limit]]\nendpoint='https://example.test/v1'\nconcurrency=3\n",
+    );
+    let settings = daemon_settings(&fixture.paths).unwrap();
+    assert_eq!(settings.idle_exit, 42);
+    assert_eq!(
+        settings.notify,
+        Some(vec!["notify".into(), "--json".into()])
+    );
+    assert_eq!(settings.approval_timeout, Some(17));
+    assert_eq!(settings.limit.len(), 1);
+    assert_eq!(settings.limit[0].endpoint, "https://example.test/v1");
+    assert_eq!(settings.limit[0].concurrency, 3);
+    assert_eq!(fixture.config().daemon, settings);
+}
+
+#[test]
+fn daemon_settings_ignore_every_non_global_layer_even_when_trusted() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "[daemon]\nidle_exit=42\n",
+    );
+    let explicit = fixture.paths.home.join("extra.toml");
+    for path in [
+        explicit.clone(),
+        fixture.workspace.join(".xi/config.toml"),
+        fixture.workspace.join(".xi/config.local.toml"),
+    ] {
+        // Ignored tables are not parsed or validated.
+        write(
+            &path,
+            "[daemon]\nunknown=true\n[[daemon.limit]]\nconcurrency=0\n",
+        );
+    }
+    for trusted in [false, true] {
+        if trusted {
+            fixture.paths.trust(&fixture.workspace).unwrap();
+        }
+        let config = Config::load(
+            fixture.paths.clone(),
+            &fixture.workspace,
+            std::slice::from_ref(&explicit),
+        )
+        .unwrap();
+        assert_eq!(config.daemon.idle_exit, 42);
+        assert!(config.daemon.limit.is_empty());
+        assert_eq!(config.warnings.len(), 3);
+        assert!(
+            config
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("ignoring")),
+            "{:?}",
+            config.warnings
+        );
+    }
+}
+
+#[test]
+fn global_daemon_rejects_zero_concurrency_and_unknown_fields() {
+    let fixture = Fixture::new();
+    for (text, expected) in [
+        (
+            "[[daemon.limit]]\nendpoint='local'\nconcurrency=0\n",
+            "concurrency must be at least 1",
+        ),
+        ("[daemon]\nunknown=true\n", "unknown field"),
+        (
+            "[[daemon.limit]]\nendpoint='local'\nconcurrency=1\nunknown=true\n",
+            "unknown field",
+        ),
+    ] {
+        write(&fixture.paths.config.join("config.toml"), text);
+        for error in [
+            daemon_settings(&fixture.paths).unwrap_err(),
+            Config::load(fixture.paths.clone(), &fixture.workspace, &[]).unwrap_err(),
+        ] {
+            assert!(matches!(&error, xi_kernel::Error::Config(_)));
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+}
+
+#[test]
+fn sandbox_runtime_directory_guard() {
+    let fixture = Fixture::new();
+    let readable = fixture.paths.home.join("readable");
+    let writable = fixture.paths.home.join("writable");
+    let alias = fixture.paths.home.join("workspace-link");
+    std::os::unix::fs::symlink(&fixture.workspace, &alias).unwrap();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "[sandbox]\nreadable=['~/readable']\nwritable=['~/writable']\n",
+    );
+    let cases = [
+        (fixture.workspace.join("run"), true),
+        (fixture.workspace.clone(), true),
+        (fixture.workspace.join("missing/../run"), true),
+        (alias.clone(), true),
+        (alias.join("run"), true),
+        (readable.join("run"), true),
+        (writable.join("run"), true),
+        (fixture.paths.state.join("run"), false),
+        (fixture.workspace.join("../state/run"), false),
+    ];
+    for (runtime, reject) in cases {
+        // Child process environments isolate XI_RUNTIME_DIR from every other test.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox_runtime_directory_guard_child",
+                "--nocapture",
+            ])
+            .env("XI_RUNTIME_DIR", &runtime)
+            .env("XI_TEST_RUNTIME_GUARD_ROOT", fixture._dir.path())
+            .env(
+                "XI_TEST_RUNTIME_GUARD_REJECT",
+                if reject { "1" } else { "0" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "runtime {}:\n{}\n{}",
+            runtime.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn sandbox_runtime_directory_guard_child() {
+    let Some(root) = std::env::var_os("XI_TEST_RUNTIME_GUARD_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root).canonicalize().unwrap();
+    let paths = Paths {
+        home: root.join("home"),
+        config: root.join("config"),
+        data: root.join("data"),
+        state: root.join("state"),
+    };
+    let workspace = root.join("workspace");
+    let config = Config::load(paths, &workspace, &[]).unwrap();
+    let result = Session::create(
+        config,
+        None,
+        EventBus::default(),
+        opts(),
+        Some(Backend {
+            provider: Script::new(vec![]),
+            model: model(),
+            tools: vec![Arc::new(FakeTool { gate: None })],
+        }),
+    );
+    if std::env::var("XI_TEST_RUNTIME_GUARD_REJECT").unwrap() == "1" {
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("runtime directory inside sandbox was accepted"),
+        };
+        let xi_kernel::Error::Config(message) = error else {
+            panic!("expected config error, got {error}");
+        };
+        let runtime = xi_protocol::runtime::dir().unwrap();
+        assert!(
+            message.starts_with(&format!(
+                "runtime directory {} is inside sandbox root ",
+                runtime.display()
+            )),
+            "{message}"
+        );
+    } else {
+        assert!(result.is_ok(), "{}", result.err().unwrap());
+    }
 }
 
 #[test]

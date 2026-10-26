@@ -27,10 +27,11 @@ use tokio_util::sync::CancellationToken;
 use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
 use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, SessionInfo};
+use xi_protocol::model::ModelInfo;
 use xi_protocol::{
     Block, Decision, EventId, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput,
 };
-use xi_provider::{ModelInfo, Provider, Request, Response};
+use xi_provider::{Provider, Request, Response};
 use xi_session::SessionLog;
 use xi_tools::{Crossing, Tool};
 
@@ -777,6 +778,7 @@ impl Session {
                 self.0.bus.send(Notification::Delta(DeltaParams {
                     session: self.id(),
                     delta,
+                    attempt: 0,
                 }));
             };
             let result = tokio::select! {

@@ -8,10 +8,9 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
 };
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::{Block, event::ModelRef, manifest::ToolSpec};
-use xi_provider::{
-    Api, Auth, ModelInfo, Provider, ProviderConfig, Reasoning, Registry, RegistryConfig, Request,
-};
+use xi_provider::{Api, Auth, Provider, ProviderConfig, Registry, RegistryConfig, Request};
 
 pub fn request() -> Request {
     Request {

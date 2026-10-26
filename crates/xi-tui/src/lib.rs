@@ -31,8 +31,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
 use xi_kernel::config::{Config, parse_model};
 use xi_kernel::{EventBus, Notification, Session, TurnOptions, TurnOutcome};
+use xi_protocol::model::ModelInfo;
 use xi_protocol::{Block, Event, EventId, SessionId, Timestamp};
-use xi_provider::ModelInfo;
 
 use crate::editor::Editor;
 use crate::screen::Screen;

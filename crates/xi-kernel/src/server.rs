@@ -27,7 +27,7 @@ pub struct Options {
     /// CLI-selected model, overriding loaded settings on creation.
     pub model: Option<xi_protocol::event::ModelRef>,
     /// CLI-selected reasoning level.
-    pub reasoning: Option<xi_provider::Reasoning>,
+    pub reasoning: Option<xi_protocol::model::Reasoning>,
     /// CLI-selected tools.
     pub tools: Option<Vec<String>>,
     /// CLI extension directories, resolved against the process directory.

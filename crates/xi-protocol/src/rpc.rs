@@ -242,6 +242,20 @@ impl RpcError {
     pub const INVALID_PARAMS: i64 = -32602;
     /// The handler failed.
     pub const INTERNAL_ERROR: i64 = -32603;
+    /// The connection has not completed initialization.
+    pub const NOT_INITIALIZED: i64 = -32001;
+    /// The client and daemon protocol versions differ.
+    pub const VERSION_MISMATCH: i64 = -32002;
+    /// No live worker owns the requested session.
+    pub const UNKNOWN_SESSION: i64 = -32003;
+    /// The operation requires an idle session.
+    pub const SESSION_RUNNING: i64 = -32004;
+    /// Another worker holds the session file.
+    pub const SESSION_HELD: i64 = -32005;
+    /// No approval is pending for the call.
+    pub const APPROVAL_NOT_PENDING: i64 = -32006;
+    /// The worker exited before answering.
+    pub const WORKER_EXITED: i64 = -32007;
 
     /// Builds an error without structured data.
     #[must_use]
@@ -250,6 +264,16 @@ impl RpcError {
             code,
             message: message.into(),
             data: None,
+        }
+    }
+
+    /// Builds an error with structured data.
+    #[must_use]
+    pub fn with_data(code: i64, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(data),
         }
     }
 }
