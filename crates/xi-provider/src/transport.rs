@@ -55,12 +55,10 @@ impl Signer for Key {
 /// [`Compat`] resolved against the provider's, with defaults applied.
 #[derive(Clone, Debug)]
 pub(crate) struct Shape {
-    /// The model reasons.
-    pub(crate) reasoning: bool,
+    /// Reasoning levels the model accepts; empty when it doesn't reason.
+    pub(crate) reasoning: Vec<Reasoning>,
     /// Responses requests carry the output-token limit.
     pub(crate) output_limit: bool,
-    /// The Responses effort sent when reasoning is off.
-    pub(crate) reasoning_off: Reasoning,
     /// The header carrying the session's prompt-cache key.
     pub(crate) session_header: Option<HeaderName>,
     /// The Responses Lite request shape.
@@ -68,7 +66,7 @@ pub(crate) struct Shape {
 }
 
 impl Shape {
-    pub(crate) fn new(reasoning: bool, compat: &Compat) -> Result<Self, Error> {
+    pub(crate) fn new(reasoning: Vec<Reasoning>, compat: &Compat) -> Result<Self, Error> {
         let session_header = compat
             .session_header
             .as_deref()
@@ -78,10 +76,27 @@ impl Shape {
         Ok(Self {
             reasoning,
             output_limit: compat.output_limit.unwrap_or(true),
-            reasoning_off: compat.reasoning_off.unwrap_or(Reasoning::Off),
             session_header,
             lite: compat.responses_lite.unwrap_or(false),
         })
+    }
+
+    /// Whether the model reasons, after checking that it accepts the
+    /// request's level.
+    fn reasons(&self, request: &Request) -> Result<bool, Error> {
+        if self.reasoning.is_empty() || self.reasoning.contains(&request.reasoning) {
+            return Ok(!self.reasoning.is_empty());
+        }
+        let levels: Vec<_> = self.reasoning.iter().map(|level| level.name()).collect();
+        Err(Error::new(
+            ErrorKind::Config,
+            format!(
+                "{} does not support {} reasoning; it accepts {}",
+                request.model,
+                request.reasoning,
+                levels.join(", ")
+            ),
+        ))
     }
 }
 
@@ -125,7 +140,7 @@ impl HttpProvider {
             api: config.api,
             signer,
             shapes,
-            unlisted: Shape::new(false, &config.compat)?,
+            unlisted: Shape::new(Vec::new(), &config.compat)?,
         })
     }
 
@@ -177,6 +192,7 @@ impl Provider for HttpProvider {
     ) -> BoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
             let shape = self.shapes.get(&request.model).unwrap_or(&self.unlisted);
+            let reasoning = shape.reasons(request)?;
             let mut headers = self.headers.clone();
             if let Some(name) = &shape.session_header
                 && let Some(value) = request
@@ -188,15 +204,15 @@ impl Provider for HttpProvider {
             }
             match self.api {
                 Api::AnthropicMessages => {
-                    let body = crate::anthropic::body(request, shape.reasoning)?;
+                    let body = crate::anthropic::body(request, reasoning)?;
                     crate::anthropic::consume(self.send(&body, headers).await?, on_delta).await
                 }
                 Api::OpenaiChat => {
-                    let body = crate::openai::body(request, shape.reasoning)?;
+                    let body = crate::openai::body(request, reasoning)?;
                     crate::openai::consume(self.send(&body, headers).await?, on_delta).await
                 }
                 Api::OpenaiResponses => {
-                    let body = crate::responses::body(request, shape)?;
+                    let body = crate::responses::body(request, shape, reasoning)?;
                     if shape.lite {
                         headers.insert(
                             "x-openai-internal-codex-responses-lite",

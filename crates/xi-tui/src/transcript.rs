@@ -772,15 +772,8 @@ impl Transcript {
                     ],
                 );
             }
-            EventKind::ReasoningChanged { reasoning } => {
-                self.push(
-                    &mut out,
-                    [Line::default().dim(format!(
-                        "  reasoning → {}",
-                        crate::reasoning_name(*reasoning)
-                    ))],
-                );
-            }
+            // Reasoning changes are reflected in the footer, not the transcript.
+            EventKind::ReasoningChanged { .. } => {}
             EventKind::UserMessage { content } => {
                 self.gap(&mut out);
                 let text = blocks_text(content);
@@ -1320,6 +1313,22 @@ mod tests {
 
     fn plain(lines: &[Line]) -> Vec<String> {
         lines.iter().map(Line::plain).collect()
+    }
+
+    #[test]
+    fn reasoning_changes_do_not_add_transcript_lines() {
+        let mut t = Transcript::default();
+        let rows = t.apply(
+            &ev(
+                EventKind::ReasoningChanged {
+                    reasoning: xi_protocol::model::Reasoning::XHigh,
+                },
+                0,
+            ),
+            80,
+        );
+        assert!(rows.is_empty());
+        assert!(t.live(80, 0).is_empty());
     }
 
     #[test]

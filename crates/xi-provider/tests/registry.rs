@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use wiremock::MockServer;
 use xi_protocol::event::ModelRef;
-use xi_protocol::model::ModelInfo;
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_provider::{Api, Auth, ErrorKind, ProviderConfig, Registry, RegistryConfig};
 
 fn model_ref(model: &str) -> ModelRef {
@@ -34,7 +34,7 @@ async fn provider_and_model_overrides_take_effect_and_unknown_models_connect() {
         first.uri(),
         Api::AnthropicMessages,
         "test-model",
-        false,
+        &[],
         Auth::None,
     );
     registry
@@ -59,7 +59,7 @@ async fn provider_and_model_overrides_take_effect_and_unknown_models_connect() {
                 id: "test-model".into(),
                 context_window: 100000,
                 max_output: 20000,
-                reasoning: true,
+                reasoning: Reasoning::ALL.to_vec(),
                 pricing: None,
             }
             .into(),
@@ -169,7 +169,7 @@ fn invalid_credentials_and_urls_fail_without_disclosing_secrets() {
             "http://localhost".into(),
             Api::OpenaiChat,
             "test-model",
-            false,
+            &[],
             auth,
         );
         assert_eq!(
@@ -183,7 +183,7 @@ fn invalid_credentials_and_urls_fail_without_disclosing_secrets() {
         "http://localhost".into(),
         Api::OpenaiChat,
         "test-model",
-        false,
+        &[],
         Auth::File(file.path().into()),
     );
     let error = match registry.connect(&model_ref("test-model")) {
@@ -198,8 +198,7 @@ fn invalid_credentials_and_urls_fail_without_disclosing_secrets() {
         "https://secret@example.com/v1",
         "https://example.com?key=secret",
     ] {
-        let registry =
-            common::registry(url.into(), Api::OpenaiChat, "test-model", false, Auth::None);
+        let registry = common::registry(url.into(), Api::OpenaiChat, "test-model", &[], Auth::None);
         assert_eq!(
             error_kind(&registry, &model_ref("test-model")),
             ErrorKind::Config
@@ -221,7 +220,7 @@ fn credential_permissions_are_checked_on_the_open_file() {
             "http://localhost".into(),
             Api::OpenaiChat,
             "test-model",
-            false,
+            &[],
             Auth::File(file.path().into()),
         );
         assert_eq!(
@@ -238,7 +237,7 @@ fn credential_permissions_are_checked_on_the_open_file() {
             "http://localhost".into(),
             Api::OpenaiChat,
             "test-model",
-            false,
+            &[],
             Auth::File(file.path().into()),
         );
         assert!(
@@ -258,7 +257,7 @@ async fn environment_credentials_are_resolved_without_modifying_process_environm
         &server,
         Api::OpenaiChat,
         "test-model",
-        false,
+        &[],
         Auth::Env(name.into()),
     );
     provider.stream(&request(), &mut |_| {}).await.unwrap();

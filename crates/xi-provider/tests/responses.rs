@@ -57,6 +57,45 @@ fn transcript() -> String {
 }
 
 #[tokio::test]
+async fn listed_levels_are_sent_by_name_and_others_fail_before_sending() {
+    for (api, response) in [
+        (
+            Api::OpenaiChat,
+            openai(vec![chunk(json!({"content":"ok"}), Some("stop"))]),
+        ),
+        (Api::OpenaiResponses, sse(vec![completed(1, 0, 1)])),
+    ] {
+        let server = MockServer::start().await;
+        mock(&server, api, response).await;
+        let levels = [Reasoning::Off, Reasoning::Low, Reasoning::XHigh];
+        let provider = provider(&server, api, "test-model", &levels, Auth::None);
+        let mut request = request();
+        for level in [Reasoning::Off, Reasoning::XHigh] {
+            request.reasoning = level;
+            provider.stream(&request, &mut |_| {}).await.unwrap();
+        }
+        request.reasoning = Reasoning::Max;
+        let error = provider.stream(&request, &mut |_| {}).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config, "{api:?}");
+        assert!(error.message.contains("accepts off, low, xhigh"), "{api:?}");
+        let efforts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|received| {
+                let body: Value = received.body_json().unwrap();
+                match api {
+                    Api::OpenaiChat => body["reasoning_effort"].clone(),
+                    _ => body["reasoning"]["effort"].clone(),
+                }
+            })
+            .collect();
+        assert_eq!(efforts, ["none", "xhigh"], "{api:?}");
+    }
+}
+
+#[tokio::test]
 async fn reasoning_text_tools_and_usage_round_trip_statelessly() {
     let server = MockServer::start().await;
     mock(&server, Api::OpenaiResponses, transcript()).await;
@@ -64,7 +103,7 @@ async fn reasoning_text_tools_and_usage_round_trip_statelessly() {
         &server,
         Api::OpenaiResponses,
         "test-model",
-        true,
+        &Reasoning::ALL,
         Auth::None,
     );
     let mut request = request();
@@ -169,7 +208,7 @@ async fn other_providers_reasoning_is_left_out_of_the_replay() {
         &server,
         Api::OpenaiResponses,
         "test-model",
-        true,
+        &Reasoning::ALL,
         Auth::None,
     );
     let mut request = request();
@@ -245,13 +284,7 @@ async fn failures_limits_and_truncation_are_classified() {
     ] {
         let server = MockServer::start().await;
         mock(&server, Api::OpenaiResponses, sse(events)).await;
-        let provider = provider(
-            &server,
-            Api::OpenaiResponses,
-            "test-model",
-            false,
-            Auth::None,
-        );
+        let provider = provider(&server, Api::OpenaiResponses, "test-model", &[], Auth::None);
         let result = provider.stream(&request(), &mut |_| {}).await;
         match expected {
             Ok(stop) => assert_eq!(result.unwrap().stop, stop),
@@ -294,21 +327,21 @@ async fn chatgpt_requests_are_signed_and_model_compat_overrides_the_provider() {
         api = "openai-responses"
         base_url = "{}"
         auth = {{ login = "chatgpt" }}
-        compat = {{ output_limit = false, reasoning_off = "low", session_header = "session-id" }}
+        compat = {{ output_limit = false, session_header = "session-id" }}
 
         [[model]]
         provider = "test"
         id = "test-model"
         context_window = 32768
         max_output = 8192
-        reasoning = true
+        reasoning = ["low", "medium", "high"]
 
         [[model]]
         provider = "test"
         id = "lite-model"
         context_window = 272000
         max_output = 128000
-        reasoning = true
+        reasoning = ["low", "medium", "high"]
         compat = {{ responses_lite = true, output_limit = true }}
         "#,
         server.uri()
@@ -352,9 +385,9 @@ async fn chatgpt_requests_are_signed_and_model_compat_overrides_the_provider() {
     );
 
     // The model turns on Lite and the output limit and keeps the provider's
-    // session header and reasoning clamp.
+    // session header.
     request.model = "lite-model".into();
-    request.reasoning = Reasoning::Off;
+    request.reasoning = Reasoning::Low;
     registry
         .connect(&model("lite-model"))
         .unwrap()
@@ -373,7 +406,7 @@ async fn chatgpt_requests_are_signed_and_model_compat_overrides_the_provider() {
     assert_eq!(body["parallel_tool_calls"], false);
     assert_eq!(
         body["reasoning"],
-        json!({"effort":"low","context":"all_turns"})
+        json!({"effort":"low","summary":"auto","context":"all_turns"})
     );
     assert_eq!(
         body["input"][0],

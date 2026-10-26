@@ -680,12 +680,32 @@ impl Session {
         Ok(())
     }
 
-    /// Changes reasoning depth at an idle prompt, recording only changed levels.
+    /// Changes reasoning depth at an idle prompt, recording only changed
+    /// levels. A model that reasons must list the level.
     pub async fn set_reasoning(&self, reasoning: Reasoning) -> Result<()> {
         let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
         let control = self.0.control.lock().expect("control lock");
         if control.running {
             return Err(Error::Running);
+        }
+        let registry;
+        let model = match &state.backend {
+            Some(backend) => Some(&backend.model),
+            None => {
+                registry = state.config.registry();
+                registry.model(&state.config.model)
+            }
+        };
+        if let Some(model) = model
+            && model.resolve(reasoning) != reasoning
+        {
+            let levels: Vec<_> = model.reasoning.iter().map(|level| level.name()).collect();
+            return Err(Error::Config(format!(
+                "{}/{} does not support {reasoning} reasoning; it accepts {}",
+                model.provider,
+                model.id,
+                levels.join(", ")
+            )));
         }
         if reasoning != state.config.reasoning {
             self.append(&mut state, EventKind::ReasoningChanged { reasoning })?;
@@ -958,7 +978,7 @@ impl Session {
                 messages: context::messages(state.log.context(state.head).expect("known head")),
                 tools: state.tool_specs().cloned().collect(),
                 max_tokens: backend.model.max_output,
-                reasoning: state.config.reasoning,
+                reasoning: backend.model.resolve(state.config.reasoning),
                 cache_key: Some(self.id().to_string()),
             };
             let response = self

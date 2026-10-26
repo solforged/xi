@@ -274,7 +274,7 @@ impl Session {
                 messages,
                 tools: Vec::new(),
                 max_tokens: backend.model.max_output,
-                reasoning: state.config.reasoning,
+                reasoning: backend.model.resolve(state.config.reasoning),
                 cache_key: Some(self.id().to_string()),
             };
             // Summary deltas are not assistant output. Only the finished durable

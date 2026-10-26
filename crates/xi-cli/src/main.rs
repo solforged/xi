@@ -30,9 +30,9 @@ struct Cli {
     /// Provider/model selector.
     #[arg(short, long, global = true)]
     model: Option<String>,
-    /// Reasoning depth.
-    #[arg(long, value_enum, global = true)]
-    reasoning: Option<Reasoning>,
+    /// Reasoning depth; models run the nearest level they accept.
+    #[arg(long, global = true, value_parser = reasoning_parser())]
+    reasoning: Option<xi_protocol::model::Reasoning>,
     /// Additional full-authority configuration layer; repeatable.
     #[arg(long, global = true)]
     config: Vec<PathBuf>,
@@ -104,23 +104,14 @@ enum DaemonCommand {
     Uninstall,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Reasoning {
-    Off,
-    Low,
-    Medium,
-    High,
+fn reasoning_parser() -> impl clap::builder::TypedValueParser<Value = xi_protocol::model::Reasoning>
+{
+    use clap::builder::TypedValueParser;
+    use xi_protocol::model::Reasoning;
+    clap::builder::PossibleValuesParser::new(Reasoning::ALL.map(Reasoning::name))
+        .map(|name| name.parse::<Reasoning>().expect("a listed level"))
 }
-impl From<Reasoning> for xi_protocol::model::Reasoning {
-    fn from(value: Reasoning) -> Self {
-        match value {
-            Reasoning::Off => Self::Off,
-            Reasoning::Low => Self::Low,
-            Reasoning::Medium => Self::Medium,
-            Reasoning::High => Self::High,
-        }
-    }
-}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum OnAsk {
     Deny,
@@ -213,7 +204,7 @@ async fn run(cli: Cli) -> Result<u8> {
         options: SessionOptions {
             configs: cli.config.iter().map(|path| absolute(path)).collect(),
             session_dir: cli.session_dir.as_deref().map(absolute),
-            reasoning: cli.reasoning.map(Into::into),
+            reasoning: cli.reasoning,
             tools: cli.tools,
             extensions: cli.extension.iter().map(|path| absolute(path)).collect(),
             max_turns: cli.max_turns,

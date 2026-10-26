@@ -326,7 +326,7 @@ async fn routes_remaining_typed_requests() {
                     id: "model".into(),
                     context_window: 1000,
                     max_output: 100,
-                    reasoning: true,
+                    reasoning: Reasoning::ALL.to_vec(),
                     pricing: None,
                 },
                 available: false,

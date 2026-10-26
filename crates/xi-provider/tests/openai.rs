@@ -37,7 +37,7 @@ async fn indexed_tools_reasoning_usage_and_request_round_trip() {
         &server,
         Api::OpenaiChat,
         "test-model",
-        true,
+        &Reasoning::ALL,
         Auth::File(key.path().into()),
     );
     let mut request = request();
@@ -188,7 +188,7 @@ async fn alternate_reasoning_field_is_not_replayed_and_auth_is_optional() {
         ]),
     )
     .await;
-    let provider = provider(&server, Api::OpenaiChat, "test-model", false, Auth::None);
+    let provider = provider(&server, Api::OpenaiChat, "test-model", &[], Auth::None);
     let mut request = request();
     let response = provider.stream(&request, &mut |_| {}).await.unwrap();
     assert_eq!(
@@ -220,7 +220,13 @@ async fn modern_openai_output_limit_and_delayed_call_id() {
         chunk(json!({"tool_calls":[{"index":0,"id":"late_id","function":{"name":"re","arguments":"\"file\"}"}}]}), None),
         chunk(json!({"tool_calls":[{"index":0,"function":{"name":"ad"}}]}), Some("tool_calls")),
     ])).await;
-    let provider = provider(&server, Api::OpenaiChat, "gpt-5.5", true, Auth::None);
+    let provider = provider(
+        &server,
+        Api::OpenaiChat,
+        "gpt-5.5",
+        &Reasoning::ALL,
+        Auth::None,
+    );
     let mut request = request();
     request.model = "gpt-5.5".into();
     let mut deltas = Vec::new();

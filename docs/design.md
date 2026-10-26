@@ -141,7 +141,7 @@ Client → daemon requests:
 | `session/checkout` | `{session, event}` → null | Route to the worker; move the head to an earlier event to branch. Idle only. |
 | `session/compact` | `{session}` → `{head, tokens_before}` | Route to the worker; summarize older context at an idle prompt. |
 | `session/set_model` | `{session, model}` → null | Idle only; record `model_changed`. |
-| `session/set_reasoning` | `{session, reasoning}` → null | Idle only; record `reasoning_changed` when the level changes. Reopening a log restores the last level on the head's lineage. Models without reasoning keep the setting and ignore it. |
+| `session/set_reasoning` | `{session, reasoning}` → null | Idle only; record `reasoning_changed` when the level changes. A model that reasons must list the level, or the request fails with the levels it accepts. Reopening a log restores the last level on the head's lineage. Models without reasoning keep the setting and ignore it. |
 | `session/models` | `{session}` → `{current, reasoning, models: [{model, info, available}]}` | Route to the worker; list the session's model registry with `ModelInfo`. `available` is false when the provider's credential is missing. No credential value is ever returned. |
 | `session/commands` | `{session}` → `[{name, description}]` | Route to the worker; list the session's extension slash commands for completion. |
 | `session/command` | `{session, name, args}` → command result or null | Route an extension slash command to the worker. The result is the extension protocol's `CommandResult`; null means an unknown command. |
@@ -258,7 +258,9 @@ Built-ins currently implement the same tool schema and policy contract in-proces
 
 The provider layer converts between xi content blocks and each provider's wire format. Conversion is lossless: thinking signatures, redacted thinking and provider-specific blocks round-trip through `thinking` and `opaque` blocks. Model metadata (context window, pricing, capabilities) comes from a registry file, not code.
 
-Code grows per wire API (Anthropic Messages, OpenAI-compatible Chat, OpenAI Responses), not per provider. A new provider that speaks one of them is a `[provider.<name>]` table. Its differences go in `compat`, named for the behavior rather than the vendor: `output_limit`, `reasoning_off`, `session_header` and `responses_lite`. A `[[model]]` table may set its own `compat`, which overrides the provider's one field at a time. These settings stay in the provider crate, so the protocol's model metadata carries none of them. The credential source is `auth`: an environment variable, a `0600` file, or `{ login = "chatgpt" }` for tokens from `xi login`. Each one signs requests through the same interface, which may refresh the credential once after a 401.
+Code grows per wire API (Anthropic Messages, OpenAI-compatible Chat, OpenAI Responses), not per provider. A new provider that speaks one of them is a `[provider.<name>]` table. Its differences go in `compat`, named for the behavior rather than the vendor: `output_limit`, `session_header` and `responses_lite`. A `[[model]]` table may set its own `compat`, which overrides the provider's one field at a time. These settings stay in the provider crate, so the protocol's model metadata carries none of them. The credential source is `auth`: an environment variable, a `0600` file, or `{ login = "chatgpt" }` for tokens from `xi login`. Each one signs requests through the same interface, which may refresh the credential once after a 401.
+
+Reasoning levels are one ordered scale, the union of the providers' effort names: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`. Each `[[model]]` lists the levels it accepts in `reasoning`, for example `reasoning = ["low", "medium", "high", "xhigh", "max"]`; an empty or missing list means the model doesn't reason. `off` is listed only when the model can stop reasoning, so models that always think leave it out. The session keeps the level the user chose and each request runs at the model's nearest accepted level: the closest one below, never `off` unless `off` was chosen, else the closest one above. A config default or `--reasoning` therefore carries across models, and switching back restores the chosen level. Adapters reject a level the model doesn't list before sending anything. Each wire API maps a level to its own field: Chat and Responses send the name as `reasoning_effort` or `reasoning.effort` (`off` as `none`), current Claude models send it as `output_config.effort`, and older Claude models turn it into a thinking budget.
 
 Context is built to keep the cached prefix stable: the system prompt has no timestamps or dynamic state, history is append-only, and compaction is the only operation that changes the prefix.
 
@@ -297,7 +299,7 @@ Composer keys are unique. Keys inside an overlay apply only while it has focus.
 | `ctrl+r` | Search prompt history. |
 | `ctrl+g` | Edit the prompt in the external editor. |
 | `alt+m` | Open the model picker. |
-| `shift+tab` | Cycle reasoning: off, low, medium, high. |
+| `shift+tab` | Cycle reasoning through the levels the model accepts. |
 | `ctrl+o` | Expand the newest collapsed result; repeat to walk back. |
 | `ctrl+t` | Cycle thinking display: full, first line, hidden. |
 | Editing | `ctrl+a`/`ctrl+e` line start and end, `ctrl+b`/`ctrl+f` and arrows by character, `ctrl+w` and `alt+backspace` delete a word, `ctrl+u`/`ctrl+k` delete to line start and end. |
@@ -325,14 +327,14 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 | `/resume` | Open the session picker. |
 | `/tree` | Open the branch overlay and check out an earlier point. |
 | `/model [PROVIDER/MODEL]` | Switch model; without an argument, open the model picker. |
-| `/reasoning [off\|low\|medium\|high]` | Set reasoning; without an argument, show it. |
+| `/reasoning [LEVEL]` | Set reasoning; without an argument, show it and the levels the model accepts. |
 | `/compact` | Summarize older context now. |
 | `/approvals` | Open the approvals inbox for all sessions. |
 | `/settings` | Open the settings view. |
 | `/copy` | Copy the last response through OSC 52, which also works over SSH. |
 | `/name args` | Any other name runs an extension command through `session/command`; an unknown name points to `/help`. |
 
-Built-in names are reserved, so an extension cannot shadow them. Model, reasoning, compaction and `/new` are idle only; during a turn the client says so instead of queueing the change.
+Built-in names are reserved, so an extension cannot shadow them. Model, reasoning, compaction and `/new` are idle only; during a turn the client says so instead of queueing the change. Reasoning changes update the footer without adding transcript lines.
 
 #### Composer
 
@@ -370,7 +372,7 @@ Global defaults go through `config/set`, which edits the global `config.toml` wi
 
 #### Footer and rendering
 
-The footer shows workspace, model, reasoning, context use, cache hit rate, cost when pricing is known, trust, taint and waiting approvals. Context, taint, approvals and trust never drop. As the terminal narrows, segments first switch to their short forms, such as the workspace's last path component, and then drop in a fixed order: sandbox, cache, branch, reasoning, cost, workspace, model. Reasoning shows as `think off`, `think low`, `think med` or `think high`, and as `no think` for models without reasoning.
+The footer shows workspace, model, reasoning, context use, cache hit rate, cost when pricing is known, trust, taint and waiting approvals. Context, taint, approvals and trust never drop. As the terminal narrows, segments first switch to their short forms, such as the workspace's last path component, and then drop in a fixed order: sandbox, cache, branch, reasoning, cost, workspace, model. Reasoning shows the level the model runs at, such as `think off`, `think med` or `think xhigh`, and `no think` for models without reasoning.
 
 Tool results show a headline and at most three lines; `ctrl+o` expands the rest. A successful `edit` renders as a diff instead: the lines shared by the start and end of the old and new text are cut to one line of context on each side, then the removed and added lines, at most eight rows, with `+N −M` in the headline; `hashline` edits show their added lines. Thinking blocks follow the thinking display setting, `first` by default: `full` shows the whole text dimmed, `first` its first line, and `hidden` nothing; streaming thinking follows the same setting in the live region. `ctrl+t` changes it for output from then on. Images show as a placeholder.
 

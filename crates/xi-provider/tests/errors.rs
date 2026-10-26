@@ -49,7 +49,7 @@ async fn both_adapters_classify_http_errors_and_retry_after() {
                 )
                 .mount(&server)
                 .await;
-            let provider = provider(&server, api, "test-model", false, Auth::None);
+            let provider = provider(&server, api, "test-model", &[], Auth::None);
             let error = provider.stream(&request(), &mut |_| {}).await.unwrap_err();
             assert_eq!(error.kind, kind, "{api:?}: {status}");
             assert_eq!(error.retry_after, Some(Duration::from_millis(2500)));
@@ -65,7 +65,7 @@ async fn both_adapters_classify_http_errors_and_retry_after() {
             )
             .mount(&server)
             .await;
-        let provider = provider(&server, api, "test-model", false, Auth::None);
+        let provider = provider(&server, api, "test-model", &[], Auth::None);
         let delay = provider
             .stream(&request(), &mut |_| {})
             .await
@@ -115,7 +115,7 @@ async fn both_adapters_classify_in_stream_errors_after_partial_output() {
                 format!("{prefix}event: error\ndata: {error}\n\n"),
             )
             .await;
-            let provider = provider(&server, api, "test-model", false, Auth::None);
+            let provider = provider(&server, api, "test-model", &[], Auth::None);
             let mut deltas = Vec::new();
             let error = provider
                 .stream(&request(), &mut |delta| deltas.push(delta))
@@ -146,7 +146,7 @@ async fn malformed_truncated_and_empty_streams_fail_instead_of_succeeding() {
         ] {
             let server = MockServer::start().await;
             mock(&server, api, body).await;
-            let provider = provider(&server, api, "test-model", false, Auth::None);
+            let provider = provider(&server, api, "test-model", &[], Auth::None);
             assert_eq!(
                 provider
                     .stream(&request(), &mut |_| {})
@@ -177,7 +177,7 @@ async fn malformed_tool_json_is_decode_error_for_each_adapter() {
             Api::OpenaiResponses => unreachable!("covered in tests/responses.rs"),
         };
         mock(&server, api, body).await;
-        let provider = provider(&server, api, "test-model", false, Auth::None);
+        let provider = provider(&server, api, "test-model", &[], Auth::None);
         assert_eq!(
             provider
                 .stream(&request(), &mut |_| {})
@@ -224,7 +224,7 @@ async fn stop_reasons_are_not_conflated() {
                 },
             )
             .await;
-            let provider = provider(&server, api, "test-model", false, Auth::None);
+            let provider = provider(&server, api, "test-model", &[], Auth::None);
             assert_eq!(
                 provider.stream(&request(), &mut |_| {}).await.unwrap().stop,
                 expected
@@ -252,7 +252,7 @@ async fn abruptly_dropped_http_body_is_network_error() {
             format!("http://{address}"),
             api,
             "test-model",
-            false,
+            &[],
             Auth::None,
         );
         let provider = registry

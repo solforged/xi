@@ -131,7 +131,7 @@ impl Action {
             Self::Search => "search prompt history; repeat for older matches",
             Self::External => "edit the prompt in the external editor",
             Self::Models => "open the model picker",
-            Self::Reasoning => "cycle reasoning: off, low, medium, high",
+            Self::Reasoning => "cycle reasoning through the model's levels",
             Self::Expand => "expand the newest collapsed result; repeat for older",
             Self::Thinking => "cycle thinking display: full, first line, hidden",
             Self::Home => "line start",

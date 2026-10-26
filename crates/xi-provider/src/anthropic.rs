@@ -75,8 +75,8 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
 
 // https://platform.claude.com/docs/en/build-with-claude/thinking
 // https://platform.claude.com/docs/en/build-with-claude/effort
-// 4.6+ uses adaptive thinking. 4.5 and earlier use explicit budgets.
-// Mandatory-thinking models clamp Off to low effort instead of failing a run.
+// 4.6+ uses adaptive thinking. 4.5 and earlier use explicit budgets. Models
+// that always think don't list `off`, so it never reaches them.
 fn configure_thinking(body: &mut Value, request: &Request) -> Result<(), Error> {
     let mut parts = request
         .model
@@ -95,14 +95,9 @@ fn configure_thinking(body: &mut Value, request: &Request) -> Result<(), Error> 
     let adaptive = matches!(family, "fable" | "mythos")
         || major >= 5
         || (major == 4 && minor >= 6 && matches!(family, "opus" | "sonnet"));
-    let always_on = matches!(family, "fable" | "mythos")
-        || (family == "opus" && (major > 5 || (major == 5 && minor >= 5)));
     let between_tools = family == "sonnet" && major == 5 && minor >= 5;
     if request.reasoning == Reasoning::Off {
-        if always_on {
-            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
-            body["output_config"] = json!({"effort": "low"});
-        } else if between_tools {
+        if between_tools {
             body["thinking"] = json!({"type": "between_tools", "display": "summarized"});
             body["output_config"] = json!({"effort": "low"});
         } else {
@@ -117,13 +112,15 @@ fn configure_thinking(body: &mut Value, request: &Request) -> Result<(), Error> 
         } else {
             json!({"type": "adaptive"})
         };
-        body["output_config"] = json!({"effort": effort(request.reasoning)});
+        body["output_config"] = json!({"effort": request.reasoning.name()});
     } else {
         let requested = match request.reasoning {
-            Reasoning::Low => 1024,
+            Reasoning::Off => unreachable!(),
+            Reasoning::Minimal | Reasoning::Low => 1024,
             Reasoning::Medium => 4096,
             Reasoning::High => 16384,
-            Reasoning::Off => unreachable!(),
+            Reasoning::XHigh => 32768,
+            Reasoning::Max => 65536,
         };
         let budget = requested.min(request.max_tokens.saturating_sub(1));
         if budget < 1024 {
@@ -135,15 +132,6 @@ fn configure_thinking(body: &mut Value, request: &Request) -> Result<(), Error> 
         body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
     }
     Ok(())
-}
-
-pub(crate) fn effort(reasoning: Reasoning) -> &'static str {
-    match reasoning {
-        Reasoning::Off => "none",
-        Reasoning::Low => "low",
-        Reasoning::Medium => "medium",
-        Reasoning::High => "high",
-    }
 }
 
 fn block(block: &Block) -> Result<Value, Error> {

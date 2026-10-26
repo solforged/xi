@@ -173,22 +173,25 @@ fn builtin_commands() -> Vec<CommandSpec> {
         .collect()
 }
 
-fn reasoning_name(reasoning: Reasoning) -> &'static str {
+/// The footer's form of a level.
+fn short_reasoning(reasoning: Reasoning) -> &'static str {
     match reasoning {
-        Reasoning::Off => "off",
-        Reasoning::Low => "low",
-        Reasoning::Medium => "medium",
-        Reasoning::High => "high",
+        Reasoning::Minimal => "min",
+        Reasoning::Medium => "med",
+        level => level.name(),
     }
 }
 
-fn next_reasoning(reasoning: Reasoning) -> Reasoning {
-    match reasoning {
-        Reasoning::Off => Reasoning::Low,
-        Reasoning::Low => Reasoning::Medium,
-        Reasoning::Medium => Reasoning::High,
-        Reasoning::High => Reasoning::Off,
-    }
+/// The levels a model lists, lowest first, joined by `separator`.
+fn reasoning_levels(model: &xi_protocol::model::ModelInfo, separator: &str) -> String {
+    let mut levels = model.reasoning.clone();
+    levels.sort_unstable();
+    levels.dedup();
+    levels
+        .iter()
+        .map(|level| level.name())
+        .collect::<Vec<_>>()
+        .join(separator)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -797,10 +800,7 @@ impl App {
             settings::Action::None => {}
             settings::Action::Close => self.close_overlay(),
             settings::Action::Models => self.open_models().await,
-            settings::Action::Reasoning => {
-                self.set_reasoning(next_reasoning(self.launch.attached.info.reasoning))
-                    .await;
-            }
+            settings::Action::Reasoning => self.cycle_reasoning().await,
             settings::Action::Thinking => {
                 let thinking = self.transcript.thinking_display().next();
                 self.transcript.set_thinking(thinking);
@@ -903,6 +903,19 @@ impl App {
                 self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
                 false
             }
+        }
+    }
+
+    /// Steps to the model's next accepted level. Does nothing until the
+    /// next attach supplies a switched model's levels.
+    async fn cycle_reasoning(&mut self) {
+        let info = &self.launch.attached.info;
+        if let Some(next) = info
+            .model_info
+            .as_ref()
+            .and_then(|model| model.next_reasoning(info.reasoning))
+        {
+            self.set_reasoning(next).await;
         }
     }
 
@@ -1385,27 +1398,30 @@ impl App {
                 _ => self.note(vec![Line::default().dim("  /model expects PROVIDER/MODEL")]),
             },
             Some(Builtin::Reasoning) if rest.is_empty() => {
-                self.note(vec![Line::default().dim(format!(
-                    "  reasoning {} · /reasoning off|low|medium|high",
-                    reasoning_name(self.launch.attached.info.reasoning)
-                ))]);
-            }
-            Some(Builtin::Reasoning) => {
-                let reasoning = match rest {
-                    "off" => Some(Reasoning::Off),
-                    "low" => Some(Reasoning::Low),
-                    "medium" => Some(Reasoning::Medium),
-                    "high" => Some(Reasoning::High),
-                    _ => None,
+                let info = &self.launch.attached.info;
+                let line = match &info.model_info {
+                    Some(model) if model.reasoning.is_empty() => {
+                        format!("  {} does not reason", model.id)
+                    }
+                    Some(model) => format!(
+                        "  reasoning {} · /reasoning {}",
+                        model.resolve(info.reasoning),
+                        reasoning_levels(model, "|")
+                    ),
+                    None => format!("  reasoning {}", info.reasoning),
                 };
-                if let Some(reasoning) = reasoning {
-                    self.set_reasoning(reasoning).await;
-                } else {
-                    self.note(vec![
-                        Line::default().dim("  /reasoning expects off, low, medium, or high"),
-                    ]);
-                }
+                self.note(vec![Line::default().dim(line)]);
             }
+            Some(Builtin::Reasoning) => match rest.parse::<Reasoning>() {
+                Ok(reasoning) => self.set_reasoning(reasoning).await,
+                Err(error) => {
+                    let names = match &self.launch.attached.info.model_info {
+                        Some(model) if !model.reasoning.is_empty() => reasoning_levels(model, ", "),
+                        _ => Reasoning::ALL.map(Reasoning::name).join(", "),
+                    };
+                    self.note(vec![Line::default().dim(format!("  {error}; use {names}"))]);
+                }
+            },
             Some(Builtin::Compact) => {
                 if !self.idle_only("/compact") {
                     return Ok(());
@@ -1818,8 +1834,7 @@ impl App {
                 return Ok(());
             }
             Some(Action::Reasoning) => {
-                let next = next_reasoning(self.launch.attached.info.reasoning);
-                self.set_reasoning(next).await;
+                self.cycle_reasoning().await;
                 return Ok(());
             }
             Some(Action::Expand) => {
@@ -1907,21 +1922,12 @@ impl App {
             )
             .short(Line::default().ink(&model.model)),
         );
-        let reasoning = if info
-            .model_info
-            .as_ref()
-            .is_some_and(|model| !model.reasoning)
-        {
-            "no think"
-        } else {
-            match info.reasoning {
-                Reasoning::Off => "think off",
-                Reasoning::Low => "think low",
-                Reasoning::Medium => "think med",
-                Reasoning::High => "think high",
-            }
+        let reasoning = match &info.model_info {
+            Some(model) if model.reasoning.is_empty() => "no think".to_owned(),
+            Some(model) => format!("think {}", short_reasoning(model.resolve(info.reasoning))),
+            None => format!("think {}", short_reasoning(info.reasoning)),
         };
-        segs.push(Segment::new("reasoning", d(reasoning.into())));
+        segs.push(Segment::new("reasoning", d(reasoning)));
         if let Some(model) = &info.model_info {
             let window = model.context_window.max(1);
             segs.push(Segment::new(
@@ -2163,7 +2169,7 @@ mod tests {
             id: "script".into(),
             context_window: 256_000,
             max_output: 4_096,
-            reasoning: true,
+            reasoning: Reasoning::ALL.to_vec(),
             pricing: None,
         }
     }
@@ -2566,30 +2572,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shift_tab_sets_reasoning_and_updates_the_footer() {
+    async fn shift_tab_cycles_the_models_levels_and_updates_the_footer() {
         let (launch, mut requests) = launch(snapshot(false)).await;
         let mut app = App::new(launch, 160, 24);
         assert!(app.footer(160).plain().contains("think med"));
-        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
-            .await
-            .unwrap();
-        let params = request(&mut requests, "session/set_reasoning");
-        assert_eq!(params["session"], json!(app.session_id()));
-        assert_eq!(params["reasoning"], "high");
-        assert_eq!(app.launch.attached.info.reasoning, Reasoning::High);
-        assert!(app.footer(160).plain().contains("think high"));
-        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
-            .await
-            .unwrap();
-        assert!(app.footer(160).plain().contains("think off"));
+        let model = app.launch.attached.info.model_info.as_mut().unwrap();
+        model.reasoning = vec![Reasoning::Low, Reasoning::High, Reasoning::XHigh];
+        // Medium isn't listed, so the model runs, and shows, low.
+        assert!(app.footer(160).plain().contains("think low"));
+        for expected in [Reasoning::High, Reasoning::XHigh, Reasoning::Low] {
+            app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+                .await
+                .unwrap();
+            let params = request(&mut requests, "session/set_reasoning");
+            assert_eq!(params["session"], json!(app.session_id()));
+            assert_eq!(params["reasoning"], expected.name());
+            assert_eq!(app.launch.attached.info.reasoning, expected);
+            assert!(
+                app.footer(160)
+                    .plain()
+                    .contains(&format!("think {}", expected.name()))
+            );
+        }
         app.launch
             .attached
             .info
             .model_info
             .as_mut()
             .unwrap()
-            .reasoning = false;
+            .reasoning
+            .clear();
         assert!(app.footer(160).plain().contains("no think"));
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reasoning_command_accepts_xhigh_without_a_transcript_note() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 160, 24);
+        app.commit.clear();
+        app.command("/reasoning xhigh").await.unwrap();
+        assert_eq!(
+            request(&mut requests, "session/set_reasoning")["reasoning"],
+            "xhigh"
+        );
+        assert_eq!(app.launch.attached.info.reasoning, Reasoning::XHigh);
+        assert!(app.footer(160).plain().contains("think xhigh"));
+        assert!(app.commit.is_empty());
     }
 
     #[tokio::test]
@@ -2794,6 +2826,11 @@ mod tests {
         assert_eq!(app.launch.attached.info.model.model, "other");
         assert!(app.refresh);
         assert!(app.footer(160).plain().contains("think low"));
+        assert!(
+            app.commit
+                .iter()
+                .all(|line| !line.plain().contains("reasoning →"))
+        );
     }
 
     #[tokio::test]

@@ -34,7 +34,7 @@ pub fn provider(
     server: &MockServer,
     api: Api,
     model: &str,
-    reasoning: bool,
+    reasoning: &[Reasoning],
     auth: Auth,
 ) -> Arc<dyn Provider> {
     registry(server.uri(), api, model, reasoning, auth)
@@ -45,7 +45,13 @@ pub fn provider(
         .unwrap()
 }
 
-pub fn registry(base_url: String, api: Api, model: &str, reasoning: bool, auth: Auth) -> Registry {
+pub fn registry(
+    base_url: String,
+    api: Api,
+    model: &str,
+    reasoning: &[Reasoning],
+    auth: Auth,
+) -> Registry {
     let mut registry = Registry::default();
     registry.extend(RegistryConfig {
         provider: BTreeMap::from([(
@@ -63,7 +69,7 @@ pub fn registry(base_url: String, api: Api, model: &str, reasoning: bool, auth: 
                 id: model.into(),
                 context_window: 32768,
                 max_output: 8192,
-                reasoning,
+                reasoning: reasoning.to_vec(),
                 pricing: None,
             }
             .into(),

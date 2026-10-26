@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id: model.clone(),
                 context_window: 262144,
                 max_output: 4096,
-                reasoning: true,
+                reasoning: Reasoning::ALL.to_vec(),
                 pricing: None,
             }
             .into(),

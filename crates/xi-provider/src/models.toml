@@ -6,6 +6,11 @@
 # https://developers.openai.com/api/docs/models/gpt-5.4-mini
 # Cache writes use the Anthropic five-minute rate. OpenAI has no separate charge.
 # Long-context premiums and regional surcharges are not represented.
+#
+# `reasoning` lists the levels each model accepts, from the provider's own
+# per-model documentation; `off` only where reasoning can be turned off.
+# https://platform.claude.com/docs/en/build-with-claude/effort
+# https://developers.openai.com/api/docs/guides/reasoning
 
 [provider.anthropic]
 api = "anthropic-messages"
@@ -19,30 +24,34 @@ auth = { env = "OPENAI_API_KEY" }
 
 # A ChatGPT plan through the Codex backend (`xi login chatgpt`). Usage counts
 # against the plan's limits, so these models carry no per-token pricing.
-# The backend takes no output limit, offers no `none` effort and keys its
-# prompt cache by session. Its current models all need Responses Lite.
-# Context windows are the account's `/models` values.
+# The backend takes no output limit and keys its prompt cache by session.
+# Its current models all need Responses Lite and can't turn reasoning off.
+# Context windows and reasoning levels are the account's `/models` values,
+# less `ultra`: Codex sends it as `max` or `xhigh` plus a proactive
+# multi-agent prompt, and the backend rejects it as an effort.
 # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
 [provider.chatgpt]
 api = "openai-responses"
 base_url = "https://chatgpt.com/backend-api/codex"
 auth = { login = "chatgpt" }
-compat = { output_limit = false, reasoning_off = "low", session_header = "session-id" }
+compat = { output_limit = false, session_header = "session-id" }
 
+# Opus 5.5 always thinks: `thinking: disabled` fails at every effort.
 [[model]]
 provider = "anthropic"
 id = "claude-opus-5-5"
 context_window = 1000000
 max_output = 128000
-reasoning = true
+reasoning = ["low", "medium", "high", "xhigh", "max"]
 pricing = { input = 4, output = 20, cache_read = 0.20, cache_write = 5 }
 
+# Off sends `thinking: between_tools`, its lowest setting.
 [[model]]
 provider = "anthropic"
 id = "claude-sonnet-5-5"
 context_window = 1000000
 max_output = 128000
-reasoning = true
+reasoning = ["off", "low", "medium", "high", "xhigh", "max"]
 pricing = { input = 2, output = 10, cache_read = 0.10, cache_write = 2.50 }
 
 [[model]]
@@ -50,15 +59,16 @@ provider = "anthropic"
 id = "claude-fable-5-1"
 context_window = 1000000
 max_output = 128000
-reasoning = true
+reasoning = ["low", "medium", "high", "xhigh", "max"]
 pricing = { input = 10, output = 50, cache_read = 0.25, cache_write = 12.50 }
 
+# Sonnet 4.6 has `max` but no `xhigh`.
 [[model]]
 provider = "anthropic"
 id = "claude-sonnet-4-6"
 context_window = 1000000
 max_output = 128000
-reasoning = true
+reasoning = ["off", "low", "medium", "high", "max"]
 pricing = { input = 3, output = 15, cache_read = 0.30, cache_write = 3.75 }
 
 [[model]]
@@ -66,7 +76,7 @@ provider = "openai"
 id = "gpt-5.5"
 context_window = 1050000
 max_output = 128000
-reasoning = true
+reasoning = ["off", "low", "medium", "high", "xhigh"]
 pricing = { input = 5, output = 30, cache_read = 0.50 }
 
 [[model]]
@@ -74,7 +84,7 @@ provider = "openai"
 id = "gpt-5.4"
 context_window = 1050000
 max_output = 128000
-reasoning = true
+reasoning = ["off", "low", "medium", "high", "xhigh"]
 pricing = { input = 2.50, output = 15, cache_read = 0.25 }
 
 [[model]]
@@ -82,7 +92,7 @@ provider = "openai"
 id = "gpt-5.4-mini"
 context_window = 400000
 max_output = 128000
-reasoning = true
+reasoning = ["off", "low", "medium", "high", "xhigh"]
 pricing = { input = 0.75, output = 4.50, cache_read = 0.075 }
 
 [[model]]
@@ -90,7 +100,7 @@ provider = "chatgpt"
 id = "gpt-6.1-sol"
 context_window = 500000
 max_output = 128000
-reasoning = true
+reasoning = ["low", "medium", "high", "xhigh", "max"]
 compat = { responses_lite = true }
 
 [[model]]
@@ -98,7 +108,7 @@ provider = "chatgpt"
 id = "gpt-6.1-terra"
 context_window = 500000
 max_output = 128000
-reasoning = true
+reasoning = ["low", "medium", "high", "xhigh", "max"]
 compat = { responses_lite = true }
 
 [[model]]
@@ -106,7 +116,7 @@ provider = "chatgpt"
 id = "gpt-6-sol"
 context_window = 272000
 max_output = 128000
-reasoning = true
+reasoning = ["low", "medium", "high", "xhigh", "max"]
 compat = { responses_lite = true }
 
 [[model]]
@@ -114,7 +124,7 @@ provider = "chatgpt"
 id = "gpt-6-astra"
 context_window = 272000
 max_output = 128000
-reasoning = true
+reasoning = ["low", "medium", "high", "xhigh", "max"]
 compat = { responses_lite = true }
 
 [[model]]
@@ -122,5 +132,5 @@ provider = "chatgpt"
 id = "gpt-6-luna"
 context_window = 272000
 max_output = 128000
-reasoning = true
+reasoning = ["low", "medium", "high", "xhigh", "max"]
 compat = { responses_lite = true }

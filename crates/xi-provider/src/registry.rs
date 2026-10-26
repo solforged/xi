@@ -109,7 +109,10 @@ impl Registry {
             .iter()
             .filter(|entry| entry.info.provider == model.provider)
             .map(|entry| {
-                let shape = Shape::new(entry.info.reasoning, &entry.compat.or(&config.compat))?;
+                let shape = Shape::new(
+                    entry.info.reasoning.clone(),
+                    &entry.compat.or(&config.compat),
+                )?;
                 Ok((entry.info.id.clone(), shape))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;

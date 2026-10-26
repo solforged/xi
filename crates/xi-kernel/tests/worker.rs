@@ -143,7 +143,7 @@ impl Fixture {
                 "default_model = 'test/script'\ntools = []\n\
                  [provider.test]\napi = 'openai-chat'\nbase_url = '{ENDPOINT}'\n\
                  [[model]]\nprovider = 'test'\nid = 'script'\n\
-                 context_window = 8192\nmax_output = 1024\nreasoning = false\n"
+                 context_window = 8192\nmax_output = 1024\n"
             ),
         )
         .unwrap();
@@ -277,7 +277,7 @@ fn model() -> ModelInfo {
         id: "script".into(),
         context_window: 8192,
         max_output: 1024,
-        reasoning: false,
+        reasoning: Vec::new(),
         pricing: None,
     }
 }
@@ -405,7 +405,7 @@ async fn model_catalog_checks_credentials_child() {
     }
     config.push_str(
         "\n[[model]]\nprovider = 'chatgpt'\nid = 'gpt-6.1-sol'\n\
-         context_window = 7777\nmax_output = 100\nreasoning = true\n",
+         context_window = 7777\nmax_output = 100\nreasoning = ['low', 'high']\n",
     );
     std::fs::write(config_path, config).unwrap();
     let harness = fixture.spawn(None);

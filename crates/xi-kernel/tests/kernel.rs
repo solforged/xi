@@ -234,7 +234,7 @@ fn model() -> ModelInfo {
         id: "test".into(),
         context_window: 8192,
         max_output: 1024,
-        reasoning: true,
+        reasoning: Reasoning::ALL.to_vec(),
         pricing: None,
     }
 }
@@ -1179,6 +1179,44 @@ async fn reasoning_changes_record_once_and_reach_the_next_provider_request() {
         script.requests.lock().unwrap()[0].reasoning,
         Reasoning::High
     );
+}
+
+#[tokio::test]
+async fn requests_run_at_a_listed_level_and_unlisted_choices_are_refused() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![Step::Reply(done()), Step::Reply(done())]);
+    let mut config = fixture.config();
+    config.reasoning = Reasoning::Off;
+    let session = Session::create(
+        config,
+        None,
+        EventBus::default(),
+        opts(),
+        Some(Backend {
+            provider: script.clone(),
+            model: ModelInfo {
+                reasoning: vec![Reasoning::Low, Reasoning::High, Reasoning::Max],
+                ..model()
+            },
+            tools: Vec::new(),
+        }),
+    )
+    .unwrap();
+    // A default the model can't run still reaches it as its nearest level.
+    session.prompt(input("default")).await.unwrap();
+    let error = session.set_reasoning(Reasoning::XHigh).await.unwrap_err();
+    assert!(matches!(error, xi_kernel::Error::Config(_)));
+    assert!(error.to_string().contains("accepts low, high, max"));
+    session.set_reasoning(Reasoning::Max).await.unwrap();
+    session.prompt(input("max")).await.unwrap();
+    let sent: Vec<_> = script
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request.reasoning)
+        .collect();
+    assert_eq!(sent, [Reasoning::Low, Reasoning::Max]);
 }
 
 #[tokio::test]
