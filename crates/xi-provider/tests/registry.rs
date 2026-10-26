@@ -7,7 +7,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use wiremock::MockServer;
 use xi_protocol::event::ModelRef;
-use xi_provider::{Api, Auth, ErrorKind, ModelInfo, ProviderConfig, Registry, RegistryConfig};
+use xi_protocol::model::ModelInfo;
+use xi_provider::{Api, Auth, ErrorKind, ProviderConfig, Registry, RegistryConfig};
 
 fn model_ref(model: &str) -> ModelRef {
     ModelRef {

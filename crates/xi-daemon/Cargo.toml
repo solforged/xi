@@ -1,0 +1,38 @@
+[package]
+name = "xi-daemon"
+description = "The per-user xi daemon: routing, worker supervision and socket activation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+xi-client.workspace = true
+xi-kernel.workspace = true
+xi-protocol.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+listenfd.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+# The workspace forbids unsafe code; macOS socket activation needs one FFI
+# call, so this crate denies unsafe code and allows it on that function only.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

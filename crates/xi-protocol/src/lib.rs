@@ -5,13 +5,17 @@
 //! - [`rpc`]: the JSON-RPC 2.0 envelope and typed method traits.
 //! - [`methods`]: every protocol method, grouped by peer.
 //! - [`manifest`]: extension package manifests and runtime registration.
+//! - [`model`]: provider-neutral model metadata and reasoning settings.
+//! - [`runtime`]: per-user daemon runtime paths.
 
 pub mod content;
 pub mod event;
 pub mod ids;
 pub mod manifest;
 pub mod methods;
+pub mod model;
 pub mod rpc;
+pub mod runtime;
 
 pub use content::{Block, OutputBlock, ToolOutput};
 pub use event::{Decision, Event, EventKind};

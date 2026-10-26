@@ -5,12 +5,13 @@ mod common;
 use common::*;
 use serde_json::{Value, json};
 use wiremock::MockServer;
+use xi_protocol::model::Reasoning;
 use xi_protocol::{
     Block, OutputBlock, ToolOutput,
     event::{StopReason, Usage},
     methods::client::Delta,
 };
-use xi_provider::{Api, Auth, Message, Reasoning, ToolResult};
+use xi_provider::{Api, Auth, Message, ToolResult};
 
 fn transcript() -> String {
     anthropic(vec![

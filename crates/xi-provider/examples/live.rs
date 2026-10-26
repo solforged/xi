@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use serde_json::json;
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::{
     Block, OutputBlock, ToolOutput,
     event::{ModelRef, StopReason},
@@ -14,8 +15,7 @@ use xi_protocol::{
     methods::client::Delta,
 };
 use xi_provider::{
-    Api, Auth, Message, ModelInfo, ProviderConfig, Reasoning, Registry, RegistryConfig, Request,
-    ToolResult,
+    Api, Auth, Message, ProviderConfig, Registry, RegistryConfig, Request, ToolResult,
 };
 
 fn print_delta(delta: Delta) {

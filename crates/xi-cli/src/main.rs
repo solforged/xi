@@ -78,7 +78,7 @@ enum Reasoning {
     Medium,
     High,
 }
-impl From<Reasoning> for xi_provider::Reasoning {
+impl From<Reasoning> for xi_protocol::model::Reasoning {
     fn from(value: Reasoning) -> Self {
         match value {
             Reasoning::Off => Self::Off,

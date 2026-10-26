@@ -10,8 +10,9 @@ use xi_kernel::config::{Config, Paths};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Session, TurnOptions};
 use xi_protocol::event::{Approver, StopReason, Usage};
 use xi_protocol::methods::client::Delta;
+use xi_protocol::model::ModelInfo;
 use xi_protocol::{Block, Decision, EventKind, OutputBlock};
-use xi_provider::{BoxFuture, ModelInfo, Provider, Request, Response};
+use xi_provider::{BoxFuture, Provider, Request, Response};
 
 struct Fake {
     input: Value,

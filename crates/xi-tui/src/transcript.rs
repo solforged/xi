@@ -12,8 +12,8 @@ use serde_json::Value;
 use xi_kernel::Notification;
 use xi_protocol::event::{Decision, ModelRef, StopReason, Usage};
 use xi_protocol::methods::client::Delta;
+use xi_protocol::model::Pricing;
 use xi_protocol::{Block, EventKind, OutputBlock, Timestamp, ToolCallId, ToolOutput};
-use xi_provider::Pricing;
 
 use crate::style::{Line, Role, lr, wrap};
 

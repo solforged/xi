@@ -209,6 +209,12 @@ pub enum Approver {
     },
     /// No client was attached; the headless default (`--on-ask`) applied.
     Headless,
+    /// The approval deadline expired.
+    Timeout,
+    /// The worker stopped before the approval was resolved.
+    Interrupted,
+    /// The turn was cancelled while approval was pending.
+    Cancelled,
 }
 
 #[cfg(test)]
