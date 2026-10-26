@@ -10,6 +10,7 @@
 //! The client attaches to a daemon session over the typed JSON-RPC connection.
 
 pub mod approvals;
+pub mod children;
 pub mod clipboard;
 mod commands;
 pub mod complete;
@@ -469,6 +470,12 @@ impl App {
     }
 
     fn notify(&mut self, notification: &ClientNotification) {
+        if let ClientNotification::Event(params) = notification
+            && params.session != self.session_id()
+            && self.transcript.child(self.session_id(), params)
+        {
+            return;
+        }
         if !self.mine(notification) {
             if let ClientNotification::ApprovalPending(pending) = notification {
                 let cwd = self.approval_workspaces.get(&pending.session).cloned();

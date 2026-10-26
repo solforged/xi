@@ -574,13 +574,20 @@ impl Peer {
                         }
                     }
                     Message::Request(request) => {
+                        let id = request.id.clone();
+                        // Routing before spawning keeps a session's requests,
+                        // such as concurrent `agent/run`s, in the order the
+                        // extension sent them, so children start in that order.
+                        let routed =
+                            route(&reader_wire, &routes, extension.clone(), subagents, request);
                         let wire = reader_wire.clone();
-                        let routes = routes.clone();
-                        let extension = extension.clone();
                         tokio::spawn(async move {
-                            let id = request.id.clone();
-                            let result =
-                                incoming(&wire, &routes, extension, subagents, request).await;
+                            let result = match routed {
+                                Ok(reply) => reply.await.unwrap_or_else(|_| {
+                                    Err(Error::Config("session extension request cancelled".into()))
+                                }),
+                                Err(error) => Err(error),
+                            };
                             let response = match result {
                                 Ok(value) => rpc::Response {
                                     jsonrpc: rpc::Version,
@@ -739,17 +746,21 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn incoming(
+/// Checks an extension request and hands it to its session. The receiver
+/// yields the session's answer.
+fn route(
     wire: &Wire,
     routes: &Mutex<HashMap<SessionId, Route>>,
     extension: ExtensionId,
     subagents: bool,
     request: rpc::Request,
-) -> Result<Value> {
+) -> Result<oneshot::Receiver<Result<Value>>> {
+    let (reply, receiver) = oneshot::channel();
     if request.method == "log" {
         let params: LogParams = serde_json::from_value(request.params)?;
         wire.log(&format!("{:?}: {}", params.level, params.message));
-        return Ok(Value::Null);
+        let _ = reply.send(Ok(Value::Null));
+        return Ok(receiver);
     }
     if request.method != AppendCustom::METHOD && request.method != AgentRun::METHOD {
         return Err(Error::Config(format!(
@@ -769,23 +780,18 @@ async fn incoming(
             .cloned()
             .unwrap_or(Value::Null),
     )?;
-    let (reply, receiver) = oneshot::channel();
-    {
-        let routes = routes.lock().expect("extension routes");
-        let route = routes
-            .get(&session)
-            .filter(|route| route.peers.contains(&extension))
-            .ok_or_else(|| Error::Config("session is not serving this extension".into()))?;
-        route
-            .sender
-            .send(Incoming {
-                extension,
-                request,
-                reply,
-            })
-            .map_err(|_| Error::Config("session extension scope closed".into()))?;
-    }
-    receiver
-        .await
-        .map_err(|_| Error::Config("session extension request cancelled".into()))?
+    let routes = routes.lock().expect("extension routes");
+    let route = routes
+        .get(&session)
+        .filter(|route| route.peers.contains(&extension))
+        .ok_or_else(|| Error::Config("session is not serving this extension".into()))?;
+    route
+        .sender
+        .send(Incoming {
+            extension,
+            request,
+            reply,
+        })
+        .map_err(|_| Error::Config("session extension scope closed".into()))?;
+    Ok(receiver)
 }

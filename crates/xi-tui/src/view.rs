@@ -91,6 +91,18 @@ impl App {
             self.transcript.end_turn();
         }
         self.transcript.partial(&self.launch.attached.partial);
+        let parent = self.launch.attached.info.session;
+        for child in &self.launch.attached.children {
+            for event in &child.events {
+                self.transcript.child(
+                    parent,
+                    &EventParams {
+                        session: child.session,
+                        event: event.clone(),
+                    },
+                );
+            }
+        }
         for pending in &self.launch.attached.pending_approvals {
             self.transcript.apply(
                 &ClientNotification::ApprovalPending(pending.clone()),
@@ -158,6 +170,16 @@ impl App {
                 "cost",
                 Line::default().ink(format!("${cost:.2}")),
             ));
+        }
+        let running = self.transcript.children().running();
+        if running > 0 {
+            segs.push(
+                Segment::new(
+                    "children",
+                    d("agents ".into()).ink(format!("{running} running")),
+                )
+                .short(d("ag ".into()).ink(running.to_string())),
+            );
         }
         if !info.trusted {
             segs.push(Segment::new("trust", Line::default().brass("untrusted")));

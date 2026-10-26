@@ -13,10 +13,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use xi_client::peer::{Incoming, Peer};
 use xi_protocol::methods::client::{
-    ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, Delta, EventAppended, ModelEntry,
-    ModelsResult, PendingApproval, PromptParams, PromptResult, ResolveParams, SessionCommandParams,
-    SessionDetails, SessionOptions, SessionRef, SetModelParams, SetReasoningParams, StreamDelta,
-    StreamReset,
+    ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, ChildEvents, Delta, EventAppended,
+    EventParams, ModelEntry, ModelsResult, PendingApproval, PromptParams, PromptResult,
+    ResolveParams, SessionCommandParams, SessionDetails, SessionOptions, SessionRef,
+    SetModelParams, SetReasoningParams, StreamDelta, StreamReset,
 };
 use xi_protocol::methods::worker::{LeaseParams, ModelLease, ModelRelease, WorkerStartParams};
 use xi_protocol::model::Reasoning;
@@ -93,6 +93,8 @@ struct Mirror {
     stream_sequence: u64,
     tools: HashMap<ToolCallId, String>,
     pending: Vec<PendingApproval>,
+    /// Children started since the last tool result, kept for attach.
+    children: Vec<ChildEvents>,
 }
 
 impl Mirror {
@@ -110,9 +112,14 @@ impl Mirror {
                     }
                 }
             }
-            EventKind::UserMessage { .. } | EventKind::TurnFailed { .. } => {
+            EventKind::UserMessage { .. } => {
+                self.partial.clear();
+                self.children.clear();
+            }
+            EventKind::TurnFailed { .. } => {
                 self.partial.clear();
             }
+            EventKind::Compaction { .. } => self.children.clear(),
             EventKind::ModelChanged { model } => {
                 self.info.model = model.clone();
                 self.info.model_info = self.registry.model(model).cloned();
@@ -145,11 +152,39 @@ impl Mirror {
             EventKind::ToolResult { call, .. } => {
                 self.pending.retain(|pending| pending.call != *call);
                 self.tools.remove(call);
+                // The call these children ran under has its result.
+                self.children.clear();
             }
             _ => {}
         }
         self.index.insert(event.id, self.events.len());
         self.events.push(event.clone());
+    }
+
+    /// Records an event from another session on this worker's bus. Returns
+    /// whether it belongs to a child of this session.
+    fn child(&mut self, params: &EventParams) -> bool {
+        if let Some(child) = self
+            .children
+            .iter_mut()
+            .find(|c| c.session == params.session)
+        {
+            child.events.push(params.event.clone());
+            return true;
+        }
+        match &params.event.kind {
+            EventKind::SessionStarted {
+                parent_session: Some(parent),
+                ..
+            } if *parent == self.info.session => {
+                self.children.push(ChildEvents {
+                    session: params.session,
+                    events: vec![params.event.clone()],
+                });
+                true
+            }
+            _ => false,
+        }
     }
 
     fn checkout(&mut self, head: EventId) {
@@ -237,6 +272,7 @@ impl Mirror {
             stream_sequence: self.stream_sequence,
             running,
             pending_approvals: self.pending.clone(),
+            children: self.children.clone(),
         })
     }
 }
@@ -519,6 +555,7 @@ async fn start(
         stream_sequence: 0,
         tools: HashMap::new(),
         pending: Vec::new(),
+        children: Vec::new(),
     };
     for event in state.log.events() {
         mirror.event(event);
@@ -686,6 +723,11 @@ fn mirror(worker: &mut Option<Worker>, peer: &Peer, notification: Notification) 
             params.sequence = active.mirror.stream_sequence;
             active.mirror.partial.clear();
             let _ = peer.notify::<StreamReset>(&params);
+        }
+        // Only the session's children share its bus. Their stream deltas
+        // stay in the worker; clients draw children from events.
+        Notification::Event(params) if active.mirror.child(&params) => {
+            let _ = peer.notify::<EventAppended>(&params);
         }
         _ => {}
     }

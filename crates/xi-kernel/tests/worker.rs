@@ -1524,3 +1524,244 @@ async fn attach_mirrors_pending_approvals_and_resolve_stays_responsive() {
     );
     harness.close(session).await;
 }
+
+/// The parent calls the fixture extension's `probe` tool in `mode`; children
+/// answer at once, or never for `slow child`.
+struct Delegating(&'static str);
+
+impl Provider for Delegating {
+    fn stream<'a>(
+        &'a self,
+        request: &'a Request,
+        _: &'a mut (dyn FnMut(Delta) + Send),
+    ) -> BoxFuture<'a, Result<Response, Error>> {
+        Box::pin(async move {
+            let wire = format!("{:?}", request.messages);
+            if wire.contains("slow child") {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            let child = wire.contains("child one") || wire.contains("child two");
+            let answered = request
+                .messages
+                .iter()
+                .any(|message| matches!(message, xi_provider::Message::ToolResults(_)));
+            let (content, stop) = if child || answered {
+                (text("answer"), StopReason::EndTurn)
+            } else {
+                (
+                    vec![Block::ToolUse {
+                        id: "probe-call".into(),
+                        name: "probe".into(),
+                        input: json!({ "mode": self.0 }),
+                        extra: Default::default(),
+                    }],
+                    StopReason::ToolUse,
+                )
+            };
+            Ok(Response {
+                content,
+                stop,
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+
+/// A worker whose session loads the subagent-capable fixture extension.
+async fn delegating(fixture: &Fixture, mode: &'static str) -> (Harness, SessionId) {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .canonicalize()
+        .unwrap();
+    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../sdk/typescript")
+        .canonicalize()
+        .unwrap();
+    let package = fixture.cwd.join("probe");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("xi-extension.toml"),
+        format!(
+            "name = 'probe'\nversion = '0.1.0'\nrun = ['node', '{}']\n\
+             [capabilities]\nfs_read = ['{}', '{}']\nsubagents = true\n",
+            fixtures.join("extension.ts").display(),
+            fixtures.display(),
+            sdk.display(),
+        ),
+    )
+    .unwrap();
+    let harness = fixture.worker_with_tools(
+        Arc::new(Delegating(mode)),
+        xi_tools::toolset(&["read"]).unwrap(),
+    );
+    let mut params = fixture.create();
+    let WorkerStartParams::Create(create) = &mut params else {
+        unreachable!()
+    };
+    create.options.extensions = vec![package];
+    let attached = request::<WorkerStart>(&harness.peer, &params)
+        .await
+        .unwrap();
+    (harness, attached.info.session)
+}
+
+fn prompt(harness: &Harness, session: SessionId) -> JoinHandle<()> {
+    let peer = harness.peer.clone();
+    tokio::spawn(async move {
+        let _ = request::<SessionPrompt>(
+            &peer,
+            &PromptParams {
+                session,
+                content: text("parent prompt"),
+            },
+        )
+        .await;
+    })
+}
+
+impl Harness {
+    /// Grants model leases until an event matches `until`, returning every
+    /// event notification up to and including it.
+    async fn events_until(&mut self, until: impl Fn(&EventParams) -> bool) -> Vec<EventParams> {
+        let mut events = Vec::new();
+        loop {
+            match self.next().await {
+                Incoming::Request { id, .. } => self.peer.respond(id, Ok(Value::Null)).unwrap(),
+                Incoming::Notification { method, params } if method == "event/appended" => {
+                    let params: EventParams = serde_json::from_value(params).unwrap();
+                    let done = until(&params);
+                    events.push(params);
+                    if done {
+                        return events;
+                    }
+                }
+                Incoming::Notification { .. } => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_events_reach_the_parent_client_and_clear_with_the_result() {
+    let fixture = Fixture::new();
+    let (mut harness, session) = delegating(&fixture, "child").await;
+    let turn = prompt(&harness, session);
+    let events = harness
+        .events_until(|p| {
+            p.session == session && matches!(p.event.kind, EventKind::ToolResult { .. })
+        })
+        .await;
+    let mut children: Vec<SessionId> = Vec::new();
+    for params in events.iter().filter(|p| p.session != session) {
+        if let EventKind::SessionStarted { parent_session, .. } = &params.event.kind {
+            assert_eq!(*parent_session, Some(session));
+            children.push(params.session);
+        } else {
+            assert!(
+                children.contains(&params.session),
+                "child event before its root"
+            );
+        }
+    }
+    // Children start in the order the extension asked for them.
+    let prompts: Vec<String> = children
+        .iter()
+        .map(|child| {
+            events
+                .iter()
+                .find_map(|p| match &p.event.kind {
+                    EventKind::UserMessage { content } if p.session == *child => {
+                        Some(format!("{content:?}"))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("child one") && prompts[1].contains("child two"));
+    for child in &children {
+        assert!(events.iter().any(|p| p.session == *child
+            && matches!(
+                p.event.kind,
+                EventKind::AssistantMessage {
+                    stop: StopReason::EndTurn,
+                    ..
+                }
+            )));
+    }
+    let snapshot = request::<SessionAttach>(
+        &harness.peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(snapshot.children.is_empty());
+    harness
+        .events_until(|p| {
+            p.session == session
+                && matches!(
+                    p.event.kind,
+                    EventKind::AssistantMessage {
+                        stop: StopReason::EndTurn,
+                        ..
+                    }
+                )
+        })
+        .await;
+    turn.await.unwrap();
+    harness.close(session).await;
+}
+
+#[tokio::test]
+async fn attaching_mid_call_replays_running_children() {
+    let fixture = Fixture::new();
+    let (mut harness, session) = delegating(&fixture, "slow_child").await;
+    let turn = prompt(&harness, session);
+    let events = harness
+        .events_until(|p| {
+            p.session != session && matches!(p.event.kind, EventKind::UserMessage { .. })
+        })
+        .await;
+    let child = events.last().unwrap().session;
+    let snapshot = request::<SessionAttach>(
+        &harness.peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(snapshot.running);
+    assert_eq!(snapshot.children.len(), 1);
+    assert_eq!(snapshot.children[0].session, child);
+    let kinds: Vec<_> = snapshot.children[0]
+        .events
+        .iter()
+        .map(|event| &event.kind)
+        .collect();
+    assert!(matches!(
+        kinds[..],
+        [
+            EventKind::SessionStarted {
+                parent_session: Some(parent),
+                ..
+            },
+            EventKind::UserMessage { .. },
+        ] if *parent == session
+    ));
+    request::<SessionCancel>(&harness.peer, &SessionRef { session })
+        .await
+        .unwrap();
+    harness
+        .events_until(|p| {
+            p.session == session && matches!(p.event.kind, EventKind::ToolResult { .. })
+        })
+        .await;
+    turn.await.unwrap();
+    harness.close(session).await;
+}

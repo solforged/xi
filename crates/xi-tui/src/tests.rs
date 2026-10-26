@@ -10,12 +10,12 @@ use crate::approvals::Choice;
 use crate::keys::Action;
 use serde_json::{Value, json};
 use xi_client::peer::{Incoming, Peer};
-use xi_protocol::EventKind;
 use xi_protocol::event::{Remember, StopReason, Usage};
 use xi_protocol::methods::client::{
-    ConfigFiles, Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails, Setting,
-    SettingLayer, SettingsReport,
+    ChildEvents, ConfigFiles, Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails,
+    Setting, SettingLayer, SettingsReport,
 };
+use xi_protocol::{EventKind, OutputBlock, ToolOutput};
 
 use super::*;
 
@@ -54,6 +54,7 @@ fn snapshot(running: bool) -> AttachResult {
         stream_sequence: 0,
         running,
         pending_approvals: Vec::new(),
+        children: Vec::new(),
     }
 }
 
@@ -825,6 +826,210 @@ fn live_text(app: &App) -> String {
         .map(Line::plain)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn child_event(app: &mut App, child: SessionId, kind: EventKind) {
+    app.notify(&ClientNotification::Event(EventParams {
+        session: child,
+        event: Event {
+            id: EventId::generate(),
+            parent: None,
+            at: Timestamp::now(),
+            kind,
+        },
+    }));
+}
+
+fn child_root(parent: SessionId, child: SessionId) -> EventKind {
+    EventKind::SessionStarted {
+        session: child,
+        cwd: "/tmp/xi-tui-demo".into(),
+        model: ModelRef {
+            provider: "demo".into(),
+            model: "script".into(),
+        },
+        xi_version: "test".into(),
+        parent_session: Some(parent),
+    }
+}
+
+fn reply(content: Vec<Block>, stop: StopReason) -> EventKind {
+    EventKind::AssistantMessage {
+        model: ModelRef {
+            provider: "demo".into(),
+            model: "script".into(),
+        },
+        content,
+        stop,
+        usage: Usage {
+            input: 1_000,
+            output: 10,
+            cache_read: 0,
+            cache_write: 0,
+        },
+    }
+}
+
+fn task_call() -> EventKind {
+    reply(
+        vec![Block::ToolUse {
+            id: "task-call".into(),
+            name: "task".into(),
+            input: json!({ "tasks": [{ "prompt": "a" }, { "prompt": "b" }, { "prompt": "c" }] }),
+            extra: Default::default(),
+        }],
+        StopReason::ToolUse,
+    )
+}
+
+fn read_call() -> EventKind {
+    reply(
+        vec![Block::ToolUse {
+            id: "read-call".into(),
+            name: "read".into(),
+            input: json!({ "path": "docs/policies.md" }),
+            extra: Default::default(),
+        }],
+        StopReason::ToolUse,
+    )
+}
+
+#[tokio::test]
+async fn children_get_live_rows_then_commit_one_line_each_under_their_call() {
+    let (launch, _) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 120, 30);
+    let parent = app.session_id();
+    append(&mut app, task_call());
+    let [one, two, three] = [(); 3].map(|()| SessionId::generate());
+    for child in [one, two, three] {
+        child_event(&mut app, child, child_root(parent, child));
+    }
+    child_event(&mut app, one, read_call());
+    child_event(
+        &mut app,
+        two,
+        reply(
+            text_blocks("**4 fixtures** still use archived keys\nmore detail"),
+            StopReason::EndTurn,
+        ),
+    );
+    child_event(
+        &mut app,
+        three,
+        EventKind::TurnFailed {
+            message: "provider unavailable".into(),
+        },
+    );
+    // Another session's events are neither children nor this session's.
+    let stranger = SessionId::generate();
+    child_event(&mut app, stranger, read_call());
+    child_event(
+        &mut app,
+        stranger,
+        child_root(SessionId::generate(), stranger),
+    );
+
+    let live = live_text(&app);
+    assert!(live.contains("task 3 tasks"), "{live}");
+    assert!(live.contains("↑ 2.0k"), "{live}");
+    let rows: Vec<&str> = live.lines().filter(|l| l.contains("─ ")).collect();
+    assert_eq!(rows.len(), 3, "{live}");
+    assert!(rows[0].starts_with("  ├─ ") && rows[0].contains(" 1  read docs/policies.md"));
+    assert!(rows[0].contains("1 call · "));
+    assert!(rows[1].contains("● 2  4 fixtures still use archived keys"));
+    assert!(!rows[1].contains("**") && !rows[1].contains("more detail"));
+    assert!(rows[2].starts_with("  └─ ✕ 3  failed · provider unavailable"));
+    assert!(app.footer(120).plain().contains("agents 1 running"));
+
+    child_event(&mut app, one, result("read-call", "1|x"));
+    assert!(live_text(&app).contains(" 1  thinking"));
+    child_event(
+        &mut app,
+        one,
+        reply(text_blocks("all keys match"), StopReason::EndTurn),
+    );
+    assert!(!app.footer(120).plain().contains("agents"));
+
+    app.commit.clear();
+    append(
+        &mut app,
+        result(
+            "task-call",
+            "Task 1 [done]\nall keys match\n\nTask 2 [done]\n4 fixtures",
+        ),
+    );
+    let committed: Vec<String> = app.commit.iter().map(Line::plain).collect();
+    let text = committed.join("\n");
+    assert!(
+        committed.iter().any(|l| l.starts_with("● task 3 tasks")),
+        "{text}"
+    );
+    assert!(text.contains("├─ ● 1  all keys match"), "{text}");
+    assert!(
+        text.contains("└─ ✕ 3  failed · provider unavailable"),
+        "{text}"
+    );
+    assert!(!text.contains("Task 1 [done]"), "{text}");
+    assert!(
+        app.transcript.collapsed(),
+        "the full result stays one ctrl+o away"
+    );
+    assert!(!live_text(&app).contains("─ "));
+
+    // The next call's result does not claim children it never started.
+    app.commit.clear();
+    append(&mut app, read_call());
+    append(&mut app, result("read-call", "1|x"));
+    assert!(app.commit.iter().all(|l| !l.plain().contains("─ ")));
+}
+
+fn result(call: &str, text: &str) -> EventKind {
+    EventKind::ToolResult {
+        call: call.into(),
+        output: ToolOutput {
+            content: vec![OutputBlock::Text { text: text.into() }],
+            is_error: false,
+            untrusted: false,
+        },
+        spill: None,
+    }
+}
+
+#[tokio::test]
+async fn attaching_mid_call_shows_children_already_running() {
+    let mut attached = snapshot(true);
+    let parent = attached.info.session;
+    let call = Event {
+        id: EventId::generate(),
+        parent: Some(attached.info.head),
+        at: Timestamp::now(),
+        kind: task_call(),
+    };
+    attached.info.head = call.id;
+    attached.events.push(call);
+    let child = SessionId::generate();
+    attached.children.push(ChildEvents {
+        session: child,
+        events: [child_root(parent, child), read_call()]
+            .into_iter()
+            .map(|kind| Event {
+                id: EventId::generate(),
+                parent: None,
+                at: Timestamp::now(),
+                kind,
+            })
+            .collect(),
+    });
+    let (launch, _) = launch(attached).await;
+    let app = App::new(launch, 120, 30);
+    let live = live_text(&app);
+    assert!(live.contains("└─ "), "{live}");
+    assert!(live.contains(" 1  read docs/policies.md"), "{live}");
+    assert!(app.footer(120).plain().contains("agents 1 running"));
+}
+
+fn text_blocks(text: &str) -> Vec<Block> {
+    vec![Block::Text { text: text.into() }]
 }
 
 #[tokio::test]

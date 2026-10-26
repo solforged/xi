@@ -1007,6 +1007,15 @@ impl Router {
             return;
         };
         if notification.session() != session {
+            // A worker forwards other sessions' events only for its own
+            // session's children; clients attached to the parent draw them.
+            if matches!(notification, WorkerNotification::Event(_)) {
+                for connection in self.clients.values() {
+                    if connection.initialized && connection.attached.contains(&session) {
+                        notification.send(&connection.peer);
+                    }
+                }
+            }
             return;
         }
         let mut pending = None;

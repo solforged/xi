@@ -369,6 +369,19 @@ pub mod client {
         /// Calls awaiting approval.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub pending_approvals: Vec<PendingApproval>,
+        /// Child sessions started since the session's last tool result, in
+        /// start order, with every event each has appended so far.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub children: Vec<ChildEvents>,
+    }
+
+    /// A child session's events, from its root.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct ChildEvents {
+        /// The child session.
+        pub session: SessionId,
+        /// Its events in file order.
+        pub events: Vec<Event>,
     }
 
     /// Metadata for a live session.
@@ -1234,6 +1247,7 @@ mod tests {
                 taint: true,
                 trusted: true,
             }],
+            children: Vec::new(),
         };
         let wire = json!({
             "info": {

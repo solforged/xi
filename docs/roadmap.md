@@ -52,6 +52,8 @@ The goal is a client good enough for daily work, including developing xi with xi
 
 After these, in rough order of daily value: `!cmd` and `!!cmd` run in the session sandbox (needs `session/shell`), session rename and auto-naming, a large-paste menu, image paste, `alt+up` to pull queued prompts back, git branch and session cost in the footer, `/export`, and themes. Plan mode, todo, advisor, an agent hub and dashboards stay packages in the feature queue.
 
+Children of a running call now get live rows under it and commit one line each when the call's result lands, with running children in the footer; a mid-call attach replays them. Opening a child in its own view, letting a child ask through the parent instead of being denied headlessly, and naming children are next.
+
 Self-hosting limits outside the client: tools have no network, so adding a crate or pushing happens in the user's shell until the egress proxy exists. Daily use runs the `mise run install` build; workers keep the binary they started with, so rebuilding the repository does not disturb running sessions.
 
 ## Platform queue

@@ -96,6 +96,7 @@ fn snapshot() -> AttachResult {
         partial: Vec::new(),
         running: false,
         pending_approvals: Vec::new(),
+        children: Vec::new(),
         stream_sequence: 0,
     }
 }

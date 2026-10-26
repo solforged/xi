@@ -11,10 +11,11 @@ use std::time::Instant;
 use serde_json::Value;
 use xi_client::client::ClientNotification;
 use xi_protocol::event::{Decision, ModelRef, Remember, StopReason, Usage};
-use xi_protocol::methods::client::Delta;
+use xi_protocol::methods::client::{Delta, EventParams};
 use xi_protocol::model::Pricing;
-use xi_protocol::{Block, EventKind, OutputBlock, Timestamp, ToolCallId, ToolOutput};
+use xi_protocol::{Block, EventKind, OutputBlock, SessionId, Timestamp, ToolCallId, ToolOutput};
 
+use crate::children::Children;
 use crate::style::{Line, Role, inline, lr, prose, wrap};
 
 /// Terminal spinner frames, one every 125 ms.
@@ -133,6 +134,8 @@ struct Call {
     approved: Option<bool>,
     remember: Remember,
     result: Option<(ToolOutput, Option<std::path::PathBuf>, Timestamp)>,
+    /// Children the call started, once its result has landed.
+    children: Children,
 }
 
 /// Text the transcript showed cut short, kept whole for ctrl+o.
@@ -160,7 +163,7 @@ pub struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, usage: Usage) {
+    pub(crate) fn add(&mut self, usage: Usage) {
         self.input += usage.input;
         self.output += usage.output;
         self.cache_read += usage.cache_read;
@@ -216,6 +219,8 @@ pub struct Transcript {
     details: Vec<Detail>,
     /// Collapsed results already expanded, counted back from the newest.
     expanded: usize,
+    /// Children started since the last tool result.
+    children: Children,
 }
 
 /// `14.2k`, `1.2M`, `950`.
@@ -261,7 +266,11 @@ fn relative<'a>(path: &'a str, workspace: Option<&std::path::Path>) -> &'a str {
 /// The argument that matters for a call's headline. Paths inside the
 /// workspace show relative to it, and a command's leading `cd` into the
 /// workspace is dropped, since every command already starts there.
-fn headline_arg(name: &str, input: &Value, workspace: Option<&std::path::Path>) -> String {
+pub(crate) fn headline_arg(
+    name: &str,
+    input: &Value,
+    workspace: Option<&std::path::Path>,
+) -> String {
     let field = |k: &str| input.get(k).and_then(Value::as_str);
     let first = |s: &str| s.lines().next().unwrap_or("").to_owned();
     match name {
@@ -294,6 +303,11 @@ fn headline_arg(name: &str, input: &Value, workspace: Option<&std::path::Path>) 
             Some(".") | None => p.to_owned(),
             Some(path) => format!("{p} in {path}"),
         }),
+        // The subagents package's tool; its children show in their own rows.
+        "task" => input
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(|tasks| counted(tasks.len(), "task", "tasks")),
         _ => field("url").map(str::to_owned),
     }
     .unwrap_or_else(|| {
@@ -318,7 +332,7 @@ fn text_of(output: &ToolOutput) -> String {
 }
 
 /// `n` and the noun for that many.
-fn counted(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn counted(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -539,6 +553,17 @@ impl Call {
             Line::default().span(role, false, meta.join(" · ")),
             cols,
         )];
+        if !self.children.is_empty() {
+            lines.extend(self.children.committed(cols));
+            let detail = (!text.trim().is_empty()).then(|| Detail {
+                head: self.head(self.mark()),
+                what: "full output",
+                text,
+                error: output.is_error,
+                spill: spill.clone(),
+            });
+            return (lines, detail);
+        }
         if let Some(diff) = diff {
             lines.extend(
                 diff.rows
@@ -653,6 +678,23 @@ impl Transcript {
         self.turn = Totals::default();
     }
 
+    /// Takes an event from another session. Returns whether that session is
+    /// a child of `parent`, the session this transcript draws.
+    pub fn child(&mut self, parent: SessionId, params: &EventParams) -> bool {
+        self.children.event(
+            parent,
+            params.session,
+            &params.event,
+            self.workspace.as_deref(),
+        )
+    }
+
+    /// Children of the call in flight.
+    #[must_use]
+    pub fn children(&self) -> &Children {
+        &self.children
+    }
+
     fn gap(&mut self, out: &mut Vec<Line>) {
         if !self.blank {
             out.push(Line::default());
@@ -718,6 +760,7 @@ impl Transcript {
             ClientNotification::Exited(params) => {
                 self.end_turn();
                 self.calls.clear();
+                self.children.clear();
                 let mut message = "  session exited".to_owned();
                 if let Some(status) = params.status {
                     message.push_str(&format!(" · status {status}"));
@@ -775,6 +818,7 @@ impl Transcript {
             // Reasoning changes are reflected in the footer, not the transcript.
             EventKind::ReasoningChanged { .. } => {}
             EventKind::UserMessage { content } => {
+                self.children.clear();
                 self.gap(&mut out);
                 let text = blocks_text(content);
                 let rows = wrap(&text, cols.saturating_sub(2));
@@ -864,6 +908,7 @@ impl Transcript {
                             approved: None,
                             remember: Remember::Once,
                             result: None,
+                            children: Children::default(),
                         }),
                         _ => {}
                     }
@@ -925,8 +970,11 @@ impl Transcript {
                 spill,
             } => {
                 self.asks.retain(|a| &a.call != call);
-                if let Some(c) = self.call(call) {
+                if let Some(c) = self.calls.iter_mut().find(|c| &c.id == call) {
                     c.result = Some((output.clone(), spill.clone(), at));
+                    // Calls run one at a time, so the children started
+                    // since the last result are this call's.
+                    c.children = std::mem::take(&mut self.children);
                 }
                 let done = self.calls.iter().take_while(|c| c.result.is_some()).count();
                 let mut lines = Vec::new();
@@ -956,6 +1004,7 @@ impl Transcript {
                 usage,
                 ..
             } => {
+                self.children.clear();
                 if let Some(usage) = usage {
                     self.session.add(*usage);
                     self.turn.add(*usage);
@@ -1122,6 +1171,7 @@ impl Transcript {
                 lines.push(Line::default().dim("  ∴ redacted thinking").truncate(cols));
             }
         }
+        let mut roster = (!self.children.is_empty()).then_some(&self.children);
         for call in &self.calls {
             let waiting = call.decision == Some(Decision::Ask) && call.approved.is_none();
             let (mark, meta) = if waiting {
@@ -1135,19 +1185,28 @@ impl Transcript {
                 let elapsed = call.since.map_or(0, |s| {
                     u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)
                 });
-                let meta = match call.rule.as_ref().filter(|r| !r.starts_with("builtin#")) {
+                let mut meta = match call.rule.as_ref().filter(|r| !r.starts_with("builtin#")) {
                     Some(rule) if rule == "session" => {
                         format!("allowed for this session · {}", duration(elapsed))
                     }
                     Some(rule) => format!("{rule} · {}", duration(elapsed)),
                     None => duration(elapsed),
                 };
+                if let Some(children) = roster {
+                    meta = format!("↑ {} · {meta}", tokens(children.sent()));
+                }
                 (
                     Line::default().brass(SPINNER[frame % SPINNER.len()]),
                     Line::default().dim(meta),
                 )
             };
             lines.push(lr(call.head(mark), meta, cols));
+            if call.result.is_none()
+                && !waiting
+                && let Some(children) = roster.take()
+            {
+                lines.extend(children.live(cols, frame));
+            }
         }
         lines
     }
