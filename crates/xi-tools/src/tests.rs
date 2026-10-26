@@ -176,6 +176,28 @@ async fn edit_stale_anchors_reject_every_change_and_show_each_context() {
 }
 
 #[tokio::test]
+async fn edit_accepts_anchors_copied_with_row_content_and_still_checks_hash() {
+    let f = Fixture::new();
+    f.put("text", "a\nb\n");
+    let ran = f
+        .run(
+            "edit",
+            json!({"path":"text", "edits":[{"start":format!("{}|b", anchor(2, "b")), "lines":["B"]}]}),
+        )
+        .await;
+    assert!(!ran.output.is_error, "{}", text(&ran));
+    assert_eq!(f.get("text"), "a\nB\n");
+    let stale = f
+        .run(
+            "edit",
+            json!({"path":"text", "edits":[{"start":format!("{}|b", anchor(2, "b")), "lines":["x"]}]}),
+        )
+        .await;
+    assert!(stale.output.is_error);
+    assert_eq!(f.get("text"), "a\nB\n");
+}
+
+#[tokio::test]
 async fn edit_rejects_overlapping_ranges_and_interior_insertions() {
     let f = Fixture::new();
     let original = "a\nb\nc\nd\n";

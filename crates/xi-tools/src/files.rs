@@ -93,7 +93,10 @@ struct Anchor {
 impl Anchor {
     fn parse(anchor: &str) -> Result<Self, String> {
         let invalid = || format!("Invalid anchor {anchor:?}: expected LINE:HH from read or search");
-        let (line, hash) = anchor.split_once(':').ok_or_else(invalid)?;
+        // Models often copy the whole `LINE:HH|content` row; the hash still
+        // guards against stale content, so the copied text is ignored.
+        let bare = anchor.split_once('|').map_or(anchor, |(bare, _)| bare);
+        let (line, hash) = bare.split_once(':').ok_or_else(invalid)?;
         if line.is_empty()
             || !line.bytes().all(|c| c.is_ascii_digit())
             || hash.len() != 2
