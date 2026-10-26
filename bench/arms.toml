@@ -33,3 +33,10 @@ name = "xi-subagents"
 kind = "xi"
 argv = ["xi", "--json", "--on-ask", "deny", "--extension", "{arms_dir}/../extensions/subagents", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "-p", "{prompt}"]
 [arm.env]
+
+# Measures the task tool when it is used: the prompt asks for delegation.
+[[arm]]
+name = "xi-delegate"
+kind = "xi"
+argv = ["xi", "--json", "--on-ask", "deny", "--extension", "{arms_dir}/../extensions/subagents", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "-p", "{prompt}\n\nUse the task tool to work on independent parts in parallel."]
+[arm.env]
