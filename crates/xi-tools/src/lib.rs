@@ -12,6 +12,20 @@
 //!   link cannot smuggle a write out of the workspace.
 //! - `bash` runs through `xi-sandbox-exec`, and every command is a
 //!   [`Crossing::Exec`] so policy can deny specific command lines.
+//!
+//! `read` and `search` return `LINE:HH|text` anchors, where `HH` is the
+//! leading byte of xxh3-64. `edit` validates all anchors against one snapshot
+//! before writing. Offsets for `read` are one-based. Shell output is merged
+//! at the pipe, bounded in memory, and spilled before it can grow unbounded.
+
+mod bash;
+mod files;
+mod output;
+mod paths;
+mod search;
+
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,21 +93,36 @@ pub trait Tool: Send + Sync {
 
     /// Runs the call. Failures are reported as output with `is_error` set,
     /// so the model sees them.
-    fn run<'a>(&'a self, call: &'a ToolCallId, input: Value, ctx: &'a Context)
-    -> BoxFuture<'a, Ran>;
+    fn run<'a>(
+        &'a self,
+        call: &'a ToolCallId,
+        input: Value,
+        ctx: &'a Context,
+    ) -> BoxFuture<'a, Ran>;
 }
 
 /// The default toolset: `read`, `edit`, `write`, `bash` and `search`.
 #[must_use]
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
-    todo!("tools lane")
+    ["read", "edit", "write", "bash", "search"]
+        .into_iter()
+        .map(|name| by_name(name).expect("built-in tool"))
+        .collect()
 }
 
 /// A built-in tool by name, including ones not in the default set.
 #[must_use]
 pub fn by_name(name: &str) -> Option<Arc<dyn Tool>> {
-    let _ = name;
-    todo!("tools lane")
+    let kind = match name {
+        "read" => Kind::Read,
+        "edit" => Kind::Edit,
+        "write" => Kind::Write,
+        "bash" => Kind::Bash,
+        "search" => Kind::Search,
+        "replace" => Kind::Replace,
+        _ => return None,
+    };
+    Some(Arc::new(kind))
 }
 
 /// Truncates `text` to `ctx.output_limit` bytes for context. When it is
@@ -102,6 +131,119 @@ pub fn by_name(name: &str) -> Option<Arc<dyn Tool>> {
 /// for extension tool output.
 #[must_use]
 pub fn truncate(call: &ToolCallId, text: String, ctx: &Context) -> (String, Option<PathBuf>) {
-    let _ = (call, text, ctx);
-    todo!("tools lane")
+    output::truncate(call, text, ctx)
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Read,
+    Edit,
+    Write,
+    Bash,
+    Search,
+    Replace,
+}
+
+impl Tool for Kind {
+    fn spec(&self) -> ToolSpec {
+        use serde_json::json;
+        let (name, description, properties, required) = match self {
+            Self::Read => (
+                "read",
+                "Read text as LINE:HH|content anchors, list directories, or view images. offset is a 1-based line (default 1), limit defaults to 2000. Long lines are clipped.",
+                json!({"path":{"type":"string"}, "offset":{"type":"integer","minimum":1}, "limit":{"type":"integer","minimum":1}}),
+                vec!["path"],
+            ),
+            Self::Edit => (
+                "edit",
+                "Edit using read/search anchors from the current file. Replace inclusive start..end (end defaults to start), or insert after an anchor (\"0\" inserts at top). lines is an array of new lines; [] deletes. Anchors must match, edits cannot overlap. Preserves line endings.",
+                json!({"path":{"type":"string"}, "edits":{"type":"array","minItems":1,"items":{"oneOf":[
+                    {"type":"object","properties":{"start":{"type":"string"},"end":{"type":"string"},"lines":{"type":"array","items":{"type":"string"}}},"required":["start","lines"],"additionalProperties":false},
+                    {"type":"object","properties":{"after":{"type":"string"},"lines":{"type":"array","items":{"type":"string"}}},"required":["after","lines"],"additionalProperties":false}
+                ]}}}),
+                vec!["path", "edits"],
+            ),
+            Self::Write => (
+                "write",
+                "Create or overwrite a UTF-8 text file. Creates missing parent directories. Returns byte and line counts. Prefer edit for existing files.",
+                json!({"path":{"type":"string"}, "content":{"type":"string"}}),
+                vec!["path", "content"],
+            ),
+            Self::Bash => (
+                "bash",
+                "Run a shell command in the workspace sandbox with no stdin. timeout is seconds (default 120, maximum 600). Returns merged stdout/stderr and exit status. Timeout or cancellation kills the process group. Large output is spilled to a readable file.",
+                json!({"command":{"type":"string"}, "timeout":{"type":"integer","minimum":1,"maximum":600}}),
+                vec!["command"],
+            ),
+            Self::Search => (
+                "search",
+                "Search a regex and return file paths with LINE:HH|text anchors. Without pattern, glob is required and matching files are listed. Respects ignore files and skips hidden files. path defaults to the workspace; limit defaults to 200. Paths are workspace-relative.",
+                json!({"pattern":{"type":"string"}, "path":{"type":"string"}, "glob":{"type":"string"}, "ignore_case":{"type":"boolean"}, "limit":{"type":"integer","minimum":1}}),
+                vec![],
+            ),
+            Self::Replace => (
+                "replace",
+                "Replace an exact string in a text file. old must occur exactly once unless all is true. Empty old is invalid.",
+                json!({"path":{"type":"string"}, "old":{"type":"string"}, "new":{"type":"string"}, "all":{"type":"boolean"}}),
+                vec!["path", "old", "new"],
+            ),
+        };
+        ToolSpec {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            input_schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
+        }
+    }
+
+    fn crossings(&self, input: &Value, ctx: &Context) -> Result<Vec<Crossing>, String> {
+        let (path, write) = match self {
+            Self::Read => (files::read_input(input)?.path, false),
+            Self::Edit => (files::edit_input(input)?.path, true),
+            Self::Write => (files::write_input(input)?.path, true),
+            Self::Replace => (files::replace_input(input)?.path, true),
+            Self::Search => (search::input(input)?.path, false),
+            Self::Bash => return Ok(vec![Crossing::Exec(bash::input(input)?.command)]),
+        };
+        paths::crossings(&path, write, ctx)
+    }
+
+    fn run<'a>(
+        &'a self,
+        call: &'a ToolCallId,
+        input: Value,
+        ctx: &'a Context,
+    ) -> BoxFuture<'a, Ran> {
+        Box::pin(async move {
+            if let Err(error) = self.crossings(&input, ctx) {
+                return output::text(call, error, true, ctx);
+            }
+            if matches!(self, Self::Bash) {
+                return match bash::run(call, &input, ctx).await {
+                    Ok(ran) => ran,
+                    Err(error) => output::text(call, error, true, ctx),
+                };
+            }
+            let kind = *self;
+            let call_owned = call.clone();
+            let context = ctx.clone();
+            let result = tokio::task::spawn_blocking(move || match kind {
+                Self::Read => files::read(&call_owned, &input, &context),
+                Self::Edit => files::edit(&call_owned, &input, &context),
+                Self::Write => files::write(&call_owned, &input, &context),
+                Self::Search => search::run(&call_owned, &input, &context),
+                Self::Replace => files::replace(&call_owned, &input, &context),
+                Self::Bash => unreachable!(),
+            })
+            .await;
+            match result {
+                Ok(Ok(ran)) => ran,
+                Ok(Err(error)) => output::text(call, error, true, ctx),
+                Err(error) => output::text(call, format!("Tool worker failed: {error}"), true, ctx),
+            }
+        })
+    }
+}
+
+fn parse<T: serde::de::DeserializeOwned>(input: &Value) -> Result<T, String> {
+    T::deserialize(input).map_err(|error| format!("Invalid input: {error}"))
 }
