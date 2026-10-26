@@ -34,9 +34,25 @@ Rows 1 to 5 are done; their results are below.
 | 7 | Todo or plan tool | package | Pass rate on multi-step tasks (`invoice-rounding`, `revision-store`), prompt size. |
 | 8 | `fetch` and web search, with taint wired in | package plus platform egress proxy | Tasks that need docs; taint must turn later egress into `ask`. |
 | 9 | Memory | package | Last: needs multi-session tasks to measure. |
-| 10 | TUI | client | Implemented as a daemon client with event replay and deduplication, streaming retry resets and a `/tree` checkout overlay. Not benchmarked. |
+| 10 | TUI | client | Daemon client with event replay and deduplication, streaming retry resets and a `/tree` checkout overlay. The surface for daily use is tracked in [Terminal client](#terminal-client). Not benchmarked. |
 
-Interactive steering in line mode is missing (the RPC path queues prompts already) and belongs with the TUI. A response that stops at `max_tokens` without tool calls ends the turn; two `parallel-kernels` baseline failures ended that way, so continuing such a turn is worth measuring.
+A response that stops at `max_tokens` without tool calls ends the turn; two `parallel-kernels` baseline failures ended that way, so continuing such a turn is worth measuring.
+
+## Terminal client
+
+The goal is a client good enough for daily work, including developing xi with xi. The target surface is in the [design](design.md#terminal-client). It lands in five slices; slices 1 and 3 run first because they touch different code.
+
+| Slice | Contents | Protocol | Status |
+|---|---|---|---|
+| 1. Model and reasoning | Model picker, `shift+tab` reasoning cycle, `/reasoning`, reasoning in the footer | `session/models`, `session/set_reasoning`, `reasoning` in `SessionDetails` | In progress |
+| 2. Sessions and approvals | `/resume` picker, approvals inbox across sessions, approval scopes | `remember` on `approval/resolve`; `session/list` and `approval/list` exist | Planned |
+| 3. Composer | Saved history with `ctrl+r`, `ctrl+g` external editor, `/` and `@` completion, extension commands and `/compact` in the TUI | `session/commands` | In progress |
+| 4. Rendering and keys | `edit` diffs, `ctrl+t` thinking display, `/copy`, `/help` from the dispatch table, `[keys]` in `tui.toml` | None | Planned |
+| 5. Settings | Settings view with config layers, save as default | None; the client edits the global config file | Planned |
+
+After these, in rough order of daily value: `!cmd` and `!!cmd` run in the session sandbox (needs `session/shell`), session rename and auto-naming, a large-paste menu, image paste, `alt+up` to pull queued prompts back, git branch and session cost in the footer, `/export`, and themes. Plan mode, todo, advisor, an agent hub and dashboards stay packages in the feature queue.
+
+Self-hosting limits outside the client: tools have no network, so adding a crate or pushing happens in the user's shell until the egress proxy exists. Daily use runs the `mise run install` build; workers keep the binary they started with, so rebuilding the repository does not disturb running sessions.
 
 ## Platform queue
 
