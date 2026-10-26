@@ -13,13 +13,14 @@ base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 httpdate.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["gzip", "brotli", "deflate", "zstd"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 xi-protocol.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

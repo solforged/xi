@@ -7,7 +7,7 @@ use crate::sse::Events;
 use crate::transport::{api_error, decode};
 use crate::*;
 
-pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
+pub(crate) fn body(request: &Request, reasoning: bool, max_tokens: u32) -> Result<Value, Error> {
     let cache = json!({"type": "ephemeral"});
     let mut messages: Vec<Value> = Vec::with_capacity(request.messages.len());
     let mut previous_results = false;
@@ -54,7 +54,7 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
         last["cache_control"] = cache.clone();
     }
     let mut body = json!({
-        "model": request.model, "max_tokens": request.max_tokens, "stream": true,
+        "model": request.model, "max_tokens": max_tokens, "stream": true,
         "messages": messages,
     });
     if !request.system.is_empty() {
@@ -68,7 +68,7 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
         body["tools"] = tools.into();
     }
     if reasoning {
-        configure_thinking(&mut body, request)?;
+        configure_thinking(&mut body, request, max_tokens)?;
     }
     Ok(body)
 }
@@ -77,7 +77,7 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
 // https://platform.claude.com/docs/en/build-with-claude/effort
 // 4.6+ uses adaptive thinking. 4.5 and earlier use explicit budgets. Models
 // that always think don't list `off`, so it never reaches them.
-fn configure_thinking(body: &mut Value, request: &Request) -> Result<(), Error> {
+fn configure_thinking(body: &mut Value, request: &Request, max_tokens: u32) -> Result<(), Error> {
     let mut parts = request
         .model
         .strip_prefix("claude-")
@@ -122,7 +122,7 @@ fn configure_thinking(body: &mut Value, request: &Request) -> Result<(), Error> 
             Reasoning::XHigh => 32768,
             Reasoning::Max => 65536,
         };
-        let budget = requested.min(request.max_tokens.saturating_sub(1));
+        let budget = requested.min(max_tokens.saturating_sub(1));
         if budget < 1024 {
             return Err(Error::new(
                 ErrorKind::InvalidRequest,
@@ -151,8 +151,23 @@ fn block(block: &Block) -> Result<Value, Error> {
             ));
         }
         Block::RedactedThinking { data } => json!({"type": "redacted_thinking", "data": data}),
-        Block::ToolUse { id, name, input } => {
-            json!({"type": "tool_use", "id": id, "name": name, "input": input})
+        Block::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        } => {
+            let mut value = extra
+                .get("anthropic")
+                .filter(|value| value.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            // Interpreted fields are authoritative over retained wire metadata.
+            value["type"] = "tool_use".into();
+            value["id"] = json!(id);
+            value["name"] = name.clone().into();
+            value["input"] = input.clone();
+            value
         }
         Block::Opaque { provider, value } if provider == "anthropic" && value.is_object() => {
             value.clone()
@@ -186,6 +201,7 @@ struct Content {
 pub(crate) async fn consume(
     response: reqwest::Response,
     on_delta: &mut (dyn FnMut(Delta) + Send),
+    subscription: bool,
 ) -> Result<Response, Error> {
     let mut events = Events::new(response);
     let mut blocks: BTreeMap<u64, Content> = BTreeMap::new();
@@ -321,7 +337,12 @@ pub(crate) async fn consume(
                 return Ok(Response {
                     content: blocks
                         .into_values()
-                        .map(|block| decode_block(block.value))
+                        .map(|mut block| {
+                            if subscription {
+                                crate::claude_code::decode_name(&mut block.value);
+                            }
+                            decode_block(block.value)
+                        })
                         .collect::<Result<_, _>>()?,
                     stop: stop.ok_or_else(|| decode("Anthropic message has no stop reason"))?,
                     usage,
@@ -375,14 +396,38 @@ fn update_usage(usage: &mut Usage, value: &Value) {
 }
 
 fn decode_block(mut value: Value) -> Result<Block, Error> {
+    // Additional wire fields do not change the semantics of a client tool call.
+    // Preserve them without hiding the call from execution and history repair.
+    if value["type"] == "tool_use" {
+        let id = ToolCallId(take_string(&mut value, "id")?);
+        let name = take_string(&mut value, "name")?;
+        let input = value
+            .get_mut("input")
+            .ok_or_else(|| decode("Tool use has no input"))?
+            .take();
+        let fields = value.as_object_mut().expect("tool_use is an object");
+        for key in ["type", "id", "name", "input"] {
+            fields.remove(key);
+        }
+        let extra = if fields.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("anthropic".into(), value)])
+        };
+        return Ok(Block::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        });
+    }
     let fields: &[&str] = match value["type"].as_str() {
         Some("text") => &["type", "text"],
         Some("thinking") => &["type", "thinking", "signature"],
         Some("redacted_thinking") => &["type", "data"],
-        Some("tool_use") => &["type", "id", "name", "input"],
         _ => &[],
     };
-    // Even known blocks become opaque when extra fields would otherwise be lost.
+    // Non-actionable known blocks remain opaque if extra fields would be lost.
     if fields.is_empty()
         || value
             .as_object()
@@ -406,15 +451,6 @@ fn decode_block(mut value: Value) -> Result<Block, Error> {
         "redacted_thinking" => Ok(Block::RedactedThinking {
             data: take_string(&mut value, "data")?,
         }),
-        "tool_use" => {
-            let id = ToolCallId(take_string(&mut value, "id")?);
-            let name = take_string(&mut value, "name")?;
-            let input = value
-                .get_mut("input")
-                .ok_or_else(|| decode("Tool use has no input"))?
-                .take();
-            Ok(Block::ToolUse { id, name, input })
-        }
         _ => unreachable!(),
     }
 }
@@ -423,5 +459,56 @@ fn take_string(value: &mut Value, key: &str) -> Result<String, Error> {
     match value[key].take() {
         Value::String(text) => Ok(text),
         _ => Err(decode(format!("Missing string field: {key}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_metadata_stays_executable_and_round_trips_without_a_server() {
+        for metadata in [
+            json!({}),
+            json!({"caller":{"type":"direct"}, "future_field":[1, 2]}),
+        ] {
+            let mut wire = metadata;
+            wire["type"] = json!("tool_use");
+            wire["id"] = json!("call");
+            wire["name"] = json!("read");
+            wire["input"] = json!({"path":"a"});
+            let call = decode_block(wire.clone()).unwrap();
+            assert!(matches!(call, Block::ToolUse { .. }));
+            assert_eq!(block(&call).unwrap(), wire);
+            let persisted: Block =
+                serde_json::from_value(serde_json::to_value(&call).unwrap()).unwrap();
+            assert_eq!(block(&persisted).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn retained_metadata_cannot_override_interpreted_tool_fields() {
+        let call = Block::ToolUse {
+            id: "call".into(),
+            name: "read".into(),
+            input: json!({"path":"a"}),
+            extra: BTreeMap::from([
+                (
+                    "anthropic".into(),
+                    json!({
+                        "type":"other", "id":"wrong", "name":"wrong", "input":null,
+                        "caller":{"type":"direct"},
+                    }),
+                ),
+                ("other".into(), json!({"foreign":true})),
+            ]),
+        };
+        assert_eq!(
+            block(&call).unwrap(),
+            json!({
+                "type":"tool_use", "id":"call", "name":"read", "input":{"path":"a"},
+                "caller":{"type":"direct"},
+            })
+        );
     }
 }

@@ -26,7 +26,7 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
                     match block {
                         Block::Text { text } => content.push(json!({"type": "text", "text": text})),
                         Block::Image { media_type, data } => content.push(image(media_type, data)),
-                        Block::ToolUse { id, name, input } => calls.push(json!({
+                        Block::ToolUse { id, name, input, .. } => calls.push(json!({
                             "id": id, "type": "function", "function": {"name": name, "arguments": input.to_string()},
                         })),
                         Block::Thinking { .. } => {} // Reasoning is never replayed on Chat Completions.
@@ -246,6 +246,7 @@ fn finish(content: Vec<Content>, mut calls: BTreeMap<u64, Call>) -> Result<Vec<B
                         id: ToolCallId(call.id),
                         name: call.name,
                         input,
+                        extra: Default::default(),
                     }
                 }
             })

@@ -40,12 +40,14 @@ impl Provider for Fake {
                     id: "ask-call".into(),
                     name: "bash".into(),
                     input: json!({"command":"touch forbidden"}),
+                    extra: Default::default(),
                 }]
             } else if child && self.input["read_children"] == true && !seen_result {
                 vec![Block::ToolUse {
                     id: "read-call".into(),
                     name: "read".into(),
                     input: json!({"path":"sample"}),
+                    extra: Default::default(),
                 }]
             } else if child {
                 vec![Block::Text {
@@ -70,6 +72,7 @@ impl Provider for Fake {
                     }
                     .into(),
                     input: self.input.clone(),
+                    extra: Default::default(),
                 }]
             };
             let stop = if matches!(content[0], Block::ToolUse { .. }) {

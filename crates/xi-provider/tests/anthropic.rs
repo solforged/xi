@@ -34,7 +34,7 @@ fn transcript() -> String {
         json!({"type":"ping"}),
         json!({"type":"content_block_delta","index":4,"delta":{"type":"text_delta","text":"café."}}),
         json!({"type":"content_block_stop","index":4}),
-        json!({"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"call_1","name":"read","input":{}}}),
+        json!({"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"call_1","name":"read","input":{},"caller":{"type":"direct"}}}),
         json!({"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/"}}),
         json!({"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":"one.rs\"}"}}),
         json!({"type":"content_block_stop","index":5}),
@@ -122,7 +122,11 @@ async fn signed_thinking_unknown_blocks_tools_usage_and_request_round_trip() {
         Block::ToolUse {
             id: "call_1".into(),
             name: "read".into(),
-            input: json!({"path":"src/one.rs"})
+            input: json!({"path":"src/one.rs"}),
+            extra: std::collections::BTreeMap::from([(
+                "anthropic".into(),
+                json!({"caller":{"type":"direct"}}),
+            )]),
         }
     );
     assert_eq!(
@@ -130,7 +134,8 @@ async fn signed_thinking_unknown_blocks_tools_usage_and_request_round_trip() {
         Block::ToolUse {
             id: "call_2".into(),
             name: "read".into(),
-            input: json!({"path":"two.rs"})
+            input: json!({"path":"two.rs"}),
+            extra: Default::default(),
         }
     );
     assert_eq!(
@@ -209,6 +214,7 @@ async fn signed_thinking_unknown_blocks_tools_usage_and_request_round_trip() {
         json!({"type":"redacted_thinking","data":"encrypted"})
     );
     assert_eq!(assistant["content"][2], server_call);
+    assert_eq!(assistant["content"][5]["caller"], json!({"type":"direct"}));
     assert_eq!(
         assistant["content"][3]["content"][0]["encrypted_content"],
         "opaque"

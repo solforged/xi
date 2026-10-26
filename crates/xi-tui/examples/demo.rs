@@ -137,6 +137,7 @@ impl Provider for Script {
                     id: format!("call-{n}-{i}").as_str().into(),
                     name: name.into(),
                     input,
+                    extra: Default::default(),
                 });
             }
             let stop = if content.iter().any(|b| matches!(b, Block::ToolUse { .. })) {

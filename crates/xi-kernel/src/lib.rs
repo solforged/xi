@@ -880,7 +880,10 @@ impl Session {
                 .content
                 .iter()
                 .filter_map(|b| {
-                    if let Block::ToolUse { id, name, input } = b {
+                    if let Block::ToolUse {
+                        id, name, input, ..
+                    } = b
+                    {
                         Some((id.clone(), name.clone(), input.clone()))
                     } else {
                         None

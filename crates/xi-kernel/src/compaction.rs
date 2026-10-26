@@ -95,7 +95,20 @@ fn block_chars(block: &Block) -> u64 {
         Block::Thinking { text, signature } => chars(text) + signature.as_deref().map_or(0, chars),
         Block::Image { media_type, data } => chars(media_type) + chars(data),
         Block::RedactedThinking { data } => chars(data),
-        Block::ToolUse { id, name, input } => chars(&id.0) + chars(name) + value_chars(input),
+        Block::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        } => {
+            chars(&id.0)
+                + chars(name)
+                + value_chars(input)
+                + extra
+                    .iter()
+                    .map(|(provider, value)| chars(provider) + value_chars(value))
+                    .sum::<u64>()
+        }
         Block::Opaque { provider, value } => chars(provider) + value_chars(value),
     }
 }

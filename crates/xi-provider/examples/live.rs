@@ -85,7 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(reply.stop, StopReason::ToolUse);
     let mut results = Vec::new();
     for block in &reply.content {
-        if let Block::ToolUse { id, name, input } = block {
+        if let Block::ToolUse {
+            id, name, input, ..
+        } = block
+        {
             assert_eq!(name, "add");
             assert_eq!(input, &json!({"a":19,"b":23}));
             let sum = input["a"].as_i64().unwrap() + input["b"].as_i64().unwrap();

@@ -79,12 +79,14 @@ async fn indexed_tools_reasoning_usage_and_request_round_trip() {
             Block::ToolUse {
                 id: "call_1".into(),
                 name: "read".into(),
-                input: json!({"path":"one.rs"})
+                input: json!({"path":"one.rs"}),
+                extra: Default::default(),
             },
             Block::ToolUse {
                 id: "call_2".into(),
                 name: "read".into(),
-                input: json!({"path":"two.rs"})
+                input: json!({"path":"two.rs"}),
+                extra: Default::default(),
             },
         ]
     );
@@ -239,7 +241,8 @@ async fn modern_openai_output_limit_and_delayed_call_id() {
         vec![Block::ToolUse {
             id: "late_id".into(),
             name: "read".into(),
-            input: json!({"path":"file"})
+            input: json!({"path":"file"}),
+            extra: Default::default(),
         }]
     );
     assert_eq!(

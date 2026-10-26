@@ -419,6 +419,7 @@ mod tests {
                 id: format!("{name}-{i}").as_str().into(),
                 name: (*name).into(),
                 input: json!({}),
+                extra: Default::default(),
             });
         }
         EventKind::AssistantMessage {

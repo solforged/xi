@@ -375,6 +375,11 @@ async fn model_catalog_checks_credentials_child() {
         "never-return-this-login-secret",
     )
     .unwrap();
+    std::fs::write(
+        xi_provider::anthropic_file(&fixture.paths.credentials()),
+        "never-return-this-anthropic-secret",
+    )
+    .unwrap();
     let config_path = fixture.paths.config.join("config.toml");
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     for (provider, auth) in [
@@ -424,6 +429,7 @@ async fn model_catalog_checks_credentials_child() {
         ("file_set", true),
         ("file_missing", false),
         ("login", true),
+        ("claude", true),
     ] {
         let model = models
             .models
@@ -467,6 +473,7 @@ async fn model_catalog_checks_credentials_child() {
         "never-return-this-env-secret",
         "never-return-this-file-secret",
         "never-return-this-login-secret",
+        "never-return-this-anthropic-secret",
         "XI_MODEL_CATALOG_SECRET",
         credential.to_str().unwrap(),
     ] {
@@ -474,10 +481,11 @@ async fn model_catalog_checks_credentials_child() {
     }
     std::fs::remove_file(&credential).unwrap();
     std::fs::remove_file(xi_provider::chatgpt_file(&fixture.paths.credentials())).unwrap();
+    std::fs::remove_file(xi_provider::anthropic_file(&fixture.paths.credentials())).unwrap();
     let models = request::<SessionModels>(&harness.peer, &SessionRef { session })
         .await
         .unwrap();
-    for provider in ["file_set", "login", "chatgpt"] {
+    for provider in ["file_set", "login", "chatgpt", "claude"] {
         assert!(
             models
                 .models
@@ -1345,6 +1353,7 @@ impl Provider for ToolScript {
                         id: "ask".into(),
                         name: "fake".into(),
                         input: json!({}),
+                        extra: Default::default(),
                     }],
                     StopReason::ToolUse,
                 )

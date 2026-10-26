@@ -157,6 +157,7 @@ fn assistant(blocks: &[Block], lite: bool, input: &mut Vec<Value>) {
                 id,
                 name,
                 input: arguments,
+                ..
             } => {
                 flush(&mut text, input, at);
                 input.push(json!({
@@ -342,6 +343,7 @@ fn finish(
                     id: ToolCallId(id.into()),
                     name: name.into(),
                     input,
+                    extra: Default::default(),
                 });
             }
             _ => content.push(Block::Opaque {

@@ -121,14 +121,27 @@ impl Registry {
 }
 
 fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn Signer>, Error> {
-    if let Auth::Login(LoginService::Chatgpt) = config.auth {
+    if let Auth::Login(service) = config.auth {
         let credentials = credentials.ok_or_else(|| {
             Error::new(
                 ErrorKind::Config,
-                "No credential directory for ChatGPT tokens",
+                "No credential directory for login tokens",
             )
         })?;
-        return Ok(Box::new(chatgpt::Signer::new(chatgpt_file(credentials))));
+        return match service {
+            LoginService::Chatgpt => Ok(Box::new(chatgpt::Signer::new(chatgpt_file(credentials)))),
+            LoginService::Anthropic => {
+                if config.api != Api::AnthropicMessages {
+                    return Err(Error::new(
+                        ErrorKind::Config,
+                        "Anthropic login requires the Anthropic Messages API",
+                    ));
+                }
+                Ok(Box::new(anthropic_login::Signer::new(anthropic_file(
+                    credentials,
+                ))))
+            }
+        };
     }
     let Some(credential) = resolve_auth(&config.auth)? else {
         return Ok(Box::new(Key(None)));
