@@ -738,10 +738,11 @@ impl Session {
             let response = self
                 .stream(backend.provider.as_ref(), &request, cancel)
                 .await;
+            // Overflow recovery runs even with automatic compaction off: the
+            // request has already failed, so summarising costs nothing extra.
             match response {
                 Err(error)
                     if error.kind == xi_provider::ErrorKind::ContextOverflow
-                        && state.config.compaction.enabled
                         && !overflow_compacted =>
                 {
                     overflow_compacted = true;
