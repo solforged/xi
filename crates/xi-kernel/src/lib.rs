@@ -487,7 +487,8 @@ impl Session {
         Ok(())
     }
 
-    /// Switches model at an idle prompt and records the selection.
+    /// Switches model at an idle prompt and records the selection. Selecting
+    /// the model already in use connects it but records nothing.
     pub async fn set_model(&self, model: ModelRef) -> Result<()> {
         let mut state = self
             .0
@@ -501,7 +502,9 @@ impl Session {
         let mut next = state.config.clone();
         next.model = model.clone();
         let backend = Backend::connect(&next)?;
-        self.append(&mut state, EventKind::ModelChanged { model })?;
+        if model != state.config.model {
+            self.append(&mut state, EventKind::ModelChanged { model })?;
+        }
         state.config = next;
         state.backend = Some(backend.into());
         Ok(())

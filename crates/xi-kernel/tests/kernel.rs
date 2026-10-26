@@ -825,6 +825,27 @@ async fn resume_latest_leaf_and_checkout_branch_without_rewriting() {
     assert_eq!(resumed.info().await.head, info.head);
 }
 
+#[tokio::test]
+async fn selecting_the_current_model_records_nothing() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "default_model = 'local/m'\n[provider.local]\napi = 'openai-chat'\nbase_url = 'http://127.0.0.1:9/v1'\nauth = 'none'\n[[model]]\nprovider = 'local'\nid = 'm'\ncontext_window = 1000\nmax_output = 100\n[[model]]\nprovider = 'local'\nid = 'n'\ncontext_window = 1000\nmax_output = 100\n",
+    );
+    let (session, _) = fixture.session(Script::new(vec![]), FakeTool { gate: None }, opts());
+    let before = session.info().await.events.len();
+    session.set_model(fixture.config().model).await.unwrap();
+    assert_eq!(session.info().await.events.len(), before);
+    let other = ModelRef {
+        provider: "local".into(),
+        model: "n".into(),
+    };
+    session.set_model(other.clone()).await.unwrap();
+    let events = session.info().await.events;
+    assert_eq!(events.len(), before + 1);
+    assert!(matches!(&events[before].kind, EventKind::ModelChanged { model } if *model == other));
+}
+
 #[tokio::test(start_paused = true)]
 async fn retry_limit_backoff_and_retry_after_cap() {
     let fixture = Fixture::new();
