@@ -192,6 +192,8 @@ pub enum Approver {
         /// The extension that answered.
         extension: ExtensionId,
     },
+    /// No client was attached; the headless default (`--on-ask`) applied.
+    Headless,
 }
 
 #[cfg(test)]
