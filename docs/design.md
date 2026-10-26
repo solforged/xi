@@ -35,30 +35,65 @@ This document records the design decisions and the reasons behind them. Status o
 
 ```mermaid
 flowchart LR
-  subgraph Kernel["xi kernel (Rust)"]
-    Loop["Agent loop"] --> Log["Session log"]
-    Loop --> Prov["Providers"]
-    Loop --> Pol["Policy"]
-    Pol --> SB["Sandbox runner"]
+  Clients["Clients: TUI, editors, SDK"] <-->|Unix stream socket| Daemon["xi daemon: routing and supervision"]
+  subgraph SessionA["Session A"]
+    WorkerA["xi worker: kernel and credentials"]
+    WorkerA --> ToolsA["Sandboxed tools"]
+    WorkerA <--> ExtensionsA["Sandboxed extensions"]
   end
-  Log --> Bus["Protocol (JSON-RPC 2.0)"]
-  Bus --> TUI["TUI client"]
-  Bus --> Editors["Editor clients"]
-  Bus --> Headless["SDK / CI"]
-  Bus <--> Ext["Extensions (sandboxed processes)"]
-  SB --> Tools["Tool processes"]
+  subgraph SessionB["Session B"]
+    WorkerB["xi worker: kernel and credentials"]
+    WorkerB --> ToolsB["Sandboxed tools"]
+    WorkerB <--> ExtensionsB["Sandboxed extensions"]
+  end
+  Daemon <-->|"stdin/stdout pipe, same protocol"| WorkerA
+  Daemon <-->|"stdin/stdout pipe, same protocol"| WorkerB
+  WorkerA --> Providers["Model providers"]
+  WorkerB --> Providers
 ```
 
-### Kernel
+### Processes
 
-The kernel is a long-running process per workspace. It is headless; every UI is a client. Responsibilities:
+The target is one daemon per OS user per machine, with one worker process per open session. Per-user scope gives clients one known socket, a session list, an approvals inbox and a model-request scheduler. Workspace boundaries are ambiguous between cwd, git root and worktree; each session already records its `cwd`. A workspace socket would still need to live outside the repository to stay outside the sandbox. Separate workers contain provider-parsing panics and leaks to one session. Jupyter uses a per-user server with a kernel process per notebook; Docker uses a daemon and per-container shims. In contrast, one tmux server crash loses every session.
+
+| Process | Count | Owns | Never does |
+|---|---|---|---|
+| `xi daemon` | One per OS user per machine | Client socket, version handshake, session index, worker supervision, per-session routing, approvals inbox, model-request scheduler | Model calls, tools, provider-stream parsing, holding credentials |
+| `xi worker` (internal subcommand) | One per open session | Session log and its exclusive lock, agent loop, provider credentials, policy, sandboxed tools, the session's extension host, subagent children | Listen on a socket |
+| Clients: TUI, editors, `xi -p`, SDK | Any | UI | Touch logs directly |
+
+The client socket and worker pipes carry NDJSON JSON-RPC 2.0 with the same framing and method types. The daemon forwards session requests; workers hold credentials and call providers. `agent/run` children run inside the parent's worker. Socket paths and access checks are in [Daemon socket](#daemon-socket); method names, routing and approvals are in [Protocol](#protocol).
+
+Each worker runs the kernel with these responsibilities:
 
 1. Run the agent loop: build context, call the model, dispatch tool calls, append results.
 2. Own the session log and broadcast every appended event.
 3. Evaluate policy for every boundary crossing and run tools inside the sandbox.
 4. Spawn, supervise and route to extensions.
 
-Anything not on that list belongs in an extension or a client.
+Other agent behavior belongs in an extension or a client.
+
+#### Lifecycle
+
+| Transition | Behavior |
+|---|---|
+| Start | Use OS socket activation where installed: a launchd LaunchAgent with a `Sockets` entry on macOS, or a systemd user `.socket` unit on Linux. Otherwise a client finding no listener spawns `xi daemon`. The daemon takes an exclusive lock on `daemon.lock` before binding; a losing racer exits and the client retries the connection. |
+| Daemon idle exit | Exit with no workers and no connected clients after `[daemon] idle_exit`, default 10 minutes. |
+| Client detach | Closing a client cancels nothing. Turns keep running and any client can attach later. Cancellation requires an explicit request. |
+| Worker exit | Exit when the session is closed, or when idle with no attached clients for `idle_exit`. |
+| Worker crash | The daemon broadcasts the exit status. The log remains intact; opening it resumes the session in a new worker. |
+| Daemon death | Workers see EOF on their pipe and abort in-flight model requests. They let the running tool batch finish, record its results, append `turn_failed` with `"daemon connection lost"`, then exit. The session resumes in a new worker. |
+| Upgrade | Workers keep the binary they started with until they exit. The daemon re-executes itself when its executable changes on disk and it has no workers. The client handshake rejects incompatible protocol versions with a dedicated error code. An idle shutdown request lets a newer client request a restart once workers finish. |
+
+`xi -p`, the benchmark and tests use a private instance: the daemon library runs in-process with no listener, its own worker children and a temporary runtime directory. It exits with the client. This uses the real daemon's code paths without shared state between benchmark trials. Benchmark argv does not change.
+
+#### Model-request scheduling
+
+`[[daemon.limit]]` entries set an `endpoint` (provider base URL) and `concurrency` (maximum simultaneous model requests). Endpoints without an entry are unlimited. Before each model request, a worker requests an endpoint lease and waits for a grant. Leases are FIFO per endpoint. The worker releases its lease when the response ends, fails or is cancelled; worker exit releases leases implicitly. Retries of the same request keep the lease. Lease method names are in [Protocol](#protocol).
+
+#### Current state
+
+Today `xi serve` serves one stdio client per process and cancels turns on disconnect. Line mode, `-p` and `xi-tui` embed the kernel in-process. Extension peers are cached per workspace and package across sessions in one process; approvals wait on an in-memory channel. The topology above is planned; [Crate map](#crate-map) tracks implementation status.
 
 ### Session log
 
@@ -72,41 +107,85 @@ A session is an append-only JSONL file. Every line is one event with an id, an o
 
 Durability: each append is written as one buffer and synced before it is acknowledged. An unterminated final line can only come from an append that was never acknowledged, so opening a session truncates it. A malformed complete line is corruption and fails the open with its line number.
 
-One kernel owns a session at a time; the file is locked exclusively while open.
+One worker owns a session at a time; the file is locked exclusively while open.
 
 The log doubles as the audit trail (policy decisions and approvals are events), the replay input for evals, and the source of cost accounting (`usage` on assistant messages).
 
 ### Protocol
 
-All process boundaries use JSON-RPC 2.0 over stdio or a Unix socket. Methods are typed in `xi-protocol` with one marker type per method, following the pattern of `lsp-types`.
+The protocol below describes the target daemon and worker design; the [crate map](#crate-map) records implementation status. All links use newline-delimited JSON (NDJSON), with one JSON-RPC 2.0 message per line. Types live in `xi-protocol`, with one marker type per method, following the pattern of `lsp-types`.
 
-Client methods:
+| Link | Transport |
+|---|---|
+| Client ↔ daemon | Unix stream socket |
+| Daemon ↔ worker | Worker's stdin/stdout pipe |
+| Worker ↔ extension | Stdio |
 
-| Method | Direction | Purpose |
+The first client request must be `initialize`. The daemon checks `protocol_version`; any other request before initialization fails with -32001, and an incompatible version fails with -32002.
+
+Client → daemon requests:
+
+| Method | Params → result | Purpose |
 |---|---|---|
-| `session/create`, `session/open` | client → kernel | Start or resume a session. |
-| `session/prompt` | client → kernel | Run a turn; returns the new head when the turn ends. |
-| `session/cancel` | client → kernel | Stop the running turn. |
-| `session/checkout` | client → kernel | Move the head to an earlier event to branch. |
-| `session/compact` | client → kernel | Summarize older context at an idle prompt. |
-| `approval/resolve` | client → kernel | Answer an `ask` decision. |
-| `event/appended` | kernel → client | Every persisted event. |
-| `stream/delta` | kernel → client | Streaming model output; not persisted. |
+| `initialize` | `{protocol_version, client: {name, version}}` → `{protocol_version, daemon_version, capabilities}` | Initialize the connection and check the protocol version. |
+| `session/create` | `{cwd, model?}` → attach result | Spawn a worker and attach the caller. |
+| `session/open` | `{path}` → attach result | Spawn a worker for an existing log. If another worker holds it, fail with -32005 and return its session id so the client can attach instead. |
+| `session/attach` | `{session, since?}` → `{info, events, partial, running, pending_approvals}` | Subscribe the connection to the session's notifications. `since` is the last event id the client already has; `events` contains the events after it on disk, or the whole log without `since`. `partial` contains in-flight assistant blocks not yet persisted. |
+| `session/detach` | `{session}` → null | Unsubscribe; the turn keeps running. |
+| `session/list` | `{cwd?, running?}` → `[{session, path, cwd, model, head, running, pending_approvals, parent_session}]` | List live sessions and sessions found in the session directories; read root lines only. |
+| `session/close` | `{session}` → null | Stop the worker; fail while a turn runs. |
+| `session/prompt` | `{session, content}` → `{head}` | Route to the worker; run a turn and return the new head when it ends. |
+| `session/cancel` | `{session}` → null | Route to the worker; stop the running turn. |
+| `session/checkout` | `{session, event}` → null | Route to the worker; move the head to an earlier event to branch. Idle only. |
+| `session/compact` | `{session}` → `{head, tokens_before}` | Route to the worker; summarize older context at an idle prompt. |
+| `session/set_model` | `{session, model}` → null | Idle only; record `model_changed`. |
+| `approval/list` | `{}` → `[{session, call, tool, action, rule}]` | Return pending asks across all sessions. |
+| `approval/resolve` | `{session, call, approved}` → null | Route the answer to the owning worker; the first answer wins. |
+| `daemon/status` | `{}` → `{version, pid, uptime, workers, clients, leases}` | Return daemon status. |
+| `daemon/shutdown` | `{when: "idle" \| "now"}` → null | Shut down when idle or now; `now` cancels running turns first. |
 
-Approvals are events, not blocking requests. Any attached client can answer, and the decision lands in the log.
+Daemon → client notifications go only to connections attached to that session, except where noted:
+
+| Notification | Payload | Recipients and meaning |
+|---|---|---|
+| `event/appended` | `{session, event}` | Attached clients; every persisted event. |
+| `stream/delta` | `{session, delta, attempt}` | Attached clients; streaming model output, not persisted. `attempt` is an integer starting at 0. |
+| `stream/reset` | `{session, attempt}` | Attached clients; sent before a retried model request. Clients drop partial text from earlier attempts so retries do not duplicate text. |
+| `session/exited` | `{session, status}` | Attached clients and any client that called `session/list` with `running`; reports worker exit. |
+| `approval/pending` | `{session, call, tool, action, rule}` | Every initialized connection, not just attached ones; updates the approvals inbox. |
+
+Approvals are events, not blocking requests. The worker remains the authority for its asks; the decision is a `tool_decision` event with `decision = ask`. The daemon exposes one inbox through `approval/list` and routes `approval/resolve` to the owning worker. The first answer wins; later answers fail with -32006. The resolution lands in the log.
+
+With no client attached, the worker waits. The optional `[daemon] notify` command is an argv list from user config only, never project config. The daemon passes the session id, tool and action to it as JSON on stdin. Optional `[daemon] approval_timeout` defaults to none; expiry records `approval_resolved` with `approved = false` and `by = "timeout"`.
+
+When a worker opens a log whose head ends in an unresolved ask, it first appends `approval_resolved { approved: false, by: "interrupted" }` and a synthetic cancelled `tool_result`. This follows the rule that a dangling tool call gets a synthetic result. Cancelled asks follow the same rule, with `by = "cancelled"`, so no ask remains unanswered. `Approver` gains `timeout`, `interrupted` and `cancelled`. See [Processes](#processes) for lifecycle.
+
+On the daemon ↔ worker link, the daemon forwards client requests unchanged. The worker sends the same `event/appended`, `stream/delta` and `stream/reset` notifications to the daemon, plus a `worker/ready` handshake notification after opening the log. Before each model request it sends `model/lease` naming the endpoint and waits for a grant. It sends `model/release` when the response ends, fails or is cancelled. Leases are FIFO per endpoint; retries of the same request keep the lease, and worker exit releases its leases implicitly.
+
+Errors use the JSON-RPC server range; `data` carries structured detail:
+
+| Code | Meaning |
+|---|---|
+| -32001 | Not initialized |
+| -32002 | Protocol version mismatch; `data: {daemon_protocol_version}` |
+| -32003 | Unknown session |
+| -32004 | Session is running |
+| -32005 | Session held by another worker; `data: {session}` |
+| -32006 | Approval not pending |
+| -32007 | Worker exited; `data: {status}` |
 
 Extension methods:
 
 | Method | Direction | Purpose |
 |---|---|---|
-| `initialize` | kernel → extension | Handshake; the extension returns the tools, hooks and commands it registers. |
-| `tool/invoke` | kernel → extension | Run a registered tool. |
-| `hook/run` | kernel → extension | Run a hook at a loop point. |
-| `command/run` | kernel → extension | Run a slash command. |
-| `shutdown` | kernel → extension | Ask the extension to exit. |
-| `session/append_custom` | extension → kernel | Persist extension state as a `custom` event. |
-| `agent/run` | extension → kernel | Run a linked child session with a reduced built-in toolset. Requires `subagents`. |
-| `log` | extension → kernel | Diagnostic output. |
+| `initialize` | worker → extension | Handshake; the extension returns the tools, hooks and commands it registers. |
+| `tool/invoke` | worker → extension | Run a registered tool. |
+| `hook/run` | worker → extension | Run a hook at a loop point. |
+| `command/run` | worker → extension | Run a slash command. |
+| `shutdown` | worker → extension | Ask the extension to exit. |
+| `session/append_custom` | extension → worker | Persist extension state as a `custom` event. |
+| `agent/run` | extension → worker | Run a linked child session with a reduced built-in toolset. Requires `subagents`. |
+| `log` | extension → worker | Diagnostic output. |
 
 Hook points in protocol version 0: `pre_tool` (continue, deny, or rewrite the input), `post_tool` (continue or replace the output), `turn_end` (observe only), and `compact` (continue or supply a summary). Hooks run in registration order. The host rejects outcomes that do not match their hook point. Rewritten input goes through policy before execution. Replacement output cannot clear a prior untrusted flag.
 
@@ -133,9 +212,9 @@ There is no `exec` capability. Forked processes inherit the same OS sandbox, whi
 
 Load packages with `extensions = ["~/path/to/package"]` in a config file, or repeat `--extension DIR` on the CLI. Each config layer replaces the previous package list; CLI entries append. Config-relative paths resolve against the config file directory, and CLI-relative paths against the process directory. Project and local package settings are ignored until the workspace is trusted.
 
-One extension supervisor belongs to the kernel's event bus. It starts packages lazily and caches processes by canonical package root and workspace. Each session keeps its own ordered catalog. `initialize` supplies tools, hooks and slash commands. Tools follow built-ins in the model catalog, cross `ActionKind::Tool` policy, and preserve output taint. Duplicate tool, command or package names fail startup. `/name args` in line mode dispatches `command/run`; built-in command names are reserved.
+Each worker owns its session's extension host and supervisor. It starts packages lazily and caches processes by canonical package root within that worker; extension processes are never shared across sessions. Each session keeps its own ordered catalog. `initialize` supplies tools, hooks and slash commands. Tools follow built-ins in the model catalog, cross `ActionKind::Tool` policy, and preserve output taint. Duplicate tool, command or package names fail startup. `/name args` in line mode dispatches `command/run`; built-in command names are reserved.
 
-Stdio carries full-duplex NDJSON JSON-RPC. A reader routes responses independently from extension requests, so several `agent/run` requests can run while `tool/invoke` is pending. The turn owner services `session/append_custom` without reacquiring its session lock. Every extension has a stderr and diagnostic log beside the first session that loaded it. Crashes are logged and the call returns an error result. Turn cancellation cancels child sessions and stops the extension's process group, so no cancelled invocation keeps changing the workspace. A stopped extension starts again on its next use: the next turn, command or compaction. Normal CLI/server exit sends `shutdown`, closes the connection, terminates descendants and reaps the process. The SDK also accepts `$/cancelRequest` for cooperative `AbortSignal` handling.
+Stdio carries full-duplex NDJSON JSON-RPC. A reader routes responses independently from extension requests, so several `agent/run` requests can run while `tool/invoke` is pending. The turn owner services `session/append_custom` without reacquiring its session lock. Every extension has a stderr and diagnostic log beside the first session that loaded it. Crashes are logged and the call returns an error result. Turn cancellation cancels child sessions and stops the extension's process group, so no cancelled invocation keeps changing the workspace. This affects only the owning session; it cannot stop an extension serving another session. A stopped extension starts again on its next use: the next turn, command or compaction. Normal worker exit sends `shutdown`, closes the connection, terminates descendants and reaps the process. The SDK also accepts `$/cancelRequest` for cooperative `AbortSignal` handling.
 
 `agent/run` requires `subagents = true`. Children have fresh logs in the parent's session directory with `parent_session` set, the same workspace and sandbox configuration, and the parent's built-in tools or a requested subset of them. Unknown or extension tool names fail. Children never load extensions, so they cannot delegate further. Approval asks are recorded and denied headlessly. The result contains the final text, failure flag and usage summed across child requests. Children share files, so callers must assign disjoint edit scopes.
 
@@ -264,9 +343,27 @@ This addresses the combination of private data, untrusted content and an exfiltr
 
 Opening a repository for the first time loads no repo-supplied hooks, extensions or loosening rules. The committed project policy still applies, because it can only tighten. The user grants trust once per repository root; trust is stored outside the repository.
 
+### Daemon socket
+
+The planned daemon uses a per-user runtime directory:
+
+| Selection | Directory |
+|---|---|
+| Override on either platform | `$XI_RUNTIME_DIR`, if set |
+| Linux default | `$XDG_RUNTIME_DIR/xi`, falling back to `/run/user/<uid>/xi` |
+| macOS default | `~/Library/Application Support/xi/run` |
+
+The directory has mode 0700 and holds `daemon.sock` (0600) and `daemon.lock`. The daemon checks every connection's peer uid with `SO_PEERCRED` on Linux or `getpeereid` on macOS and rejects other users.
+
+The runtime directory must lie outside every sandbox readable or writable root. A worker refuses to start a session whose sandbox spec contains it. On Linux, Landlock blocks pathname Unix socket connections outside the sandbox. On macOS, the profile permits Unix connections only beneath writable roots and the session tmp directory. Sandboxed processes therefore cannot connect to the daemon. Neither the runtime directory path nor `XI_RUNTIME_DIR` is in the tool environment allowlist.
+
+There is no network listener. Remote clients forward the Unix socket over ssh with StreamLocal forwarding: `ssh -L local.sock:remote.sock`.
+
+The optional `[daemon] notify` command is honored only from user config, never project config.
+
 ### Secrets
 
-Provider credentials live in the kernel, loaded from the OS keychain or a user-only file. They are never placed in a tool or extension environment.
+Provider credentials live in workers, loaded from the OS keychain or a user-only file. The daemon holds none. Credentials are never placed in a tool or extension environment.
 
 ## Defaults
 
@@ -281,17 +378,18 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 
 | Crate | Purpose | Status |
 |---|---|---|
-| `xi-protocol` | Event, content, JSON-RPC envelope, method and manifest types. | Implemented |
+| `xi-protocol` | Event, content, JSON-RPC envelope, method and manifest types; daemon methods, notifications and error types. | Existing types implemented; daemon additions planned |
 | `xi-session` | Append-only session tree log with crash recovery and locking. | Implemented |
 | `xi-policy` | Policy rules, layering and taint-aware evaluation. | Implemented |
 | `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock, macOS Seatbelt. | Implemented |
 | `xi-sandbox` egress proxy | Kernel-side CONNECT proxy and in-namespace forwarder. | Planned |
 | `xi-provider` | Anthropic Messages and OpenAI-compatible Chat adapters, model registry. | Implemented (Anthropic live path untested) |
 | `xi-tools` | `read`, exact-string `edit`, `write`, `bash`, `search`, plus opt-in `hashline` edits. | Implemented |
-| `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server and sandboxed extension host. | Implemented |
-| `xi-cli` | The `xi` binary: line mode, headless `-p`, `serve`, `trust`. | Implemented |
+| `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server and sandboxed extension host; worker entry point with `server.rs` as the worker side of the pipe link. | Existing kernel implemented; worker entry point planned |
+| `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler and private-instance mode. | Planned |
+| `xi-cli` | The `xi` binary: line mode, headless `-p`, `serve`, `trust`; `xi daemon`, internal `xi worker` and private-instance `-p`. | Existing commands implemented; daemon, worker and private-instance mode planned |
 | `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |
-| `xi-tui` | Terminal client: scrollback commits, a live region, `ctrl+o` full results and a `/tree` checkout overlay. | Implemented (in process; no child sessions yet) |
+| `xi-tui` | Terminal client: scrollback commits, a live region, `ctrl+o` full results and a `/tree` checkout overlay; daemon client. | Existing TUI implemented (kernel in process; no child sessions yet); daemon client planned |
 | `sdk/typescript` | Zero-dependency extension SDK and full-duplex NDJSON peer. | Implemented |
 
 ## Build order
@@ -300,11 +398,13 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 2. `xi-provider`, `xi-kernel`, `xi-tools` and a line-mode client: the first usable agent. Done.
 3. `xi-bench`, so features are added on measurements. Done.
 4. Harder tasks, the edit-format decision, compaction, the extension host with the TypeScript SDK, and subagents as a package. Done.
+5. Protocol types for the handshake, attach, list, approvals inbox, stream reset and error codes; the worker entry point over a pipe; `xi-daemon` with private-instance mode; `xi -p` and the benchmark on the private instance (benchmark argv unchanged).
+6. The per-user daemon: socket, peer-uid check, lock-based startup, idle exit, launchd and systemd units, `notify` and `approval_timeout`.
+7. `xi-tui` as a daemon client; scheduler leases.
 
 What comes next, and how features and sandbox work proceed side by side, is in [roadmap.md](roadmap.md).
 
 ## Open questions
 
-- Whether the kernel should be one process per workspace or one per user with workspaces as tenants.
 - Wasm components as a second extension format once the component toolchain is easy enough for models to target.
 - Whether frontier-model tests justify hash-anchored or AST-aware edits over exact-string edits.
