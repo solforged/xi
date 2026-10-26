@@ -2287,9 +2287,11 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "futures",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",

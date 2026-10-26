@@ -1,17 +1,34 @@
 //! Model providers.
 //!
 //! A [`Provider`] turns a provider-neutral [`Request`] into one streamed
-//! model response. Conversion is lossless in both directions: thinking
-//! signatures, redacted thinking and provider-specific blocks come back as
-//! [`Block::Thinking`], [`Block::RedactedThinking`] and [`Block::Opaque`] and
-//! are sent back unchanged on the next request.
+//! model response. Anthropic thinking signatures, redacted thinking and
+//! provider-specific blocks round-trip unchanged. OpenAI-compatible reasoning
+//! is exposed as [`Block::Thinking`] but is not replayed.
 //!
 //! The [`Registry`] knows which providers and models exist. It starts from a
 //! built-in table and is extended from config ([`RegistryConfig`]).
+//!
+//! Clients share a connection pool per provider, use a 30-second connection
+//! timeout and a 120-second read/idle timeout, and have no total timeout.
+//! Anthropic caches the system, final tool definition and final history block.
+//! Current Claude models use adaptive thinking and effort; older models use
+//! token budgets. Models that cannot disable thinking clamp [`Reasoning::Off`]
+//! to their lowest effort (Sonnet 5.5 also disables up-front thinking).
+//! Built-in prices are base, standard-tier USD per million tokens, not
+//! long-context premiums. Config layers can replace all built-in metadata.
+//!
+//! The `live` example accepts `XI_BASE_URL` and `XI_MODEL` and exercises an
+//! OpenAI-compatible stream plus a tool-result round trip without credentials.
+
+mod anthropic;
+mod openai;
+mod registry;
+mod sse;
+mod transport;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use futures::future::BoxFuture;
@@ -207,6 +224,7 @@ pub struct ModelInfo {
     pub max_output: u32,
     /// Whether the model supports reasoning.
     #[serde(default)]
+    /// Anthropic models with mandatory reasoning clamp `Off` to low effort.
     pub reasoning: bool,
     /// Prices in US dollars per million tokens, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,41 +265,5 @@ pub struct RegistryConfig {
 pub struct Registry {
     providers: BTreeMap<String, ProviderConfig>,
     models: Vec<ModelInfo>,
-}
-
-impl Registry {
-    /// The built-in providers and models.
-    #[must_use]
-    pub fn builtin() -> Self {
-        todo!("provider lane")
-    }
-
-    /// Adds or overrides providers and models from a config layer.
-    pub fn extend(&mut self, config: RegistryConfig) {
-        let _ = (&mut self.providers, &mut self.models, config);
-        todo!("provider lane")
-    }
-
-    /// Metadata for a model.
-    #[must_use]
-    pub fn model(&self, model: &ModelRef) -> Option<&ModelInfo> {
-        let _ = model;
-        todo!("provider lane")
-    }
-
-    /// All known models.
-    #[must_use]
-    pub fn models(&self) -> &[ModelInfo] {
-        &self.models
-    }
-
-    /// Builds a client for `model`'s provider, resolving its credential.
-    ///
-    /// # Errors
-    /// Fails with [`ErrorKind::Config`] for an unknown provider and
-    /// [`ErrorKind::Auth`] when the credential cannot be read.
-    pub fn connect(&self, model: &ModelRef) -> Result<Arc<dyn Provider>, Error> {
-        let _ = model;
-        todo!("provider lane")
-    }
+    clients: Arc<Mutex<BTreeMap<String, reqwest::Client>>>,
 }
