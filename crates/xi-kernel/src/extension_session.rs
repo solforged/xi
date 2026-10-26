@@ -30,6 +30,13 @@ impl Session {
                     )
                     .await?,
             );
+            *self.0.commands.lock().expect("command catalog") = state
+                .extensions
+                .as_ref()
+                .expect("loaded extensions")
+                .commands()
+                .cloned()
+                .collect();
         }
         Ok(())
     }

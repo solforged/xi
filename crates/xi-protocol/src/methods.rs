@@ -97,6 +97,18 @@ pub mod client {
         SessionSetModel, "session/set_model", SetModelParams => ()
     );
     request!(
+        /// Client → daemon: select a session's reasoning depth.
+        SessionSetReasoning, "session/set_reasoning", SetReasoningParams => ()
+    );
+    request!(
+        /// Client → daemon: list the session's available model metadata.
+        SessionModels, "session/models", SessionRef => ModelsResult
+    );
+    request!(
+        /// Client → daemon: list the session's registered extension commands.
+        SessionCommands, "session/commands", SessionRef => Vec<crate::manifest::CommandSpec>
+    );
+    request!(
         /// Client → daemon: run an extension slash command.
         SessionCommand, "session/command", SessionCommandParams => Option<super::extension::CommandResult>
     );
@@ -279,6 +291,9 @@ pub mod client {
         pub trusted: bool,
         /// Selected model.
         pub model: ModelRef,
+        /// Current reasoning depth.
+        #[serde(default)]
+        pub reasoning: Reasoning,
         /// Registry metadata for the selected model, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model_info: Option<ModelInfo>,
@@ -328,6 +343,37 @@ pub mod client {
         pub session: SessionId,
         /// Model to select.
         pub model: ModelRef,
+    }
+
+    /// Parameters for [`SessionSetReasoning`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SetReasoningParams {
+        /// Session to update.
+        pub session: SessionId,
+        /// Reasoning depth to select.
+        pub reasoning: Reasoning,
+    }
+
+    /// Session model selection and registry metadata.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct ModelsResult {
+        /// Currently selected model.
+        pub current: ModelRef,
+        /// Current reasoning depth.
+        pub reasoning: Reasoning,
+        /// Models sorted by provider and model id.
+        pub models: Vec<ModelEntry>,
+    }
+
+    /// Public metadata and credential availability for one model.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct ModelEntry {
+        /// Provider and model id.
+        pub model: ModelRef,
+        /// Registry metadata.
+        pub info: ModelInfo,
+        /// Whether the provider's credential exists, or no credential is needed.
+        pub available: bool,
     }
 
     /// Parameters for [`SessionCommand`].
@@ -820,6 +866,103 @@ mod tests {
     use crate::{Block, Event, EventId, SessionId, Timestamp};
 
     #[test]
+    fn reasoning_models_and_commands_wire_shapes() {
+        use crate::manifest::CommandSpec;
+        use crate::model::{ModelInfo, Reasoning};
+
+        let session = SessionId::generate();
+        let params = SetReasoningParams {
+            session,
+            reasoning: Reasoning::Low,
+        };
+        let request = Request::new::<SessionSetReasoning>(RequestId::Number(1), &params).unwrap();
+        let wire = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/set_reasoning",
+            "params": {"session": session, "reasoning": "low"},
+        });
+        assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<SetReasoningParams>(wire["params"].clone()).unwrap(),
+            params,
+        );
+        let model = ModelRef {
+            provider: "test".into(),
+            model: "m".into(),
+        };
+        let models = ModelsResult {
+            current: model.clone(),
+            reasoning: Reasoning::High,
+            models: vec![ModelEntry {
+                model,
+                info: ModelInfo {
+                    provider: "test".into(),
+                    id: "m".into(),
+                    context_window: 1000,
+                    max_output: 100,
+                    reasoning: true,
+                    pricing: None,
+                },
+                available: false,
+            }],
+        };
+        let wire = json!({
+            "current": {"provider": "test", "model": "m"}, "reasoning": "high",
+            "models": [{
+                "model": {"provider": "test", "model": "m"},
+                "info": {
+                    "provider": "test", "id": "m", "context_window": 1000,
+                    "max_output": 100, "reasoning": true,
+                },
+                "available": false,
+            }],
+        });
+        assert_eq!(serde_json::to_value(&models).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<ModelsResult>(wire).unwrap(),
+            models
+        );
+        for (request, method) in [
+            (
+                Request::new::<SessionModels>(RequestId::Number(2), &SessionRef { session })
+                    .unwrap(),
+                "session/models",
+            ),
+            (
+                Request::new::<SessionCommands>(RequestId::Number(3), &SessionRef { session })
+                    .unwrap(),
+                "session/commands",
+            ),
+        ] {
+            assert_eq!(request.method, method);
+            assert_eq!(request.params, json!({"session": session}));
+        }
+        let commands = vec![CommandSpec {
+            name: "hello".into(),
+            description: "Greet.".into(),
+        }];
+        let wire = json!([{"name": "hello", "description": "Greet."}]);
+        assert_eq!(serde_json::to_value(&commands).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<Vec<CommandSpec>>(wire).unwrap(),
+            commands
+        );
+    }
+
+    #[test]
+    fn saved_session_details_without_reasoning_default_to_medium() {
+        let info: SessionDetails = serde_json::from_value(json!({
+            "session": SessionId::generate(),
+            "path": "/sessions/test.jsonl",
+            "head": EventId::generate(),
+            "cwd": "/work",
+            "trusted": false,
+            "model": {"provider": "test", "model": "m"},
+        }))
+        .unwrap();
+        assert_eq!(info.reasoning, crate::model::Reasoning::Medium);
+    }
+
+    #[test]
     fn initialize_params_wire_shape() {
         let params = InitializeParams {
             protocol_version: crate::PROTOCOL_VERSION,
@@ -862,6 +1005,7 @@ mod tests {
                 cwd: "/work".into(),
                 trusted: true,
                 model,
+                reasoning: crate::model::Reasoning::Medium,
                 model_info: None,
                 parent_session: None,
             },
@@ -893,6 +1037,7 @@ mod tests {
                 "session": session, "path": "/sessions/test.jsonl", "head": head,
                 "cwd": "/work", "trusted": true,
                 "model": {"provider": "test", "model": "model"},
+                "reasoning": "medium",
             },
             "events": [{
                 "id": head, "at": 7, "type": "user_message",

@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::content::{Block, ToolOutput};
 use crate::ids::{EventId, ExtensionId, SessionId, Timestamp, ToolCallId};
+use crate::model::Reasoning;
 
 /// One entry in a session log.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -132,6 +133,11 @@ pub enum EventKind {
         /// The new model.
         model: ModelRef,
     },
+    /// The user changed reasoning depth.
+    ReasoningChanged {
+        /// The new reasoning depth.
+        reasoning: Reasoning,
+    },
     /// State persisted by an extension. The kernel does not interpret it.
     Custom {
         /// The extension that wrote the event.
@@ -223,6 +229,16 @@ mod tests {
 
     use super::*;
     use crate::content::OutputBlock;
+
+    #[test]
+    fn reasoning_changed_wire_shape() {
+        let event = EventKind::ReasoningChanged {
+            reasoning: Reasoning::High,
+        };
+        let wire = json!({"type": "reasoning_changed", "reasoning": "high"});
+        assert_eq!(serde_json::to_value(&event).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<EventKind>(wire).unwrap(), event);
+    }
 
     #[test]
     fn tool_result_is_one_flat_object_on_disk() {

@@ -9,8 +9,10 @@ use tokio::sync::mpsc;
 use xi_protocol::content::Block;
 use xi_protocol::event::ModelRef;
 use xi_protocol::ids::{EventId, SessionId, ToolCallId};
+use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::*;
 use xi_protocol::methods::extension::CommandResult;
+use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::{NotificationMethod, RequestMethod, RpcError};
 
 use crate::connect;
@@ -217,6 +219,27 @@ impl Client {
     /// Selects a session's model.
     pub async fn set_model(&self, session: SessionId, model: ModelRef) -> Result<(), ClientError> {
         self.request::<SessionSetModel>(&SetModelParams { session, model })
+            .await
+    }
+
+    /// Selects a session's reasoning depth while idle.
+    pub async fn set_reasoning(
+        &self,
+        session: SessionId,
+        reasoning: Reasoning,
+    ) -> Result<(), ClientError> {
+        self.request::<SessionSetReasoning>(&SetReasoningParams { session, reasoning })
+            .await
+    }
+
+    /// Lists registry models and credential availability without exposing credentials.
+    pub async fn models(&self, session: SessionId) -> Result<ModelsResult, ClientError> {
+        self.request::<SessionModels>(&SessionRef { session }).await
+    }
+
+    /// Lists extension slash commands in registration order.
+    pub async fn commands(&self, session: SessionId) -> Result<Vec<CommandSpec>, ClientError> {
+        self.request::<SessionCommands>(&SessionRef { session })
             .await
     }
 

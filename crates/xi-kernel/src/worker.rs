@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -13,14 +13,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use xi_client::peer::{Incoming, Peer};
 use xi_protocol::methods::client::{
-    ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, Delta, EventAppended,
-    PendingApproval, PromptParams, PromptResult, ResolveParams, SessionCommandParams,
-    SessionDetails, SessionOptions, SessionRef, SetModelParams, StreamDelta, StreamReset,
+    ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, Delta, EventAppended, ModelEntry,
+    ModelsResult, PendingApproval, PromptParams, PromptResult, ResolveParams, SessionCommandParams,
+    SessionDetails, SessionOptions, SessionRef, SetModelParams, SetReasoningParams, StreamDelta,
+    StreamReset,
 };
 use xi_protocol::methods::worker::{LeaseParams, ModelLease, ModelRelease, WorkerStartParams};
+use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::{RequestId, RpcError};
 use xi_protocol::{Block, Decision, Event, EventId, EventKind, SessionId, ToolCallId};
-use xi_provider::Registry;
+use xi_provider::{Auth, LoginService, Registry};
 use xi_session::SessionLog;
 
 use crate::config::{Config, Paths};
@@ -83,6 +85,8 @@ struct Worker {
 struct Mirror {
     info: SessionDetails,
     registry: Registry,
+    credentials: PathBuf,
+    initial_reasoning: Reasoning,
     events: Vec<Event>,
     index: HashMap<EventId, usize>,
     partial: Vec<Block>,
@@ -112,6 +116,9 @@ impl Mirror {
             EventKind::ModelChanged { model } => {
                 self.info.model = model.clone();
                 self.info.model_info = self.registry.model(model).cloned();
+            }
+            EventKind::ReasoningChanged { reasoning } => {
+                self.info.reasoning = *reasoning;
             }
             EventKind::ToolDecision {
                 call,
@@ -144,19 +151,68 @@ impl Mirror {
 
     fn checkout(&mut self, head: EventId) {
         self.info.head = head;
+        self.info.reasoning = self.initial_reasoning;
+        let mut model_found = false;
+        let mut reasoning_found = false;
         let mut next = Some(head);
         while let Some(id) = next {
             let Some(event) = self.index.get(&id).map(|index| &self.events[*index]) else {
                 break;
             };
             match &event.kind {
-                EventKind::SessionStarted { model, .. } | EventKind::ModelChanged { model } => {
+                EventKind::SessionStarted { model, .. } | EventKind::ModelChanged { model }
+                    if !model_found =>
+                {
                     self.info.model = model.clone();
                     self.info.model_info = self.registry.model(model).cloned();
-                    break;
+                    model_found = true;
                 }
-                _ => next = event.parent,
+                EventKind::ReasoningChanged { reasoning } if !reasoning_found => {
+                    self.info.reasoning = *reasoning;
+                    reasoning_found = true;
+                }
+                _ => {}
             }
+            if model_found && reasoning_found {
+                break;
+            }
+            next = event.parent;
+        }
+    }
+
+    fn models(&self) -> ModelsResult {
+        let mut models: Vec<_> = self
+            .registry
+            .models()
+            .map(|info| ModelEntry {
+                model: xi_protocol::event::ModelRef {
+                    provider: info.provider.clone(),
+                    model: info.id.clone(),
+                },
+                available: self
+                    .registry
+                    .provider(&info.provider)
+                    .is_some_and(|provider| match &provider.auth {
+                        Auth::None => true,
+                        Auth::Env(name) => {
+                            std::env::var_os(name).is_some_and(|value| !value.is_empty())
+                        }
+                        Auth::File(path) => path.exists(),
+                        Auth::Login(LoginService::Chatgpt) => {
+                            xi_provider::chatgpt_file(&self.credentials).exists()
+                        }
+                    }),
+                info: info.clone(),
+            })
+            .collect();
+        models.sort_by(|left, right| {
+            (&left.model.provider, &left.model.model)
+                .cmp(&(&right.model.provider, &right.model.model))
+        });
+        ModelsResult {
+            current: self.info.model.clone(),
+            reasoning: self.info.reasoning,
+            models,
         }
     }
 
@@ -235,6 +291,17 @@ where
                     continue;
                 };
                 match method.as_str() {
+                    "session/models" | "session/commands" => {
+                        let result = decode::<SessionRef>(params).and_then(|params| {
+                            check_session(&active.session, params.session)?;
+                            if method == "session/models" {
+                                encode(active.mirror.models())
+                            } else {
+                                encode(&*active.session.0.commands.lock().expect("command catalog"))
+                            }
+                        });
+                        let _ = peer.respond(id, result);
+                    }
                     "session/attach" => {
                         let result = decode::<AttachParams>(params).and_then(|params| {
                             check_session(&active.session, params.session)?;
@@ -382,7 +449,43 @@ async fn start(
         ),
     }
     .map_err(kernel_error)?;
-    let state = session.0.state.lock().await;
+    let mut state = session.0.state.lock().await;
+    let mut commands = Vec::new();
+    if !state.config.extensions.is_empty() {
+        // Registration needs tool schemas, not a model connection or credential.
+        let specs = match &state.backend {
+            Some(backend) => Ok(std::borrow::Cow::Borrowed(backend.specs.as_slice())),
+            None => xi_tools::toolset(&state.config.tools)
+                .map(|tools| {
+                    std::borrow::Cow::Owned(tools.iter().map(|tool| tool.spec()).collect())
+                })
+                .map_err(Error::Config),
+        };
+        let loaded = match specs {
+            Ok(specs) => {
+                bus.1
+                    .startup(
+                        &state.config,
+                        &state.tools_context,
+                        state.log.file_path(),
+                        &specs,
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match loaded {
+            Ok((extensions, complete)) => {
+                commands = extensions.commands().cloned().collect();
+                // Incomplete startup catalogs retry through the normal use path.
+                if complete {
+                    state.extensions = Some(extensions);
+                }
+            }
+            Err(error) => eprintln!("xi: extension startup: {error}"),
+        }
+    }
+    *session.0.commands.lock().expect("command catalog") = commands;
     let registry = state.config.registry();
     let parent_session = match &state.log.root().kind {
         EventKind::SessionStarted { parent_session, .. } => *parent_session,
@@ -395,12 +498,15 @@ async fn start(
         cwd: state.config.workspace.clone(),
         trusted: state.config.trusted,
         model: state.config.model.clone(),
+        reasoning: state.config.reasoning,
         model_info: registry.model(&state.config.model).cloned(),
         parent_session,
     };
     let mut mirror = Mirror {
         info,
         registry,
+        credentials: state.config.paths.credentials(),
+        initial_reasoning: state.initial_reasoning,
         events: Vec::with_capacity(state.log.events().len()),
         index: HashMap::new(),
         partial: Vec::new(),
@@ -412,6 +518,8 @@ async fn start(
         mirror.event(event);
     }
     mirror.checkout(state.head);
+    // Replaying the log must not overwrite an explicit open-time override.
+    mirror.info.reasoning = state.config.reasoning;
     drop(state);
     Ok(Worker { session, mirror })
 }
@@ -468,6 +576,7 @@ fn session_config(paths: &Paths, cwd: &Path, options: &SessionOptions) -> Result
     let mut config = Config::load(paths.clone(), cwd, &options.configs)?;
     if let Some(reasoning) = options.reasoning {
         config.reasoning = reasoning;
+        config.reasoning_override = Some(reasoning);
     }
     if let Some(tools) = &options.tools {
         config.tools = tools.clone();
@@ -502,6 +611,15 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
             check_session(&session, params.session)?;
             session
                 .set_model(params.model)
+                .await
+                .map_err(kernel_error)?;
+            Value::Null
+        }
+        "session/set_reasoning" => {
+            let params: SetReasoningParams = decode(params)?;
+            check_session(&session, params.session)?;
+            session
+                .set_reasoning(params.reasoning)
                 .await
                 .map_err(kernel_error)?;
             Value::Null

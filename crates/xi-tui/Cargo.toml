@@ -10,14 +10,16 @@ publish.workspace = true
 [dependencies]
 crossterm.workspace = true
 futures.workspace = true
+ignore.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
 xi-client.workspace = true
 xi-protocol.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 xi-daemon.workspace = true
 xi-kernel.workspace = true
 xi-provider.workspace = true

@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
 use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, ResetParams};
-use xi_protocol::model::ModelInfo;
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::{
     Block, Decision, EventId, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput,
 };
@@ -246,6 +246,7 @@ struct State {
     log: SessionLog,
     head: EventId,
     config: Config,
+    initial_reasoning: Reasoning,
     system: SystemContext,
     tools_context: xi_tools::Context,
     backend: Option<ActiveBackend>,
@@ -267,6 +268,7 @@ struct Inner {
     id: SessionId,
     state: tokio::sync::Mutex<State>,
     control: Mutex<Control>,
+    commands: Mutex<Vec<xi_protocol::manifest::CommandSpec>>,
     bus: EventBus,
     options: TurnOptions,
     stop: CancellationToken,
@@ -363,10 +365,18 @@ impl Session {
         let id = *id;
         let head = log.leaves().last().expect("session has a leaf").id;
         config.model = model.clone();
+        let initial_reasoning = config.reasoning_override.unwrap_or(config.reasoning);
+        config.reasoning = initial_reasoning;
+        // Only an explicit invocation override beats saved reasoning. Config
+        // defaults fill logs that have no reasoning change on this lineage.
+        let restore_reasoning = config.reasoning_override.is_none();
         let mut pending = Vec::<(ToolCallId, bool)>::new();
         for event in log.lineage(head).expect("known head") {
             match &event.kind {
                 EventKind::ModelChanged { model } => config.model = model.clone(),
+                EventKind::ReasoningChanged { reasoning } if restore_reasoning => {
+                    config.reasoning = *reasoning;
+                }
                 EventKind::AssistantMessage { content, .. } => {
                     for block in content {
                         if let Block::ToolUse { id, .. } = block {
@@ -424,12 +434,14 @@ impl Session {
                 log,
                 head,
                 config,
+                initial_reasoning,
                 system,
                 tools_context,
                 backend,
                 extensions: None,
             }),
             control: Mutex::new(Control::default()),
+            commands: Mutex::new(Vec::new()),
             bus,
             options,
             stop: CancellationToken::new(),
@@ -585,15 +597,20 @@ impl Session {
             .lineage(event)
             .ok_or_else(|| Error::Config("unknown checkout event".into()))?;
         let mut selected = None;
+        let mut reasoning = state.initial_reasoning;
         for event in lineage {
             match &event.kind {
                 EventKind::SessionStarted { model, .. } | EventKind::ModelChanged { model } => {
                     selected = Some(model.clone())
                 }
+                EventKind::ReasoningChanged {
+                    reasoning: selected,
+                } => reasoning = *selected,
                 _ => {}
             }
         }
         state.head = event;
+        state.config.reasoning = reasoning;
         if let Some(model) = selected
             && model != state.config.model
         {
@@ -619,6 +636,20 @@ impl Session {
         }
         state.config = next;
         state.backend = Some(backend.into());
+        Ok(())
+    }
+
+    /// Changes reasoning depth at an idle prompt, recording only changed levels.
+    pub async fn set_reasoning(&self, reasoning: Reasoning) -> Result<()> {
+        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
+        let control = self.0.control.lock().expect("control lock");
+        if control.running {
+            return Err(Error::Running);
+        }
+        if reasoning != state.config.reasoning {
+            self.append(&mut state, EventKind::ReasoningChanged { reasoning })?;
+            state.config.reasoning = reasoning;
+        }
         Ok(())
     }
 

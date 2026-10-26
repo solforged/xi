@@ -282,6 +282,7 @@ async fn run(cli: Cli) -> Result<u8> {
         notifications,
         template,
         attached,
+        history: Some(paths.state.join("prompts.jsonl")),
     };
     if !cli.plain && xi_tui::available() {
         xi_tui::run(launch).await?;

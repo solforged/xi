@@ -444,6 +444,15 @@ impl Transcript {
                     ],
                 );
             }
+            EventKind::ReasoningChanged { reasoning } => {
+                self.push(
+                    &mut out,
+                    [Line::default().dim(format!(
+                        "  reasoning → {}",
+                        crate::reasoning_name(*reasoning)
+                    ))],
+                );
+            }
             EventKind::UserMessage { content } => {
                 self.gap(&mut out);
                 let text = blocks_text(content);

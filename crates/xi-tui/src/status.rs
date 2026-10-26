@@ -56,7 +56,8 @@ impl Segment {
     }
 }
 
-/// Drop order: higher numbers shorten and drop first; 0 never drops.
+/// Drop order: higher numbers shorten and drop first; 0 never drops. Every
+/// short form is used before any segment drops.
 #[must_use]
 pub fn priority(name: &str) -> u8 {
     match name {
@@ -122,27 +123,25 @@ pub fn fit(segments: Vec<Segment>, cols: usize) -> Fitted {
         2 + join(slots, Side::Left, "  ").width() + 2 + join(slots, Side::Right, " · ").width()
     };
     while width(&slots) > cols {
-        let candidate = slots
+        let rank = |(i, s): &(usize, &Slot)| (priority(s.segment.name), std::cmp::Reverse(*i));
+        let shorten = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.segment.short.is_some() && !s.short)
+            .max_by_key(rank)
+            .map(|(i, _)| i);
+        if let Some(i) = shorten {
+            slots[i].short = true;
+            continue;
+        }
+        let drop = slots
             .iter()
             .enumerate()
             .filter(|(_, s)| priority(s.segment.name) > 0)
-            .max_by_key(|(i, s)| (priority(s.segment.name), std::cmp::Reverse(*i)))
+            .max_by_key(rank)
             .map(|(i, _)| i);
-        if let Some(i) = candidate {
-            let slot = &mut slots[i];
-            if slot.segment.short.is_some() && !slot.short {
-                slot.short = true;
-            } else {
-                dropped.push(slot.segment.name);
-                slots.remove(i);
-            }
-            continue;
-        }
-        match slots
-            .iter_mut()
-            .find(|s| s.segment.short.is_some() && !s.short)
-        {
-            Some(slot) => slot.short = true,
+        match drop {
+            Some(i) => dropped.push(slots.remove(i).segment.name),
             None => break,
         }
     }
@@ -191,13 +190,16 @@ mod tests {
     }
 
     #[test]
-    fn segments_shorten_then_drop_in_priority_order() {
+    fn short_forms_are_used_before_segments_drop_in_priority_order() {
         let fitted = fit(segments(), 60);
-        assert_eq!(
-            fitted.dropped,
-            ["sandbox", "cache", "branch", "reasoning", "cost"]
+        assert_eq!(fitted.dropped, ["sandbox", "cache", "branch"]);
+        let text = fitted.line.plain();
+        assert!(text.starts_with(" ledger"), "{text}");
+        assert!(
+            text.contains("think med") && text.contains("$0.29"),
+            "{text}"
         );
-        assert!(fitted.line.plain().contains("◆ tainted · ? 1 waiting"));
+        assert!(text.contains("◆ · ?1"), "{text}");
         assert_eq!(fitted.line.width(), 60);
     }
 

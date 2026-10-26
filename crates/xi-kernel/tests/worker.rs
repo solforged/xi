@@ -19,10 +19,11 @@ use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::{
     ApprovalResolve, AttachParams, AttachResult, CreateParams, Delta, DeltaParams, EventParams,
     OpenParams, PromptParams, ResetParams, SessionAttach, SessionCancel, SessionClose,
-    SessionOptions, SessionPrompt, SessionRef,
+    SessionCommands, SessionModels, SessionOptions, SessionPrompt, SessionRef, SessionSetReasoning,
+    SetReasoningParams,
 };
 use xi_protocol::methods::worker::{LeaseParams, WorkerStart, WorkerStartParams};
-use xi_protocol::model::ModelInfo;
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestMethod, RpcError};
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput};
 use xi_provider::{BoxFuture, Error, ErrorKind, Provider, Request, Response};
@@ -158,6 +159,14 @@ impl Fixture {
     }
 
     fn worker_with_tools(&self, script: Arc<dyn Provider>, tools: Vec<Arc<dyn Tool>>) -> Harness {
+        self.spawn(Some(Backend {
+            provider: script,
+            model: model(),
+            tools,
+        }))
+    }
+
+    fn spawn(&self, backend: Option<Backend>) -> Harness {
         let (daemon, worker) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(worker);
         let task = tokio::spawn(run(
@@ -165,11 +174,7 @@ impl Fixture {
             writer,
             WorkerSetup {
                 paths: self.paths.clone(),
-                backend: Some(Backend {
-                    provider: script,
-                    model: model(),
-                    tools,
-                }),
+                backend,
             },
         ));
         let (reader, writer) = tokio::io::split(daemon);
@@ -298,6 +303,9 @@ async fn requires_start_and_create_returns_root_and_config_details() {
         "session/prompt",
         "session/cancel",
         "unknown",
+        "session/set_reasoning",
+        "session/models",
+        "session/commands",
     ] {
         assert_code(
             harness.peer.request_value(method, json!({})).await,
@@ -316,6 +324,7 @@ async fn requires_start_and_create_returns_root_and_config_details() {
         }
     );
     assert_eq!(attached.info.model_info, Some(model()));
+    assert_eq!(attached.info.reasoning, Reasoning::Medium);
     assert!(!attached.info.trusted);
     assert!(attached.info.parent_session.is_none());
     assert!(attached.info.path.is_absolute());
@@ -328,6 +337,378 @@ async fn requires_start_and_create_returns_root_and_config_details() {
         EventKind::SessionStarted { .. }
     ));
     harness.close(attached.info.session).await;
+}
+
+#[test]
+fn model_catalog_checks_credentials_in_a_child_process() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "model_catalog_checks_credentials_child",
+            "--nocapture",
+        ])
+        .env("XI_MODEL_CATALOG_CHILD", "1")
+        .env("XI_MODEL_CATALOG_SECRET", "never-return-this-env-secret")
+        .env("XI_MODEL_CATALOG_EMPTY", "")
+        .env_remove("XI_MODEL_CATALOG_MISSING")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn model_catalog_checks_credentials_child() {
+    if std::env::var_os("XI_MODEL_CATALOG_CHILD").is_none() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let credential = fixture.paths.data.join("file-key");
+    std::fs::create_dir_all(fixture.paths.credentials()).unwrap();
+    std::fs::write(&credential, "never-return-this-file-secret").unwrap();
+    std::fs::write(
+        xi_provider::chatgpt_file(&fixture.paths.credentials()),
+        "never-return-this-login-secret",
+    )
+    .unwrap();
+    let config_path = fixture.paths.config.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    for (provider, auth) in [
+        ("z_public", "'none'".to_owned()),
+        ("env_set", "{ env = 'XI_MODEL_CATALOG_SECRET' }".to_owned()),
+        ("env_empty", "{ env = 'XI_MODEL_CATALOG_EMPTY' }".to_owned()),
+        (
+            "env_missing",
+            "{ env = 'XI_MODEL_CATALOG_MISSING' }".to_owned(),
+        ),
+        (
+            "file_set",
+            format!("{{ file = '{}' }}", credential.display()),
+        ),
+        (
+            "file_missing",
+            format!(
+                "{{ file = '{}' }}",
+                fixture.paths.data.join("absent").display()
+            ),
+        ),
+        ("login", "{ login = 'chatgpt' }".to_owned()),
+    ] {
+        config.push_str(&format!(
+            "\n[provider.{provider}]\napi = 'openai-chat'\nbase_url = 'http://127.0.0.1:9/v1'\nauth = {auth}\n\
+             [[model]]\nprovider = '{provider}'\nid = 'm'\ncontext_window = 2048\nmax_output = 100\n",
+        ));
+    }
+    config.push_str(
+        "\n[[model]]\nprovider = 'chatgpt'\nid = 'gpt-6.1-sol'\n\
+         context_window = 7777\nmax_output = 100\nreasoning = true\n",
+    );
+    std::fs::write(config_path, config).unwrap();
+    let harness = fixture.spawn(None);
+    let attached = harness.start(&fixture).await;
+    let session = attached.info.session;
+    let models = request::<SessionModels>(&harness.peer, &SessionRef { session })
+        .await
+        .unwrap();
+    assert_eq!(models.current, attached.info.model);
+    assert_eq!(models.reasoning, Reasoning::Medium);
+    for (provider, available) in [
+        ("z_public", true),
+        ("env_set", true),
+        ("env_empty", false),
+        ("env_missing", false),
+        ("file_set", true),
+        ("file_missing", false),
+        ("login", true),
+    ] {
+        let model = models
+            .models
+            .iter()
+            .find(|entry| entry.model.provider == provider)
+            .unwrap();
+        assert_eq!(model.available, available, "{provider}");
+    }
+    let keys: Vec<_> = models
+        .models
+        .iter()
+        .map(|entry| (&entry.model.provider, &entry.model.model))
+        .collect();
+    assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    for builtin in xi_provider::Registry::builtin().models() {
+        assert!(models.models.iter().any(|entry| {
+            entry.model.provider == builtin.provider && entry.model.model == builtin.id
+        }));
+    }
+    assert_eq!(
+        models
+            .models
+            .iter()
+            .find(|entry| {
+                entry.model.provider == "chatgpt" && entry.model.model == "gpt-6.1-sol"
+            })
+            .unwrap()
+            .info
+            .context_window,
+        7777,
+    );
+    let wire = serde_json::to_value(&models).unwrap();
+    for entry in wire["models"].as_array().unwrap() {
+        assert_eq!(entry.as_object().unwrap().len(), 3);
+        assert!(entry.get("model").is_some());
+        assert!(entry.get("info").is_some());
+        assert!(entry.get("available").is_some());
+    }
+    let text = wire.to_string();
+    for private in [
+        "never-return-this-env-secret",
+        "never-return-this-file-secret",
+        "never-return-this-login-secret",
+        "XI_MODEL_CATALOG_SECRET",
+        credential.to_str().unwrap(),
+    ] {
+        assert!(!text.contains(private));
+    }
+    std::fs::remove_file(&credential).unwrap();
+    std::fs::remove_file(xi_provider::chatgpt_file(&fixture.paths.credentials())).unwrap();
+    let models = request::<SessionModels>(&harness.peer, &SessionRef { session })
+        .await
+        .unwrap();
+    for provider in ["file_set", "login", "chatgpt"] {
+        assert!(
+            models
+                .models
+                .iter()
+                .filter(|entry| entry.model.provider == provider)
+                .all(|entry| !entry.available)
+        );
+    }
+    harness.close(session).await;
+}
+
+#[tokio::test]
+async fn commands_use_startup_registration_order_without_connecting_a_provider() {
+    let fixture = Fixture::new();
+    let mut extensions = Vec::new();
+    for (name, names) in [
+        ("zeta", vec!["z_two", "z_one"]),
+        ("alpha", vec!["a_command"]),
+    ] {
+        let package = fixture.cwd.join(name);
+        std::fs::create_dir_all(&package).unwrap();
+        let commands: Vec<_> = names
+            .iter()
+            .map(|name| json!({"name": name, "description": name}))
+            .collect();
+        let script = format!(
+            "const readline = require('node:readline');\n\
+             readline.createInterface({{input: process.stdin}}).on('line', line => {{\n\
+               const p = JSON.parse(line);\n\
+               if (p.id === undefined) return;\n\
+               const result = p.method === 'initialize' ? {{commands: {}}} : null;\n\
+               if (p.method === 'initialize') console.error('initialized');\n\
+               process.stdout.write(JSON.stringify({{jsonrpc: '2.0', id: p.id, result}}) + '\\n',\n\
+                 () => {{if (p.method === 'shutdown') process.exit(0);}});\n\
+             }});\n",
+            serde_json::to_string(&commands).unwrap(),
+        );
+        let script_path = package.join("commands.js");
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::write(
+            package.join("xi-extension.toml"),
+            format!(
+                "name = '{name}'\nversion = '0.1.0'\nrun = ['node', '{}']\n",
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        extensions.push(package);
+    }
+    let broken = fixture.cwd.join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(
+        broken.join("xi-extension.toml"),
+        "name = 'broken'\nversion = '0.1.0'\nrun = ['false']\n",
+    )
+    .unwrap();
+    extensions.insert(1, broken);
+    let mut params = fixture.create();
+    let WorkerStartParams::Create(create) = &mut params else {
+        unreachable!()
+    };
+    create.options.extensions = extensions;
+    let config = fixture.paths.config.join("config.toml");
+    std::fs::write(
+        config,
+        format!(
+            "default_model = 'test/script'\ntools = []\n\
+             [provider.test]\napi = 'openai-chat'\nbase_url = '{ENDPOINT}'\n\
+             auth = {{ env = 'XI_MISSING_{}' }}\n\
+             [[model]]\nprovider = 'test'\nid = 'script'\n\
+             context_window = 8192\nmax_output = 1024\n",
+            SessionId::generate(),
+        ),
+    )
+    .unwrap();
+    let harness = fixture.spawn(None);
+    let attached = request::<WorkerStart>(&harness.peer, &params)
+        .await
+        .unwrap();
+    let session = attached.info.session;
+    for _ in 0..2 {
+        let commands = request::<SessionCommands>(&harness.peer, &SessionRef { session })
+            .await
+            .unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["z_two", "z_one", "a_command"],
+        );
+    }
+    for name in ["zeta", "alpha"] {
+        let log = std::fs::read_to_string(attached.info.path.with_extension(format!("{name}.log")))
+            .unwrap();
+        assert_eq!(log.matches("initialized").count(), 1);
+    }
+    harness.close(session).await;
+}
+
+#[tokio::test]
+async fn reasoning_dispatch_updates_attach_and_reopens_with_an_explicit_override() {
+    let fixture = Fixture::new();
+    let harness = fixture.worker(Script::new(vec![]));
+    let attached = harness.start(&fixture).await;
+    let session = attached.info.session;
+    request::<SessionSetReasoning>(
+        &harness.peer,
+        &SetReasoningParams {
+            session,
+            reasoning: Reasoning::Low,
+        },
+    )
+    .await
+    .unwrap();
+    let changed = request::<SessionAttach>(
+        &harness.peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(changed.info.reasoning, Reasoning::Low);
+    assert!(matches!(
+        changed.events.last().unwrap().kind,
+        EventKind::ReasoningChanged {
+            reasoning: Reasoning::Low
+        }
+    ));
+    for method in [
+        "session/set_reasoning",
+        "session/models",
+        "session/commands",
+    ] {
+        assert_code(
+            harness
+                .peer
+                .request_value(
+                    method,
+                    json!({"session": SessionId::generate(), "reasoning": "high"}),
+                )
+                .await,
+            RpcError::UNKNOWN_SESSION,
+        );
+    }
+    harness.close(session).await;
+
+    for (override_level, expected) in [
+        (None, Reasoning::Low),
+        (Some(Reasoning::Off), Reasoning::Off),
+    ] {
+        let harness = fixture.worker(Script::new(vec![]));
+        let opened = request::<WorkerStart>(
+            &harness.peer,
+            &WorkerStartParams::Open(OpenParams {
+                path: attached.info.path.clone(),
+                options: SessionOptions {
+                    reasoning: override_level,
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened.info.reasoning, expected);
+        assert_eq!(
+            request::<SessionModels>(&harness.peer, &SessionRef { session })
+                .await
+                .unwrap()
+                .reasoning,
+            expected,
+        );
+        harness.close(session).await;
+    }
+}
+
+#[tokio::test]
+async fn reasoning_is_idle_only_but_catalogs_remain_responsive_while_running() {
+    let fixture = Fixture::new();
+    let gate = Arc::new(Semaphore::new(0));
+    let mut harness = fixture.worker(Script::new(vec![Step {
+        text: "partial".into(),
+        gate: Some(gate),
+        error: None,
+    }]));
+    let attached = harness.start(&fixture).await;
+    let session = attached.info.session;
+    let peer = harness.peer.clone();
+    let prompt = tokio::spawn(async move {
+        request::<SessionPrompt>(
+            &peer,
+            &PromptParams {
+                session,
+                content: text("work"),
+            },
+        )
+        .await
+        .unwrap()
+    });
+    harness.lease().await;
+    assert_code(
+        request::<SessionSetReasoning>(
+            &harness.peer,
+            &SetReasoningParams {
+                session,
+                reasoning: Reasoning::High,
+            },
+        )
+        .await,
+        RpcError::SESSION_RUNNING,
+    );
+    assert_eq!(
+        request::<SessionModels>(&harness.peer, &SessionRef { session })
+            .await
+            .unwrap()
+            .reasoning,
+        Reasoning::Medium,
+    );
+    assert!(
+        request::<SessionCommands>(&harness.peer, &SessionRef { session })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    request::<SessionCancel>(&harness.peer, &SessionRef { session })
+        .await
+        .unwrap();
+    assert!(prompt.await.unwrap().cancelled);
+    harness.close(session).await;
 }
 
 #[tokio::test]

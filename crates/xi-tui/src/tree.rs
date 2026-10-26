@@ -109,6 +109,10 @@ impl Summary {
                 self.notes
                     .push(format!("model → {}/{}", model.provider, model.model));
             }
+            EventKind::ReasoningChanged { reasoning } => {
+                self.notes
+                    .push(format!("reasoning → {}", crate::reasoning_name(*reasoning)));
+            }
             EventKind::TurnFailed { .. } => self.notes.push("turn failed".into()),
             _ => {}
         }

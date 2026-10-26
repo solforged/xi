@@ -234,6 +234,8 @@ pub struct Config {
     pub model: ModelRef,
     /// Reasoning setting.
     pub reasoning: Reasoning,
+    /// Explicit per-invocation override, which takes precedence over a saved level.
+    pub reasoning_override: Option<Reasoning>,
     /// Enabled tool names in request order.
     pub tools: Vec<String>,
     /// Extension package directories, resolved against their config files.
@@ -285,6 +287,7 @@ impl Config {
             trusted,
             model: parse_model("chatgpt/gpt-6.1-sol")?,
             reasoning: Reasoning::Medium,
+            reasoning_override: None,
             tools: ["read", "edit", "write", "bash", "search"]
                 .into_iter()
                 .map(str::to_owned)

@@ -40,14 +40,14 @@ A response that stops at `max_tokens` without tool calls ends the turn; two `par
 
 ## Terminal client
 
-The goal is a client good enough for daily work, including developing xi with xi. The target surface is in the [design](design.md#terminal-client). It lands in five slices; slices 1 and 3 run first because they touch different code.
+The goal is a client good enough for daily work, including developing xi with xi. The target surface is in the [design](design.md#terminal-client). It lands in five slices.
 
 | Slice | Contents | Protocol | Status |
 |---|---|---|---|
-| 1. Model and reasoning | Model picker, `shift+tab` reasoning cycle, `/reasoning`, reasoning in the footer | `session/models`, `session/set_reasoning`, `reasoning` in `SessionDetails` | In progress |
+| 1. Model and reasoning | Model picker, `shift+tab` reasoning cycle, `/reasoning` (also in line mode), reasoning in the footer | `session/models`, `session/set_reasoning`, `reasoning` in `SessionDetails` | Done |
 | 2. Sessions and approvals | `/resume` picker, approvals inbox across sessions, approval scopes | `remember` on `approval/resolve`; `session/list` and `approval/list` exist | Planned |
-| 3. Composer | Saved history with `ctrl+r`, `ctrl+g` external editor, `/` and `@` completion, extension commands and `/compact` in the TUI | `session/commands` | In progress |
-| 4. Rendering and keys | `edit` diffs, `ctrl+t` thinking display, `/copy`, `/help` from the dispatch table, `[keys]` in `tui.toml` | None | Planned |
+| 3. Composer | Saved history with `ctrl+r`, `ctrl+g` external editor, `/` and `@` completion, extension commands and `/compact` in the TUI; `/help` built from the key dispatch table | `session/commands` | Done |
+| 4. Rendering and keys | `edit` diffs, `ctrl+t` thinking display, `/copy`, `[keys]` in `tui.toml` | None | Planned |
 | 5. Settings | Settings view with config layers, save as default | None; the client edits the global config file | Planned |
 
 After these, in rough order of daily value: `!cmd` and `!!cmd` run in the session sandbox (needs `session/shell`), session rename and auto-naming, a large-paste menu, image paste, `alt+up` to pull queued prompts back, git branch and session cost in the footer, `/export`, and themes. Plan mode, todo, advisor, an agent hub and dashboards stay packages in the feature queue.

@@ -14,7 +14,7 @@ use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
-use xi_protocol::model::ModelInfo;
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, ToolCallId, ToolOutput};
 use xi_provider::{BoxFuture, Error, ErrorKind, Message, Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
@@ -1147,6 +1147,110 @@ async fn selecting_the_current_model_records_nothing() {
     let events = session.info().await.events;
     assert_eq!(events.len(), before + 1);
     assert!(matches!(&events[before].kind, EventKind::ModelChanged { model } if *model == other));
+}
+
+#[tokio::test]
+async fn reasoning_changes_record_once_and_reach_the_next_provider_request() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![Step::Reply(done())]);
+    let (session, _) = fixture.session(script.clone(), FakeTool { gate: None }, opts());
+    session.set_reasoning(Reasoning::Medium).await.unwrap();
+    assert_eq!(session.info().await.events.len(), 1);
+    session.set_reasoning(Reasoning::High).await.unwrap();
+    session.set_reasoning(Reasoning::High).await.unwrap();
+    let info = session.info().await;
+    assert_eq!(info.events.len(), 2);
+    assert!(matches!(
+        info.events[1].kind,
+        EventKind::ReasoningChanged {
+            reasoning: Reasoning::High
+        }
+    ));
+    session.prompt(input("work")).await.unwrap();
+    assert_eq!(
+        script.requests.lock().unwrap()[0].reasoning,
+        Reasoning::High
+    );
+}
+
+#[tokio::test]
+async fn reasoning_changes_are_refused_while_a_turn_runs() {
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let script = Script::new(vec![Step::Wait(gate.clone())]);
+    let (session, _) = fixture.session(script.clone(), FakeTool { gate: None }, opts());
+    let prompt = session.submit(input("work"));
+    gate.entered.notified().await;
+    assert!(matches!(
+        session.set_reasoning(Reasoning::Off).await,
+        Err(xi_kernel::Error::Running)
+    ));
+    session.cancel();
+    prompt.await.unwrap().unwrap();
+    assert_eq!(
+        script.requests.lock().unwrap()[0].reasoning,
+        Reasoning::Medium
+    );
+    assert!(
+        !session
+            .info()
+            .await
+            .events
+            .iter()
+            .any(|event| { matches!(event.kind, EventKind::ReasoningChanged { .. }) })
+    );
+}
+
+#[tokio::test]
+async fn reasoning_reopens_from_the_head_lineage_and_explicit_override_wins() {
+    let fixture = Fixture::new();
+    let (session, _) = fixture.session(Script::new(vec![]), FakeTool { gate: None }, opts());
+    let root = session.info().await.head;
+    session.set_reasoning(Reasoning::High).await.unwrap();
+    session.checkout(root).await.unwrap();
+    session.set_reasoning(Reasoning::Low).await.unwrap();
+    let path = session.info().await.path;
+    drop(session);
+
+    let reopen = |config: Config, script: Arc<Script>| {
+        Session::from_log(
+            xi_session::SessionLog::open(&path).unwrap(),
+            config,
+            EventBus::default(),
+            opts(),
+            Some(Backend {
+                provider: script,
+                model: model(),
+                tools: Vec::new(),
+            }),
+        )
+        .unwrap()
+    };
+    let mut config = fixture.config();
+    config.reasoning = Reasoning::High;
+    let script = Script::new(vec![Step::Reply(done()), Step::Reply(done())]);
+    let session = reopen(config, script.clone());
+    session.prompt(input("restored")).await.unwrap();
+    assert_eq!(script.requests.lock().unwrap()[0].reasoning, Reasoning::Low);
+    session.checkout(root).await.unwrap();
+    session
+        .prompt(input("default on original root"))
+        .await
+        .unwrap();
+    assert_eq!(
+        script.requests.lock().unwrap()[1].reasoning,
+        Reasoning::High
+    );
+    session.set_reasoning(Reasoning::Low).await.unwrap();
+    drop(session);
+
+    let mut config = fixture.config();
+    config.reasoning = Reasoning::Off;
+    config.reasoning_override = Some(Reasoning::Off);
+    let script = Script::new(vec![Step::Reply(done())]);
+    let session = reopen(config, script.clone());
+    session.prompt(input("explicit override")).await.unwrap();
+    assert_eq!(script.requests.lock().unwrap()[0].reasoning, Reasoning::Off);
 }
 
 #[tokio::test(start_paused = true)]
