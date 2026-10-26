@@ -52,10 +52,12 @@ struct Call {
     result: Option<(ToolOutput, Option<std::path::PathBuf>, Timestamp)>,
 }
 
-/// A result the transcript showed cut short, kept whole for ctrl+o.
+/// Text the transcript showed cut short, kept whole for ctrl+o.
 struct Detail {
-    /// The call's headline: mark, tool and argument.
+    /// The headline: a call's mark, tool and argument, or the compaction.
     head: Line,
+    /// What the expansion shows, such as `full output`.
+    what: &'static str,
     text: String,
     error: bool,
     spill: Option<std::path::PathBuf>,
@@ -120,6 +122,8 @@ pub struct Transcript {
     pub context: u64,
     /// The selected model, once known.
     pub model: Option<ModelRef>,
+    /// Workspace root, from the session's first event.
+    workspace: Option<std::path::PathBuf>,
     blank: bool,
     /// Collapsed results, oldest first.
     details: Vec<Detail>,
@@ -151,16 +155,44 @@ pub fn duration(ms: u64) -> String {
     }
 }
 
-/// The argument that matters for a call's headline.
-fn headline_arg(name: &str, input: &Value) -> String {
+/// `path` relative to the workspace when it lies inside it; `.` for the
+/// workspace itself.
+fn relative<'a>(path: &'a str, workspace: Option<&std::path::Path>) -> &'a str {
+    let Some(rest) = workspace
+        .and_then(|w| w.to_str())
+        .and_then(|w| path.strip_prefix(w))
+    else {
+        return path;
+    };
+    match rest.strip_prefix('/') {
+        Some(rest) if !rest.is_empty() => rest,
+        None if rest.is_empty() => ".",
+        _ => path,
+    }
+}
+
+/// The argument that matters for a call's headline. Paths inside the
+/// workspace show relative to it, and a command's leading `cd` into the
+/// workspace is dropped, since every command already starts there.
+fn headline_arg(name: &str, input: &Value, workspace: Option<&std::path::Path>) -> String {
     let field = |k: &str| input.get(k).and_then(Value::as_str);
     let first = |s: &str| s.lines().next().unwrap_or("").to_owned();
     match name {
-        "bash" => field("command").map(first),
-        "read" | "write" | "edit" => field("path").map(str::to_owned),
-        "search" => field("pattern").map(|p| match field("path") {
+        "bash" => field("command").map(|c| {
+            let c = c.trim_start();
+            let rest = c.strip_prefix("cd ").and_then(|rest| {
+                let (dir, rest) = rest.split_once("&&")?;
+                (relative(dir.trim().trim_matches(['"', '\'']), workspace) == ".")
+                    .then(|| rest.trim_start())
+            });
+            first(rest.unwrap_or(c))
+        }),
+        "read" | "write" | "edit" | "hashline" => {
+            field("path").map(|p| relative(p, workspace).to_owned())
+        }
+        "search" => field("pattern").map(|p| match field("path").map(|d| relative(d, workspace)) {
+            Some(".") | None => p.to_owned(),
             Some(path) => format!("{p} in {path}"),
-            None => p.to_owned(),
         }),
         _ => field("url").map(str::to_owned),
     }
@@ -287,6 +319,7 @@ impl Call {
         }
         let detail = (hidden > 0).then(|| Detail {
             head: self.head(self.mark()),
+            what: "full output",
             text,
             error: output.is_error,
             spill: spill.clone(),
@@ -353,7 +386,10 @@ impl Transcript {
     fn event(&mut self, kind: &EventKind, at: Timestamp, cols: usize) -> Vec<Line> {
         let mut out = Vec::new();
         match kind {
-            EventKind::SessionStarted { model, .. } => self.model = Some(model.clone()),
+            EventKind::SessionStarted { model, cwd, .. } => {
+                self.model = Some(model.clone());
+                self.workspace = Some(cwd.clone());
+            }
             EventKind::ModelChanged { model } => {
                 self.model = Some(model.clone());
                 self.push(
@@ -411,7 +447,7 @@ impl Transcript {
                         Block::ToolUse { id, name, input } => self.calls.push(Call {
                             id: id.clone(),
                             name: name.clone(),
-                            arg: headline_arg(name, input),
+                            arg: headline_arg(name, input, self.workspace.as_deref()),
                             since: Some(Instant::now()),
                             decided_at: None,
                             decision: None,
@@ -510,8 +546,29 @@ impl Transcript {
                     .dim(format!(" {} tokens before ", tokens(*tokens_before)));
                 let fill = cols.saturating_sub(head.width());
                 let mut lines = vec![head.dim("─".repeat(fill)).truncate(cols)];
-                for row in wrap(summary.trim(), cols.saturating_sub(2)) {
-                    lines.push(Line::default().dim("  ").ink(row));
+                let (rows, hidden) = digest(summary);
+                for (label, text) in rows {
+                    lines.push(
+                        Line::default()
+                            .dim(format!("  {label:<9} "))
+                            .ink(text)
+                            .truncate(cols),
+                    );
+                }
+                if hidden > 0 {
+                    lines.push(
+                        Line::default()
+                            .dim(format!("  … {hidden} more lines of summary · ctrl+o"))
+                            .truncate(cols),
+                    );
+                    self.details.push(Detail {
+                        head: Line::default().strong(Role::Ink, "≡ compacted"),
+                        what: "full summary",
+                        text: summary.trim().to_owned(),
+                        error: false,
+                        spill: None,
+                    });
+                    self.expanded = 0;
                 }
                 lines.push(crate::style::rule(cols));
                 self.push(&mut out, lines);
@@ -545,7 +602,7 @@ impl Transcript {
         let count = detail.text.lines().count();
         let mut lines = vec![lr(
             detail.head.clone(),
-            Line::default().dim(format!("full output · {count} lines")),
+            Line::default().dim(format!("{} · {count} lines", detail.what)),
             cols,
         )];
         for (i, row) in wrap(&detail.text, cols.saturating_sub(4))
@@ -631,6 +688,55 @@ impl Transcript {
         }
         lines
     }
+}
+
+/// Rows that stand for a compaction summary: the first entry under each of
+/// the kernel's headings that says where the work stands, with a short
+/// label, and how many lines the digest leaves out. A summary without those
+/// headings, such as one an extension wrote, shows its first lines.
+fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
+    const LABELS: [(&str, &str); 6] = [
+        ("user goal", "goal"),
+        ("decision", "decided"),
+        ("files", "touched"),
+        ("current state", "state"),
+        ("open", "open"),
+        ("next", "next"),
+    ];
+    const ROWS: usize = 5;
+    let lines: Vec<&str> = summary
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut rows = Vec::new();
+    let mut label = None;
+    for line in &lines {
+        let heading = line.trim_start_matches('#').trim_matches('*').trim();
+        if line.starts_with('#') || (line.starts_with("**") && line.ends_with("**")) {
+            let lower = heading.to_lowercase();
+            label = LABELS
+                .iter()
+                .find(|(prefix, _)| lower.starts_with(prefix))
+                .map(|(_, l)| *l);
+            continue;
+        }
+        if let Some(l) = label.take()
+            && rows.len() < ROWS
+        {
+            let text = line.trim_start_matches(['-', '*', ' ']).to_owned();
+            rows.push((l, text));
+        }
+    }
+    if rows.is_empty() {
+        rows = lines
+            .iter()
+            .take(3)
+            .map(|l| ("", (*l).to_owned()))
+            .collect();
+    }
+    let hidden = lines.len().saturating_sub(rows.len());
+    (rows, hidden)
 }
 
 fn blocks_text(content: &[Block]) -> String {
@@ -842,6 +948,78 @@ mod tests {
         assert_eq!(older[2..], ["  └ 1", "    2", "    3", "    ", "    4"]);
         assert!(t.expand(60).is_none());
         assert!(plain(&t.expand(60).unwrap())[1].starts_with("✕ bash make test"));
+    }
+
+    #[test]
+    fn headlines_drop_the_workspace_but_keep_paths_outside_it() {
+        let w = Some(std::path::Path::new("/tmp/ranges"));
+        let arg = |name, input| headline_arg(name, &input, w);
+        assert_eq!(
+            arg("read", json!({"path": "/tmp/ranges/src/lib.rs"})),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            arg("read", json!({"path": "/tmp/ranges-old/x"})),
+            "/tmp/ranges-old/x"
+        );
+        assert_eq!(arg("read", json!({"path": "/etc/hosts"})), "/etc/hosts");
+        assert_eq!(
+            arg(
+                "bash",
+                json!({"command": "cd /tmp/ranges && cargo test\necho"})
+            ),
+            "cargo test"
+        );
+        assert_eq!(
+            arg("bash", json!({"command": "cd /tmp && ls"})),
+            "cd /tmp && ls"
+        );
+        assert_eq!(
+            arg("search", json!({"pattern": "fn ", "path": "/tmp/ranges"})),
+            "fn "
+        );
+        assert_eq!(
+            arg(
+                "search",
+                json!({"pattern": "fn ", "path": "/tmp/ranges/src"})
+            ),
+            "fn  in src"
+        );
+    }
+
+    #[test]
+    fn compaction_commits_a_digest_and_keeps_the_summary_for_ctrl_o() {
+        let summary = "## User goal and constraints\n- Fix covered_length.\n- Keep tests.\n\n## Decisions\n- Skip empty ranges.\n\n## Commands run and results\n- cargo test: ok\n\n## Open questions\n- None.\n";
+        let mut t = Transcript::default();
+        let rows = plain(&t.apply(
+            &ev(
+                EventKind::Compaction {
+                    summary: summary.into(),
+                    tokens_before: 30_700,
+                    kept: None,
+                    usage: None,
+                },
+                0,
+            ),
+            60,
+        ));
+        assert!(
+            rows[1].starts_with("─── ≡ compacted 30.7k tokens before ─"),
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows[2..6],
+            [
+                "  goal      Fix covered_length.",
+                "  decided   Skip empty ranges.",
+                "  open      None.",
+                "  … 6 more lines of summary · ctrl+o",
+            ]
+        );
+        let full = plain(&t.expand(60).unwrap());
+        // The divider already ended in a blank row, so no gap comes first.
+        assert!(full[0].ends_with("full summary · 12 lines"), "{full:?}");
+        assert_eq!(full[1], "  └ ## User goal and constraints");
     }
 
     #[test]
