@@ -1,0 +1,5 @@
+prompt = "Repair covered_length in this dependency-free Rust crate. It must return the union length of unordered half-open u32 ranges, ignoring empty or reversed ranges, without counting overlaps twice. Run cargo test --offline --quiet. Do not modify tests, Cargo.toml, or .gitignore."
+check = ["cargo", "test", "--offline", "--quiet"]
+timeout_seconds = 300
+protected_paths = ["tests", "Cargo.toml", ".gitignore"]
+tags = ["rust", "intervals"]

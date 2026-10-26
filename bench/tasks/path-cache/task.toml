@@ -1,0 +1,5 @@
+prompt = "Fix response_cache.cache_key so equivalent URL scheme and hostname casing share a cache entry, while preserving case-sensitive paths, query values, and user-info. Omit URL fragments, keep explicit ports, and normalize method casing. The tempting fix of lowercasing the entire URL breaks valid requests. Run python3 -m unittest discover -s tests. Do not modify tests or .gitignore."
+check = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+timeout_seconds = 300
+protected_paths = ["tests", ".gitignore"]
+tags = ["python", "regression-trap"]

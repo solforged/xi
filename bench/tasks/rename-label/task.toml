@@ -1,0 +1,5 @@
+prompt = "Rename the public render_label function to format_label and migrate all production callers. Remove the old symbol rather than keeping an alias. Preserve report formatting, including blank labels and non-ASCII names. Run python3 -m unittest discover -s tests. Do not modify tests or .gitignore."
+check = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+timeout_seconds = 300
+protected_paths = ["tests", ".gitignore"]
+tags = ["python", "refactor"]

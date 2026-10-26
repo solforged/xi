@@ -1,0 +1,17 @@
+[[arm]]
+name = "xi"
+kind = "xi"
+argv = ["xi", "-p", "--json", "--on-ask", "deny", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "{prompt}"]
+[arm.env]
+
+[[arm]]
+name = "xi-replace"
+kind = "xi"
+argv = ["xi", "-p", "--json", "--on-ask", "deny", "--tools", "read,replace,write,bash,search", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "{prompt}"]
+[arm.env]
+
+[[arm]]
+name = "omp"
+kind = "omp"
+argv = ["omp", "-p", "--mode", "json", "--model", "{model}", "--thinking", "medium", "--no-extensions", "--no-skills", "--no-rules", "--no-title", "--approval-mode", "yolo", "--config", "{session_dir}/omp.yml", "--session-dir", "{session_dir}", "{prompt}"]
+[arm.env]
