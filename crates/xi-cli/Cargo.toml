@@ -1,6 +1,6 @@
 [package]
 name = "xi-cli"
-description = "The `xi` command: line-mode client and headless runner."
+description = "The `xi` command: terminal client, line-mode client and headless runner."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,6 +20,7 @@ xi-kernel.workspace = true
 xi-protocol.workspace = true
 xi-provider.workspace = true
 xi-session.workspace = true
+xi-tui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

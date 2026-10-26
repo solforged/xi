@@ -1,4 +1,5 @@
-//! The `xi` command: interactive lines, headless turns and JSON-RPC stdio.
+//! The `xi` command: the terminal client, line mode, headless turns and
+//! JSON-RPC stdio.
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -54,6 +55,9 @@ struct Cli {
     /// Workspace root (default: current directory).
     #[arg(long, global = true)]
     cwd: Option<PathBuf>,
+    /// Use the line-mode client even in a terminal.
+    #[arg(long, conflicts_with = "prompt")]
+    plain: bool,
 }
 
 #[derive(Subcommand)]
@@ -190,6 +194,18 @@ async fn run(cli: Cli) -> Result<u8> {
         }
         bus.shutdown_extensions().await;
         return Ok(u8::from(outcome.failed || outcome.cancelled));
+    }
+    if !cli.plain && xi_tui::available() {
+        xi_tui::run(xi_tui::Launch {
+            session,
+            notifications,
+            bus,
+            config,
+            session_dir: options.session_dir,
+            turn_options,
+        })
+        .await?;
+        return Ok(0);
     }
     std::fs::create_dir_all(&paths.state)?;
     let history = paths.state.join("history");
