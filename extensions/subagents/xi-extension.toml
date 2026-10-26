@@ -1,0 +1,7 @@
+name = "subagents"
+version = "0.1.0"
+run = ["node", "index.ts"]
+
+[capabilities]
+subagents = true
+fs_read = ["../../sdk/typescript"]

@@ -2321,6 +2321,7 @@ name = "xi-kernel"
 version = "0.0.0"
 dependencies = [
  "futures",
+ "nix",
  "serde",
  "serde_json",
  "serde_yaml_ng",

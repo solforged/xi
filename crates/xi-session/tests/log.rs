@@ -251,6 +251,12 @@ fn compaction_keeps_recent_messages_and_rejects_bad_kept() {
 
     drop(log);
     let log = SessionLog::open(session_file(&dir)).unwrap();
-    let ids: Vec<_> = log.context(u4).unwrap().events.iter().map(|e| e.id).collect();
+    let ids: Vec<_> = log
+        .context(u4)
+        .unwrap()
+        .events
+        .iter()
+        .map(|e| e.id)
+        .collect();
     assert_eq!(ids, [u2, u3, u4]);
 }

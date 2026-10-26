@@ -30,6 +30,8 @@ pub struct Options {
     pub reasoning: Option<xi_provider::Reasoning>,
     /// CLI-selected tools.
     pub tools: Option<Vec<String>>,
+    /// CLI extension directories, resolved against the process directory.
+    pub extensions: Vec<PathBuf>,
 }
 
 impl Options {
@@ -44,6 +46,11 @@ impl Options {
         }
         if let Some(tools) = &self.tools {
             config.tools = tools.clone();
+        }
+        for path in &self.extensions {
+            config
+                .extensions
+                .push(std::env::current_dir()?.join(self.paths.expand(path)));
         }
         Ok(config)
     }
@@ -124,7 +131,7 @@ where
                             pending += 1;
                             let tx = reply_tx.clone();
                             tokio::spawn(async move {
-                                let result = match session.compact(None).await {
+                                let result = match session.compact().await {
                                     Ok(result) => success(id.clone().unwrap_or(Value::Null), json!(result)),
                                     Err(error) => failure(id.clone().unwrap_or(Value::Null), -32000, error.to_string()),
                                 };
@@ -156,6 +163,7 @@ where
             break;
         }
     }
+    bus.shutdown_extensions().await;
     Ok(())
 }
 

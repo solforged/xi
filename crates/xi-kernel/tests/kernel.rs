@@ -1075,9 +1075,15 @@ async fn compaction_triggers_at_threshold_using_all_usage_fields_and_new_charact
 }
 
 #[tokio::test]
-async fn compaction_keeps_an_oversized_tool_batch_whole_and_override_skips_provider() {
+async fn compaction_keeps_an_oversized_tool_batch_whole() {
     let fixture = Fixture::new();
-    let script = Script::new(vec![Step::Reply(done())]);
+    let summary = Response {
+        content: vec![Block::Text {
+            text: "model summary".into(),
+        }],
+        ..done()
+    };
+    let script = Script::new(vec![Step::Reply(summary), Step::Reply(done())]);
     let result = |id: &str| EventKind::ToolResult {
         call: id.into(),
         output: ToolOutput {
@@ -1113,26 +1119,23 @@ async fn compaction_keeps_an_oversized_tool_batch_whole_and_override_skips_provi
         },
     );
     let before = session.info().await;
-    let compact = session
-        .compact(Some("supplied summary".into()))
-        .await
-        .unwrap();
+    let compact = session.compact().await.unwrap();
     let info = session.info().await;
     assert_eq!(compact.head, info.head);
     assert!(matches!(
         info.events.last().unwrap().kind,
         EventKind::Compaction {
             kept: Some(kept),
-            usage: None,
+            usage: Some(_),
             ..
         } if kept == before.events[2].id
     ));
-    assert!(script.requests.lock().unwrap().is_empty());
     session.prompt(input("next")).await.unwrap();
     let requests = script.requests.lock().unwrap();
-    let messages = &requests[0].messages;
+    assert!(requests[0].tools.is_empty());
+    let messages = &requests[1].messages;
     assert_eq!(messages.len(), 4);
-    assert_eq!(messages[0], Message::User(input("supplied summary")));
+    assert_eq!(messages[0], Message::User(input("model summary")));
     let Message::ToolResults(results) = &messages[2] else {
         panic!("missing retained results")
     };
@@ -1167,7 +1170,7 @@ async fn summary_includes_previous_summary_and_resume_rebuilds_identical_context
             ..Default::default()
         },
     );
-    session.compact(None).await.unwrap();
+    session.compact().await.unwrap();
     let compacted = session.info().await;
     assert!(!session.prompt(input("continue")).await.unwrap().failed);
     let resumed_at = session.info().await;
@@ -1275,7 +1278,7 @@ async fn manual_compaction_rejects_dangling_calls_without_appending() {
         },
     );
     let before = session.info().await;
-    let error = session.compact(Some("summary".into())).await.unwrap_err();
+    let error = session.compact().await.unwrap_err();
     assert!(error.to_string().contains("pending tool calls"));
     assert_eq!(session.info().await.events, before.events);
 }
@@ -1299,7 +1302,7 @@ async fn cancelled_summary_preserves_context_and_does_not_emit_partial_assistant
     let before = session.info().await;
     let task = {
         let session = session.clone();
-        tokio::spawn(async move { session.compact(None).await })
+        tokio::spawn(async move { session.compact().await })
     };
     gate.entered.notified().await;
     session.cancel();
@@ -1372,6 +1375,6 @@ async fn compaction_without_an_older_prefix_is_a_noop() {
             keep_recent_tokens: 20_000,
         },
     );
-    assert!(session.compact(None).await.is_err());
+    assert!(session.compact().await.is_err());
     assert!(script.requests.lock().unwrap().is_empty());
 }

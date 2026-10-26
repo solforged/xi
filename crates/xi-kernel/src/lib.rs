@@ -13,6 +13,8 @@
 pub mod compaction;
 pub mod config;
 pub mod context;
+mod extension_session;
+pub mod extensions;
 pub mod server;
 
 use std::collections::{HashMap, VecDeque};
@@ -86,7 +88,10 @@ impl Notification {
 
 /// Fanout without lossy broadcast-ring overwrites.
 #[derive(Clone, Default)]
-pub struct EventBus(Arc<Mutex<Vec<mpsc::UnboundedSender<Notification>>>>);
+pub struct EventBus(
+    Arc<Mutex<Vec<mpsc::UnboundedSender<Notification>>>>,
+    Arc<extensions::ExtensionHost>,
+);
 
 impl EventBus {
     /// Subscribes to future notifications.
@@ -101,6 +106,11 @@ impl EventBus {
             .lock()
             .expect("event bus lock")
             .retain(|tx| tx.send(notification.clone()).is_ok());
+    }
+
+    /// Gracefully stops the process-wide extension host.
+    pub async fn shutdown_extensions(&self) {
+        self.1.shutdown().await;
     }
 }
 
@@ -223,6 +233,19 @@ struct State {
     system: SystemContext,
     tools_context: xi_tools::Context,
     backend: Option<ActiveBackend>,
+    extensions: Option<extensions::Extensions>,
+}
+
+impl State {
+    /// Every tool offered to the model: built-ins, then extension tools.
+    fn tool_specs(&self) -> impl Iterator<Item = &xi_protocol::manifest::ToolSpec> {
+        let backend = self.backend.as_ref().expect("connected backend");
+        backend.specs.iter().chain(
+            self.extensions
+                .iter()
+                .flat_map(|extensions| extensions.specs()),
+        )
+    }
 }
 struct Inner {
     id: SessionId,
@@ -245,6 +268,17 @@ impl Session {
         options: TurnOptions,
         backend: Option<Backend>,
     ) -> Result<Self> {
+        Self::create_linked(config, directory, bus, options, backend, None)
+    }
+
+    fn create_linked(
+        config: Config,
+        directory: Option<&Path>,
+        bus: EventBus,
+        options: TurnOptions,
+        backend: Option<Backend>,
+        parent_session: Option<SessionId>,
+    ) -> Result<Self> {
         let directory = directory.map_or_else(|| config.session_dir(), Path::to_owned);
         std::fs::create_dir_all(&directory)?;
         let directory = directory.canonicalize()?;
@@ -261,7 +295,7 @@ impl Session {
                 cwd: config.workspace.clone(),
                 model: config.model.clone(),
                 xi_version: env!("CARGO_PKG_VERSION").into(),
-                parent_session: None,
+                parent_session,
             },
         )?;
         let root = log.root().clone();
@@ -314,9 +348,16 @@ impl Session {
         config::write_sandbox_git(&git, &config.paths)?;
         let git = git.canonicalize()?;
         let sandbox = config.sandbox_spec(&tmp, &spill, &system.skill_roots, &git)?;
+        let executable = std::env::current_exe()?;
+        let binary_dir = executable.parent().expect("executable directory");
+        let binary_dir = if binary_dir.file_name().is_some_and(|name| name == "deps") {
+            binary_dir.parent().expect("Cargo target directory")
+        } else {
+            binary_dir
+        };
         let helper = std::env::var_os("XI_SANDBOX_EXEC")
             .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe()?.with_file_name("xi-sandbox-exec"));
+            .unwrap_or_else(|| binary_dir.join("xi-sandbox-exec"));
         let tools_context = xi_tools::Context {
             workspace: config.workspace.clone(),
             sandbox,
@@ -335,6 +376,7 @@ impl Session {
                 system,
                 tools_context,
                 backend,
+                extensions: None,
             }),
             control: Mutex::new(Control::default()),
             bus,
@@ -552,6 +594,7 @@ impl Session {
             cancelled: false,
             text: String::new(),
         };
+        self.prepare_extensions(state).await?;
         let mut requests = 0;
         loop {
             if cancel.is_cancelled() {
@@ -575,6 +618,7 @@ impl Session {
             if state.backend.is_none() {
                 state.backend = Some(Backend::connect(&state.config)?.into());
             }
+
             requests += 1;
             let response = self.model_response(state, cancel).await;
             let response = match response {
@@ -649,6 +693,23 @@ impl Session {
                 }
             }
         }
+        let extensions = state.extensions.clone().unwrap_or_default();
+        if !cancel.is_cancelled() && extensions.has_hook(xi_protocol::manifest::HookPoint::TurnEnd)
+        {
+            let event = xi_protocol::methods::extension::HookEvent::TurnEnd { head: state.head };
+            if let Err(error) = self
+                .extension_wait(state, extensions.hook(self.id(), event, cancel), cancel)
+                .await
+            {
+                self.append(
+                    state,
+                    EventKind::TurnFailed {
+                        message: error.to_string(),
+                    },
+                )?;
+                outcome.failed = true;
+            }
+        }
         outcome.head = state.head;
         Ok(outcome)
     }
@@ -666,7 +727,7 @@ impl Session {
                     .compaction
                     .trigger(backend.model.context_window)
         {
-            self.compact_at_boundary(state, cancel, None).await?;
+            self.compact_at_boundary(state, cancel).await?;
         }
         let mut overflow_compacted = false;
         loop {
@@ -675,7 +736,7 @@ impl Session {
                 model: state.config.model.model.clone(),
                 system: state.system.prompt.clone(),
                 messages: context::messages(state.log.context(state.head).expect("known head")),
-                tools: backend.specs.clone(),
+                tools: state.tool_specs().cloned().collect(),
                 max_tokens: backend.model.max_output,
                 reasoning: state.config.reasoning,
                 cache_key: Some(self.id().to_string()),
@@ -690,10 +751,7 @@ impl Session {
                         && !overflow_compacted =>
                 {
                     overflow_compacted = true;
-                    if self
-                        .compact_at_boundary(state, cancel, None)
-                        .await?
-                        .is_none()
+                    if self.compact_at_boundary(state, cancel).await?.is_none()
                         && !cancel.is_cancelled()
                     {
                         return Err(error.into());
@@ -760,9 +818,54 @@ impl Session {
         state: &mut State,
         call: ToolCallId,
         name: &str,
-        input: serde_json::Value,
+        mut input: serde_json::Value,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        use xi_protocol::methods::extension::{HookEvent, HookOutcome, InvokeParams};
+        let extensions = state.extensions.clone().unwrap_or_default();
+        if extensions.has_hook(xi_protocol::manifest::HookPoint::PreTool) {
+            let event = HookEvent::PreTool {
+                call: call.clone(),
+                tool: name.into(),
+                input: input.clone(),
+            };
+            match self
+                .extension_wait(state, extensions.hook(self.id(), event, cancel), cancel)
+                .await
+            {
+                Ok(HookOutcome::RewriteInput { input: rewritten }) => input = rewritten,
+                Ok(HookOutcome::Deny { reason }) => {
+                    self.append(
+                        state,
+                        EventKind::ToolDecision {
+                            call: call.clone(),
+                            action: format!("tool {name}"),
+                            decision: Decision::Deny,
+                            rule: Some("extension pre_tool".into()),
+                        },
+                    )?;
+                    return self.append(
+                        state,
+                        EventKind::ToolResult {
+                            call,
+                            output: error_output(reason),
+                            spill: None,
+                        },
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return self.append(
+                        state,
+                        EventKind::ToolResult {
+                            call,
+                            output: error_output(error.to_string()),
+                            spill: None,
+                        },
+                    );
+                }
+            }
+        }
         let tool = state
             .backend
             .as_ref()
@@ -770,7 +873,7 @@ impl Session {
             .tools
             .get(name)
             .cloned();
-        let Some(tool) = tool else {
+        if tool.is_none() && !extensions.has_tool(name) {
             return self.append(
                 state,
                 EventKind::ToolResult {
@@ -780,7 +883,10 @@ impl Session {
                 },
             );
         };
-        let crossings = match tool.crossings(&input, &state.tools_context) {
+        let crossings = match tool.as_ref().map_or_else(
+            || Ok(Vec::new()),
+            |tool| tool.crossings(&input, &state.tools_context),
+        ) {
             Ok(crossings) => crossings,
             Err(error) => {
                 return self.append(
@@ -898,11 +1004,90 @@ impl Session {
                 },
             );
         }
-        let result = tokio::select! {
-            biased;
-            () = cancel.cancelled() => xi_tools::Ran { output: error_output("cancelled"), spill: None },
-            result = tool.run(&call, input, &state.tools_context) => result,
+        let post_input = extensions
+            .has_hook(xi_protocol::manifest::HookPoint::PostTool)
+            .then(|| input.clone());
+        let mut result = if let Some(tool) = tool {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => xi_tools::Ran { output: error_output("cancelled"), spill: None },
+                result = tool.run(&call, input, &state.tools_context) => result,
+            }
+        } else {
+            let params = InvokeParams {
+                session: self.id(),
+                call: call.clone(),
+                tool: name.into(),
+                input,
+            };
+            let output = self
+                .extension_wait(state, extensions.invoke(&params, cancel), cancel)
+                .await
+                .unwrap_or_else(|error| error_output(error.to_string()));
+            xi_tools::Ran {
+                output,
+                spill: None,
+            }
         };
+        if !cancel.is_cancelled()
+            && let Some(input) = post_input
+        {
+            let event = HookEvent::PostTool {
+                call: call.clone(),
+                tool: name.into(),
+                input,
+                output: result.output.clone(),
+            };
+            match self
+                .extension_wait(state, extensions.hook(self.id(), event, cancel), cancel)
+                .await
+            {
+                Ok(HookOutcome::ReplaceOutput { output }) => {
+                    result.output = output;
+                    result.spill = None;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let untrusted = result.output.untrusted;
+                    result.output = error_output(error.to_string());
+                    result.output.untrusted = untrusted;
+                    result.spill = None;
+                }
+            }
+        }
+        if result.spill.is_none()
+            && result
+                .output
+                .content
+                .iter()
+                .all(|block| matches!(block, OutputBlock::Text { .. }))
+            && result
+                .output
+                .content
+                .iter()
+                .map(|block| match block {
+                    OutputBlock::Text { text } => text.len().saturating_add(1),
+                    _ => 0,
+                })
+                .sum::<usize>()
+                > state.tools_context.output_limit
+        {
+            let text = result
+                .output
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    OutputBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.len() > state.tools_context.output_limit {
+                let (text, spill) = xi_tools::truncate(&call, text, &state.tools_context);
+                result.output.content = vec![OutputBlock::Text { text }];
+                result.spill = spill;
+            }
+        }
         let untrusted = result.output.untrusted;
         self.append(
             state,
