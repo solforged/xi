@@ -64,7 +64,12 @@ pub(crate) fn input(input: &Value) -> Result<Input, String> {
     Ok(input)
 }
 
-pub(crate) fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Result<Ran, String> {
+pub(crate) fn run(
+    call: &ToolCallId,
+    value: &Value,
+    ctx: &Context,
+    anchors: bool,
+) -> Result<Ran, String> {
     // Tool::run has already validated the arguments before dispatch.
     let input: Input = parse(value)?;
     let root = paths::resolve(&input.path, ctx)?;
@@ -120,7 +125,7 @@ pub(crate) fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Result<Ran
                         } else {
                             line
                         };
-                        files::anchored(&mut out, number as usize, line);
+                        files::numbered(&mut out, number as usize, line, anchors);
                         count += 1;
                         Ok(true)
                     }),

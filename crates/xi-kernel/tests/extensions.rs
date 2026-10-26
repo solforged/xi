@@ -40,6 +40,12 @@ impl Provider for Fake {
                     name: "bash".into(),
                     input: json!({"command":"touch forbidden"}),
                 }]
+            } else if child && self.input["read_children"] == true && !seen_result {
+                vec![Block::ToolUse {
+                    id: "read-call".into(),
+                    name: "read".into(),
+                    input: json!({"path":"sample"}),
+                }]
             } else if child {
                 vec![Block::Text {
                     text: if wire.contains("child one") {
@@ -136,6 +142,7 @@ impl Fixture {
             requests: Mutex::new(Vec::new()),
         });
         let bus = EventBus::default();
+        let tools = xi_tools::toolset(&config.tools).unwrap();
         let session = Session::create(
             config,
             None,
@@ -154,7 +161,7 @@ impl Fixture {
                     reasoning: false,
                     pricing: None,
                 },
-                tools: xi_tools::builtin(),
+                tools,
             }),
         )
         .unwrap();
@@ -361,6 +368,45 @@ async fn concurrent_children_have_linked_logs_reduced_tools_and_usage() {
         2
     );
     bus.shutdown_extensions().await;
+}
+
+#[tokio::test]
+async fn children_inherit_parent_read_format_without_the_editor() {
+    for editor in ["edit", "hashline"] {
+        let fixture = Fixture::new("subagents=true");
+        std::fs::write(fixture.workspace.join("sample"), "sample\n").unwrap();
+        let mut config = fixture.config();
+        config.tools = ["read", editor, "write", "bash", "search"]
+            .map(str::to_owned)
+            .into();
+        let (session, bus, fake) =
+            fixture.session_with(json!({"mode":"child","read_children":true}), config);
+        assert!(!run(&session).await.failed);
+        let requests = fake.requests.lock().unwrap().clone();
+        let children: Vec<_> = requests.iter().filter(|r| r.tools.len() == 1).collect();
+        assert_eq!(children.len(), 4);
+        for request in children {
+            assert_eq!(request.tools[0].name, "read");
+            assert_eq!(
+                request.tools[0].description.contains("LINE:HH|text"),
+                editor == "hashline"
+            );
+            for message in &request.messages {
+                if let xi_provider::Message::ToolResults(results) = message {
+                    for result in results {
+                        let row = text(&result.output);
+                        if editor == "hashline" {
+                            assert!(row.starts_with("1:"));
+                            assert!(row.ends_with("|sample\n"));
+                        } else {
+                            assert_eq!(row, "1|sample\n");
+                        }
+                    }
+                }
+            }
+        }
+        bus.shutdown_extensions().await;
+    }
 }
 
 #[tokio::test]

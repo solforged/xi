@@ -156,7 +156,7 @@ pub(crate) fn render(records: &[Record]) -> String {
         write!(output, "\n### {}\n\n", cell(task)).expect("writing a String cannot fail");
         table(&mut output, &records);
     }
-    output.push_str("\nCounts and token columns are per-run medians. Edit failure rates pool observed edit/replace results. Missing event metrics are excluded, not counted as zero. Model time is wall time minus the union of completed tool spans; it also includes harness overhead.\n");
+    output.push_str("\nCounts and token columns are per-run medians. Edit failure rates pool observed edit/hashline results. Missing event metrics are excluded, not counted as zero. Model time is wall time minus the union of completed tool spans; it also includes harness overhead.\n");
     output
 }
 

@@ -6,12 +6,13 @@ use tokio_util::sync::CancellationToken;
 use xi_protocol::{OutputBlock, ToolCallId};
 use xi_sandbox::Spec;
 
-use crate::{Context, Crossing, Ran, by_name, truncate};
+use crate::{Context, Crossing, Ran, toolset, truncate};
 
 struct Fixture {
     _root: tempfile::TempDir,
     ctx: Context,
     outside: PathBuf,
+    anchors: bool,
 }
 impl Fixture {
     fn new() -> Self {
@@ -35,6 +36,7 @@ impl Fixture {
         Self {
             _root: root,
             outside,
+            anchors: false,
             ctx: Context {
                 workspace,
                 sandbox,
@@ -52,13 +54,26 @@ impl Fixture {
         fs::read_to_string(self.ctx.workspace.join(path)).unwrap()
     }
     async fn run(&self, name: &str, input: Value) -> Ran {
-        by_name(name)
-            .unwrap()
+        self.tool(name)
             .run(&ToolCallId::from("test-call"), input, &self.ctx)
             .await
     }
     fn crossings(&self, name: &str, input: Value) -> Result<Vec<Crossing>, String> {
-        by_name(name).unwrap().crossings(&input, &self.ctx)
+        self.tool(name).crossings(&input, &self.ctx)
+    }
+    fn tool(&self, name: &str) -> std::sync::Arc<dyn crate::Tool> {
+        let names = if self.anchors {
+            vec![name, "hashline"]
+        } else {
+            vec![name]
+        };
+        toolset(&names).unwrap().remove(0)
+    }
+    fn with_anchors() -> Self {
+        Self {
+            anchors: true,
+            ..Self::new()
+        }
     }
 }
 fn text(ran: &Ran) -> &str {
@@ -74,9 +89,96 @@ fn anchor(line: usize, content: &str) -> String {
     )
 }
 
+#[test]
+fn tool_names_and_schemas_use_exact_edit_by_default() {
+    let tools = crate::builtin();
+    let specs: Vec<_> = tools.iter().map(|tool| tool.spec()).collect();
+    assert_eq!(
+        specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>(),
+        ["read", "edit", "write", "bash", "search"]
+    );
+    assert_eq!(
+        specs[1].input_schema["required"],
+        json!(["path", "old", "new"])
+    );
+    let hashline = toolset(&["hashline"]).unwrap()[0].spec();
+    assert_eq!(hashline.input_schema["required"], json!(["path", "edits"]));
+    for name in ["replace", "unknown"] {
+        assert!(!crate::is_builtin(name));
+        assert_eq!(
+            toolset(&[name]).err().unwrap(),
+            format!("unknown tool {name}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_and_search_formats_follow_the_toolset_and_survive_subsetting() {
+    let f = Fixture::new();
+    f.put("text", "first\r\n  needle\r\n");
+    for editor in ["edit", "hashline"] {
+        let tools = toolset(&["read", editor, "write", "bash", "search"]).unwrap();
+        let row = if editor == "hashline" {
+            format!("{}|  needle\n", anchor(2, "  needle"))
+        } else {
+            "2|  needle\n".into()
+        };
+        // Children clone their parent's tools, even when omitting the editor.
+        for tool in [tools[0].clone(), tools[4].clone()] {
+            let spec = tool.spec();
+            let format = if editor == "hashline" {
+                "LINE:HH|text"
+            } else {
+                "LINE|text"
+            };
+            assert!(spec.description.contains(format));
+            assert_eq!(spec.description.contains("LINE:HH"), editor == "hashline");
+            let (input, expected) = if spec.name == "read" {
+                (json!({"path":"text","offset":2}), row.clone())
+            } else {
+                (
+                    json!({"path":"text","pattern":"needle"}),
+                    format!("text\n{row}"),
+                )
+            };
+            let ran = tool.run(&"format".into(), input, &f.ctx).await;
+            assert!(!ran.output.is_error);
+            assert_eq!(text(&ran), expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn edit_matches_whitespace_and_line_endings_exactly() {
+    let f = Fixture::new();
+    let original = "def f():\r\n    return 1\r\n";
+    f.put("text", original);
+    for old in ["return 1\n", "  return 1\r\n", "    return 1\n"] {
+        let ran = f
+            .run(
+                "edit",
+                json!({"path":"text","old":format!("\n{old}"),"new":"bad"}),
+            )
+            .await;
+        assert!(ran.output.is_error);
+        assert_eq!(f.get("text"), original);
+    }
+    let ran = f
+        .run(
+            "edit",
+            json!({"path":"text","old":"    return 1\r\n","new":"    return 2\r\n"}),
+        )
+        .await;
+    assert!(!ran.output.is_error);
+    assert_eq!(f.get("text"), "def f():\r\n    return 2\r\n");
+}
+
 #[tokio::test]
 async fn read_anchors_offsets_and_clipping() {
-    let f = Fixture::new();
+    let f = Fixture::with_anchors();
     f.put("text", "first\r\nsecond\r\nthird\r\n");
     let ran = f
         .run("read", json!({"path":"text", "offset":2, "limit":1}))
@@ -135,12 +237,12 @@ async fn read_directory_images_and_binary() {
 }
 
 #[tokio::test]
-async fn edit_replaces_inserts_and_deletes_from_original_snapshot() {
+async fn hashline_replaces_inserts_and_deletes_from_original_snapshot() {
     let f = Fixture::new();
     f.put("text", "a\nb\nc\nd\ne\n");
     let ran = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text", "edits":[
                 {"start":anchor(4,"d"), "end":anchor(5,"e"), "lines":[]},
                 {"after":"0", "lines":["top"]},
@@ -155,13 +257,13 @@ async fn edit_replaces_inserts_and_deletes_from_original_snapshot() {
 }
 
 #[tokio::test]
-async fn edit_stale_anchors_reject_every_change_and_show_each_context() {
+async fn hashline_stale_anchors_reject_every_change_and_show_each_context() {
     let f = Fixture::new();
     let original = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
     f.put("text", original);
     let ran = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text", "edits":[
                 {"after":"0", "lines":["must not write"]},
                 {"start":anchor(2,"old b"), "lines":["bad"]},
@@ -176,12 +278,12 @@ async fn edit_stale_anchors_reject_every_change_and_show_each_context() {
 }
 
 #[tokio::test]
-async fn edit_accepts_anchors_copied_with_row_content_and_still_checks_hash() {
+async fn hashline_accepts_anchors_copied_with_row_content_and_still_checks_hash() {
     let f = Fixture::new();
     f.put("text", "a\nb\n");
     let ran = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text", "edits":[{"start":format!("{}|b", anchor(2, "b")), "lines":["B"]}]}),
         )
         .await;
@@ -189,7 +291,7 @@ async fn edit_accepts_anchors_copied_with_row_content_and_still_checks_hash() {
     assert_eq!(f.get("text"), "a\nB\n");
     let stale = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text", "edits":[{"start":format!("{}|b", anchor(2, "b")), "lines":["x"]}]}),
         )
         .await;
@@ -198,7 +300,7 @@ async fn edit_accepts_anchors_copied_with_row_content_and_still_checks_hash() {
 }
 
 #[tokio::test]
-async fn edit_rejects_overlapping_ranges_and_interior_insertions() {
+async fn hashline_rejects_overlapping_ranges_and_interior_insertions() {
     let f = Fixture::new();
     let original = "a\nb\nc\nd\n";
     for edits in [
@@ -207,7 +309,9 @@ async fn edit_rejects_overlapping_ranges_and_interior_insertions() {
         json!([{"after":"0","lines":["x"]},{"after":"0","lines":["y"]}]),
     ] {
         f.put("text", original);
-        let ran = f.run("edit", json!({"path":"text", "edits":edits})).await;
+        let ran = f
+            .run("hashline", json!({"path":"text", "edits":edits}))
+            .await;
         assert!(ran.output.is_error);
         assert!(text(&ran).contains("Overlapping"));
         assert_eq!(f.get("text"), original);
@@ -215,7 +319,7 @@ async fn edit_rejects_overlapping_ranges_and_interior_insertions() {
 }
 
 #[tokio::test]
-async fn edit_preserves_crlf_and_trailing_newline_presence() {
+async fn hashline_preserves_crlf_and_trailing_newline_presence() {
     let f = Fixture::new();
     for (original, expected) in [
         ("a\r\nb\r\n", "a\r\nB\r\nC\r\n"),
@@ -225,7 +329,7 @@ async fn edit_preserves_crlf_and_trailing_newline_presence() {
         f.put("text", original);
         let ran = f
             .run(
-                "edit",
+                "hashline",
                 json!({"path":"text","edits":[{"start":anchor(2,"b"),"lines":["B","C"]}]}),
             )
             .await;
@@ -235,7 +339,7 @@ async fn edit_preserves_crlf_and_trailing_newline_presence() {
     f.put("text", "");
     let ran = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text","edits":[{"after":"0","lines":["first"]}]}),
         )
         .await;
@@ -243,7 +347,7 @@ async fn edit_preserves_crlf_and_trailing_newline_presence() {
     assert_eq!(f.get("text"), "first");
     let ran = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text","edits":[{"start":anchor(1,"first"),"lines":[]}]}),
         )
         .await;
@@ -252,12 +356,12 @@ async fn edit_preserves_crlf_and_trailing_newline_presence() {
 }
 
 #[tokio::test]
-async fn edit_keeps_unmodified_mixed_line_endings() {
+async fn hashline_keeps_unmodified_mixed_line_endings() {
     let f = Fixture::new();
     f.put("text", "a\r\nb\nc\r\n");
     let ran = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text","edits":[{"after":anchor(3,"c"),"lines":["d"]}]}),
         )
         .await;
@@ -266,26 +370,26 @@ async fn edit_keeps_unmodified_mixed_line_endings() {
 }
 
 #[tokio::test]
-async fn replace_requires_unique_text_unless_all() {
+async fn edit_requires_unique_text_unless_all() {
     let f = Fixture::new();
     f.put("text", "a a b");
     for (old, count) in [("a", 2), ("missing", 0)] {
         let ran = f
-            .run("replace", json!({"path":"text","old":old,"new":"x"}))
+            .run("edit", json!({"path":"text","old":old,"new":"x"}))
             .await;
         assert!(ran.output.is_error);
         assert!(text(&ran).contains(&format!("{count} times")));
         assert_eq!(f.get("text"), "a a b");
     }
     assert!(
-        !f.run("replace", json!({"path":"text","old":"b","new":"B"}))
+        !f.run("edit", json!({"path":"text","old":"b","new":"B"}))
             .await
             .output
             .is_error
     );
     assert!(
         !f.run(
-            "replace",
+            "edit",
             json!({"path":"text","old":"a","new":"A","all":true})
         )
         .await
@@ -396,18 +500,18 @@ fn invalid_input_is_rejected_before_policy() {
         ("read", json!({"path":"x","offset":0})),
         ("read", json!({"path":""})),
         (
-            "edit",
+            "hashline",
             json!({"path":"x","edits":[{"start":"1:xyz","lines":[]}]}),
         ),
         (
-            "edit",
+            "hashline",
             json!({"path":"x","edits":[{"start":"0:ab","lines":[]}]}),
         ),
         (
-            "edit",
+            "hashline",
             json!({"path":"x","edits":[{"after":"0","lines":["two\nlines"]}]}),
         ),
-        ("replace", json!({"path":"x","old":"","new":"a"})),
+        ("edit", json!({"path":"x","old":"","new":"a"})),
         ("search", json!({})),
         ("search", json!({"pattern":"["})),
         ("bash", json!({"command":"x","timeout":601})),
@@ -431,11 +535,7 @@ async fn search_respects_gitignore_hidden_files_and_match_limit() {
         )
         .await;
     assert!(!ran.output.is_error, "{}", text(&ran));
-    assert!(text(&ran).starts_with(&format!(
-        "a\n{}|needle\n{}|NEEDLE\n",
-        anchor(1, "needle"),
-        anchor(2, "NEEDLE")
-    )));
+    assert!(text(&ran).starts_with("a\n1|needle\n2|NEEDLE\n"));
     assert!(text(&ran).contains("Truncated after 2"));
     assert!(!text(&ran).contains("ignored"));
     let ran = f.run("search", json!({"glob":"*"})).await;
@@ -446,7 +546,7 @@ async fn search_respects_gitignore_hidden_files_and_match_limit() {
 
 #[tokio::test]
 async fn search_outputs_editable_anchors_and_relative_outside_paths() {
-    let f = Fixture::new();
+    let f = Fixture::with_anchors();
     f.put("text", "before\r\nneedle\r\n");
     let ran = f
         .run("search", json!({"pattern":"needle","glob":"text"}))
@@ -460,7 +560,7 @@ async fn search_outputs_editable_anchors_and_relative_outside_paths() {
         .unwrap();
     let ran = f
         .run(
-            "edit",
+            "hashline",
             json!({"path":"text","edits":[{"start":found,"lines":["changed"]}]}),
         )
         .await;
@@ -622,8 +722,7 @@ mod shell {
         let f = Fixture::new();
         let ctx = f.ctx.clone();
         let task = tokio::spawn(async move {
-            by_name("bash")
-                .unwrap()
+            toolset(&["bash"]).unwrap()[0]
                 .run(
                     &ToolCallId::from("drop"),
                     json!({"command":"sleep 60 & echo $! > child; wait"}),
@@ -679,7 +778,7 @@ mod shell {
 
 #[tokio::test]
 async fn search_keeps_bom_and_lone_carriage_return_in_anchors() {
-    let f = Fixture::new();
+    let f = Fixture::with_anchors();
     for contents in ["\u{feff}needle\n", "needle\r"] {
         f.put("text", contents);
         let read = f.run("read", json!({"path":"text"})).await;
@@ -700,12 +799,9 @@ async fn cancelled_file_mutations_do_not_write() {
     f.ctx.cancel.cancel();
     for (name, input) in [
         ("write", json!({"path":"new/file","content":"bad"})),
+        ("edit", json!({"path":"text","old":"original","new":"bad"})),
         (
-            "replace",
-            json!({"path":"text","old":"original","new":"bad"}),
-        ),
-        (
-            "edit",
+            "hashline",
             json!({"path":"text","edits":[{"start":anchor(1,"original"),"lines":["bad"]}]}),
         ),
     ] {

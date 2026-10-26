@@ -135,13 +135,13 @@ Load packages with `extensions = ["~/path/to/package"]` in a config file, or rep
 
 One extension supervisor belongs to the kernel's event bus. It starts packages lazily and caches processes by canonical package root and workspace. Each session keeps its own ordered catalog. `initialize` supplies tools, hooks and slash commands. Tools follow built-ins in the model catalog, cross `ActionKind::Tool` policy, and preserve output taint. Duplicate tool, command or package names fail startup. `/name args` in line mode dispatches `command/run`; built-in command names are reserved.
 
-Stdio carries full-duplex NDJSON JSON-RPC. A reader routes responses independently from extension requests, so several `agent/run` requests can run while `tool/invoke` is pending. The turn owner services `session/append_custom` without reacquiring its session lock. Every extension has a stderr and diagnostic log beside the first session that loaded it. Crashes are logged and leave registered tools returning errors. Normal CLI/server exit sends `shutdown`, closes the connection, terminates descendants and reaps the process. Turn cancellation cancels child sessions and retires the active extension process group; later calls fail until the kernel restarts. The SDK also accepts `$/cancelRequest` for cooperative `AbortSignal` handling.
+Stdio carries full-duplex NDJSON JSON-RPC. A reader routes responses independently from extension requests, so several `agent/run` requests can run while `tool/invoke` is pending. The turn owner services `session/append_custom` without reacquiring its session lock. Every extension has a stderr and diagnostic log beside the first session that loaded it. Crashes are logged and the call returns an error result. Turn cancellation cancels child sessions and stops the extension's process group, so no cancelled invocation keeps changing the workspace. A stopped extension starts again on its next use: the next turn, command or compaction. Normal CLI/server exit sends `shutdown`, closes the connection, terminates descendants and reaps the process. The SDK also accepts `$/cancelRequest` for cooperative `AbortSignal` handling.
 
-`agent/run` requires `subagents = true`. Children have fresh logs in the parent's session directory with `parent_session` set, the same workspace and sandbox configuration, and only a requested subset of the parent's built-ins. Unknown or extension tool names fail. Children never load extensions. Approval asks are recorded and denied headlessly. The result contains the final text, failure flag and usage summed across child requests. Children share files, so callers must assign disjoint edit scopes.
+`agent/run` requires `subagents = true`. Children have fresh logs in the parent's session directory with `parent_session` set, the same workspace and sandbox configuration, and the parent's built-in tools or a requested subset of them. Unknown or extension tool names fail. Children never load extensions, so they cannot delegate further. Approval asks are recorded and denied headlessly. The result contains the final text, failure flag and usage summed across child requests. Children share files, so callers must assign disjoint edit scopes.
 
-The compact hook seam is `Extensions::compact(session, tokens_before, previous_summary, cancel) -> Result<Option<String>>`. `Session::extension_summary` wraps it with callback servicing; the locked variant is available to the compaction implementation. `None` keeps kernel-generated summarization. The last supplied summary wins.
+Compaction runs `compact` hooks before its own summary request. The last summary an extension supplies replaces the kernel's, and the `compaction` event then records no usage.
 
-The [TypeScript SDK](../sdk/typescript/README.md) runs under Node 26 or Bun without dependencies or a build step. `extensions/subagents` is the optional `task` package: one to eight concurrent self-contained prompts, defaulting to read, edit, write, bash and search. Output stays in input order and marks failures.
+The [TypeScript SDK](../sdk/typescript/README.md) runs under Node 26 or Bun without dependencies or a build step. `extensions/subagents` is the optional `task` package: one to eight concurrent self-contained prompts, each child getting the parent's built-in tools unless the call names a subset. Output stays in input order and marks failures.
 
 Built-ins currently implement the same tool schema and policy contract in-process; they do not run over an extension pipe. Content-hash package pinning and hot reload remain unimplemented. Install never runs package scripts.
 
@@ -161,7 +161,7 @@ At or above the trigger, the kernel keeps the earliest message-boundary suffix t
 
 The same provider and model summarize the older prefix, including any previous summary, with no tools. The short `crates/xi-kernel/src/compact.md` prompt requests the goal and constraints, decisions, files and facts, commands and results, current state, open questions and next steps. The finished summary is appended and broadcast as a `compaction` event with the estimate, retained boundary and summary-request usage. Cancellation or an incomplete summary does not replace context.
 
-The summary is the first user-side content after the unchanged system prompt. The log supplies retained events before descendants, so reopening or branching rebuilds the same context. `Session::compact(Option<String>)` and the internal boundary operation accept a supplied summary; this skips the model call and records `usage: None`. The extension compact hook can use that seam.
+The summary is the first user-side content after the unchanged system prompt. The log supplies retained events before descendants, so reopening or branching rebuilds the same context. An extension `compact` hook can supply the summary instead, which skips the model call and records `usage: None`.
 
 
 ## Security model
@@ -268,7 +268,7 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 
 ## Defaults
 
-- Tools: `read`, `edit`, `write`, `bash`, `search`. Edits are anchored to a content hash of the lines being replaced, so a stale view fails loudly. Large outputs are truncated in context and spilled to a file the model can read.
+- Tools: `read`, `edit`, `write`, `bash`, `search`. `edit` replaces exact text, including whitespace and indentation. Read first and include enough surrounding lines to make the match unique, unless replacing all occurrences. The opt-in `hashline` tool edits by line and content hash, rejecting stale anchors. Read and search output uses `LINE|text` by default and `LINE:HH|text` when `hashline` is active. Children inherit the parent's output format, even if their tool subset omits `hashline`. Large outputs are truncated in context and spilled to a file the model can read.
 - Context files: `AGENTS.md` and Agent Skills.
 - System prompt: under 1k tokens, static.
 - Compaction: user-visible; produces a structured summary (goal, decisions, touched files, open work).
@@ -285,7 +285,7 @@ Provider credentials live in the kernel, loaded from the OS keychain or a user-o
 | `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock, macOS Seatbelt. | Implemented |
 | `xi-sandbox` egress proxy | Kernel-side CONNECT proxy and in-namespace forwarder. | Planned |
 | `xi-provider` | Anthropic Messages and OpenAI-compatible Chat adapters, model registry. | Implemented (Anthropic live path untested) |
-| `xi-tools` | `read`, `edit`, `write`, `bash`, `search`, plus `replace` for edit-format comparisons. | Implemented |
+| `xi-tools` | `read`, exact-string `edit`, `write`, `bash`, `search`, plus opt-in `hashline` edits. | Implemented |
 | `xi-kernel` | Agent loop, context builder, layered config, workspace trust, JSON-RPC server and sandboxed extension host. | Implemented |
 | `xi-cli` | The `xi` binary: line mode, headless `-p`, `serve`, `trust`. | Implemented |
 | `xi-bench` | Runs xi and omp arms on a task suite and reports metrics. | Implemented |
@@ -304,4 +304,4 @@ What comes next, and how features and sandbox work proceed side by side, is in [
 
 - Whether the kernel should be one process per workspace or one per user with workspaces as tenants.
 - Wasm components as a second extension format once the component toolchain is easy enough for models to target.
-- Whether edits should use line-hash anchors or AST-aware anchors by default.
+- Whether frontier-model tests justify hash-anchored or AST-aware edits over exact-string edits.
