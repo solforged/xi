@@ -160,7 +160,7 @@ impl Sessions {
                 age(entry.updated, now)
             );
             if self.all {
-                label.push_str(&format!(" · {}", crate::home(&entry.cwd)))
+                label.push_str(&format!(" · {}", crate::view::home(&entry.cwd)))
             }
             if entry.running {
                 label.push_str(" · running")

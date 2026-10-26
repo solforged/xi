@@ -1,0 +1,1699 @@
+use std::path::Path;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use xi_protocol::Timestamp;
+use xi_protocol::event::ModelRef;
+use xi_protocol::methods::client::SessionSummary;
+use xi_protocol::model::Reasoning;
+
+use crate::approvals::Choice;
+use crate::keys::Action;
+use serde_json::{Value, json};
+use xi_client::peer::{Incoming, Peer};
+use xi_protocol::EventKind;
+use xi_protocol::event::{Remember, StopReason, Usage};
+use xi_protocol::methods::client::{
+    ConfigFiles, Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails, Setting,
+    SettingLayer, SettingsReport,
+};
+
+use super::*;
+
+fn snapshot(running: bool) -> AttachResult {
+    let session = SessionId::generate();
+    let model = ModelRef {
+        provider: "demo".into(),
+        model: "script".into(),
+    };
+    let root = Event {
+        id: EventId::generate(),
+        parent: None,
+        at: Timestamp(0),
+        kind: EventKind::SessionStarted {
+            session,
+            cwd: "/tmp/xi-tui-demo".into(),
+            model: model.clone(),
+            xi_version: "test".into(),
+            parent_session: None,
+        },
+    };
+    AttachResult {
+        info: SessionDetails {
+            session,
+            path: "/tmp/xi-tui-demo/session.jsonl".into(),
+            head: root.id,
+            cwd: "/tmp/xi-tui-demo".into(),
+            trusted: true,
+            model,
+            reasoning: Reasoning::Medium,
+            model_info: Some(model_info()),
+            parent_session: None,
+        },
+        events: vec![root],
+        partial: Vec::new(),
+        stream_sequence: 0,
+        running,
+        pending_approvals: Vec::new(),
+    }
+}
+
+fn model_info() -> xi_protocol::model::ModelInfo {
+    xi_protocol::model::ModelInfo {
+        provider: "demo".into(),
+        id: "script".into(),
+        context_window: 256_000,
+        max_output: 4_096,
+        reasoning: Reasoning::ALL.to_vec(),
+        pricing: None,
+    }
+}
+
+fn settings_report() -> SettingsReport {
+    let settings = [
+        ("default_model", json!("default/model")),
+        ("reasoning", json!("low")),
+        ("approvals", json!("ask")),
+        (
+            "tools",
+            json!(["read", "edit", "write", "bash", "search", "hashline"]),
+        ),
+        ("compaction.enabled", json!(true)),
+        ("compaction.trigger_tokens", Value::Null),
+        ("compaction.keep_recent_tokens", json!(16_000)),
+        ("extensions", json!(["/tmp/extensions"])),
+        ("sandbox.readable", json!(["/tmp/notes"])),
+        ("sandbox.writable", json!(["/tmp/output"])),
+        ("sandbox.env", json!(["LANG"])),
+        ("sandbox.env_command", json!(["sh", "-c", "printenv"])),
+        ("daemon.idle_exit", json!(900)),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (key, value))| Setting {
+        key: key.into(),
+        value,
+        source: SettingLayer::Default,
+        editable: index < 7,
+        held_back: None,
+    })
+    .collect();
+    SettingsReport {
+        files: ConfigFiles {
+            global: "/tmp/xi-test-config/config.toml".into(),
+            explicit: Vec::new(),
+            project: "/tmp/xi-tui-demo/.xi/config.toml".into(),
+            local: "/tmp/xi-tui-demo/.xi/config.local.toml".into(),
+        },
+        trusted: true,
+        settings,
+        warnings: Vec::new(),
+    }
+}
+
+#[derive(Default)]
+struct FakeData {
+    sessions: Vec<AttachResult>,
+    summaries: Vec<SessionSummary>,
+    approvals: Vec<PendingApproval>,
+    held: bool,
+    reject_resolve: bool,
+    settings: Option<SettingsReport>,
+    reject_settings: bool,
+    reject_setting: bool,
+    /// Keep answered asks in `approval/list`, as the daemon does until
+    /// the resolution event arrives.
+    lagging_inbox: bool,
+}
+
+async fn launch(attached: AttachResult) -> (Launch, mpsc::UnboundedReceiver<(String, Value)>) {
+    launch_with(attached, FakeData::default()).await
+}
+
+async fn launch_with(
+    attached: AttachResult,
+    mut data: FakeData,
+) -> (Launch, mpsc::UnboundedReceiver<(String, Value)>) {
+    let (connection, server) = tokio::io::duplex(16 * 1024);
+    let (reader, writer) = tokio::io::split(server);
+    let (peer, mut incoming) = Peer::spawn(reader, writer);
+    let (requests, observed) = mpsc::unbounded_channel();
+    let response = attached.clone();
+    data.sessions.push(response.clone());
+    data.approvals.extend(response.pending_approvals.clone());
+    let mut settings = data.settings.take().unwrap_or_else(settings_report);
+    tokio::spawn(async move {
+        while let Some(message) = incoming.recv().await {
+            if let Incoming::Request { id, method, params } = message {
+                let _ = requests.send((method.clone(), params.clone()));
+                let result = match method.as_str() {
+                    "initialize" => Ok(json!({
+                        "protocol_version": xi_protocol::PROTOCOL_VERSION,
+                        "daemon_version": "test",
+                        "capabilities": { "private": true },
+                    })),
+                    "session/create" => Ok(serde_json::to_value(&response).unwrap()),
+                    "session/attach" => {
+                        let session: SessionId =
+                            serde_json::from_value(params["session"].clone()).unwrap();
+                        let found = data
+                            .sessions
+                            .iter()
+                            .find(|attached| attached.info.session == session)
+                            .unwrap_or(&response);
+                        Ok(serde_json::to_value(found).unwrap())
+                    }
+                    "session/open" => {
+                        let found = data
+                            .sessions
+                            .iter()
+                            .find(|attached| json!(attached.info.path) == params["path"])
+                            .unwrap_or(&response);
+                        if data.held {
+                            Err(RpcError::with_data(
+                                RpcError::SESSION_HELD,
+                                "session held",
+                                json!({ "session": found.info.session }),
+                            ))
+                        } else {
+                            Ok(serde_json::to_value(found).unwrap())
+                        }
+                    }
+                    "session/list" => Ok(serde_json::to_value(
+                        data.summaries
+                            .iter()
+                            .filter(|row| {
+                                params.get("cwd").is_none_or(|cwd| *cwd == json!(row.cwd))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()),
+                    "approval/list" => Ok(serde_json::to_value(&data.approvals).unwrap()),
+                    "config/settings" if data.reject_settings => Err(RpcError::new(
+                        RpcError::INVALID_PARAMS,
+                        "settings unavailable",
+                    )),
+                    "config/settings" => Ok(serde_json::to_value(&settings).unwrap()),
+                    "config/set" if data.reject_setting => {
+                        Err(RpcError::new(RpcError::INVALID_PARAMS, "setting rejected"))
+                    }
+                    "config/set" => {
+                        let row = settings
+                            .settings
+                            .iter_mut()
+                            .find(|row| json!(row.key) == params["key"])
+                            .unwrap();
+                        row.value = params["value"].clone();
+                        row.source = SettingLayer::Global;
+                        Ok(serde_json::to_value(&settings).unwrap())
+                    }
+                    "session/models" => Ok(json!({
+                        "current": response.info.model,
+                        "reasoning": response.info.reasoning,
+                        "models": [
+                            { "model": response.info.model, "info": model_info(), "available": true },
+                            {
+                                "model": { "provider": "demo", "model": "second" },
+                                "info": (xi_protocol::model::ModelInfo { id: "second".into(), ..model_info() }),
+                                "available": true,
+                            },
+                        ],
+                    })),
+                    "session/commands" => {
+                        Ok(json!([{ "name": "known", "description": "an extension command" }]))
+                    }
+                    "session/command" if params["name"] == "known" => {
+                        Ok(json!({ "message": "extension result" }))
+                    }
+                    "session/compact" => {
+                        Ok(json!({ "head": response.info.head, "tokens_before": 42_000 }))
+                    }
+                    "session/prompt" => Ok(serde_json::to_value(PromptResult {
+                        head: response.info.head,
+                        failed: false,
+                        cancelled: false,
+                        text: "finished".into(),
+                    })
+                    .unwrap()),
+                    "approval/resolve" if data.reject_resolve => {
+                        Err(RpcError::new(RpcError::INVALID_PARAMS, "scope rejected"))
+                    }
+                    "approval/resolve" => {
+                        let before = data.approvals.len();
+                        let kept: Vec<_> = data
+                            .approvals
+                            .iter()
+                            .filter(|ask| {
+                                json!(ask.session) != params["session"]
+                                    || json!(ask.call) != params["call"]
+                            })
+                            .cloned()
+                            .collect();
+                        let found = kept.len() < before;
+                        if !data.lagging_inbox {
+                            data.approvals = kept;
+                        }
+                        if found {
+                            Ok(Value::Null)
+                        } else {
+                            Err(RpcError::new(
+                                RpcError::APPROVAL_NOT_PENDING,
+                                "already answered",
+                            ))
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                };
+                let _ = peer.respond(id, result);
+            }
+        }
+    });
+    let (reader, writer) = tokio::io::split(connection);
+    let (client, notifications) = Client::over(reader, writer, "test-tui").await.unwrap();
+    let template = CreateParams {
+        cwd: attached.info.cwd.clone(),
+        model: Some(attached.info.model.clone()),
+        options: Default::default(),
+    };
+    (
+        Launch {
+            client,
+            notifications,
+            template,
+            attached,
+            history: None,
+            tui_config: None,
+        },
+        observed,
+    )
+}
+
+#[tokio::test]
+async fn attach_keeps_partial_and_deduplicates_events_after_interleaved_appends() {
+    let mut attached = snapshot(true);
+    attached.partial = vec![Block::Text {
+        text: "in flight".into(),
+    }];
+    attached.events.push(attached.events[0].clone());
+    let root = attached.events[0].clone();
+    let (launch, _) = launch(attached).await;
+    let mut app = App::new(launch, 80, 24);
+    assert_eq!(app.launch.attached.events.len(), 1);
+    assert!(
+        app.transcript
+            .live(80, 0)
+            .iter()
+            .any(|line| line.plain().contains("in flight"))
+    );
+    let event = Event {
+        id: EventId::generate(),
+        parent: Some(root.id),
+        at: Timestamp(1),
+        kind: EventKind::UserMessage {
+            content: vec![Block::Text {
+                text: "hello".into(),
+            }],
+        },
+    };
+    app.notify(&ClientNotification::Event(EventParams {
+        session: app.session_id(),
+        event: event.clone(),
+    }));
+    let committed = app.commit.len();
+    app.notify(&ClientNotification::Event(EventParams {
+        session: app.session_id(),
+        event,
+    }));
+    app.notify(&ClientNotification::Event(EventParams {
+        session: app.session_id(),
+        event: root,
+    }));
+    assert_eq!(app.launch.attached.events.len(), 2);
+    assert_eq!(app.commit.len(), committed);
+}
+
+#[tokio::test]
+async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
+    let mut attached = snapshot(true);
+    attached.partial = vec![Block::Text {
+        text: "hello".into(),
+    }];
+    attached.stream_sequence = 7;
+    let (launch, _) = launch(attached).await;
+    let mut app = App::new(launch, 80, 24);
+    let session = app.session_id();
+    app.notify(&ClientNotification::Reset(ResetParams {
+        session,
+        attempt: 1,
+        sequence: 5,
+    }));
+    for (sequence, text) in [(6, "hel"), (7, "lo"), (8, " world"), (8, " world")] {
+        app.notify(&ClientNotification::Delta(DeltaParams {
+            session,
+            attempt: 1,
+            sequence,
+            delta: Delta::Text { text: text.into() },
+        }));
+    }
+    let live: Vec<_> = app.transcript.live(80, 0).iter().map(Line::plain).collect();
+    assert_eq!(
+        live.iter()
+            .filter(|line| line.contains("hello world"))
+            .count(),
+        1,
+    );
+    assert!(live.iter().all(|line| !line.contains("hello world world")));
+    app.notify(&ClientNotification::Reset(ResetParams {
+        session,
+        attempt: 2,
+        sequence: 9,
+    }));
+    assert!(app.transcript.live(80, 0).is_empty());
+    app.notify(&ClientNotification::Delta(DeltaParams {
+        session,
+        attempt: 2,
+        sequence: 10,
+        delta: Delta::Text {
+            text: "next".into(),
+        },
+    }));
+    assert!(
+        app.transcript
+            .live(80, 0)
+            .iter()
+            .any(|line| line.plain().contains("next"))
+    );
+}
+
+#[tokio::test]
+async fn prompt_runs_off_the_ui_and_finishes_from_the_daemon_outcome() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 80, 24);
+    app.commit.clear();
+    app.send("hello".into());
+    assert!(app.running());
+    assert_eq!(app.pending.len(), 1);
+    let reply = app.pending.next().await.unwrap();
+    app.replied(reply);
+    assert!(!app.running());
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("done ·"))
+    );
+}
+
+#[tokio::test]
+async fn approvals_resolved_elsewhere_are_not_reported_as_errors_or_revived() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 80, 24);
+    let pending = PendingApproval {
+        session: app.session_id(),
+        call: "approval".into(),
+        tool: "bash".into(),
+        action: "run command".into(),
+        rule: None,
+        taint: false,
+        trusted: true,
+    };
+    app.notify(&ClientNotification::ApprovalPending(pending.clone()));
+    app.commit.clear();
+    app.answer(Choice::Once).await;
+    assert!(app.commit.is_empty());
+    app.notify(&ClientNotification::Event(EventParams {
+        session: app.session_id(),
+        event: Event {
+            id: EventId::generate(),
+            parent: Some(app.launch.attached.info.head),
+            at: Timestamp(1),
+            kind: EventKind::ApprovalResolved {
+                call: pending.call.clone(),
+                approved: true,
+                by: xi_protocol::event::Approver::User,
+                remember: Remember::Once,
+            },
+        },
+    }));
+    app.notify(&ClientNotification::ApprovalPending(pending));
+    assert!(app.transcript.asks().is_empty());
+}
+
+#[tokio::test]
+async fn leaving_detaches_and_only_closes_an_idle_worker() {
+    for running in [false, true] {
+        let (launch, mut requests) = launch(snapshot(running)).await;
+        let app = App::new(launch, 80, 24);
+        app.release().await.unwrap();
+        let mut methods = Vec::new();
+        while let Ok((method, _)) = requests.try_recv() {
+            methods.push(method);
+        }
+        assert!(methods.iter().any(|method| method == "session/detach"));
+        assert_eq!(
+            methods.iter().any(|method| method == "session/close"),
+            !running
+        );
+        assert!(methods.iter().all(|method| method != "session/cancel"));
+    }
+}
+
+fn request(requests: &mut mpsc::UnboundedReceiver<(String, Value)>, wanted: &str) -> Value {
+    while let Ok((method, params)) = requests.try_recv() {
+        if method == wanted {
+            return params;
+        }
+    }
+    panic!("missing request {wanted}");
+}
+
+#[tokio::test]
+async fn shift_tab_cycles_the_models_levels_and_updates_the_footer() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 160, 24);
+    assert!(app.footer(160).plain().contains("think med"));
+    let model = app.launch.attached.info.model_info.as_mut().unwrap();
+    model.reasoning = vec![Reasoning::Low, Reasoning::High, Reasoning::XHigh];
+    // Medium isn't listed, so the model runs, and shows, low.
+    assert!(app.footer(160).plain().contains("think low"));
+    for expected in [Reasoning::High, Reasoning::XHigh, Reasoning::Low] {
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "session/set_reasoning");
+        assert_eq!(params["session"], json!(app.session_id()));
+        assert_eq!(params["reasoning"], expected.name());
+        assert_eq!(app.launch.attached.info.reasoning, expected);
+        assert!(
+            app.footer(160)
+                .plain()
+                .contains(&format!("think {}", expected.name()))
+        );
+    }
+    app.launch
+        .attached
+        .info
+        .model_info
+        .as_mut()
+        .unwrap()
+        .reasoning
+        .clear();
+    assert!(app.footer(160).plain().contains("no think"));
+    app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn reasoning_command_accepts_xhigh_without_a_transcript_note() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 160, 24);
+    app.commit.clear();
+    app.command("/reasoning xhigh").await.unwrap();
+    assert_eq!(
+        request(&mut requests, "session/set_reasoning")["reasoning"],
+        "xhigh"
+    );
+    assert_eq!(app.launch.attached.info.reasoning, Reasoning::XHigh);
+    assert!(app.footer(160).plain().contains("think xhigh"));
+    assert!(app.commit.is_empty());
+}
+
+#[tokio::test]
+async fn model_command_opens_the_picker_and_enter_selects_a_model() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 120, 24);
+    app.command("/model").await.unwrap();
+    assert!(app.focus == Focus::Models);
+    assert_eq!(
+        request(&mut requests, "session/models")["session"],
+        json!(app.session_id())
+    );
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "session/set_model")["model"],
+        json!({
+            "provider": "demo", "model": "second",
+        })
+    );
+    assert_eq!(app.launch.attached.info.model.model, "second");
+    assert!(app.focus == Focus::Composer);
+}
+
+#[tokio::test]
+async fn unknown_commands_are_sent_to_extensions_and_point_to_help() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 80, 24);
+    app.command("/missing raw arguments").await.unwrap();
+    let params = request(&mut requests, "session/command");
+    assert_eq!(params["name"], "missing");
+    assert_eq!(params["args"], "raw arguments");
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("unknown command /missing · /help"))
+    );
+    app.command("/known argument").await.unwrap();
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("extension result"))
+    );
+}
+
+#[tokio::test]
+async fn accepting_command_completion_replaces_the_composer_without_submitting() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 80, 24);
+    for c in "/rea".chars() {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    assert!(app.completion.is_some());
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.editor.text(), "/reasoning ");
+    assert!(app.completion.is_none());
+    assert!(app.pending.is_empty());
+    assert!(!app.running());
+    while let Ok((method, _)) = requests.try_recv() {
+        assert_eq!(method, "initialize");
+    }
+}
+
+#[tokio::test]
+async fn enter_on_a_fully_typed_command_runs_it() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 80, 24);
+    app.commit.clear();
+    for c in "/help".chars() {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    assert!(app.completion.is_some());
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.editor.is_empty());
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("show keys and commands"))
+    );
+}
+
+#[tokio::test]
+async fn submitted_prompts_are_persisted_but_commands_are_not() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("prompts.jsonl");
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.history = Some(path.clone());
+    let mut app = App::new(launch, 80, 24);
+    app.editor.set_text("persist this prompt");
+    app.submit(false).await.unwrap();
+    let reply = app.pending.next().await.unwrap();
+    app.replied(reply);
+    app.editor.set_text("/reasoning");
+    app.submit(false).await.unwrap();
+    let lines = std::fs::read_to_string(path).unwrap();
+    let entries: Vec<Value> = lines
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["text"], "persist this prompt");
+    assert_eq!(entries[0]["cwd"], json!(app.launch.attached.info.cwd));
+    app.editor.history_back();
+    assert_eq!(app.editor.text(), "persist this prompt");
+}
+
+#[tokio::test]
+async fn history_search_walks_older_matches_and_restores_the_draft() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 80, 24);
+    app.history.push("first matching prompt").unwrap();
+    app.history.push("second matching prompt").unwrap();
+    app.editor.set_text("unfinished draft");
+    app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.search.as_ref().unwrap().current(&app.history),
+        Some("first matching prompt")
+    );
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.editor.text(), "unfinished draft");
+    app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.editor.text(), "second matching prompt");
+    assert!(app.focus == Focus::Composer);
+}
+
+#[tokio::test]
+async fn model_reasoning_and_compaction_changes_are_refused_while_running() {
+    let (launch, mut requests) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 80, 24);
+    app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+    app.command("/model demo/second").await.unwrap();
+    app.command("/compact").await.unwrap();
+    app.command("/new").await.unwrap();
+    app.command("/resume").await.unwrap();
+    assert_eq!(app.launch.attached.info.reasoning, Reasoning::Medium);
+    assert_eq!(app.launch.attached.info.model.model, "script");
+    while let Ok((method, _)) = requests.try_recv() {
+        assert_eq!(method, "initialize");
+    }
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("waits for the turn to end"))
+    );
+}
+
+#[tokio::test]
+async fn reasoning_and_model_events_from_other_clients_update_metadata() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 160, 24);
+    for kind in [
+        EventKind::ReasoningChanged {
+            reasoning: Reasoning::Low,
+        },
+        EventKind::ModelChanged {
+            model: ModelRef {
+                provider: "demo".into(),
+                model: "other".into(),
+            },
+        },
+    ] {
+        app.notify(&ClientNotification::Event(EventParams {
+            session: app.session_id(),
+            event: Event {
+                id: EventId::generate(),
+                parent: Some(app.launch.attached.info.head),
+                at: Timestamp(1),
+                kind,
+            },
+        }));
+    }
+    assert_eq!(app.launch.attached.info.reasoning, Reasoning::Low);
+    assert_eq!(app.launch.attached.info.model.model, "other");
+    assert!(app.refresh);
+    assert!(app.footer(160).plain().contains("think low"));
+    assert!(
+        app.commit
+            .iter()
+            .all(|line| !line.plain().contains("reasoning →"))
+    );
+}
+
+#[tokio::test]
+async fn help_uses_dispatch_bindings_and_only_implemented_commands() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 80, 24);
+    app.commit.clear();
+    app.command("/hotkeys").await.unwrap();
+    let help = app
+        .commit
+        .iter()
+        .map(Line::plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for action in Action::ALL {
+        for binding in app.keymap.bindings(*action) {
+            assert_eq!(
+                app.keymap
+                    .action(KeyEvent::new(binding.code, binding.modifiers)),
+                Some(*action)
+            );
+            assert!(help.contains(&binding.label()));
+        }
+    }
+    for implemented in ["/resume", "/approvals", "/copy", "/settings", "ctrl+t"] {
+        assert!(help.contains(implemented));
+    }
+}
+
+#[tokio::test]
+async fn session_completion_loads_extension_commands_and_workspace_files() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("source.rs"), "content").unwrap();
+    let mut attached = snapshot(false);
+    attached.info.cwd = temp.path().to_path_buf();
+    let (launch, mut requests) = launch(attached).await;
+    let mut app = App::new(launch, 80, 24);
+    app.initialize_composer().await;
+    request(&mut requests, "session/commands");
+    app.editor.set_text("/kno");
+    app.update_completion();
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.editor.text(), "/known ");
+    app.editor.set_text("read @sour");
+    app.update_completion();
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.editor.text(), "read @source.rs ");
+}
+
+fn pending(session: SessionId) -> PendingApproval {
+    PendingApproval {
+        session,
+        call: "pending".into(),
+        tool: "bash".into(),
+        action: "exec git push".into(),
+        rule: Some("project#1".into()),
+        taint: false,
+        trusted: true,
+    }
+}
+
+fn summary(attached: &AttachResult, live: bool, title: &str, updated: u64) -> SessionSummary {
+    SessionSummary {
+        session: attached.info.session,
+        path: attached.info.path.clone(),
+        cwd: attached.info.cwd.clone(),
+        model: attached.info.model.clone(),
+        head: live.then_some(attached.info.head),
+        running: attached.running,
+        pending_approvals: attached.pending_approvals.len(),
+        parent_session: None,
+        started: Some(Timestamp(0)),
+        updated: Some(Timestamp(updated)),
+        title: Some(title.into()),
+    }
+}
+
+fn append(app: &mut App, kind: EventKind) {
+    app.notify(&ClientNotification::Event(EventParams {
+        session: app.session_id(),
+        event: Event {
+            id: EventId::generate(),
+            parent: Some(app.launch.attached.info.head),
+            at: Timestamp::now(),
+            kind,
+        },
+    }));
+}
+
+fn live_text(app: &App) -> String {
+    app.live()
+        .0
+        .iter()
+        .map(Line::plain)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn approval_option_two_remembers_the_session_scope() {
+    let mut attached = snapshot(true);
+    let ask = pending(attached.info.session);
+    attached.pending_approvals.push(ask.clone());
+    let (launch, mut requests) = launch(attached).await;
+    let mut app = App::new(launch, 120, 32);
+    let overlay = live_text(&app);
+    for label in [
+        "1 Allow once",
+        "2 Allow for this session",
+        "3 Always allow in this workspace",
+        "4 Deny",
+    ] {
+        assert!(overlay.contains(label), "{overlay}");
+    }
+    app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "approval/resolve");
+    assert_eq!(params["session"], json!(ask.session));
+    assert_eq!(params["call"], json!(ask.call));
+    assert_eq!(params["approved"], true);
+    assert_eq!(params["remember"], "session");
+    assert!(app.focus == Focus::Composer);
+}
+
+#[tokio::test]
+async fn taint_approval_hides_persistent_scopes_without_renumbering_deny() {
+    let mut attached = snapshot(true);
+    let mut ask = pending(attached.info.session);
+    ask.taint = true;
+    attached.pending_approvals.push(ask);
+    let (launch, mut requests) = launch(attached).await;
+    let mut app = App::new(launch, 120, 32);
+    let overlay = live_text(&app);
+    assert!(overlay.contains("1 Allow once"));
+    assert!(overlay.contains("4 Deny"));
+    assert!(overlay.contains("tainted branch: only once or deny"));
+    assert!(!overlay.contains("2 Allow for this session"));
+    assert!(!overlay.contains("3 Always allow"));
+    for c in ['2', '3'] {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    while let Ok((method, _)) = requests.try_recv() {
+        assert_ne!(method, "approval/resolve");
+    }
+    assert!(app.focus == Focus::Approval);
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "approval/resolve");
+    assert_eq!(params["approved"], false);
+    assert!(params.get("remember").is_none());
+}
+
+#[tokio::test]
+async fn untrusted_approval_hides_workspace_scope_and_uses_session_details_for_events() {
+    let mut attached = snapshot(true);
+    attached.info.trusted = false;
+    let (launch, mut requests) = launch(attached).await;
+    let mut app = App::new(launch, 120, 32);
+    append(
+        &mut app,
+        EventKind::AssistantMessage {
+            model: ModelRef {
+                provider: "demo".into(),
+                model: "script".into(),
+            },
+            content: vec![Block::ToolUse {
+                id: "event-ask".into(),
+                name: "bash".into(),
+                input: json!({ "command": "git push" }),
+                extra: Default::default(),
+            }],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+        },
+    );
+    append(
+        &mut app,
+        EventKind::ToolDecision {
+            call: "event-ask".into(),
+            action: "exec git push".into(),
+            decision: xi_protocol::event::Decision::Ask,
+            rule: None,
+            taint: false,
+        },
+    );
+    assert!(app.focus == Focus::Approval);
+    assert!(live_text(&app).contains("2 Allow for this session"));
+    assert!(!live_text(&app).contains("3 Always allow"));
+    app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    while let Ok((method, _)) = requests.try_recv() {
+        assert_ne!(method, "approval/resolve");
+    }
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.focus == Focus::Composer);
+    assert_eq!(app.transcript.asks().len(), 1);
+}
+
+#[tokio::test]
+async fn workspace_approval_sends_workspace_scope_and_errors_keep_the_overlay() {
+    for reject in [false, true] {
+        let mut attached = snapshot(true);
+        attached
+            .pending_approvals
+            .push(pending(attached.info.session));
+        let (launch, mut requests) = launch_with(
+            attached,
+            FakeData {
+                reject_resolve: reject,
+                ..FakeData::default()
+            },
+        )
+        .await;
+        let mut app = App::new(launch, 120, 32);
+        app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "approval/resolve");
+        assert_eq!(params["remember"], "workspace");
+        assert_eq!(app.focus == Focus::Approval, reject);
+        if reject {
+            assert!(
+                app.commit
+                    .iter()
+                    .any(|line| line.plain().contains("scope rejected"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn approvals_inbox_shows_and_resolves_another_sessions_ask() {
+    let attached = snapshot(false);
+    let mut other = snapshot(true);
+    other.info.cwd = "/tmp/other-workspace".into();
+    let ask = pending(other.info.session);
+    let data = FakeData {
+        summaries: vec![summary(&other, true, "other prompt", 100)],
+        approvals: vec![ask.clone()],
+        ..FakeData::default()
+    };
+    let (launch, mut requests) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 160, 32);
+    app.command("/approvals").await.unwrap();
+    request(&mut requests, "approval/list");
+    assert!(app.focus == Focus::Approval);
+    let overlay = live_text(&app);
+    assert!(overlay.contains(&format!("session {}", &other.info.session.to_string()[..8])));
+    assert!(overlay.contains("/tmp/other-workspace"));
+    assert!(!app.footer(160).plain().contains("waiting"));
+    app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "approval/resolve");
+    assert_eq!(params["session"], json!(ask.session));
+    assert_eq!(params["call"], json!(ask.call));
+    assert_eq!(params["remember"], "session");
+    request(&mut requests, "approval/list");
+    assert!(app.focus == Focus::Composer);
+}
+
+#[tokio::test]
+async fn an_answered_ask_still_listed_by_the_daemon_does_not_reopen_the_inbox() {
+    let attached = snapshot(false);
+    let other = snapshot(true);
+    let ask = pending(other.info.session);
+    let data = FakeData {
+        summaries: vec![summary(&other, true, "other prompt", 100)],
+        approvals: vec![ask.clone()],
+        lagging_inbox: true,
+        ..FakeData::default()
+    };
+    let (launch, mut requests) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 160, 32);
+    app.command("/approvals").await.unwrap();
+    request(&mut requests, "approval/list");
+    app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    request(&mut requests, "approval/resolve");
+    request(&mut requests, "approval/list");
+    assert!(app.focus == Focus::Composer);
+    assert!(app.approvals.is_none());
+}
+
+#[tokio::test]
+async fn approvals_inbox_keeps_current_asks_before_the_daemons_oldest_first_order() {
+    let mut attached = snapshot(true);
+    let own = pending(attached.info.session);
+    attached.pending_approvals.push(own.clone());
+    let mut older = pending(SessionId::generate());
+    older.call = "older".into();
+    let mut newer = pending(SessionId::generate());
+    newer.call = "newer".into();
+    let data = FakeData {
+        approvals: vec![older.clone(), newer.clone()],
+        ..FakeData::default()
+    };
+    let (launch, mut requests) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 120, 32);
+    app.command("/approvals").await.unwrap();
+    for expected in [own, older, newer] {
+        assert_eq!(
+            app.approvals
+                .as_ref()
+                .unwrap()
+                .current()
+                .unwrap()
+                .pending
+                .session,
+            expected.session
+        );
+        app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&mut requests, "approval/resolve")["session"],
+            json!(expected.session)
+        );
+    }
+    assert!(app.focus == Focus::Composer);
+}
+
+#[tokio::test]
+async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live_rows() {
+    for live in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut attached = snapshot(false);
+        attached.info.cwd = temp.path().into();
+        let mut target = snapshot(live);
+        target.info.cwd = temp.path().into();
+        target.info.path = temp.path().join("target.jsonl");
+        if live {
+            target.pending_approvals.push(pending(target.info.session));
+            target.partial = vec![Block::Text {
+                text: "target in flight".into(),
+            }];
+        }
+        let row = summary(&target, live, "target prompt", 200);
+        let data = FakeData {
+            sessions: vec![target.clone()],
+            summaries: vec![row],
+            ..FakeData::default()
+        };
+        let (launch, mut requests) = launch_with(attached, data).await;
+        let mut app = App::new(launch, 160, 32);
+        app.command("/resume").await.unwrap();
+        assert!(app.focus == Focus::Sessions);
+        let params = request(&mut requests, "session/list");
+        assert_eq!(params["cwd"], json!(temp.path()));
+        assert!(params.get("running").is_none());
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "session/list");
+        assert!(params.get("cwd").is_none());
+        assert!(live_text(&app).contains("all workspaces"));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        if live {
+            let params = request(&mut requests, "session/attach");
+            assert_eq!(params["session"], json!(target.info.session));
+            assert!(params.get("since").is_none());
+            assert!(app.running());
+            assert!(app.focus == Focus::Approval);
+            assert_eq!(app.transcript.asks().len(), 1);
+            assert!(live_text(&app).contains("target in flight"));
+        } else {
+            let params = request(&mut requests, "session/open");
+            assert_eq!(params["path"], json!(target.info.path));
+            assert!(!app.running());
+            assert!(app.focus == Focus::Composer);
+        }
+        assert_eq!(app.session_id(), target.info.session);
+        assert_eq!(app.launch.template.cwd, target.info.cwd);
+        assert!(app.editor.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn saved_session_held_by_a_worker_attaches_and_updates_the_new_session_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let other = temp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut target = snapshot(true);
+    target.info.cwd = other.clone();
+    target.info.path = other.join("saved.jsonl");
+    let data = FakeData {
+        sessions: vec![target.clone()],
+        summaries: vec![summary(&target, false, "held prompt", 200)],
+        held: true,
+        ..FakeData::default()
+    };
+    let (launch, mut requests) = launch_with(snapshot(false), data).await;
+    let mut app = App::new(launch, 120, 32);
+    app.command("/resume").await.unwrap();
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    request(&mut requests, "session/open");
+    assert_eq!(
+        request(&mut requests, "session/attach")["session"],
+        json!(target.info.session)
+    );
+    assert_eq!(app.launch.template.cwd, other);
+    assert_eq!(app.file_cwd.as_ref(), Some(&target.info.cwd));
+    assert!(app.running());
+}
+
+#[tokio::test]
+async fn resume_hides_children_filters_titles_and_workspaces_and_closes_on_current() {
+    let attached = snapshot(false);
+    let mut older = snapshot(false);
+    older.info.cwd = "/tmp/OTHER-workspace".into();
+    let child = snapshot(false);
+    let mut child_row = summary(&child, true, "hidden child", 300);
+    child_row.parent_session = Some(attached.info.session);
+    let data = FakeData {
+        summaries: vec![
+            summary(&attached, true, "Current prompt", 200),
+            summary(&older, false, "Older prompt", 100),
+            child_row,
+        ],
+        ..FakeData::default()
+    };
+    let (launch, mut requests) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 160, 32);
+    app.command("/resume").await.unwrap();
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!live_text(&app).contains("hidden child"));
+    assert!(live_text(&app).contains("● Current prompt"));
+    for c in "other-workspace".chars() {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        app.sessions.as_ref().unwrap().selected().unwrap().session,
+        older.info.session
+    );
+    assert!(!live_text(&app).contains("Current prompt"));
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.command("/resume").await.unwrap();
+    while requests.try_recv().is_ok() {}
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.focus == Focus::Composer);
+    assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn custom_keymap_changes_dispatch_help_and_initial_thinking() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tui.toml");
+    std::fs::write(
+        &path,
+        "[keys]\nsearch = \"ctrl+y\"\n[display]\nthinking = \"full\"\n",
+    )
+    .unwrap();
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.tui_config = Some(path);
+    let mut app = App::new(launch, 120, 32);
+    assert_eq!(
+        app.transcript.thinking_display(),
+        transcript::Thinking::Full
+    );
+    app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.focus == Focus::Composer);
+    app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.focus == Focus::Search);
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.commit.clear();
+    app.command("/help").await.unwrap();
+    let help = app
+        .commit
+        .iter()
+        .map(Line::plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(help.contains("ctrl+y"));
+    assert!(!help.contains("ctrl+r"));
+}
+
+#[tokio::test]
+async fn config_warnings_are_dim_notes_and_ctrl_t_cycles_thinking_display() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tui.toml");
+    std::fs::write(&path, "[keys]\nunknown_action = \"ctrl+y\"\n").unwrap();
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.tui_config = Some(path);
+    let mut app = App::new(launch, 120, 32);
+    assert_eq!(
+        app.commit
+            .iter()
+            .filter(|line| line.plain().contains("tui.toml:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        app.transcript.thinking_display(),
+        transcript::Thinking::First
+    );
+    for expected in [
+        transcript::Thinking::Hidden,
+        transcript::Thinking::Full,
+        transcript::Thinking::First,
+    ] {
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.transcript.thinking_display(), expected);
+        assert!(app.commit.iter().any(|line| {
+            line.plain()
+                .contains(&format!("thinking display → {}", expected.name()))
+        }));
+    }
+}
+
+#[tokio::test]
+async fn copy_queues_osc52_until_the_next_draw_on_the_frame_writer() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 120, 32);
+    app.command("/copy").await.unwrap();
+    assert!(app.controls.is_empty());
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("nothing to copy yet"))
+    );
+    append(
+        &mut app,
+        EventKind::AssistantMessage {
+            model: ModelRef {
+                provider: "demo".into(),
+                model: "script".into(),
+            },
+            content: vec![Block::Text {
+                text: "  hello\nworld  ".into(),
+            }],
+            stop: StopReason::EndTurn,
+            usage: Usage::default(),
+        },
+    );
+    app.command("/copy").await.unwrap();
+    let sequence = "\x1b]52;c;aGVsbG8Kd29ybGQ=\x07";
+    assert_eq!(app.controls, vec![sequence]);
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("copied 2 lines"))
+    );
+    let mut output = Vec::new();
+    {
+        let mut screen = Screen::new(&mut output, false, 120);
+        app.draw(&mut screen).unwrap();
+    }
+    assert!(output.starts_with(sequence.as_bytes()));
+    assert!(app.controls.is_empty());
+    assert!(String::from_utf8(output).unwrap().contains("\x1b[?2026h"));
+}
+
+async fn settings_down(app: &mut App, count: usize) {
+    for _ in 0..count {
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
+    let mut report = settings_report();
+    report.trusted = false;
+    report.settings[2].source = SettingLayer::Explicit {
+        path: "/tmp/extra.toml".into(),
+    };
+    report.settings[2].held_back = Some(SettingLayer::Local);
+    let (mut launch, mut requests) = launch_with(
+        snapshot(false),
+        FakeData {
+            settings: Some(report),
+            ..FakeData::default()
+        },
+    )
+    .await;
+    launch.template.options.configs = vec!["/tmp/extra.toml".into()];
+    let mut app = App::new(launch, 240, 40);
+    app.command("/settings").await.unwrap();
+    assert!(app.focus == Focus::Settings);
+    let params = request(&mut requests, "config/settings");
+    assert_eq!(params["cwd"], "/tmp/xi-tui-demo");
+    assert_eq!(params["configs"], json!(["/tmp/extra.toml"]));
+    let text = live_text(&app);
+    for expected in [
+        "settings",
+        "saved to /tmp/xi-test-config/config.toml",
+        "Model",
+        "demo/script",
+        "Reasoning",
+        "medium",
+        "session",
+        "Thinking display",
+        "Approvals",
+        "--config extra.toml",
+        "held back (untrusted)",
+        "Tool read",
+        "Tool hashline",
+        "Automatic compaction",
+        "80% of window",
+        "Kept tail",
+        "Sandbox readable",
+        "/tmp/notes",
+        "Sandbox writable",
+        "/tmp/output",
+        "Sandbox env",
+        "LANG",
+        "Sandbox env command",
+        "sh, -c, printenv",
+        "Extensions",
+        "/tmp/extensions",
+        "Trust",
+        "untrusted · xi trust",
+        "Daemon idle exit",
+        "900 seconds",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!text.contains("default/model"));
+    assert!(app.commands.iter().any(|command| {
+        command.name == "settings" && command.description == "show and change settings"
+    }));
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.commit.clear();
+    app.command("/help").await.unwrap();
+    assert!(app.commit.iter().any(|line| {
+        line.plain().contains("/settings") && line.plain().contains("show and change settings")
+    }));
+}
+
+#[tokio::test]
+async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    settings_down(&mut app, 10).await;
+    app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["cwd"], "/tmp/xi-tui-demo");
+    assert_eq!(params["key"], "compaction.enabled");
+    assert_eq!(params["value"], false);
+    let row = app
+        .settings
+        .as_ref()
+        .unwrap()
+        .report
+        .settings
+        .iter()
+        .find(|row| row.key == "compaction.enabled")
+        .unwrap();
+    assert_eq!(row.value, false);
+    assert_eq!(row.source, SettingLayer::Global);
+    assert!(live_text(&app).contains("saved · new sessions use it"));
+}
+
+#[tokio::test]
+async fn settings_saves_session_model_and_reasoning_and_returns_from_picker() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "default_model");
+    assert_eq!(params["value"], "demo/script");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.focus == Focus::Models);
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.focus == Focus::Settings);
+    assert_eq!(app.launch.attached.info.model.model, "second");
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(request(&mut requests, "config/set")["value"], "demo/second");
+    settings_down(&mut app, 1).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "session/set_reasoning")["reasoning"],
+        "high"
+    );
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "reasoning");
+    assert_eq!(params["value"], "high");
+    assert_eq!(app.launch.attached.info.reasoning, Reasoning::High);
+}
+
+#[tokio::test]
+async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_order() {
+    let mut report = settings_report();
+    report.settings[3].value = json!(["read", "custom", "edit"]);
+    let (launch, mut requests) = launch_with(
+        snapshot(false),
+        FakeData {
+            settings: Some(report),
+            ..FakeData::default()
+        },
+    )
+    .await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    settings_down(&mut app, 4).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "tools");
+    assert_eq!(params["value"], json!(["custom", "edit"]));
+    app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "config/set")["value"],
+        json!(["custom", "edit", "read"])
+    );
+}
+
+#[tokio::test]
+async fn settings_refuses_to_remove_the_last_tool() {
+    let mut report = settings_report();
+    report.settings[3].value = json!(["read"]);
+    let (launch, mut requests) = launch_with(
+        snapshot(false),
+        FakeData {
+            settings: Some(report),
+            ..FakeData::default()
+        },
+    )
+    .await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    settings_down(&mut app, 4).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(live_text(&app).contains("cannot remove the last tool"));
+    assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn settings_cycles_approvals_and_edits_nullable_and_positive_token_counts() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    settings_down(&mut app, 3).await;
+    for approval in ["reads", "auto", "ask"] {
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "approvals");
+        assert_eq!(params["value"], approval);
+    }
+    settings_down(&mut app, 8).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.live().1.is_some());
+    for c in "24000".chars() {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "compaction.trigger_tokens");
+    assert_eq!(params["value"], 24_000);
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(request(&mut requests, "config/set")["value"].is_null());
+    assert!(live_text(&app).contains("80% of window"));
+    settings_down(&mut app, 1).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(live_text(&app).contains("enter a positive token count"));
+    assert!(requests.try_recv().is_err());
+    for c in "8000".chars() {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "compaction.keep_recent_tokens");
+    assert_eq!(params["value"], 8_000);
+}
+
+#[tokio::test]
+async fn settings_thinking_toggle_persists_but_live_toggle_does_not() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tui.toml");
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.tui_config = Some(path.clone());
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    settings_down(&mut app, 2).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.transcript.thinking_display(),
+        transcript::Thinking::Hidden
+    );
+    assert_eq!(
+        TuiConfig::load(Some(&path)).0.thinking,
+        transcript::Thinking::Hidden
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.transcript.thinking_display(),
+        transcript::Thinking::Full
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+}
+
+#[tokio::test]
+async fn settings_handles_missing_client_path_external_file_and_ctrl_c() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.editor.set_text("keep draft");
+    app.command("/settings").await.unwrap();
+    settings_down(&mut app, 2).await;
+    app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.transcript.thinking_display(),
+        transcript::Thinking::Hidden
+    );
+    assert!(live_text(&app).contains("not saved: no config path"));
+    app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&app.external_requested, Some(ExternalRequest::Settings(path))
+            if path == Path::new("/tmp/xi-test-config/config.toml"))
+    );
+    app.external_requested = None;
+    app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.focus == Focus::Composer);
+    assert!(!app.quit);
+    assert!(app.settings.is_none());
+    assert_eq!(app.editor.text(), "keep draft");
+}
+
+#[tokio::test]
+async fn settings_errors_leave_the_composer_or_show_the_rpc_message_in_the_view() {
+    for reject_open in [true, false] {
+        let (launch, mut requests) = launch_with(
+            snapshot(false),
+            FakeData {
+                reject_settings: reject_open,
+                reject_setting: !reject_open,
+                ..FakeData::default()
+            },
+        )
+        .await;
+        let mut app = App::new(launch, 180, 40);
+        app.command("/settings").await.unwrap();
+        if reject_open {
+            assert!(app.focus == Focus::Composer);
+            assert!(app.settings.is_none());
+            assert!(
+                app.commit
+                    .iter()
+                    .any(|line| line.plain().contains("settings unavailable"))
+            );
+        } else {
+            app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+            request(&mut requests, "config/set");
+            assert!(app.focus == Focus::Settings);
+            assert!(live_text(&app).contains("setting rejected"));
+            assert!(!live_text(&app).contains("saved · new sessions use it"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_resume_uses_the_attached_workspace_for_new_sessions() {
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.template.cwd = "/tmp/original-workspace".into();
+    let app = App::new(launch, 120, 32);
+    assert_eq!(app.launch.template.cwd, app.launch.attached.info.cwd);
+}

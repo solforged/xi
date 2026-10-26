@@ -368,7 +368,7 @@ impl Settings {
         }
         let mut header = Line::default().brass("settings").dim(format!(
             " · saved to {} · enter changes · ctrl+s saves default · e edits file · esc closes",
-            crate::home(&self.report.files.global)
+            crate::view::home(&self.report.files.global)
         ));
         if header.width() > cols {
             header = Line::default()
