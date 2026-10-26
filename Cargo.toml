@@ -17,9 +17,11 @@ xi-provider = { path = "crates/xi-provider" }
 xi-sandbox = { path = "crates/xi-sandbox" }
 xi-session = { path = "crates/xi-session" }
 xi-tools = { path = "crates/xi-tools" }
+xi-tui = { path = "crates/xi-tui" }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3"
 globset = "0.4"
 grep-regex = "0.1"
@@ -40,6 +42,7 @@ time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 toml = "0.9"
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v7", "serde"] }
 wiremock = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
