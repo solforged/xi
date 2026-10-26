@@ -16,17 +16,19 @@ pub mod context;
 mod extension_session;
 pub mod extensions;
 pub mod server;
+pub mod worker;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use futures::future::BoxFuture;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
-use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, SessionInfo};
+use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, ResetParams, SessionInfo};
 use xi_protocol::model::ModelInfo;
 use xi_protocol::{
     Block, Decision, EventId, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput,
@@ -44,6 +46,12 @@ pub enum Error {
     /// Invalid settings or client operation.
     #[error("{0}")]
     Config(String),
+    /// A turn is running.
+    #[error("session is running")]
+    Running,
+    /// No ask is pending for that call.
+    #[error("no pending approval for that call")]
+    NotPending,
     /// Filesystem failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -71,6 +79,8 @@ pub enum Notification {
     Event(EventParams),
     /// A model stream increment.
     Delta(DeltaParams),
+    /// A retry replaces the preceding attempt's partial output.
+    Reset(ResetParams),
 }
 
 impl Notification {
@@ -82,6 +92,9 @@ impl Notification {
             }
             Self::Delta(params) => {
                 serde_json::json!({"jsonrpc":"2.0", "method":"stream/delta", "params":params})
+            }
+            Self::Reset(params) => {
+                serde_json::json!({"jsonrpc":"2.0", "method":"stream/reset", "params":params})
             }
         }
     }
@@ -124,13 +137,21 @@ pub enum ApprovalMode {
     Headless(bool),
 }
 
+/// Grants permission to send one model request to an endpoint.
+pub trait Leaser: Send + Sync {
+    /// Resolves when granted. The returned guard releases on drop.
+    fn lease<'a>(&'a self, endpoint: &'a str) -> BoxFuture<'a, Result<Box<dyn Send>>>;
+}
+
 /// Turn limits and client approval behavior.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct TurnOptions {
     /// Maximum model requests, excluding retries.
     pub max_turns: usize,
     /// Approval source.
     pub approval: ApprovalMode,
+    /// Optional daemon scheduler for model requests.
+    pub leaser: Option<Arc<dyn Leaser>>,
 }
 
 impl Default for TurnOptions {
@@ -138,6 +159,7 @@ impl Default for TurnOptions {
         Self {
             max_turns: 200,
             approval: ApprovalMode::Client,
+            leaser: None,
         }
     }
 }
@@ -248,6 +270,8 @@ struct Inner {
     control: Mutex<Control>,
     bus: EventBus,
     options: TurnOptions,
+    stop: CancellationToken,
+    idle: Notify,
 }
 
 /// A session handle. Prompts queue while a turn runs; control stays responsive.
@@ -327,9 +351,29 @@ impl Session {
         let id = *id;
         let head = log.leaves().last().expect("session has a leaf").id;
         config.model = model.clone();
+        let mut pending = Vec::<(ToolCallId, bool)>::new();
         for event in log.lineage(head).expect("known head") {
-            if let EventKind::ModelChanged { model } = &event.kind {
-                config.model = model.clone();
+            match &event.kind {
+                EventKind::ModelChanged { model } => config.model = model.clone(),
+                EventKind::AssistantMessage { content, .. } => {
+                    for block in content {
+                        if let Block::ToolUse { id, .. } = block {
+                            pending.push((id.clone(), false));
+                        }
+                    }
+                }
+                EventKind::ToolDecision { call, decision, .. } => {
+                    if let Some((_, unresolved)) = pending.iter_mut().find(|(id, _)| id == call) {
+                        *unresolved = *decision == Decision::Ask;
+                    }
+                }
+                EventKind::ApprovalResolved { call, .. } => {
+                    if let Some((_, unresolved)) = pending.iter_mut().find(|(id, _)| id == call) {
+                        *unresolved = false;
+                    }
+                }
+                EventKind::ToolResult { call, .. } => pending.retain(|(id, _)| id != call),
+                _ => {}
             }
         }
         let system = SystemContext::at(&config, log.root().at)?;
@@ -362,7 +406,7 @@ impl Session {
             cancel: CancellationToken::new(),
         };
         let backend = backend.map(Into::into);
-        Ok(Self(Arc::new(Inner {
+        let session = Self(Arc::new(Inner {
             id,
             state: tokio::sync::Mutex::new(State {
                 log,
@@ -376,13 +420,72 @@ impl Session {
             control: Mutex::new(Control::default()),
             bus,
             options,
-        })))
+            stop: CancellationToken::new(),
+            idle: Notify::new(),
+        }));
+        {
+            let mut state = session.0.state.try_lock().expect("new session state");
+            for (call, unresolved) in pending {
+                if unresolved {
+                    session.append(
+                        &mut state,
+                        EventKind::ApprovalResolved {
+                            call: call.clone(),
+                            approved: false,
+                            by: Approver::Interrupted,
+                        },
+                    )?;
+                }
+                session.append(
+                    &mut state,
+                    EventKind::ToolResult {
+                        call,
+                        output: error_output("interrupted"),
+                        spill: None,
+                    },
+                )?;
+            }
+        }
+        Ok(session)
     }
 
     /// Session identity.
     #[must_use]
     pub fn id(&self) -> SessionId {
         self.0.id
+    }
+
+    /// Whether a turn currently owns this session.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.0.control.lock().expect("control lock").running
+    }
+
+    /// Stops model requests after daemon loss without cancelling the tool batch.
+    /// Queued and future prompts are rejected. Repeated calls have no effect.
+    pub fn stop_requests(&self) {
+        let mut control = self.0.control.lock().expect("control lock");
+        self.0.stop.cancel();
+        for prompt in control.queue.drain(..) {
+            let _ = prompt.reply.send(Err("daemon connection lost".into()));
+        }
+        self.0.idle.notify_waiters();
+    }
+
+    /// Resolves when no turn is running and the prompt queue is empty.
+    pub async fn wait_idle(&self) {
+        loop {
+            let notified = self.0.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let control = self.0.control.lock().expect("control lock");
+                if !control.running && control.queue.is_empty() {
+                    return;
+                }
+            }
+            notified.await;
+        }
     }
 
     /// A snapshot, available when no turn holds the session log.
@@ -403,6 +506,10 @@ impl Session {
     ) -> oneshot::Receiver<std::result::Result<TurnOutcome, String>> {
         let (reply, rx) = oneshot::channel();
         let mut control = self.0.control.lock().expect("control lock");
+        if self.0.stop.is_cancelled() {
+            let _ = reply.send(Err("daemon connection lost".into()));
+            return rx;
+        }
         control.queue.push_back(Queued { content, reply });
         if !control.running {
             control.running = true;
@@ -438,6 +545,7 @@ impl Session {
         for prompt in control.queue.drain(..) {
             let _ = prompt.reply.send(Err("client disconnected".into()));
         }
+        self.0.idle.notify_waiters();
     }
 
     /// Resolves a pending ask. Duplicate and unknown answers fail.
@@ -449,21 +557,16 @@ impl Session {
             .expect("control lock")
             .approvals
             .remove(call)
-            .ok_or_else(|| Error::Config(format!("no pending approval for {call}")))?;
-        tx.send(approved)
-            .map_err(|_| Error::Config("approval was cancelled".into()))
+            .ok_or(Error::NotPending)?;
+        tx.send(approved).map_err(|_| Error::NotPending)
     }
 
     /// Moves the head only when no turn is running.
     pub async fn checkout(&self, event: EventId) -> Result<()> {
-        let mut state = self
-            .0
-            .state
-            .try_lock()
-            .map_err(|_| Error::Config("session is running".into()))?;
+        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
         let control = self.0.control.lock().expect("control lock");
         if control.running {
-            return Err(Error::Config("session is running".into()));
+            return Err(Error::Running);
         }
         let lineage = state
             .log
@@ -491,14 +594,10 @@ impl Session {
     /// Switches model at an idle prompt and records the selection. Selecting
     /// the model already in use connects it but records nothing.
     pub async fn set_model(&self, model: ModelRef) -> Result<()> {
-        let mut state = self
-            .0
-            .state
-            .try_lock()
-            .map_err(|_| Error::Config("session is running".into()))?;
+        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
         let control = self.0.control.lock().expect("control lock");
         if control.running {
-            return Err(Error::Config("session is running".into()));
+            return Err(Error::Running);
         }
         let mut next = state.config.clone();
         next.model = model.clone();
@@ -524,7 +623,7 @@ impl Session {
     fn drain(&self, state: &mut State, replies: &mut Vec<Reply>) -> Result<bool> {
         let queued = {
             let mut control = self.0.control.lock().expect("control lock");
-            if control.cancel.is_cancelled() {
+            if control.cancel.is_cancelled() || self.0.stop.is_cancelled() {
                 return Ok(false);
             }
             control.queue.drain(..).collect::<Vec<_>>()
@@ -545,20 +644,33 @@ impl Session {
     async fn drive(&self, generation: u64, cancel: CancellationToken) {
         let mut state = self.0.state.lock().await;
         state.tools_context.cancel = cancel.clone();
-        let mut replies = Vec::new();
-        let result = self.run(&mut state, &cancel, &mut replies).await;
-        // End the turn atomically with respect to submissions. On cancellation,
-        // queue entries remain until another submission starts a fresh turn.
-        {
-            let mut control = self.0.control.lock().expect("control lock");
-            if control.generation == generation {
-                control.running = false;
-                control.approvals.clear();
+        loop {
+            let mut replies = Vec::new();
+            let result = self.run(&mut state, &cancel, &mut replies).await;
+            // A prompt arriving during turn-end hooks starts a new turn.
+            // Cancellation retains steering until a later submission.
+            let again = {
+                let mut control = self.0.control.lock().expect("control lock");
+                if control.generation != generation {
+                    false
+                } else {
+                    control.approvals.clear();
+                    let again = result.is_ok()
+                        && !cancel.is_cancelled()
+                        && !self.0.stop.is_cancelled()
+                        && !control.queue.is_empty();
+                    control.running = again;
+                    again
+                }
+            };
+            let result = result.map_err(|error| error.to_string());
+            for reply in replies {
+                let _ = reply.send(result.clone());
             }
-        }
-        let result = result.map_err(|e| e.to_string());
-        for reply in replies {
-            let _ = reply.send(result.clone());
+            self.0.idle.notify_waiters();
+            if !again {
+                break;
+            }
         }
     }
 
@@ -592,9 +704,21 @@ impl Session {
             cancelled: false,
             text: String::new(),
         };
-        self.prepare_extensions(state).await?;
+        if !self.0.stop.is_cancelled() {
+            self.prepare_extensions(state).await?;
+        }
         let mut requests = 0;
         loop {
+            if self.0.stop.is_cancelled() {
+                self.append(
+                    state,
+                    EventKind::TurnFailed {
+                        message: "daemon connection lost".into(),
+                    },
+                )?;
+                outcome.failed = true;
+                break;
+            }
             if cancel.is_cancelled() {
                 outcome.cancelled = true;
                 break;
@@ -625,7 +749,11 @@ impl Session {
                     self.append(
                         state,
                         EventKind::TurnFailed {
-                            message: error.to_string(),
+                            message: if self.0.stop.is_cancelled() {
+                                "daemon connection lost".into()
+                            } else {
+                                error.to_string()
+                            },
                         },
                     )?;
                     outcome.failed = true;
@@ -684,15 +812,16 @@ impl Session {
             }
             if stop != StopReason::ToolUse {
                 // A steering message can extend an otherwise completed turn.
-                let mut control = self.0.control.lock().expect("control lock");
+                let control = self.0.control.lock().expect("control lock");
                 if control.queue.is_empty() {
-                    control.running = false;
                     break;
                 }
             }
         }
         let extensions = state.extensions.clone().unwrap_or_default();
-        if !cancel.is_cancelled() && extensions.has_hook(xi_protocol::manifest::HookPoint::TurnEnd)
+        if !cancel.is_cancelled()
+            && !self.0.stop.is_cancelled()
+            && extensions.has_hook(xi_protocol::manifest::HookPoint::TurnEnd)
         {
             let event = xi_protocol::methods::extension::HookEvent::TurnEnd { head: state.head };
             if let Err(error) = self
@@ -707,6 +836,15 @@ impl Session {
                 )?;
                 outcome.failed = true;
             }
+        }
+        if self.0.stop.is_cancelled() && !outcome.failed {
+            self.append(
+                state,
+                EventKind::TurnFailed {
+                    message: "daemon connection lost".into(),
+                },
+            )?;
+            outcome.failed = true;
         }
         outcome.head = state.head;
         Ok(outcome)
@@ -740,12 +878,18 @@ impl Session {
                 cache_key: Some(self.id().to_string()),
             };
             let response = self
-                .stream(backend.provider.as_ref(), &request, cancel)
+                .stream(
+                    backend.provider.as_ref(),
+                    &request,
+                    &state.config,
+                    cancel,
+                    true,
+                )
                 .await;
             // Overflow recovery runs even with automatic compaction off: the
             // request has already failed, so summarising costs nothing extra.
             match response {
-                Err(error)
+                Err(Error::Provider(error))
                     if error.kind == xi_provider::ErrorKind::ContextOverflow
                         && !overflow_compacted =>
                 {
@@ -756,7 +900,7 @@ impl Session {
                         return Err(error.into());
                     }
                 }
-                result => return result.map_err(Into::into),
+                result => return result,
             }
         }
     }
@@ -765,11 +909,50 @@ impl Session {
         &self,
         provider: &dyn Provider,
         request: &Request,
+        config: &Config,
         cancel: &CancellationToken,
-    ) -> std::result::Result<Response, xi_provider::Error> {
+        publish: bool,
+    ) -> Result<Response> {
+        let cancelled = |content| Response {
+            content,
+            stop: StopReason::Cancelled,
+            usage: Usage::default(),
+        };
+        let _lease = if let Some(leaser) = &self.0.options.leaser {
+            let registry = config.registry();
+            let endpoint = &registry
+                .provider(&config.model.provider)
+                .ok_or_else(|| {
+                    Error::Config(format!("unknown provider {}", config.model.provider))
+                })?
+                .base_url;
+            Some(tokio::select! {
+                biased;
+                () = self.0.stop.cancelled() => return Err(Error::Config("daemon connection lost".into())),
+                () = cancel.cancelled() => return Ok(cancelled(Vec::new())),
+                guard = leaser.lease(endpoint) => guard?,
+            })
+        } else {
+            None
+        };
         for attempt in 0..=4 {
+            if self.0.stop.is_cancelled() {
+                return Err(Error::Config("daemon connection lost".into()));
+            }
+            if cancel.is_cancelled() {
+                return Ok(cancelled(Vec::new()));
+            }
+            if attempt > 0 && publish {
+                self.0.bus.send(Notification::Reset(ResetParams {
+                    session: self.id(),
+                    attempt,
+                }));
+            }
             let mut partial = Vec::<Block>::new();
             let mut on_delta = |delta: Delta| {
+                if !publish {
+                    return;
+                }
                 match &delta {
                     Delta::Text { text } => push_partial(&mut partial, text, false),
                     Delta::Thinking { text } => push_partial(&mut partial, text, true),
@@ -778,20 +961,17 @@ impl Session {
                 self.0.bus.send(Notification::Delta(DeltaParams {
                     session: self.id(),
                     delta,
-                    attempt: 0,
+                    attempt,
                 }));
             };
             let result = tokio::select! {
                 biased;
+                () = self.0.stop.cancelled() => return Err(Error::Config("daemon connection lost".into())),
                 () = cancel.cancelled() => None,
                 result = provider.stream(request, &mut on_delta) => Some(result),
             };
             let Some(result) = result else {
-                return Ok(Response {
-                    content: partial,
-                    stop: StopReason::Cancelled,
-                    usage: Usage::default(),
-                });
+                return Ok(cancelled(partial));
             };
             match result {
                 Ok(response) => return Ok(response),
@@ -803,11 +983,13 @@ impl Session {
                         .max(backoff)
                         .min(Duration::from_secs(60));
                     tokio::select! {
-                        () = cancel.cancelled() => return Ok(Response { content: partial, stop: StopReason::Cancelled, usage: Usage::default() }),
+                        biased;
+                        () = self.0.stop.cancelled() => return Err(Error::Config("daemon connection lost".into())),
+                        () = cancel.cancelled() => return Ok(cancelled(partial)),
                         () = tokio::time::sleep(delay) => {}
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         unreachable!("last attempt returns")
@@ -960,26 +1142,34 @@ impl Session {
                 let (approved, by) = match self.0.options.approval {
                     ApprovalMode::Headless(approved) => (approved, Approver::Headless),
                     ApprovalMode::Client => {
-                        let result = tokio::select! { biased; () = cancel.cancelled() => None, result = waiter.expect("client waiter") => result.ok() };
+                        let timeout = async {
+                            match state.config.daemon.approval_timeout {
+                                Some(seconds) => {
+                                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                                }
+                                None => std::future::pending::<()>().await,
+                            }
+                        };
+                        let result = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => (false, Approver::Cancelled),
+                            () = self.0.stop.cancelled() => (false, Approver::Cancelled),
+                            result = waiter.expect("client waiter") => match result {
+                                Ok(approved) => (approved, Approver::User),
+                                Err(_) => (false, Approver::Cancelled),
+                            },
+                            () = timeout => (false, Approver::Timeout),
+                        };
                         self.0
                             .control
                             .lock()
                             .expect("control lock")
                             .approvals
                             .remove(&call);
-                        let Some(approved) = result else {
-                            return self.append(
-                                state,
-                                EventKind::ToolResult {
-                                    call,
-                                    output: error_output("cancelled"),
-                                    spill: None,
-                                },
-                            );
-                        };
-                        (approved, Approver::User)
+                        result
                     }
                 };
+                let cancelled = matches!(by, Approver::Cancelled);
                 self.append(
                     state,
                     EventKind::ApprovalResolved {
@@ -988,6 +1178,16 @@ impl Session {
                         by,
                     },
                 )?;
+                if cancelled {
+                    return self.append(
+                        state,
+                        EventKind::ToolResult {
+                            call,
+                            output: error_output("cancelled"),
+                            spill: None,
+                        },
+                    );
+                }
                 approved
             }
         };

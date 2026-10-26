@@ -154,6 +154,7 @@ async fn run(cli: Cli) -> Result<u8> {
         } else {
             ApprovalMode::Client
         },
+        leaser: None,
     };
     let (mut session, config) = if let Some(path) = cli.resume {
         let log = xi_session::SessionLog::open(paths.expand(&path))?;
@@ -161,7 +162,8 @@ async fn run(cli: Cli) -> Result<u8> {
             unreachable!("validated session")
         };
         let config = options.config(cwd)?;
-        let session = Session::from_log(log, config.clone(), bus.clone(), turn_options, None)?;
+        let session =
+            Session::from_log(log, config.clone(), bus.clone(), turn_options.clone(), None)?;
         if let Some(model) = &options.model {
             session.set_model(model.clone()).await?;
         }
@@ -172,7 +174,7 @@ async fn run(cli: Cli) -> Result<u8> {
             config.clone(),
             options.session_dir.as_deref(),
             bus.clone(),
-            turn_options,
+            turn_options.clone(),
             None,
         )?;
         (session, config)
@@ -239,7 +241,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 config.clone(),
                 options.session_dir.as_deref(),
                 bus.clone(),
-                turn_options,
+                turn_options.clone(),
                 None,
             )?;
             continue;
@@ -339,6 +341,7 @@ fn display(notification: Notification, session: &Session, render: Render) -> Res
         return Ok(());
     }
     match notification {
+        Notification::Reset(_) => {}
         Notification::Delta(params) => match params.delta {
             Delta::Text { text } => print!("{text}"),
             Delta::Thinking { text } => {

@@ -118,6 +118,7 @@ impl Session {
                 TurnOptions {
                     max_turns: self.0.options.max_turns,
                     approval: ApprovalMode::Headless(false),
+                    leaser: self.0.options.leaser.clone(),
                 },
                 Some(backend),
                 Some(self.id()),
@@ -125,11 +126,13 @@ impl Session {
             Ok((child, params.prompt))
         })();
         let cancel = cancel.clone();
+        let stop = self.0.stop.clone();
         Box::pin(async move {
             let (child, prompt) = prepared?;
             let mut reply = child.submit(vec![Block::Text { text: prompt }]);
             let outcome = tokio::select! {
                 biased;
+                () = stop.cancelled() => { child.stop_requests(); reply.await }
                 () = cancel.cancelled() => { child.cancel(); reply.await }
                 result = &mut reply => result,
             }
@@ -162,11 +165,10 @@ impl Session {
 
     /// Routes a slash command without its leading slash. `None` means unknown.
     pub async fn command(&self, name: &str, args: &str) -> Result<Option<CommandResult>> {
-        let mut state = self
-            .0
-            .state
-            .try_lock()
-            .map_err(|_| Error::Config("session is running".into()))?;
+        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
+        if self.is_running() {
+            return Err(Error::Running);
+        }
         self.prepare_extensions(&mut state).await?;
         let extensions = state.extensions.clone().unwrap_or_default();
         let params = CommandParams {

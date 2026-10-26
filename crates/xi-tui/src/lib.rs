@@ -230,6 +230,7 @@ impl App {
         let session = match notification {
             Notification::Event(p) => p.session,
             Notification::Delta(p) => p.session,
+            Notification::Reset(p) => p.session,
         };
         session == self.session_id()
     }
@@ -420,7 +421,7 @@ impl App {
                     self.launch.config.clone(),
                     self.launch.session_dir.as_deref(),
                     self.launch.bus.clone(),
-                    self.launch.turn_options,
+                    self.launch.turn_options.clone(),
                     None,
                 )?;
                 self.launch.session = session;

@@ -27,6 +27,8 @@ libc.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+xi-provider.workspace = true
+xi-tools.workspace = true
 
 # The workspace forbids unsafe code; macOS socket activation needs one FFI
 # call, so this crate denies unsafe code and allows it on that function only.

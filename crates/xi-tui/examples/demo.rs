@@ -231,7 +231,7 @@ async fn main() -> Result<(), xi_tui::Error> {
         config.clone(),
         None,
         bus.clone(),
-        turn_options,
+        turn_options.clone(),
         Some(xi_kernel::Backend {
             provider: Arc::new(script()),
             model,

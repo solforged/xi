@@ -1,0 +1,585 @@
+//! Daemon routing over real worker pipes without network model requests.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::future::BoxFuture;
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio::sync::mpsc;
+use xi_client::peer::{Incoming, Peer, PeerError};
+use xi_daemon::{Daemon, DaemonOptions, InProcessSpawner, Spawner};
+use xi_kernel::Backend;
+use xi_kernel::config::{DaemonSettings, Paths};
+use xi_protocol::event::{StopReason, Usage};
+use xi_protocol::methods::client::*;
+use xi_protocol::model::ModelInfo;
+use xi_protocol::rpc::{RequestMethod, RpcError};
+use xi_protocol::{Block, EventKind, SessionId};
+use xi_provider::{Provider, Request, Response};
+
+struct Script(Mutex<VecDeque<Response>>);
+
+impl Provider for Script {
+    fn stream<'a>(
+        &'a self,
+        _: &'a Request,
+        on_delta: &'a mut (dyn FnMut(Delta) + Send),
+    ) -> BoxFuture<'a, Result<Response, xi_provider::Error>> {
+        Box::pin(async move {
+            let response = self.0.lock().unwrap().pop_front().unwrap_or_else(done);
+            for block in &response.content {
+                if let Block::Text { text } = block {
+                    on_delta(Delta::Text { text: text.clone() });
+                }
+            }
+            Ok(response)
+        })
+    }
+}
+
+struct Fixture {
+    _temp: TempDir,
+    paths: Paths,
+    cwd: std::path::PathBuf,
+    outside: std::path::PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = Paths {
+            home: root.join("home"),
+            config: root.join("config"),
+            data: root.join("data"),
+            state: root.join("state"),
+        };
+        let cwd = root.join("workspace");
+        for path in [&paths.home, &paths.config, &cwd] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let outside = root.join("outside.txt");
+        std::fs::write(&outside, "outside data").unwrap();
+        Self {
+            _temp: temp,
+            paths,
+            cwd,
+            outside,
+        }
+    }
+
+    fn spawner(&self, responses: Vec<Response>) -> Arc<dyn Spawner> {
+        let script = Arc::new(Script(Mutex::new(responses.into())));
+        Arc::new(InProcessSpawner {
+            paths: self.paths.clone(),
+            backend: Some(Arc::new(move || Backend {
+                provider: script.clone(),
+                model: ModelInfo {
+                    provider: "anthropic".into(),
+                    id: "claude-sonnet-5-5".into(),
+                    context_window: 8192,
+                    max_output: 1024,
+                    reasoning: true,
+                    pricing: None,
+                },
+                tools: xi_tools::toolset(&["read"]).unwrap(),
+            })),
+        })
+    }
+
+    fn daemon(&self, responses: Vec<Response>, private: bool) -> Daemon {
+        Daemon::new(DaemonOptions {
+            settings: DaemonSettings::default(),
+            paths: self.paths.clone(),
+            spawner: self.spawner(responses),
+            private,
+        })
+    }
+
+    fn create(&self) -> CreateParams {
+        CreateParams {
+            cwd: self.cwd.clone(),
+            model: None,
+            options: SessionOptions::default(),
+        }
+    }
+}
+
+fn connection(daemon: &Daemon) -> (Peer, mpsc::UnboundedReceiver<Incoming>) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(server);
+    let daemon = daemon.clone();
+    tokio::spawn(async move {
+        daemon.serve(reader, writer).await;
+    });
+    let (reader, writer) = tokio::io::split(client);
+    Peer::spawn(reader, writer)
+}
+
+async fn request<M: RequestMethod>(
+    peer: &Peer,
+    params: &M::Params,
+) -> Result<M::Result, PeerError> {
+    tokio::time::timeout(Duration::from_secs(8), peer.request::<M>(params))
+        .await
+        .unwrap()
+}
+
+async fn initialize(peer: &Peer) -> InitializeResult {
+    request::<Initialize>(
+        peer,
+        &InitializeParams {
+            protocol_version: xi_protocol::PROTOCOL_VERSION,
+            client: ClientInfo {
+                name: "daemon-test".into(),
+                version: "0".into(),
+            },
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn error_code<T>(result: Result<T, PeerError>) -> i64 {
+    match result {
+        Err(PeerError::Rpc(error)) => error.code,
+        _ => panic!("expected RPC error"),
+    }
+}
+
+async fn notification(rx: &mut mpsc::UnboundedReceiver<Incoming>, name: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(Incoming::Notification { method, params }) = rx.recv().await {
+                if method == name {
+                    return params;
+                }
+            } else {
+                panic!("connection closed before notification {name}");
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn assistant(rx: &mut mpsc::UnboundedReceiver<Incoming>) -> EventParams {
+    loop {
+        let event: EventParams =
+            serde_json::from_value(notification(rx, "event/appended").await).unwrap();
+        if matches!(event.event.kind, EventKind::AssistantMessage { .. }) {
+            return event;
+        }
+    }
+}
+
+async fn prompt(peer: &Peer, session: SessionId) -> PromptResult {
+    request::<SessionPrompt>(
+        peer,
+        &PromptParams {
+            session,
+            content: vec![Block::Text {
+                text: "hello".into(),
+            }],
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn stop(peer: &Peer, daemon: &Daemon) {
+    request::<DaemonShutdown>(
+        peer,
+        &ShutdownParams {
+            when: ShutdownWhen::Now,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), daemon.finished())
+        .await
+        .unwrap();
+}
+
+fn done() -> Response {
+    Response {
+        content: vec![Block::Text {
+            text: "done".into(),
+        }],
+        stop: StopReason::EndTurn,
+        usage: Usage::default(),
+    }
+}
+
+#[tokio::test]
+async fn initialization_is_required_and_versions_must_match() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], false);
+    let (peer, _) = connection(&daemon);
+    assert_eq!(
+        error_code(request::<DaemonStatus>(&peer, &()).await),
+        RpcError::NOT_INITIALIZED
+    );
+    let error = request::<Initialize>(
+        &peer,
+        &InitializeParams {
+            protocol_version: xi_protocol::PROTOCOL_VERSION + 1,
+            client: ClientInfo {
+                name: "test".into(),
+                version: "0".into(),
+            },
+        },
+    )
+    .await
+    .unwrap_err();
+    match error {
+        PeerError::Rpc(error) => {
+            assert_eq!(error.code, RpcError::VERSION_MISMATCH);
+            assert_eq!(
+                error.data,
+                Some(json!({ "daemon_protocol_version": xi_protocol::PROTOCOL_VERSION }))
+            );
+        }
+        _ => panic!("expected version mismatch"),
+    }
+    assert_eq!(
+        error_code(request::<SessionList>(&peer, &ListParams::default()).await),
+        RpcError::NOT_INITIALIZED
+    );
+    assert!(!initialize(&peer).await.capabilities.private);
+    stop(&peer, &daemon).await;
+}
+
+#[tokio::test]
+async fn create_attach_detach_and_live_session_index() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], false);
+    let (first, mut first_events) = connection(&daemon);
+    initialize(&first).await;
+    let created = request::<SessionCreate>(&first, &fixture.create())
+        .await
+        .unwrap();
+    let session = created.info.session;
+    let root: EventParams =
+        serde_json::from_value(notification(&mut first_events, "event/appended").await).unwrap();
+    assert_eq!(root.session, session);
+    assert!(matches!(root.event.kind, EventKind::SessionStarted { .. }));
+    prompt(&first, session).await;
+    assert_eq!(assistant(&mut first_events).await.session, session);
+
+    let (second, mut second_events) = connection(&daemon);
+    initialize(&second).await;
+    let attached = request::<SessionAttach>(
+        &second,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(attached.info.session, session);
+    assert!(!attached.events.is_empty());
+    prompt(&first, session).await;
+    assistant(&mut first_events).await;
+    assert_eq!(assistant(&mut second_events).await.session, session);
+    request::<SessionDetach>(&second, &SessionRef { session })
+        .await
+        .unwrap();
+    prompt(&first, session).await;
+    assistant(&mut first_events).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), second_events.recv())
+            .await
+            .is_err()
+    );
+
+    let sessions = request::<SessionList>(&first, &ListParams::default())
+        .await
+        .unwrap();
+    let summary = sessions
+        .iter()
+        .find(|item| item.session == session)
+        .unwrap();
+    assert_eq!(summary.cwd, fixture.cwd);
+    assert!(summary.head.is_some());
+    assert!(!summary.running);
+    assert!(
+        request::<SessionList>(
+            &first,
+            &ListParams {
+                cwd: Some(fixture.paths.home.clone()),
+                running: None
+            }
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    let status = request::<DaemonStatus>(&first, &()).await.unwrap();
+    assert_eq!(status.workers, 1);
+    assert_eq!(status.clients, 2);
+
+    assert_eq!(
+        error_code(
+            request::<SessionOpen>(
+                &first,
+                &OpenParams {
+                    path: created.info.path,
+                    options: SessionOptions::default()
+                }
+            )
+            .await
+        ),
+        RpcError::SESSION_HELD
+    );
+    stop(&first, &daemon).await;
+}
+
+#[tokio::test]
+async fn asks_enter_inbox_broadcast_and_resolve_once() {
+    let fixture = Fixture::new();
+    let call = Response {
+        content: vec![Block::ToolUse {
+            id: "outside-read".into(),
+            name: "read".into(),
+            input: json!({ "path": fixture.outside }),
+        }],
+        stop: StopReason::ToolUse,
+        usage: Usage::default(),
+    };
+    let daemon = fixture.daemon(vec![call, done()], false);
+    let (first, _) = connection(&daemon);
+    let (observer, mut observed) = connection(&daemon);
+    initialize(&first).await;
+    initialize(&observer).await;
+    let session = request::<SessionCreate>(&first, &fixture.create())
+        .await
+        .unwrap()
+        .info
+        .session;
+    let prompting = first.clone();
+    let turn = tokio::spawn(async move { prompt(&prompting, session).await });
+    let pending: PendingApproval =
+        serde_json::from_value(notification(&mut observed, "approval/pending").await).unwrap();
+    assert_eq!(pending.session, session);
+    assert_eq!(pending.call, "outside-read".into());
+    assert_eq!(pending.tool, "read");
+    assert_eq!(
+        request::<ApprovalList>(&observer, &()).await.unwrap(),
+        vec![pending.clone()]
+    );
+    let running = request::<SessionList>(
+        &observer,
+        &ListParams {
+            cwd: None,
+            running: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].pending_approvals, 1);
+    request::<ApprovalResolve>(
+        &observer,
+        &ResolveParams {
+            session,
+            call: pending.call.clone(),
+            approved: true,
+        },
+    )
+    .await
+    .unwrap();
+    turn.await.unwrap();
+    assert_eq!(
+        error_code(
+            request::<ApprovalResolve>(
+                &observer,
+                &ResolveParams {
+                    session,
+                    call: pending.call,
+                    approved: true
+                }
+            )
+            .await
+        ),
+        RpcError::APPROVAL_NOT_PENDING
+    );
+    assert!(
+        request::<ApprovalList>(&observer, &())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    stop(&first, &daemon).await;
+}
+
+#[tokio::test]
+async fn worker_exit_notifies_attached_clients_and_running_list_watchers() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], false);
+    let (first, mut attached_events) = connection(&daemon);
+    let (watcher, mut watched_events) = connection(&daemon);
+    initialize(&first).await;
+    initialize(&watcher).await;
+    let session = request::<SessionCreate>(&first, &fixture.create())
+        .await
+        .unwrap()
+        .info
+        .session;
+    request::<SessionList>(
+        &watcher,
+        &ListParams {
+            cwd: None,
+            running: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    request::<SessionClose>(&first, &SessionRef { session })
+        .await
+        .unwrap();
+    for events in [&mut attached_events, &mut watched_events] {
+        let exited: ExitedParams =
+            serde_json::from_value(notification(events, "session/exited").await).unwrap();
+        assert_eq!(exited.session, session);
+        assert_eq!(exited.status, Some(0));
+    }
+    assert_eq!(
+        request::<DaemonStatus>(&first, &()).await.unwrap().workers,
+        0
+    );
+    let saved = request::<SessionList>(&first, &ListParams::default())
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].session, session);
+    assert_eq!(saved[0].head, None);
+    assert_eq!(
+        error_code(
+            request::<SessionAttach>(
+                &watcher,
+                &AttachParams {
+                    session,
+                    since: None
+                }
+            )
+            .await
+        ),
+        RpcError::UNKNOWN_SESSION
+    );
+    let reopened = request::<SessionOpen>(
+        &first,
+        &OpenParams {
+            path: saved[0].path.clone(),
+            options: SessionOptions::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.info.session, session);
+    stop(&first, &daemon).await;
+}
+
+#[tokio::test]
+async fn private_instance_shuts_down_on_last_client_disconnect() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], true);
+    let (peer, _) = connection(&daemon);
+    let (second, _) = connection(&daemon);
+    initialize(&second).await;
+    assert!(initialize(&peer).await.capabilities.private);
+    request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap();
+    peer.close();
+    assert_eq!(
+        request::<DaemonStatus>(&second, &()).await.unwrap().workers,
+        1
+    );
+    second.close();
+    tokio::time::timeout(Duration::from_secs(8), daemon.finished())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn private_helper_exposes_initialized_pipe_and_shutdown() {
+    let fixture = Fixture::new();
+    let (reader, writer) = xi_daemon::private(fixture.paths.clone(), fixture.spawner(vec![]));
+    let (peer, _) = Peer::spawn(reader, writer);
+    assert!(initialize(&peer).await.capabilities.private);
+    request::<DaemonShutdown>(
+        &peer,
+        &ShutdownParams {
+            when: ShutdownWhen::Now,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), peer.closed())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_daemon_exits_without_clients_or_workers() {
+    let fixture = Fixture::new();
+    let daemon = Daemon::new(DaemonOptions {
+        settings: DaemonSettings {
+            idle_exit: 1,
+            ..DaemonSettings::default()
+        },
+        paths: fixture.paths.clone(),
+        spawner: fixture.spawner(vec![]),
+        private: false,
+    });
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::timeout(Duration::from_secs(1), daemon.finished())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn detached_idle_worker_closes_without_exiting_connected_daemon() {
+    let fixture = Fixture::new();
+    let daemon = Daemon::new(DaemonOptions {
+        settings: DaemonSettings {
+            idle_exit: 1,
+            ..DaemonSettings::default()
+        },
+        paths: fixture.paths.clone(),
+        spawner: fixture.spawner(vec![]),
+        private: false,
+    });
+    let (peer, mut events) = connection(&daemon);
+    initialize(&peer).await;
+    let session = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap()
+        .info
+        .session;
+    request::<SessionList>(
+        &peer,
+        &ListParams {
+            cwd: None,
+            running: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    request::<SessionDetach>(&peer, &SessionRef { session })
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let exited: ExitedParams =
+        serde_json::from_value(notification(&mut events, "session/exited").await).unwrap();
+    assert_eq!(exited.session, session);
+    assert_eq!(
+        request::<DaemonStatus>(&peer, &()).await.unwrap().workers,
+        0
+    );
+    stop(&peer, &daemon).await;
+}

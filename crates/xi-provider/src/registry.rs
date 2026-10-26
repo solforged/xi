@@ -45,6 +45,12 @@ impl Registry {
         &self.models
     }
 
+    /// Connection settings for a provider key.
+    #[must_use]
+    pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.get(name)
+    }
+
     /// Builds an adapter, sharing its provider's connection pool.
     ///
     /// Unknown model ids connect with reasoning disabled unless configured.
