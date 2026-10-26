@@ -212,7 +212,7 @@ impl Approvals {
             let cwd = entry
                 .cwd
                 .as_deref()
-                .map(crate::home)
+                .map(crate::view::home)
                 .unwrap_or_else(|| "(workspace unavailable)".into());
             rows.push(Line::default().dim(format!("session {} · {cwd}", &id[..8])));
         }

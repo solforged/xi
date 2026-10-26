@@ -1,0 +1,324 @@
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use xi_client::client::ClientNotification;
+use xi_protocol::Timestamp;
+use xi_protocol::methods::client::EventParams;
+use xi_protocol::model::Reasoning;
+
+use crate::screen::Screen;
+use crate::status::{Segment, fit};
+use crate::style::{Line, Role, lr};
+use crate::transcript::{SPINNER, tokens};
+use crate::{App, Focus, lineage};
+
+/// The footer's form of a level.
+fn short_reasoning(reasoning: Reasoning) -> &'static str {
+    match reasoning {
+        Reasoning::Minimal => "min",
+        Reasoning::Medium => "med",
+        level => level.name(),
+    }
+}
+
+pub(crate) fn home(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return if rest.as_os_str().is_empty() {
+            "~".into()
+        } else {
+            format!("~/{}", rest.display())
+        };
+    }
+    path.display().to_string()
+}
+
+impl App {
+    /// Prints the header and replays the head's branch, for resumed sessions.
+    pub(crate) fn attach(&mut self) {
+        let info = &self.launch.attached.info;
+        let mut header = vec![
+            Line::default()
+                .brass("ξ ")
+                .strong(Role::Ink, "xi")
+                .dim(format!(
+                    " {} · {}",
+                    env!("CARGO_PKG_VERSION"),
+                    home(&info.cwd)
+                ))
+                .truncate(self.cols),
+        ];
+        if !info.trusted {
+            header.push(
+                Line::default()
+                    .ink("  ")
+                    .brass("untrusted")
+                    .dim(" · repo config held back · xi trust")
+                    .truncate(self.cols),
+            );
+        }
+        self.commit.extend(header);
+        self.seen.clear();
+        self.launch
+            .attached
+            .events
+            .retain(|event| self.seen.insert(event.id));
+        self.resolved = self
+            .launch
+            .attached
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xi_protocol::EventKind::ApprovalResolved { call, .. }
+                | xi_protocol::EventKind::ToolResult { call, .. } => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        let events = lineage(&self.launch.attached.events, info.head);
+        let replayed = events.len().saturating_sub(1);
+        for event in events {
+            let n = ClientNotification::Event(EventParams {
+                session: info.session,
+                event,
+            });
+            let lines = self.transcript.apply(&n, self.cols);
+            self.commit.extend(lines);
+        }
+        if self.launch.attached.running {
+            self.started = Some(Instant::now());
+        } else {
+            self.transcript.end_turn();
+        }
+        self.transcript.partial(&self.launch.attached.partial);
+        for pending in &self.launch.attached.pending_approvals {
+            self.transcript.apply(
+                &ClientNotification::ApprovalPending(pending.clone()),
+                self.cols,
+            );
+        }
+        if replayed > 0 {
+            let note = self.transcript.note(vec![Line::default().dim(format!(
+                "  resumed · {replayed} events · {}",
+                home(&info.path)
+            ))]);
+            self.commit.extend(note);
+        }
+        if !self.transcript.asks().is_empty() {
+            self.open_own_approvals();
+        }
+    }
+
+    pub(crate) fn footer(&self, cols: usize) -> Line {
+        let d = |s: String| Line::default().dim(s);
+        let info = &self.launch.attached.info;
+        let workspace = home(&info.cwd);
+        let base = info
+            .cwd
+            .file_name()
+            .map_or_else(|| workspace.clone(), |n| n.to_string_lossy().into_owned());
+        let mut segs = vec![
+            Segment::new("workspace", Line::default().ink(workspace))
+                .short(Line::default().ink(base))
+                .left(),
+        ];
+        let model = &info.model;
+        segs.push(
+            Segment::new(
+                "model",
+                Line::default().ink(format!("{}/{}", model.provider, model.model)),
+            )
+            .short(Line::default().ink(&model.model)),
+        );
+        let reasoning = match &info.model_info {
+            Some(model) if model.reasoning.is_empty() => "no think".to_owned(),
+            Some(model) => format!("think {}", short_reasoning(model.resolve(info.reasoning))),
+            None => format!("think {}", short_reasoning(info.reasoning)),
+        };
+        segs.push(Segment::new("reasoning", d(reasoning)));
+        if let Some(model) = &info.model_info {
+            let window = model.context_window.max(1);
+            segs.push(Segment::new(
+                "context",
+                d(format!("ctx {}%", self.transcript.context * 100 / window)),
+            ));
+        }
+        let session = self.transcript.session;
+        if session.sent() > 0 {
+            segs.push(Segment::new(
+                "cache",
+                d(format!(
+                    "cache {}%",
+                    session.cache_read * 100 / session.sent()
+                )),
+            ));
+        }
+        if let Some(cost) = session.cost(info.model_info.as_ref().and_then(|m| m.pricing)) {
+            segs.push(Segment::new(
+                "cost",
+                Line::default().ink(format!("${cost:.2}")),
+            ));
+        }
+        if !info.trusted {
+            segs.push(Segment::new("trust", Line::default().brass("untrusted")));
+        }
+        if self.transcript.tainted {
+            segs.push(
+                Segment::new("taint", Line::default().murex("◆ tainted"))
+                    .short(Line::default().murex("◆")),
+            );
+        }
+        let asks = self.transcript.asks().len();
+        if asks > 0 {
+            segs.push(
+                Segment::new(
+                    "approvals",
+                    Line::default().brass(format!("? {asks} waiting · tab")),
+                )
+                .short(Line::default().brass(format!("?{asks}"))),
+            );
+        }
+        fit(segs, cols).line
+    }
+
+    pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
+        let cols = self.cols;
+        let mut lines = self.transcript.live(cols, self.frame);
+        if self.focus == Focus::Approval
+            && let Some(approvals) = &self.approvals
+        {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.extend(approvals.render(cols, self.session_id()));
+        }
+        if self.focus == Focus::Tree
+            && let Some(tree) = &self.tree
+        {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            let composer = self.editor.render(cols, Role::Dim, "").0.len();
+            let rows = self.rows.saturating_sub(composer + 3);
+            lines.extend(tree.render(cols, rows, Timestamp::now()));
+        }
+        if self.running() {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            let elapsed = self.started.map_or(0, |s| s.elapsed().as_secs());
+            let turn = self.transcript.turn;
+            let what = if self.transcript.thinking() {
+                "thinking"
+            } else {
+                "working"
+            };
+            let mut line = Line::default()
+                .brass(SPINNER[self.frame % SPINNER.len()])
+                .dim(format!(" {what} · {elapsed}s"));
+            if turn.sent() > 0 {
+                line = line.dim(format!(
+                    " · ↑ {} ↓ {}",
+                    tokens(turn.sent()),
+                    tokens(turn.output)
+                ));
+            }
+            lines.push(line.dim(" · esc stop").truncate(cols));
+        }
+        for text in &self.steering {
+            lines.push(lr(
+                Line::default()
+                    .ink("  ")
+                    .brass("» steer ")
+                    .ink(text.replace('\n', " ")),
+                Line::default().dim("at the next request"),
+                cols,
+            ));
+        }
+        for text in &self.queued {
+            lines.push(lr(
+                Line::default()
+                    .ink("  ")
+                    .dim("» queued ")
+                    .ink(text.replace('\n', " ")),
+                Line::default().dim("after this turn"),
+                cols,
+            ));
+        }
+        let overlay_rows = self
+            .rows
+            .saturating_sub(self.editor.render(cols, Role::Dim, "").0.len() + 3);
+        if self.focus == Focus::Models
+            && let Some(picker) = &self.picker
+        {
+            lines.extend(picker.render(cols, overlay_rows));
+        }
+        if self.focus == Focus::Sessions
+            && let Some(sessions) = &self.sessions
+        {
+            lines.extend(sessions.render(cols, overlay_rows, Timestamp::now()));
+        }
+        let mut overlay_cursor = None;
+        if self.focus == Focus::Settings
+            && let Some(settings) = &self.settings
+        {
+            let info = &self.launch.attached.info;
+            let (overlay, cursor) = settings.render(
+                cols,
+                overlay_rows.saturating_sub(lines.len()),
+                &info.model,
+                info.reasoning,
+                self.transcript.thinking_display(),
+                self.launch.tui_config.as_deref(),
+            );
+            overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
+            lines.extend(overlay);
+        }
+        if self.focus == Focus::Search
+            && let Some(search) = &self.search
+        {
+            lines.extend(
+                search
+                    .render(&self.history, cols)
+                    .into_iter()
+                    .take(overlay_rows),
+            );
+        }
+        if self.focus == Focus::Composer
+            && let Some(menu) = &self.completion
+        {
+            lines.extend(menu.render(cols, overlay_rows.min(8)));
+        }
+        let border = if self.focus != Focus::Composer {
+            Role::Dim
+        } else if self.transcript.tainted {
+            Role::Murex
+        } else {
+            Role::Brass
+        };
+        let hint = if self.running() {
+            "enter steers · alt+enter queues · esc stops"
+        } else {
+            "enter sends · ctrl+j new line · /help"
+        };
+        let (composer, (row, col)) = self.editor.render(cols, border, hint);
+        let top = lines.len();
+        lines.extend(composer);
+        lines.push(self.footer(cols));
+        let cursor =
+            overlay_cursor.or_else(|| (self.focus == Focus::Composer).then_some((top + row, col)));
+        (lines, cursor)
+    }
+
+    pub(crate) fn draw<W: std::io::Write>(
+        &mut self,
+        screen: &mut Screen<W>,
+    ) -> std::io::Result<()> {
+        for control in self.controls.drain(..) {
+            screen.control(&control)?;
+        }
+        let (live, cursor) = self.live();
+        let commit = std::mem::take(&mut self.commit);
+        screen.draw(&commit, &live, cursor, self.rows.saturating_sub(1))
+    }
+}
