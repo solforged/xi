@@ -27,11 +27,15 @@ pub async fn connect() -> io::Result<UnixStream> {
 ///
 /// # Errors
 /// Fails when runtime paths cannot be resolved, the initial connection fails for
-/// another reason, the daemon cannot be spawned, or connection retries time out.
-/// On timeout, returns the last connection error.
+/// another reason, the daemon cannot be spawned, the daemon exits unsuccessfully
+/// before accepting a connection, or connection retries time out. On timeout,
+/// returns the last connection error.
 pub async fn connect_or_start(exe: &Path) -> io::Result<UnixStream> {
-    let socket = runtime::socket(&runtime::dir()?);
-    let mut last_error = match UnixStream::connect(&socket).await {
+    connect_or_start_at(&runtime::socket(&runtime::dir()?), exe).await
+}
+
+async fn connect_or_start_at(socket: &Path, exe: &Path) -> io::Result<UnixStream> {
+    let mut last_error = match UnixStream::connect(socket).await {
         Ok(stream) => return Ok(stream),
         Err(error)
             if matches!(
@@ -43,7 +47,7 @@ pub async fn connect_or_start(exe: &Path) -> io::Result<UnixStream> {
         }
         Err(error) => return Err(error),
     };
-    Command::new(exe)
+    let mut daemon = Command::new(exe)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -55,14 +59,45 @@ pub async fn connect_or_start(exe: &Path) -> io::Result<UnixStream> {
     let mut delay = Duration::from_millis(25);
     loop {
         sleep_until((Instant::now() + delay).min(deadline)).await;
+        // A daemon that loses the lock race exits successfully and the winner
+        // listens; any other exit means nothing will ever listen.
+        if let Some(status) = daemon.try_wait()?
+            && !status.success()
+        {
+            return Err(io::Error::other(format!(
+                "the xi daemon exited ({status}) before listening; run `xi daemon` to see why"
+            )));
+        }
         if Instant::now() >= deadline {
             return Err(last_error);
         }
-        match timeout_at(deadline, UnixStream::connect(&socket)).await {
+        match timeout_at(deadline, UnixStream::connect(socket)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(error)) => last_error = error,
             Err(_) => return Err(last_error),
         }
         delay = (delay * 2).min(Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_daemon_start_is_reported_before_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("xi");
+        std::fs::write(&exe, "#!/bin/sh\nexit 2\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = connect_or_start_at(&dir.path().join("daemon.sock"), &exe)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(error.to_string().contains("exited"), "{error}");
     }
 }

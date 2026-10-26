@@ -472,6 +472,7 @@ impl Config {
         // The toolchain pin (mise and rust-toolchain files set it), so cargo
         // picks the same toolchain as outside.
         spec.env.push("RUSTUP_TOOLCHAIN".into());
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut path: Vec<PathBuf> = host("PATH")
             .map(|p| std::env::split_paths(&p).collect())
             .unwrap_or_default();
