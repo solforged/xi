@@ -2,13 +2,15 @@
 
 xi has a usable agent on Linux and macOS, an extension host with a TypeScript SDK, and a benchmark to measure features with. Features get added one at a time and stay in the default only when a measurement supports them. The oh-my-pi (omp) survey behind the queue is summarised in [What omp teaches](#what-omp-teaches).
 
+The planned process topology is one per-user daemon that routes and supervises, with one worker per open session. See the [design](design.md#architecture) and [build order](design.md#build-order). The current clients still embed the kernel or use `xi serve`; the daemon and worker split is not built yet.
+
 ## Two tracks
 
-Work runs on two tracks that only meet at two interfaces, so neither has to wait for the other.
+Sandbox and feature work meet at the two interfaces below. The daemon work in the Platform queue also gates the TUI's move to a daemon client.
 
 | Track | Owns | Interface to the other track |
 |---|---|---|
-| Platform | `xi-sandbox`, `xi-policy`, workspace trust, egress proxy, secrets | `xi_sandbox::Spec` (what a process may touch) and `xi_tools::Crossing` (what a call asks policy for) |
+| Platform | `xi-sandbox`, `xi-policy`, workspace trust, egress proxy, secrets, daemon and worker lifecycle | `xi_sandbox::Spec` (what a process may touch) and `xi_tools::Crossing` (what a call asks policy for) |
 | Features | tools, context, compaction, extensions, subagents, clients | A feature that needs new access declares a crossing or a spec field. It never changes the sandbox itself. |
 
 A feature lands behind a toggle: a tool name for `--tools`, a config key, or an extension package. `xi-bench` then compares it against the baseline arm on the same tasks and model. A feature goes into the default set only when it pays for its tokens and time on the suite, or when safety needs it.
@@ -32,7 +34,7 @@ Rows 1 to 5 are done; their results are below.
 | 7 | Todo or plan tool | package | Pass rate on multi-step tasks (`invoice-rounding`, `revision-store`), prompt size. |
 | 8 | `fetch` and web search, with taint wired in | package plus platform egress proxy | Tasks that need docs; taint must turn later egress into `ask`. |
 | 9 | Memory | package | Last: needs multi-session tasks to measure. |
-| 10 | TUI | client | Not benchmarked; replaces line mode when the protocol is stable. |
+| 10 | TUI | client | Implemented with the kernel in process. Moves to a daemon client in build step 7, after steps 5 and 6; replaces line mode when the protocol is stable. Not benchmarked. |
 
 Interactive steering in line mode is missing (the RPC path queues prompts already) and belongs with the TUI. A response that stops at `max_tokens` without tool calls ends the turn; two `parallel-kernels` baseline failures ended that way, so continuing such a turn is worth measuring.
 
@@ -40,6 +42,9 @@ Interactive steering in line mode is missing (the RPC path queues prompts alread
 
 | Item | Why |
 |---|---|
+| Daemon and worker split, build step 5 | Planned. Add protocol types, the worker entry point over a pipe and `xi-daemon` private-instance mode; move `xi -p` and the benchmark to private instances without changing benchmark argv. See [processes](design.md#processes), [protocol](design.md#protocol) and [build order](design.md#build-order). |
+| Per-user daemon, build step 6 | Planned after step 5. Add the socket and peer-uid check, lock-based startup, idle exit, launchd and systemd units, `notify` and `approval_timeout`. See [daemon socket security](design.md#daemon-socket) and [build order](design.md#build-order). |
+| Daemon clients and scheduler, build step 7 | Planned after step 6. Move row 10's TUI from the in-process kernel to a daemon client; add scheduler leases. See [crate map](design.md#crate-map) and [build order](design.md#build-order). |
 | Egress proxy and in-namespace forwarder | Tools and extensions have no network at all today; `fetch`, package installs and `git push` need it. Extensions that declare `net` refuse to start until it exists. |
 | Frontier-model runs | Every measurement so far uses local models. The Anthropic adapter passes mocked transcripts only; there is no API key on these machines. |
 | Credentials from the keychain | Only env vars and 0600 files work now. |
