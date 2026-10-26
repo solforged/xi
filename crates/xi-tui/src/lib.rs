@@ -148,10 +148,15 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     };
     app.attach().await;
     let raw = Raw::enter()?;
-    let mut screen = Screen::new(std::io::stdout(), color);
+    let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     while !app.quit {
+        // The terminal may have reflowed since the last resize event, so the
+        // rewind counts rows at the width it has now.
+        if let Ok((c, _)) = crossterm::terminal::size() {
+            screen.resize(usize::from(c));
+        }
         app.draw(&mut screen)?;
         tokio::select! {
             // Events first: the kernel publishes a turn's last events before
