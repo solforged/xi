@@ -17,6 +17,7 @@ fn started() -> EventKind {
             model: "claude".into(),
         },
         xi_version: "0.0.0".into(),
+        parent_session: None,
     }
 }
 
@@ -184,6 +185,8 @@ fn context_and_taint_follow_the_branch() {
             EventKind::Compaction {
                 summary: "old".into(),
                 tokens_before: 10,
+                kept: None,
+                usage: None,
             },
         )
         .unwrap()
@@ -194,6 +197,8 @@ fn context_and_taint_follow_the_branch() {
             EventKind::Compaction {
                 summary: "new".into(),
                 tokens_before: 20,
+                kept: None,
+                usage: None,
             },
         )
         .unwrap()
@@ -214,4 +219,38 @@ fn context_and_taint_follow_the_branch() {
     assert_eq!(log.is_tainted(u2), Some(true));
     assert_eq!(log.is_tainted(sibling), Some(false));
     assert_eq!(log.is_tainted(EventId::generate()), None);
+}
+
+#[test]
+fn compaction_keeps_recent_messages_and_rejects_bad_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(session_file(&dir), started()).unwrap();
+    let root = log.root().id;
+    let u1 = log.append(root, user("one")).unwrap().id;
+    let u2 = log.append(u1, user("two")).unwrap().id;
+    let u3 = log.append(u2, user("three")).unwrap().id;
+    let sibling = log.append(root, user("other")).unwrap().id;
+    let compaction = |kept| EventKind::Compaction {
+        summary: "s".into(),
+        tokens_before: 1,
+        kept: Some(kept),
+        usage: None,
+    };
+
+    for bad in [sibling, root] {
+        let error = log.append(u3, compaction(bad)).unwrap_err();
+        assert!(matches!(error, Error::Rejected(Violation::BadKept(_, id)) if id == bad));
+    }
+    let c = log.append(u3, compaction(u2)).unwrap().id;
+    let u4 = log.append(c, user("four")).unwrap().id;
+
+    let context = log.context(u4).unwrap();
+    assert_eq!(context.summary, Some("s"));
+    let ids: Vec<_> = context.events.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [u2, u3, u4]);
+
+    drop(log);
+    let log = SessionLog::open(session_file(&dir)).unwrap();
+    let ids: Vec<_> = log.context(u4).unwrap().events.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [u2, u3, u4]);
 }

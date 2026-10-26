@@ -40,6 +40,10 @@ pub enum EventKind {
         model: ModelRef,
         /// Version of the xi binary that created the session.
         xi_version: String,
+        /// The session that spawned this one as a subagent. Child logs live
+        /// in the same directory as their parent's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session: Option<SessionId>,
     },
     /// Input from the user.
     UserMessage {
@@ -104,13 +108,24 @@ pub enum EventKind {
         /// Why the content is untrusted.
         reason: String,
     },
-    /// Summary standing in for every ancestor of this event when building
-    /// context. The ancestors stay in the log.
+    /// Summary standing in for older context. Context built from this
+    /// event's descendants is: the summary, then the events from `kept`
+    /// through this event's parent, then this event's descendants. Without
+    /// `kept`, every ancestor is replaced. The ancestors stay in the log.
     Compaction {
         /// The summary given to the model.
         summary: String,
         /// Context size before compaction.
         tokens_before: u64,
+        /// First ancestor kept verbatim after the summary. It is a
+        /// `user_message` or `assistant_message`, so no tool call is
+        /// separated from its result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kept: Option<EventId>,
+        /// Token use of the request that wrote the summary. Absent when an
+        /// extension supplied it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
     },
     /// The user switched models.
     ModelChanged {

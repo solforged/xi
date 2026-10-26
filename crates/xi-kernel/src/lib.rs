@@ -260,6 +260,7 @@ impl Session {
                 cwd: config.workspace.clone(),
                 model: config.model.clone(),
                 xi_version: env!("CARGO_PKG_VERSION").into(),
+                parent_session: None,
             },
         )?;
         let root = log.root().clone();

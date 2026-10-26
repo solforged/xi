@@ -304,6 +304,7 @@ fn context_groups_results_and_repairs_dangling_calls_after_compaction() {
                 model: "test".into(),
             },
             xi_version: "test".into(),
+            parent_session: None,
         },
     )
     .unwrap();
@@ -315,6 +316,8 @@ fn context_groups_results_and_repairs_dangling_calls_after_compaction() {
         EventKind::Compaction {
             summary: "summary".into(),
             tokens_before: 42,
+            kept: None,
+            usage: None,
         },
         EventKind::AssistantMessage {
             model: ModelRef {
