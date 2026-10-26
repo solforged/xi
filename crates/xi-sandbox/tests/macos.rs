@@ -73,6 +73,32 @@ fn workspace_sockets_can_be_created_and_protected_sockets_cannot() {
 }
 
 #[test]
+fn roots_under_private_tmp_are_reachable_through_the_tmp_link() {
+    let fixture = Fixture::in_dir(Path::new("/tmp"));
+    let alias = Path::new("/tmp").join(fixture.workspace.strip_prefix("/private/tmp").unwrap());
+    std::fs::write(fixture.workspace.join("note"), "kept\n").unwrap();
+    let output = sh(
+        &fixture.spec(),
+        &format!(
+            "cd '{0}' && cat note && echo written > '{0}/new' && ls '{0}' >/dev/null",
+            alias.display()
+        ),
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "kept\n");
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("new")).unwrap(),
+        "written\n"
+    );
+    // The link resolves; the host's temporary directory stays unlisted.
+    for path in ["/tmp", "/private/tmp"] {
+        let output = sh(&fixture.spec(), &format!("ls '{path}'"));
+        assert!(!output.status.success(), "listed {path}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn quoted_root_names_and_symlinked_roots_do_not_inject_policy() {
     let fixture = Fixture::new();
     let quoted = fixture
