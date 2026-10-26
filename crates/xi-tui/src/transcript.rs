@@ -1162,6 +1162,7 @@ mod client_tests {
             &ClientNotification::Reset(ResetParams {
                 session,
                 attempt: 1,
+                sequence: 0,
             }),
             60,
         );
@@ -1171,6 +1172,7 @@ mod client_tests {
             &ClientNotification::Delta(DeltaParams {
                 session,
                 attempt: 1,
+                sequence: 0,
                 delta: Delta::Text {
                     text: "new attempt".into(),
                 },

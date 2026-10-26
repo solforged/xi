@@ -147,14 +147,21 @@ struct Worker {
     buffered: Vec<(String, Value)>,
     tools: HashMap<ToolCallId, String>,
     approval: ApprovalPolicy,
-    turns: usize,
+    compactions: usize,
+    checking_idle: bool,
     idle_since: Instant,
+    activity: u64,
     closing: bool,
     close_deadline: Option<Instant>,
     close_replies: Vec<(u64, RequestId)>,
 }
 
 impl Worker {
+    fn reset_idle(&mut self) {
+        self.idle_since = Instant::now();
+        self.activity = self.activity.wrapping_add(1);
+    }
+
     fn begin_close(&mut self, key: u64, commands: &mpsc::UnboundedSender<Command>) {
         self.closing = true;
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -205,6 +212,11 @@ enum Command {
     Exited {
         worker: u64,
         status: Option<i32>,
+    },
+    IdleChecked {
+        worker: u64,
+        activity: u64,
+        result: Result<bool, RpcError>,
     },
     CloseExpired {
         worker: u64,
@@ -319,7 +331,7 @@ impl Router {
                                 .worker_id(session)
                                 .and_then(|id| self.workers.get_mut(&id))
                         {
-                            worker.idle_since = Instant::now();
+                            worker.reset_idle();
                         }
                     }
                 }
@@ -350,6 +362,11 @@ impl Router {
                 self.forwarded(client, id, worker, &method, checkout, result);
             }
             Command::WorkerCall { worker, call } => self.worker_call(worker, call),
+            Command::IdleChecked {
+                worker,
+                activity,
+                result,
+            } => self.idle_checked(worker, activity, result),
             Command::Exited { worker, status } => self.worker_exited(worker, status),
             Command::CloseExpired { worker, deadline } => {
                 if let Some(worker) = self.workers.get_mut(&worker)
@@ -432,7 +449,7 @@ impl Router {
                         .worker_id(session.session)
                         .and_then(|id| self.workers.get_mut(&id))
                 {
-                    worker.idle_since = Instant::now();
+                    worker.reset_idle();
                 }
                 self.respond(client, id, Ok(Value::Null));
             }
@@ -443,7 +460,16 @@ impl Router {
                 {
                     connection.watches_running = true;
                 }
-                let live = self.summaries();
+                let mut live = self.summaries();
+                let running: Vec<_> = self
+                    .workers
+                    .values()
+                    .filter_map(|worker| {
+                        let info = worker.info.as_ref()?;
+                        (!worker.closing)
+                            .then(|| (info.session, worker_running(&worker.peer, info)))
+                    })
+                    .collect();
                 let root = sessions_root(&self.options.paths);
                 let Some(peer) = self
                     .clients
@@ -453,13 +479,26 @@ impl Router {
                     return Ok(());
                 };
                 tokio::spawn(async move {
-                    let result =
+                    let result = async {
+                        let running = futures::future::try_join_all(running.into_iter().map(
+                            |(session, reply)| async move {
+                                Ok::<_, RpcError>((session, reply?.await?))
+                            },
+                        ))
+                        .await?
+                        .into_iter()
+                        .collect::<HashMap<_, _>>();
+                        for summary in &mut live {
+                            if let Some(running) = running.get(&summary.session) {
+                                summary.running = *running;
+                            }
+                        }
                         tokio::task::spawn_blocking(move || list_sessions(&root, live, filters))
-                            .await;
-                    let result = match result {
-                        Ok(result) => result.and_then(encode),
-                        Err(error) => Err(internal(error)),
-                    };
+                            .await
+                            .map_err(internal)?
+                            .and_then(encode)
+                    }
+                    .await;
                     let _ = peer.respond(id, result);
                 });
             }
@@ -506,6 +545,16 @@ impl Router {
         request: RequestId,
         params: WorkerStartParams,
     ) -> Result<(), RpcError> {
+        let (name, path) = match &params {
+            WorkerStartParams::Create(create) => ("cwd", &create.cwd),
+            WorkerStartParams::Open(open) => ("log path", &open.path),
+        };
+        if !path.is_absolute() {
+            return Err(RpcError::new(
+                RpcError::INVALID_PARAMS,
+                format!("session {name} must be absolute: {}", path.display()),
+            ));
+        }
         if self.shutdown.is_some() {
             return Err(RpcError::new(
                 RpcError::WORKER_EXITED,
@@ -597,8 +646,10 @@ impl Router {
                     WorkerStartParams::Create(params) => params.options.approval,
                     WorkerStartParams::Open(params) => params.options.approval,
                 },
-                turns: 0,
+                compactions: 0,
+                checking_idle: false,
                 idle_since: Instant::now(),
+                activity: 0,
                 closing: false,
                 close_deadline: None,
                 close_replies: Vec::new(),
@@ -707,16 +758,17 @@ impl Router {
         let Some(worker) = self.workers.get_mut(&key) else {
             return;
         };
+        if method == "session/compact" {
+            worker.compactions += 1;
+        }
         if matches!(method, "session/prompt" | "session/compact") {
-            worker.turns += 1;
+            worker.reset_idle();
         }
         if method == "session/close" {
             worker.begin_close(key, &self.commands);
         }
         self.forwards += 1;
-        let peer = worker.peer.clone();
         let commands = self.commands.clone();
-        let method = method.to_owned();
         let checkout = if method == "session/checkout" {
             params
                 .get("event")
@@ -724,11 +776,13 @@ impl Router {
         } else {
             None
         };
+        let reply = worker.peer.start_request_value(method, params);
+        let method = method.to_owned();
         tokio::spawn(async move {
-            let result = peer
-                .request_value(&method, params)
-                .await
-                .map_err(peer_error);
+            let result = match reply {
+                Ok(reply) => reply.await.map_err(peer_error),
+                Err(error) => Err(peer_error(error)),
+            };
             let _ = commands.send(Command::Forwarded {
                 client,
                 id,
@@ -752,11 +806,11 @@ impl Router {
         self.forwards = self.forwards.saturating_sub(1);
         let mut wait_exit = false;
         if let Some(worker) = self.workers.get_mut(&key) {
+            if method == "session/compact" {
+                worker.compactions = worker.compactions.saturating_sub(1);
+            }
             if matches!(method, "session/prompt" | "session/compact") {
-                worker.turns = worker.turns.saturating_sub(1);
-                if worker.turns == 0 {
-                    worker.idle_since = Instant::now();
-                }
+                worker.reset_idle();
             }
             if result.is_ok() {
                 if method == "session/attach" {
@@ -796,7 +850,7 @@ impl Router {
                     }
                     wait_exit = true;
                 } else {
-                    worker.idle_since = Instant::now();
+                    worker.reset_idle();
                 }
             }
         }
@@ -1029,21 +1083,36 @@ impl Router {
                 .iter()
                 .filter_map(|(key, worker)| {
                     let info = worker.info.as_ref()?;
-                    (worker.turns == 0
+                    (worker.compactions == 0
+                        && !worker.checking_idle
                         && !worker.closing
                         && !self.attached(info.session)
                         && worker.idle_since.elapsed() >= idle)
-                        .then_some((*key, info.session))
+                        .then_some(*key)
                 })
                 .collect();
-            for (key, session) in expired {
-                self.forward(
-                    None,
-                    None,
-                    key,
-                    "session/close",
-                    json!({ "session": session }),
-                );
+            for key in expired {
+                let Some(worker) = self.workers.get_mut(&key) else {
+                    continue;
+                };
+                let Some(info) = worker.info.as_ref() else {
+                    continue;
+                };
+                worker.checking_idle = true;
+                let activity = worker.activity;
+                let reply = worker_running(&worker.peer, info);
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let result = match reply {
+                        Ok(reply) => reply.await,
+                        Err(error) => Err(error),
+                    };
+                    let _ = commands.send(Command::IdleChecked {
+                        worker: key,
+                        activity,
+                        result,
+                    });
+                });
             }
             if self.workers.is_empty()
                 && self.starts.is_empty()
@@ -1052,6 +1121,38 @@ impl Router {
             {
                 self.begin_shutdown(ShutdownWhen::Idle);
             }
+        }
+    }
+
+    fn idle_checked(&mut self, key: u64, activity: u64, result: Result<bool, RpcError>) {
+        let Some(session) = self
+            .workers
+            .get(&key)
+            .and_then(|worker| worker.info.as_ref())
+            .map(|info| info.session)
+        else {
+            return;
+        };
+        let attached = self.attached(session);
+        let Some(worker) = self.workers.get_mut(&key) else {
+            return;
+        };
+        worker.checking_idle = false;
+        if worker.closing || worker.compactions > 0 || worker.activity != activity || attached {
+            return;
+        }
+        if matches!(result, Ok(false)) {
+            // Cancelled steering can retain an unanswered prompt while no turn runs.
+            // Closing an idle worker rejects that input instead of keeping it alive.
+            self.forward(
+                None,
+                None,
+                key,
+                "session/close",
+                json!({ "session": session }),
+            );
+        } else {
+            worker.reset_idle();
         }
     }
 
@@ -1090,7 +1191,7 @@ impl Router {
                     cwd: info.cwd.clone(),
                     model: info.model.clone(),
                     head: (!worker.closing).then_some(info.head),
-                    running: !worker.closing && worker.turns > 0,
+                    running: false,
                     pending_approvals: if worker.closing {
                         0
                     } else {
@@ -1104,6 +1205,25 @@ impl Router {
             })
             .collect()
     }
+}
+
+fn worker_running(
+    peer: &Peer,
+    info: &SessionDetails,
+) -> Result<impl Future<Output = Result<bool, RpcError>> + Send + 'static + use<>, RpcError> {
+    let reply = peer
+        .start_request_value(
+            "session/attach",
+            json!({ "session": info.session, "since": info.head }),
+        )
+        .map_err(peer_error)?;
+    Ok(async move {
+        let snapshot = reply.await.map_err(peer_error)?;
+        snapshot
+            .get("running")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| internal("worker snapshot has no running flag"))
+    })
 }
 
 fn remember_tools(tools: &mut HashMap<ToolCallId, String>, event: &Event) {

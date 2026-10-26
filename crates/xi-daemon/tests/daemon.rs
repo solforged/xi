@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use xi_client::peer::{Incoming, Peer, PeerError};
 use xi_daemon::{Daemon, DaemonOptions, InProcessSpawner, Spawner, WorkerProcess};
 use xi_kernel::Backend;
@@ -35,6 +35,21 @@ impl Provider for Script {
                 }
             }
             Ok(response)
+        })
+    }
+}
+
+struct WaitingProvider(Arc<Notify>);
+
+impl Provider for WaitingProvider {
+    fn stream<'a>(
+        &'a self,
+        _: &'a Request,
+        _: &'a mut (dyn FnMut(Delta) + Send),
+    ) -> BoxFuture<'a, Result<Response, xi_provider::Error>> {
+        Box::pin(async move {
+            self.0.notify_one();
+            std::future::pending().await
         })
     }
 }
@@ -71,11 +86,14 @@ impl Fixture {
     }
 
     fn spawner(&self, responses: Vec<Response>) -> Arc<dyn Spawner> {
-        let script = Arc::new(Script(Mutex::new(responses.into())));
+        self.provider_spawner(Arc::new(Script(Mutex::new(responses.into()))))
+    }
+
+    fn provider_spawner(&self, provider: Arc<dyn Provider>) -> Arc<dyn Spawner> {
         Arc::new(InProcessSpawner {
             paths: self.paths.clone(),
             backend: Some(Arc::new(move || Backend {
-                provider: script.clone(),
+                provider: provider.clone(),
                 model: ModelInfo {
                     provider: "anthropic".into(),
                     id: "claude-sonnet-5-5".into(),
@@ -308,6 +326,212 @@ async fn initialization_is_required_and_versions_must_match() {
         RpcError::NOT_INITIALIZED
     );
     assert!(!initialize(&peer).await.capabilities.private);
+    stop(&peer, &daemon).await;
+}
+
+#[tokio::test]
+async fn relative_create_and_open_paths_are_rejected_before_starting_workers() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], false);
+    let (peer, _) = connection(&daemon);
+    initialize(&peer).await;
+    let mut create = fixture.create();
+    create.cwd = ".".into();
+    assert_eq!(
+        error_code(request::<SessionCreate>(&peer, &create).await),
+        RpcError::INVALID_PARAMS
+    );
+    assert_eq!(
+        error_code(
+            request::<SessionOpen>(
+                &peer,
+                &OpenParams {
+                    path: ".".into(),
+                    options: SessionOptions::default(),
+                },
+            )
+            .await,
+        ),
+        RpcError::INVALID_PARAMS
+    );
+    assert_eq!(
+        request::<DaemonStatus>(&peer, &()).await.unwrap().workers,
+        0
+    );
+    stop(&peer, &daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn back_to_back_prompt_and_cancel_always_cancel_the_turn() {
+    let fixture = Fixture::new();
+    let daemon = Daemon::new(DaemonOptions {
+        settings: DaemonSettings::default(),
+        paths: fixture.paths.clone(),
+        spawner: fixture.provider_spawner(Arc::new(WaitingProvider(Arc::new(Notify::new())))),
+        private: false,
+    });
+    let (peer, _) = connection(&daemon);
+    initialize(&peer).await;
+    let session = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap()
+        .info
+        .session;
+    for _ in 0..64 {
+        let prompt = peer
+            .start_request_value(
+                "session/prompt",
+                serde_json::to_value(PromptParams {
+                    session,
+                    content: vec![Block::Text {
+                        text: "hello".into(),
+                    }],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let cancel = peer
+            .start_request_value(
+                "session/cancel",
+                serde_json::to_value(SessionRef { session }).unwrap(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome: PromptResult = serde_json::from_value(
+            tokio::time::timeout(Duration::from_secs(8), prompt)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(outcome.cancelled);
+    }
+    stop(&peer, &daemon).await;
+}
+
+#[tokio::test]
+async fn retained_steering_is_not_running_and_does_not_prevent_idle_close() {
+    let fixture = Fixture::new();
+    let started = Arc::new(Notify::new());
+    let daemon = Daemon::new(DaemonOptions {
+        settings: DaemonSettings {
+            idle_exit: 1,
+            ..DaemonSettings::default()
+        },
+        paths: fixture.paths.clone(),
+        spawner: fixture.provider_spawner(Arc::new(WaitingProvider(started.clone()))),
+        private: false,
+    });
+    let (peer, mut events) = connection(&daemon);
+    initialize(&peer).await;
+    let created = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap();
+    let session = created.info.session;
+    let turn = peer
+        .start_request_value(
+            "session/prompt",
+            serde_json::to_value(PromptParams {
+                session,
+                content: vec![Block::Text {
+                    text: "first".into(),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), started.notified())
+        .await
+        .unwrap();
+    let steering = peer
+        .start_request_value(
+            "session/prompt",
+            serde_json::to_value(PromptParams {
+                session,
+                content: vec![Block::Text {
+                    text: "retain until another submission".into(),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    // The snapshot request is ordered after steering registration in the worker.
+    assert!(
+        request::<SessionAttach>(
+            &peer,
+            &AttachParams {
+                session,
+                since: None,
+            },
+        )
+        .await
+        .unwrap()
+        .running
+    );
+    request::<SessionCancel>(&peer, &SessionRef { session })
+        .await
+        .unwrap();
+    let outcome: PromptResult = serde_json::from_value(
+        tokio::time::timeout(Duration::from_secs(8), turn)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(outcome.cancelled);
+    tokio::pin!(steering);
+    assert!(futures::poll!(&mut steering).is_pending());
+    let listed = request::<SessionList>(&peer, &ListParams::default())
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].running);
+    assert!(
+        !request::<SessionAttach>(
+            &peer,
+            &AttachParams {
+                session,
+                since: None,
+            },
+        )
+        .await
+        .unwrap()
+        .running
+    );
+    request::<SessionList>(
+        &peer,
+        &ListParams {
+            cwd: None,
+            running: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    request::<SessionDetach>(&peer, &SessionRef { session })
+        .await
+        .unwrap();
+    let exited: ExitedParams =
+        serde_json::from_value(notification(&mut events, "session/exited").await).unwrap();
+    assert_eq!(exited.session, session);
+    assert_eq!(exited.status, Some(0));
+    assert!(steering.await.is_err());
+    assert_eq!(
+        request::<DaemonStatus>(&peer, &()).await.unwrap().workers,
+        0
+    );
+    let reopened = request::<SessionOpen>(
+        &peer,
+        &OpenParams {
+            path: created.info.path,
+            options: SessionOptions::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.info.session, session);
     stop(&peer, &daemon).await;
 }
 
@@ -749,6 +973,7 @@ async fn stubborn_workers_are_killed_and_closing_sessions_are_not_live() {
                         },
                         events: Vec::new(),
                         partial: Vec::new(),
+                        stream_sequence: 0,
                         running: false,
                         pending_approvals: Vec::new(),
                     },

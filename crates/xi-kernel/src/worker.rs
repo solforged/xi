@@ -86,6 +86,7 @@ struct Mirror {
     events: Vec<Event>,
     index: HashMap<EventId, usize>,
     partial: Vec<Block>,
+    stream_sequence: u64,
     tools: HashMap<ToolCallId, String>,
     pending: Vec<PendingApproval>,
 }
@@ -104,6 +105,9 @@ impl Mirror {
                         self.tools.insert(id.clone(), name.clone());
                     }
                 }
+            }
+            EventKind::UserMessage { .. } | EventKind::TurnFailed { .. } => {
+                self.partial.clear();
             }
             EventKind::ModelChanged { model } => {
                 self.info.model = model.clone();
@@ -168,6 +172,7 @@ impl Mirror {
             info: self.info.clone(),
             events: self.events[start..].to_vec(),
             partial: self.partial.clone(),
+            stream_sequence: self.stream_sequence,
             running,
             pending_approvals: self.pending.clone(),
         })
@@ -306,12 +311,25 @@ where
         }
     };
     if let Some(active) = worker.as_ref() {
-        if !graceful {
+        if graceful {
+            active.session.close();
+        } else {
             active.session.stop_requests();
         }
         active.session.wait_idle().await;
     }
-    while requests.join_next().await.is_some() {}
+    // Requests still in flight, such as steering prompts rejected by close,
+    // get their replies before the pipe closes.
+    while let Some(completed) = requests.join_next().await {
+        if let Ok((id, result)) = completed {
+            drain(&mut notifications, &mut worker, &peer);
+            let result = result.map(|completion| match completion {
+                Completion::Value(value) => value,
+                Completion::Checkout(_) => Value::Null,
+            });
+            let _ = peer.respond(id, result);
+        }
+    }
     bus.shutdown_extensions().await;
     peer.close();
     peer.closed().await;
@@ -325,8 +343,12 @@ async fn start(
     bus: &EventBus,
 ) -> RpcResult<Worker> {
     let (options, cwd, log, model) = match params {
-        WorkerStartParams::Create(params) => (params.options, params.cwd, None, params.model),
+        WorkerStartParams::Create(params) => {
+            validate_absolute(&params.cwd, "cwd")?;
+            (params.options, params.cwd, None, params.model)
+        }
         WorkerStartParams::Open(params) => {
+            validate_absolute(&params.path, "session log path")?;
             validate_options(&params.options)?;
             let log = SessionLog::open(params.path).map_err(|error| kernel_error(error.into()))?;
             let EventKind::SessionStarted { cwd, .. } = &log.root().kind else {
@@ -382,6 +404,7 @@ async fn start(
         events: Vec::with_capacity(state.log.events().len()),
         index: HashMap::new(),
         partial: Vec::new(),
+        stream_sequence: 0,
         tools: HashMap::new(),
         pending: Vec::new(),
     };
@@ -400,12 +423,17 @@ fn validate_options(options: &SessionOptions) -> RpcResult<()> {
         .chain(options.session_dir.iter())
         .chain(options.extensions.iter())
     {
-        if !path.is_absolute() {
-            return Err(RpcError::new(
-                RpcError::INVALID_PARAMS,
-                format!("session option path must be absolute: {}", path.display()),
-            ));
-        }
+        validate_absolute(path, "session option path")?;
+    }
+    Ok(())
+}
+
+fn validate_absolute(path: &Path, name: &str) -> RpcResult<()> {
+    if !path.is_absolute() {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            format!("{name} must be absolute: {}", path.display()),
+        ));
     }
     Ok(())
 }
@@ -515,7 +543,9 @@ fn mirror(worker: &mut Option<Worker>, peer: &Peer, notification: Notification) 
             active.mirror.event(&params.event);
             let _ = peer.notify::<EventAppended>(&params);
         }
-        Notification::Delta(params) if params.session == active.session.id() => {
+        Notification::Delta(mut params) if params.session == active.session.id() => {
+            active.mirror.stream_sequence += 1;
+            params.sequence = active.mirror.stream_sequence;
             match &params.delta {
                 Delta::Text { text } => {
                     crate::push_partial(&mut active.mirror.partial, text, false)
@@ -527,7 +557,9 @@ fn mirror(worker: &mut Option<Worker>, peer: &Peer, notification: Notification) 
             }
             let _ = peer.notify::<StreamDelta>(&params);
         }
-        Notification::Reset(params) if params.session == active.session.id() => {
+        Notification::Reset(mut params) if params.session == active.session.id() => {
+            active.mirror.stream_sequence += 1;
+            params.sequence = active.mirror.stream_sequence;
             active.mirror.partial.clear();
             let _ = peer.notify::<StreamReset>(&params);
         }

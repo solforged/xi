@@ -79,7 +79,7 @@ Other agent behavior belongs in an extension or a client.
 
 | Transition | Behavior |
 |---|---|
-| Start | Use OS socket activation where installed: a launchd LaunchAgent with a `Sockets` entry on macOS, or a systemd user `.socket` unit on Linux. Otherwise a client finding no listener spawns `xi daemon`. The daemon takes an exclusive lock on `daemon.lock` before binding; a losing racer exits and the client retries the connection. |
+| Start | Use OS socket activation where installed: a launchd LaunchAgent with a `Sockets` entry on macOS, or a systemd user `.socket` unit on Linux. Otherwise a client finding no listener spawns `xi daemon`, and reports the daemon's exit status if it exits before listening. The daemon takes an exclusive lock on `daemon.lock` before binding; a losing racer exits and the client retries the connection. Without an activation descriptor, the daemon refuses to replace a socket that still accepts connections and removes an existing socket only when connecting to it is refused. |
 | Daemon idle exit | Exit with no workers and no connected clients after `[daemon] idle_exit`, default 10 minutes. |
 | Client detach | Closing a client cancels nothing. Turns keep running and any client can attach later. Cancellation requires an explicit request. |
 | Worker exit | Exit when the session is closed, or when idle with no attached clients for `idle_exit`. |
@@ -132,10 +132,10 @@ Client → daemon requests:
 | `initialize` | `{protocol_version, client: {name, version}}` → `{protocol_version, daemon_version, capabilities: {private}}` | Initialize the connection and require the exact protocol version. `private` is true when the daemon has no listener. |
 | `session/create` | `{cwd, model?, options}` → attach result | Spawn a worker and attach the caller. |
 | `session/open` | `{path, options}` → attach result | Spawn a worker for an existing log. If a live worker holds the same canonical path, fail with -32005 and return its session id so the client can attach instead. |
-| `session/attach` | `{session, since?}` → `{info, events, partial, running, pending_approvals}` | Subscribe the connection to the session's notifications. `since` is the last event id the client already has; `events` contains the events after it on disk, or the whole log without `since`. `partial` contains in-flight assistant blocks not yet persisted. |
+| `session/attach` | `{session, since?}` → `{info, events, partial, running, pending_approvals, stream_sequence}` | Subscribe the connection to the session's notifications. `since` is the last event id the client already has; `events` contains the events after it on disk, or the whole log without `since`. `partial` contains in-flight assistant blocks not yet persisted. |
 | `session/detach` | `{session}` → null | Unsubscribe; the turn keeps running. |
-| `session/list` | `{cwd?, running?}` → `[{session, path, cwd, model, head, running, pending_approvals, parent_session}]` | List live sessions and sessions found in the session directories; read root lines only. |
-| `session/close` | `{session}` → null | Stop the worker; fail while a turn runs. |
+| `session/list` | `{cwd?, running?}` → `[{session, path, cwd, model, head, running, pending_approvals, parent_session}]` | List live sessions and sessions found in the session directories; read root lines only. `running` is the worker's own turn state, so a steering prompt left queued after a cancel does not count. |
+| `session/close` | `{session}` → null | Stop the worker; fail while a turn runs. Steering prompts left queued after a cancel are rejected with an error. |
 | `session/prompt` | `{session, content}` → `{head, failed, cancelled, text}` | Route to the worker; run a turn and return its outcome when it ends. `text` is the final assistant response text. |
 | `session/cancel` | `{session}` → null | Route to the worker; stop the running turn. |
 | `session/checkout` | `{session, event}` → null | Route to the worker; move the head to an earlier event to branch. Idle only. |
@@ -159,15 +159,15 @@ Client → daemon requests:
 | `max_turns` | Optional integer, absent means 200 | Turn limit (`--max-turns`). |
 | `approval` | `ApprovalPolicy`: `client` (default), `allow`, or `deny` | `client` waits for a client approval; `allow` and `deny` resolve asks headlessly. |
 
-The attach result is `{info, events, partial, running, pending_approvals}` for create, open and attach. `info` is `SessionDetails`: `{session, path, head, cwd, trusted, model, model_info?, parent_session?}`. Saved sessions without a live worker have no `head` in `session/list`. The daemon guarantees at-least-once event delivery between an attach result and subsequent `event/appended` notifications, so clients deduplicate events by id. The prompt result's `failed`, `cancelled` and `text` fields come from the kernel's `TurnOutcome` and default on deserialization to false, false and an empty string.
+The attach result is `{info, events, partial, running, pending_approvals, stream_sequence}` for create, open and attach. `info` is `SessionDetails`: `{session, path, head, cwd, trusted, model, model_info?, parent_session?}`. Saved sessions without a live worker have no `head` in `session/list`. The daemon guarantees at-least-once event delivery between an attach result and subsequent `event/appended` notifications, so clients deduplicate events by id. Stream notifications can also arrive twice, because the daemon subscribes a connection before asking the worker for its snapshot; `stream_sequence` is the last stream sequence included in `partial`, and clients drop `stream/delta` and `stream/reset` notifications at or below it. A sequence of 0 means unsequenced and is always applied. The prompt result's `failed`, `cancelled` and `text` fields come from the kernel's `TurnOutcome` and default on deserialization to false, false and an empty string.
 
 Daemon → client notifications go only to connections attached to that session, except where noted:
 
 | Notification | Payload | Recipients and meaning |
 |---|---|---|
 | `event/appended` | `{session, event}` | Attached clients; every persisted event. |
-| `stream/delta` | `{session, delta, attempt}` | Attached clients; streaming model output, not persisted. `attempt` is an integer starting at 0. |
-| `stream/reset` | `{session, attempt}` | Attached clients; sent before a retried model request. Clients drop partial text from earlier attempts so retries do not duplicate text. |
+| `stream/delta` | `{session, delta, attempt, sequence}` | Attached clients; streaming model output, not persisted. `attempt` is an integer starting at 0. `sequence` comes from one counter per worker shared with `stream/reset`. |
+| `stream/reset` | `{session, attempt, sequence}` | Attached clients; sent before a retried model request. Clients drop partial text from earlier attempts so retries do not duplicate text. |
 | `session/exited` | `{session, status?, message?}` | Attached clients and any client that called `session/list` with `running = true`; reports worker exit. |
 | `approval/pending` | `{session, call, tool, action, rule}` | Every initialized connection, not just attached ones; updates the approvals inbox. |
 

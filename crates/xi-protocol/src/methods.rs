@@ -253,6 +253,10 @@ pub mod client {
         /// In-flight assistant blocks of the current attempt.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub partial: Vec<Block>,
+        /// Latest stream notification sequence included in this snapshot.
+        /// Zero means the worker does not provide stream sequencing.
+        #[serde(default)]
+        pub stream_sequence: u64,
         /// Whether a turn is running.
         pub running: bool,
         /// Calls awaiting approval.
@@ -408,6 +412,9 @@ pub mod client {
         pub session: SessionId,
         /// New model request attempt number.
         pub attempt: u32,
+        /// Monotonic worker stream sequence; zero means unsequenced.
+        #[serde(default)]
+        pub sequence: u64,
     }
 
     /// Parameters for [`SessionExited`].
@@ -503,6 +510,9 @@ pub mod client {
         /// Model request attempt, starting at zero.
         #[serde(default)]
         pub attempt: u32,
+        /// Monotonic worker stream sequence; zero means unsequenced.
+        #[serde(default)]
+        pub sequence: u64,
     }
 
     /// An increment of streaming model output.
@@ -868,6 +878,7 @@ mod tests {
             partial: vec![Block::Text {
                 text: "answer".into(),
             }],
+            stream_sequence: 7,
             running: true,
             pending_approvals: vec![PendingApproval {
                 session,
@@ -888,6 +899,7 @@ mod tests {
                 "content": [{"type": "text", "text": "hello"}],
             }],
             "partial": [{"type": "text", "text": "answer"}],
+            "stream_sequence": 7,
             "running": true,
             "pending_approvals": [{
                 "session": session, "call": "call-1", "tool": "bash",
@@ -903,8 +915,12 @@ mod tests {
         let empty: AttachResult = serde_json::from_value(minimal.clone()).unwrap();
         assert!(empty.events.is_empty());
         assert!(empty.partial.is_empty());
+        assert_eq!(empty.stream_sequence, 0);
         assert!(empty.pending_approvals.is_empty());
-        assert_eq!(serde_json::to_value(empty).unwrap(), minimal);
+        assert_eq!(
+            serde_json::to_value(empty).unwrap(),
+            json!({"info": result.info, "running": false, "stream_sequence": 0}),
+        );
     }
 
     #[test]
@@ -981,8 +997,9 @@ mod tests {
         let params = ResetParams {
             session: SessionId::generate(),
             attempt: 2,
+            sequence: 3,
         };
-        let wire = json!({"session": params.session, "attempt": 2});
+        let wire = json!({"session": params.session, "attempt": 2, "sequence": 3});
         assert_eq!(serde_json::to_value(&params).unwrap(), wire);
         assert_eq!(
             serde_json::from_value::<ResetParams>(wire.clone()).unwrap(),
@@ -992,6 +1009,12 @@ mod tests {
             serde_json::to_value(Notification::new::<StreamReset>(&params).unwrap()).unwrap(),
             json!({"jsonrpc": "2.0", "method": "stream/reset", "params": wire}),
         );
+        let legacy: ResetParams = serde_json::from_value(json!({
+            "session": params.session,
+            "attempt": 2,
+        }))
+        .unwrap();
+        assert_eq!(legacy.sequence, 0);
     }
 
     #[test]
@@ -1003,11 +1026,13 @@ mod tests {
         let params: DeltaParams = serde_json::from_value(wire).unwrap();
         assert_eq!(params.session, session);
         assert_eq!(params.attempt, 0);
+        assert_eq!(params.sequence, 0);
         assert_eq!(
             serde_json::to_value(params).unwrap(),
             json!({
                 "session": session, "delta": {"type": "text", "text": "hello"},
                 "attempt": 0,
+                "sequence": 0,
             }),
         );
     }
