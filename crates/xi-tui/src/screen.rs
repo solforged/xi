@@ -16,30 +16,47 @@ use crate::style::Line;
 pub struct Screen<W: Write> {
     out: W,
     color: bool,
-    /// Rows the live region occupies.
-    height: usize,
-    /// Row of the cursor within the live region.
-    cursor_row: usize,
+    /// Terminal width now.
+    cols: usize,
+    /// Width of each live row as last drawn, for counting the rows it takes
+    /// once a resize reflows it.
+    widths: Vec<usize>,
+    /// Row and column of the cursor within the live region.
+    cursor: (usize, usize),
 }
 
 impl<W: Write> Screen<W> {
-    /// A screen with nothing drawn yet.
-    pub fn new(out: W, color: bool) -> Self {
+    /// A screen `cols` wide with nothing drawn yet.
+    pub fn new(out: W, color: bool, cols: usize) -> Self {
         Self {
             out,
             color,
-            height: 0,
-            cursor_row: 0,
+            cols: cols.max(1),
+            widths: Vec::new(),
+            cursor: (0, 0),
         }
     }
 
+    /// Records a new terminal width. Terminals reflow the rows already on
+    /// screen, so a row drawn wider than `cols` now takes several.
+    pub fn resize(&mut self, cols: usize) {
+        self.cols = cols.max(1);
+    }
+
     fn rewind(&self, buf: &mut String) {
-        if self.height > 0 {
-            if self.cursor_row > 0 {
-                buf.push_str(&format!("\x1b[{}A", self.cursor_row));
-            }
-            buf.push_str("\r\x1b[J");
+        if self.widths.is_empty() {
+            return;
         }
+        let (row, col) = self.cursor;
+        let up: usize = self.widths[..row]
+            .iter()
+            .map(|w| w.div_ceil(self.cols).max(1))
+            .sum::<usize>()
+            + col / self.cols;
+        if up > 0 {
+            buf.push_str(&format!("\x1b[{up}A"));
+        }
+        buf.push_str("\r\x1b[J");
     }
 
     /// Commits `committed` to scrollback and redraws `live` below it. `live`
@@ -78,11 +95,15 @@ impl<W: Write> Screen<W> {
                     buf.push_str(&format!("\x1b[{col}C"));
                 }
                 buf.push_str("\x1b[?25h");
-                self.cursor_row = row;
+                self.cursor = (row, col);
             }
-            None => self.cursor_row = last,
+            // The cursor rests on the last row's final cell.
+            None => {
+                let width = live.last().map_or(0, Line::width);
+                self.cursor = (last, width.saturating_sub(1));
+            }
         }
-        self.height = live.len();
+        self.widths = live.iter().map(Line::width).collect();
         buf.push_str("\x1b[?2026l");
         self.out.write_all(buf.as_bytes())?;
         self.out.flush()
@@ -94,8 +115,8 @@ impl<W: Write> Screen<W> {
         let mut buf = String::new();
         self.rewind(&mut buf);
         buf.push_str("\x1b[?25h");
-        self.height = 0;
-        self.cursor_row = 0;
+        self.widths.clear();
+        self.cursor = (0, 0);
         self.out.write_all(buf.as_bytes())?;
         self.out.flush()
     }
@@ -117,7 +138,7 @@ mod tests {
 
     #[test]
     fn committed_lines_print_once_above_a_redrawn_region() {
-        let mut s = Screen::new(Vec::new(), false);
+        let mut s = Screen::new(Vec::new(), false, 80);
         let l = |t: &str| Line::default().ink(t);
         s.draw(&[], &[l("working"), l("ξ "), l("footer")], Some((1, 2)), 24)
             .unwrap();
@@ -140,10 +161,40 @@ mod tests {
 
     #[test]
     fn a_short_screen_keeps_the_bottom_of_the_region() {
-        let mut s = Screen::new(Vec::new(), false);
+        let mut s = Screen::new(Vec::new(), false, 80);
         let l = |t: &str| Line::default().ink(t);
         s.draw(&[], &[l("a"), l("b"), l("c")], Some((2, 0)), 2)
             .unwrap();
         assert!(text(&s).contains("b\r\nc\r\x1b[?25h"), "{:?}", text(&s));
+    }
+
+    #[test]
+    fn narrowing_rewinds_over_the_rows_the_terminal_reflowed() {
+        let mut s = Screen::new(Vec::new(), false, 10);
+        let l = |t: &str| Line::default().ink(t);
+        let live = [
+            l("streaming!"),
+            l("╭────────╮"),
+            l("│ ξ ab   │"),
+            l("footer"),
+        ];
+        s.draw(&[], &live, Some((2, 6)), 24).unwrap();
+        s.resize(4);
+        s.draw(&[], &live[1..], None, 24).unwrap();
+        // Two ten-cell rows now take three rows each; the cursor's own row
+        // wrapped once before column 6.
+        assert!(
+            text(&s).contains("\x1b[?2026h\x1b[?25l\x1b[7A\r\x1b[J╭"),
+            "{:?}",
+            text(&s)
+        );
+        s.resize(40);
+        s.draw(&[], &live[1..], None, 24).unwrap();
+        // The cursor rested at the end of `footer`, two rows below the top.
+        assert!(
+            text(&s).ends_with("\x1b[2A\r\x1b[J╭────────╮\r\n│ ξ ab   │\r\nfooter\x1b[?2026l"),
+            "{:?}",
+            text(&s)
+        );
     }
 }
