@@ -245,7 +245,7 @@ impl App {
                 Line::default()
                     .ink("  ")
                     .brass("untrusted")
-                    .dim(" · repo hooks, extensions and loosening rules are held back · xi trust loads them")
+                    .dim(" · repo config held back · xi trust")
                     .truncate(self.cols),
             );
         }
