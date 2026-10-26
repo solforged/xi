@@ -52,6 +52,15 @@ struct Call {
     result: Option<(ToolOutput, Option<std::path::PathBuf>, Timestamp)>,
 }
 
+/// A result the transcript showed cut short, kept whole for ctrl+o.
+struct Detail {
+    /// The call's headline: mark, tool and argument.
+    head: Line,
+    text: String,
+    error: bool,
+    spill: Option<std::path::PathBuf>,
+}
+
 /// Token totals.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Totals {
@@ -112,6 +121,10 @@ pub struct Transcript {
     /// The selected model, once known.
     pub model: Option<ModelRef>,
     blank: bool,
+    /// Collapsed results, oldest first.
+    details: Vec<Detail>,
+    /// Collapsed results already expanded, counted back from the newest.
+    expanded: usize,
 }
 
 /// `14.2k`, `1.2M`, `950`.
@@ -196,9 +209,11 @@ impl Call {
         }
     }
 
-    fn committed(&self, cols: usize) -> Vec<Line> {
+    /// The block the call commits, and its whole result when the block cut
+    /// lines from it.
+    fn committed(&self, cols: usize) -> (Vec<Line>, Option<Detail>) {
         let Some((output, spill, at)) = &self.result else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let text = text_of(output);
         let count = text.lines().count();
@@ -234,7 +249,7 @@ impl Call {
             cols,
         )];
         if quiet {
-            return lines;
+            return (lines, None);
         }
         let shown: Vec<&str> = text
             .lines()
@@ -259,14 +274,24 @@ impl Call {
             .filter(|l| !l.trim().is_empty())
             .count()
             .saturating_sub(shown.len());
-        if hidden > 0 || spill.is_some() {
-            let mut more = format!("    … {hidden} more lines");
-            if let Some(path) = spill {
-                more.push_str(&format!(" · full output in {}", path.display()));
-            }
+        let mut more = Vec::new();
+        if hidden > 0 {
+            more.push(format!("… {hidden} more lines · ctrl+o"));
+        }
+        if let Some(path) = spill {
+            more.push(format!("full output in {}", path.display()));
+        }
+        if !more.is_empty() {
+            let more = format!("    {}", more.join(" · "));
             lines.push(Line::default().dim(more).truncate(cols));
         }
-        lines
+        let detail = (hidden > 0).then(|| Detail {
+            head: self.head(self.mark()),
+            text,
+            error: output.is_error,
+            spill: spill.clone(),
+        });
+        (lines, detail)
     }
 }
 
@@ -447,11 +472,15 @@ impl Transcript {
                     c.result = Some((output.clone(), spill.clone(), at));
                 }
                 let done = self.calls.iter().take_while(|c| c.result.is_some()).count();
-                let lines: Vec<_> = self
-                    .calls
-                    .drain(..done)
-                    .flat_map(|c| c.committed(cols))
-                    .collect();
+                let mut lines = Vec::new();
+                for call in self.calls.drain(..done) {
+                    let (block, detail) = call.committed(cols);
+                    lines.extend(block);
+                    if let Some(detail) = detail {
+                        self.details.push(detail);
+                        self.expanded = 0;
+                    }
+                }
                 self.push(&mut out, lines);
             }
             EventKind::Tainted { reason, .. } => {
@@ -501,6 +530,60 @@ impl Transcript {
 
     fn call(&mut self, id: &ToolCallId) -> Option<&mut Call> {
         self.calls.iter_mut().find(|c| &c.id == id)
+    }
+
+    /// The whole result of the newest collapsed call not yet expanded, as
+    /// lines to commit. Each call steps one result further back; past the
+    /// oldest it returns `None` and starts again from the newest.
+    pub fn expand(&mut self, cols: usize) -> Option<Vec<Line>> {
+        let Some(at) = self.details.len().checked_sub(self.expanded + 1) else {
+            self.expanded = 0;
+            return None;
+        };
+        self.expanded += 1;
+        let detail = &self.details[at];
+        let count = detail.text.lines().count();
+        let mut lines = vec![lr(
+            detail.head.clone(),
+            Line::default().dim(format!("full output · {count} lines")),
+            cols,
+        )];
+        for (i, row) in wrap(&detail.text, cols.saturating_sub(4))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if i == 0 {
+                Line::default().dim("  └ ")
+            } else {
+                Line::default().ink("    ")
+            };
+            let body = if detail.error && i == 0 {
+                Line::default().sanguine(row)
+            } else {
+                Line::default().ink(row)
+            };
+            lines.push(lead.extend(body));
+        }
+        if let Some(path) = &detail.spill {
+            lines.push(
+                Line::default()
+                    .dim(format!("    full output in {}", path.display()))
+                    .truncate(cols),
+            );
+        }
+        Some(self.note(lines))
+    }
+
+    /// Whether any result was cut short.
+    #[must_use]
+    pub fn collapsed(&self) -> bool {
+        !self.details.is_empty()
+    }
+
+    /// Moves collapsed results over from `other`, whose scrollback they are.
+    pub fn keep_details(&mut self, other: &mut Self) {
+        self.details = std::mem::take(&mut other.details);
+        self.expanded = 0;
     }
 
     /// Clears what a cancelled or failed turn left in flight.
@@ -661,7 +744,7 @@ mod tests {
         assert!(rows[0].starts_with("✕ bash pytest -x"), "{rows:?}");
         assert!(rows[0].ends_with("user#1 · 1.8s"), "{rows:?}");
         assert_eq!(rows[1], "  └ FAILED test_x");
-        assert_eq!(rows[4], "    … 1 more lines");
+        assert_eq!(rows[4], "    … 1 more lines · ctrl+o");
         assert!(rows[5].starts_with("● read policies/archive.py"));
         assert!(rows[5].ends_with("2 lines · 0.1s"));
         assert!(t.live(60, 0).is_empty());
@@ -726,6 +809,39 @@ mod tests {
             60,
         );
         assert!(rows[0].plain().starts_with("↺ edit deleted.py"));
+    }
+
+    #[test]
+    fn ctrl_o_expands_cut_results_newest_first_then_starts_over() {
+        let mut t = Transcript::default();
+        assert!(t.expand(60).is_none());
+        t.apply(
+            &ev(
+                assistant(vec![
+                    use_("a", "bash", json!({"command": "make"})),
+                    use_("b", "bash", json!({"command": "ls"})),
+                    use_("c", "bash", json!({"command": "make test"})),
+                ]),
+                0,
+            ),
+            60,
+        );
+        t.apply(&ev(result("a", "1\n2\n3\n\n4", false), 0), 60);
+        t.apply(&ev(result("b", "short", false), 0), 60);
+        t.apply(
+            &ev(result("c", "\x1b[31mFAIL\x1b[0m\na\nb\nc", true), 0),
+            60,
+        );
+        assert!(t.collapsed());
+        let newest = plain(&t.expand(60).unwrap());
+        assert!(newest[1].starts_with("✕ bash make test"), "{newest:?}");
+        assert!(newest[1].ends_with("full output · 4 lines"), "{newest:?}");
+        assert_eq!(newest[2..], ["  └ FAIL", "    a", "    b", "    c"]);
+        let older = plain(&t.expand(60).unwrap());
+        assert!(older[1].starts_with("● bash make"), "{older:?}");
+        assert_eq!(older[2..], ["  └ 1", "    2", "    3", "    ", "    4"]);
+        assert!(t.expand(60).is_none());
+        assert!(plain(&t.expand(60).unwrap())[1].starts_with("✕ bash make test"));
     }
 
     #[test]
