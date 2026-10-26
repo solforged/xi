@@ -1,0 +1,13 @@
+[tasks.install]
+alias = "build"
+description = "Build release xi and its sandbox helper into $XDG_BIN_HOME or ~/.local/bin"
+run = '''
+set -eu
+cargo build --release --locked -p xi-cli -p xi-sandbox
+target="${CARGO_TARGET_DIR:-$MISE_PROJECT_ROOT/target}/release"
+bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
+mkdir -p "$bin"
+# xi runs tools through the xi-sandbox-exec beside its own binary.
+install -m 755 "$target/xi" "$target/xi-sandbox-exec" "$bin/"
+echo "installed xi and xi-sandbox-exec in $bin"
+'''
