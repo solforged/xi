@@ -43,7 +43,7 @@ Interactive steering in line mode is missing (the RPC path queues prompts alread
 | Item | Why |
 |---|---|
 | Egress proxy and in-namespace forwarder | Tools and extensions have no network at all today; `fetch`, package installs and `git push` need it. Extensions that declare `net` refuse to start until it exists. |
-| Frontier-model runs | Every measurement so far uses local models. The Anthropic adapter passes mocked transcripts only; there is no API key on these machines. |
+| Frontier-model runs | Benchmark measurements so far use local models. ChatGPT-plan models (`chatgpt/gpt-6.1-sol` after `xi login chatgpt`) now run live but have not been benchmarked. The Anthropic adapter passes mocked transcripts only; there is no API key on these machines. |
 | Credentials from the keychain | Only env vars and 0600 files work now. |
 | Extension package pinning | Packages load from configured directories; the content-hash lockfile is not built. |
 | PID namespace (Linux) | Other processes' command lines are visible in `/proc`. |

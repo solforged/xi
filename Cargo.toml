@@ -20,6 +20,7 @@ xi-sandbox = { path = "crates/xi-sandbox" }
 xi-session = { path = "crates/xi-session" }
 xi-tools = { path = "crates/xi-tools" }
 xi-tui = { path = "crates/xi-tui" }
+aws-lc-rs = "1"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -34,7 +35,7 @@ landlock = "0.4.7"
 libc = "0.2"
 listenfd = "1"
 nix = { version = "0.31", features = ["fs", "mount", "process", "sched", "signal", "user"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "stream", "form"] }
 rustyline = "19"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

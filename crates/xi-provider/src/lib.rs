@@ -2,8 +2,13 @@
 //!
 //! A [`Provider`] turns a provider-neutral [`Request`] into one streamed
 //! model response. Anthropic thinking signatures, redacted thinking and
-//! provider-specific blocks round-trip unchanged. OpenAI-compatible reasoning
-//! is exposed as [`Block::Thinking`] but is not replayed.
+//! provider-specific blocks round-trip unchanged. OpenAI Responses reasoning
+//! round-trips in encrypted form; Chat Completions reasoning is exposed as
+//! [`Block::Thinking`] but is not replayed.
+//!
+//! `auth = { login = "chatgpt" }` signs requests with a ChatGPT plan instead
+//! of an API key; [`Login`] obtains the tokens and requests refresh them.
+//! Providers that speak the same [`Api`] differently say so in [`Compat`].
 //!
 //! The [`Registry`] knows which providers and models exist. It starts from a
 //! built-in table and is extended from config ([`RegistryConfig`]).
@@ -21,8 +26,10 @@
 //! OpenAI-compatible stream plus a tool-result round trip without credentials.
 
 mod anthropic;
+mod chatgpt;
 mod openai;
 mod registry;
+mod responses;
 mod sse;
 mod transport;
 
@@ -31,8 +38,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use chatgpt::{Account, Login, chatgpt_file};
 pub use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
@@ -166,6 +176,8 @@ pub enum Api {
     AnthropicMessages,
     /// OpenAI-compatible Chat Completions (OpenAI, llama.cpp, vLLM, ...).
     OpenaiChat,
+    /// OpenAI Responses API, including the ChatGPT Codex backend.
+    OpenaiResponses,
 }
 
 /// Where a provider's credential comes from. Credentials stay in the
@@ -180,6 +192,61 @@ pub enum Auth {
     Env(String),
     /// A file readable only by the user (mode `0600` or stricter).
     File(PathBuf),
+    /// Tokens from `xi login <service>`, kept in the registry's credential
+    /// directory and refreshed as they expire.
+    Login(LoginService),
+}
+
+/// An account `xi login` signs in to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginService {
+    /// A ChatGPT plan, through the Codex backend.
+    Chatgpt,
+}
+
+/// Wire differences between providers that speak the same [`Api`]. Set
+/// under `[provider.<name>]` and per `[[model]]`; a model's settings
+/// override its provider's one field at a time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compat {
+    /// Whether Responses requests carry the output-token limit. Default
+    /// `true`; the ChatGPT backend rejects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_limit: Option<bool>,
+    /// The effort Responses requests send when reasoning is off, for models
+    /// that can't turn it off. Default `off`, sent as `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_off: Option<Reasoning>,
+    /// A header that carries the session's prompt-cache key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_header: Option<String>,
+    /// The Responses Lite request shape: tools travel as a leading input
+    /// item, tool calls are sequential and reasoning spans all turns.
+    /// Default `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_lite: Option<bool>,
+}
+
+impl Compat {
+    /// These settings, with unset fields taken from `base`.
+    #[must_use]
+    pub fn or(&self, base: &Self) -> Self {
+        Self {
+            output_limit: self.output_limit.or(base.output_limit),
+            reasoning_off: self.reasoning_off.or(base.reasoning_off),
+            session_header: self
+                .session_header
+                .clone()
+                .or_else(|| base.session_header.clone()),
+            responses_lite: self.responses_lite.or(base.responses_lite),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A configured provider, as written under `[provider.<name>]`.
@@ -193,6 +260,46 @@ pub struct ProviderConfig {
     /// Credential source.
     #[serde(default)]
     pub auth: Auth,
+    /// Wire differences shared by the provider's models.
+    #[serde(default, skip_serializing_if = "Compat::is_empty")]
+    pub compat: Compat,
+}
+
+/// One `[[model]]` table: provider-neutral metadata plus the model's wire
+/// differences, which stay out of the protocol's [`ModelInfo`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ModelEntry {
+    /// Metadata clients see.
+    #[serde(flatten)]
+    pub info: ModelInfo,
+    /// Overrides of the provider's [`Compat`].
+    #[serde(skip_serializing_if = "Compat::is_empty")]
+    pub compat: Compat,
+}
+
+impl From<ModelInfo> for ModelEntry {
+    fn from(info: ModelInfo) -> Self {
+        Self {
+            info,
+            compat: Compat::default(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelEntry {
+    // `#[serde(flatten)]` would hide unknown fields from `ModelInfo`'s
+    // `deny_unknown_fields`, so the table is split by hand.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut table = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let compat = table
+            .remove("compat")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .unwrap_or_default();
+        let info = serde_json::from_value(Value::Object(table)).map_err(D::Error::custom)?;
+        Ok(Self { info, compat })
+    }
 }
 
 /// The registry sections of a config file: `[provider.<name>]` tables and
@@ -205,13 +312,14 @@ pub struct RegistryConfig {
     pub provider: BTreeMap<String, ProviderConfig>,
     /// Models.
     #[serde(default)]
-    pub model: Vec<ModelInfo>,
+    pub model: Vec<ModelEntry>,
 }
 
 /// Known providers and models.
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     providers: BTreeMap<String, ProviderConfig>,
-    models: Vec<ModelInfo>,
+    models: Vec<ModelEntry>,
     clients: Arc<Mutex<BTreeMap<String, reqwest::Client>>>,
+    credentials: Option<PathBuf>,
 }

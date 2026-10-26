@@ -1,63 +1,153 @@
-use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime};
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
-use crate::{Api, BoxFuture, Delta, Error, ErrorKind, Provider, ProviderConfig, Request, Response};
+use crate::{
+    Api, BoxFuture, Compat, Delta, Error, ErrorKind, Provider, ProviderConfig, Reasoning, Request,
+    Response,
+};
+
+/// Adds a provider's credential to each request.
+pub(crate) trait Signer: Send + Sync {
+    /// Inserts the credential headers.
+    fn sign<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        headers: &'a mut HeaderMap,
+    ) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Handles a 401 for a request signed into `headers`. `Ok(true)` means
+    /// the credential changed and the request may be retried once.
+    fn rejected<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        headers: &'a HeaderMap,
+    ) -> BoxFuture<'a, Result<bool, Error>>;
+}
+
+/// A fixed credential header, or none.
+pub(crate) struct Key(pub(crate) Option<(HeaderName, HeaderValue)>);
+
+impl Signer for Key {
+    fn sign<'a>(
+        &'a self,
+        _: &'a reqwest::Client,
+        headers: &'a mut HeaderMap,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        if let Some((name, value)) = &self.0 {
+            headers.insert(name.clone(), value.clone());
+        }
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rejected<'a>(
+        &'a self,
+        _: &'a reqwest::Client,
+        _: &'a HeaderMap,
+    ) -> BoxFuture<'a, Result<bool, Error>> {
+        Box::pin(async { Ok(false) })
+    }
+}
+
+/// What a model's requests look like beyond the request itself: its
+/// [`Compat`] resolved against the provider's, with defaults applied.
+#[derive(Clone, Debug)]
+pub(crate) struct Shape {
+    /// The model reasons.
+    pub(crate) reasoning: bool,
+    /// Responses requests carry the output-token limit.
+    pub(crate) output_limit: bool,
+    /// The Responses effort sent when reasoning is off.
+    pub(crate) reasoning_off: Reasoning,
+    /// The header carrying the session's prompt-cache key.
+    pub(crate) session_header: Option<HeaderName>,
+    /// The Responses Lite request shape.
+    pub(crate) lite: bool,
+}
+
+impl Shape {
+    pub(crate) fn new(reasoning: bool, compat: &Compat) -> Result<Self, Error> {
+        let session_header = compat
+            .session_header
+            .as_deref()
+            .map(HeaderName::try_from)
+            .transpose()
+            .map_err(|_| Error::new(ErrorKind::Config, "Invalid compat session_header"))?;
+        Ok(Self {
+            reasoning,
+            output_limit: compat.output_limit.unwrap_or(true),
+            reasoning_off: compat.reasoning_off.unwrap_or(Reasoning::Off),
+            session_header,
+            lite: compat.responses_lite.unwrap_or(false),
+        })
+    }
+}
 
 pub(crate) struct HttpProvider {
     client: reqwest::Client,
     url: String,
     headers: HeaderMap,
     api: Api,
-    reasoning_models: BTreeSet<String>,
+    signer: Box<dyn Signer>,
+    /// Shapes of the provider's listed models.
+    shapes: BTreeMap<String, Shape>,
+    /// The shape of unlisted models, which don't reason.
+    unlisted: Shape,
 }
 
 impl HttpProvider {
     pub(crate) fn new(
         client: reqwest::Client,
         config: &ProviderConfig,
-        credential: Option<String>,
-        reasoning_models: BTreeSet<String>,
+        signer: Box<dyn Signer>,
+        shapes: BTreeMap<String, Shape>,
     ) -> Result<Self, Error> {
         let mut headers = HeaderMap::new();
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static(concat!("xi/", env!("CARGO_PKG_VERSION"))),
+        );
         let suffix = match config.api {
             Api::AnthropicMessages => {
                 headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
                 "/v1/messages"
             }
             Api::OpenaiChat => "/chat/completions",
+            Api::OpenaiResponses => "/responses",
         };
-        if let Some(credential) = credential {
-            let (name, value) = match config.api {
-                Api::AnthropicMessages => ("x-api-key", credential),
-                Api::OpenaiChat => ("authorization", format!("Bearer {credential}")),
-            };
-            let mut value = HeaderValue::from_str(&value).map_err(|_| {
-                Error::new(
-                    ErrorKind::Auth,
-                    "Credential contains invalid header characters",
-                )
-            })?;
-            value.set_sensitive(true);
-            headers.insert(name, value);
-        }
         Ok(Self {
             client,
             url: format!("{}{suffix}", config.base_url.trim_end_matches('/')),
             headers,
             api: config.api,
-            reasoning_models,
+            signer,
+            shapes,
+            unlisted: Shape::new(false, &config.compat)?,
         })
     }
 
-    async fn send(&self, body: &Value) -> Result<reqwest::Response, Error> {
+    async fn send(&self, body: &Value, mut headers: HeaderMap) -> Result<reqwest::Response, Error> {
+        self.signer.sign(&self.client, &mut headers).await?;
+        match self.post(body, headers.clone()).await {
+            Err(error)
+                if error.kind == ErrorKind::Auth
+                    && self.signer.rejected(&self.client, &headers).await? =>
+            {
+                self.signer.sign(&self.client, &mut headers).await?;
+                self.post(body, headers).await
+            }
+            result => result,
+        }
+    }
+
+    async fn post(&self, body: &Value, headers: HeaderMap) -> Result<reqwest::Response, Error> {
         let response = self
             .client
             .post(&self.url)
-            .headers(self.headers.clone())
+            .headers(headers)
             .json(body)
             .send()
             .await
@@ -86,15 +176,34 @@ impl Provider for HttpProvider {
         on_delta: &'a mut (dyn FnMut(Delta) + Send),
     ) -> BoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
-            let reasoning = self.reasoning_models.contains(&request.model);
+            let shape = self.shapes.get(&request.model).unwrap_or(&self.unlisted);
+            let mut headers = self.headers.clone();
+            if let Some(name) = &shape.session_header
+                && let Some(value) = request
+                    .cache_key
+                    .as_deref()
+                    .and_then(|key| HeaderValue::from_str(key).ok())
+            {
+                headers.insert(name.clone(), value);
+            }
             match self.api {
                 Api::AnthropicMessages => {
-                    let body = crate::anthropic::body(request, reasoning)?;
-                    crate::anthropic::consume(self.send(&body).await?, on_delta).await
+                    let body = crate::anthropic::body(request, shape.reasoning)?;
+                    crate::anthropic::consume(self.send(&body, headers).await?, on_delta).await
                 }
                 Api::OpenaiChat => {
-                    let body = crate::openai::body(request, reasoning)?;
-                    crate::openai::consume(self.send(&body).await?, on_delta).await
+                    let body = crate::openai::body(request, shape.reasoning)?;
+                    crate::openai::consume(self.send(&body, headers).await?, on_delta).await
+                }
+                Api::OpenaiResponses => {
+                    let body = crate::responses::body(request, shape)?;
+                    if shape.lite {
+                        headers.insert(
+                            "x-openai-internal-codex-responses-lite",
+                            HeaderValue::from_static("true"),
+                        );
+                    }
+                    crate::responses::consume(self.send(&body, headers).await?, on_delta).await
                 }
             }
         })
@@ -157,9 +266,28 @@ pub(crate) fn api_error(status: Option<u16>, value: &Value) -> Error {
                 .and_then(|value| Duration::try_from_secs_f64(value).ok()),
             _ => None,
         });
+    // The ChatGPT backend reports plan limits without a message.
+    let message = match kind {
+        "usage_limit_reached" => match detail.get("resets_at").and_then(Value::as_u64) {
+            Some(resets) => {
+                let left = (UNIX_EPOCH + Duration::from_secs(resets))
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default()
+                    .as_secs();
+                format!(
+                    "ChatGPT usage limit reached; it resets in {}h {}m",
+                    left / 3600,
+                    left % 3600 / 60
+                )
+            }
+            None => "ChatGPT usage limit reached".to_owned(),
+        },
+        "usage_not_included" => "This ChatGPT plan does not include Codex usage".to_owned(),
+        _ => message.to_owned(),
+    };
     Error {
         kind: category,
-        message: message.to_owned(),
+        message,
         retry_after,
     }
 }

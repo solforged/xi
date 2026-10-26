@@ -50,18 +50,22 @@ async fn provider_and_model_overrides_take_effect_and_unknown_models_connect() {
                 api: Api::OpenaiChat,
                 base_url: format!("{}/", second.uri()),
                 auth: Auth::None,
+                compat: Default::default(),
             },
         )]),
-        model: vec![ModelInfo {
-            provider: "test".into(),
-            id: "test-model".into(),
-            context_window: 100000,
-            max_output: 20000,
-            reasoning: true,
-            pricing: None,
-        }],
+        model: vec![
+            ModelInfo {
+                provider: "test".into(),
+                id: "test-model".into(),
+                context_window: 100000,
+                max_output: 20000,
+                reasoning: true,
+                pricing: None,
+            }
+            .into(),
+        ],
     });
-    assert_eq!(registry.models().len(), 1);
+    assert_eq!(registry.models().count(), 1);
     assert_eq!(
         registry
             .model(&model_ref("test-model"))
@@ -119,7 +123,7 @@ fn model_override_key_includes_provider() {
     custom.context_window = 4096;
     registry.extend(RegistryConfig {
         provider: BTreeMap::new(),
-        model: vec![custom.clone()],
+        model: vec![custom.clone().into()],
     });
     assert_eq!(
         registry.model(&ModelRef {
@@ -135,6 +139,20 @@ fn model_override_key_includes_provider() {
         }),
         Some(&custom)
     );
+}
+
+#[test]
+fn model_tables_split_compat_and_still_reject_unknown_fields() {
+    let table = |extra: &str| {
+        toml::from_str::<RegistryConfig>(&format!(
+            "[[model]]\nprovider = \"p\"\nid = \"m\"\ncontext_window = 1\nmax_output = 1\n{extra}"
+        ))
+    };
+    let config = table("compat = { responses_lite = true }").unwrap();
+    assert_eq!(config.model[0].info.id, "m");
+    assert_eq!(config.model[0].compat.responses_lite, Some(true));
+    assert!(table("responses_lite = true").is_err());
+    assert!(table("compat = { lite = true }").is_err());
 }
 
 #[test]

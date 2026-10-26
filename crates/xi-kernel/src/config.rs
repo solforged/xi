@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use xi_policy::{ActionKind, Authority, Condition, Policy, RuleSpec};
 use xi_protocol::Decision;
 use xi_protocol::event::ModelRef;
-use xi_protocol::model::{ModelInfo, Reasoning};
-use xi_provider::{ProviderConfig, Registry, RegistryConfig};
+use xi_protocol::model::Reasoning;
+use xi_provider::{ModelEntry, ProviderConfig, Registry, RegistryConfig};
 
 use crate::{Error, Result};
 
@@ -55,6 +55,12 @@ impl Paths {
         }
         path.strip_prefix("~/")
             .map_or_else(|_| path.to_owned(), |rest| self.home.join(rest))
+    }
+
+    /// Credentials xi manages itself, such as `xi login chatgpt` tokens.
+    /// No sandbox root covers this directory.
+    pub fn credentials(&self) -> PathBuf {
+        self.data.join("auth")
     }
 
     /// Records an exact canonical workspace root in the user trust store.
@@ -201,7 +207,7 @@ struct FileConfig {
     #[serde(default)]
     provider: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
-    model: Vec<ModelInfo>,
+    model: Vec<ModelEntry>,
     #[serde(default)]
     rule: Vec<RuleSpec>,
 }
@@ -277,7 +283,7 @@ impl Config {
             workspace,
             paths,
             trusted,
-            model: parse_model("anthropic/claude-sonnet-5-5")?,
+            model: parse_model("chatgpt/gpt-6.1-sol")?,
             reasoning: Reasoning::Medium,
             tools: ["read", "edit", "write", "bash", "search"]
                 .into_iter()
@@ -403,6 +409,7 @@ impl Config {
     /// Builds the registry after all authoritative config layers are known.
     pub fn registry(&self) -> Registry {
         let mut registry = Registry::builtin();
+        registry.set_credentials(self.paths.credentials());
         for layer in &self.registries {
             registry.extend(layer.clone());
         }

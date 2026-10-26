@@ -106,6 +106,7 @@ async fn both_adapters_classify_in_stream_errors_after_partial_output() {
                 Api::OpenaiChat => {
                     format!("data: {}\n\n", chunk(json!({"content":"Partial"}), None))
                 }
+                Api::OpenaiResponses => unreachable!("covered in tests/responses.rs"),
             };
             let error = json!({"type":"error","error":{"type":error_type,"message":message,"retry_after":3}});
             mock(
@@ -138,6 +139,7 @@ async fn malformed_truncated_and_empty_streams_fail_instead_of_succeeding() {
                 match api {
                     Api::AnthropicMessages => anthropic(vec![json!({"type":"message_stop"})]),
                     Api::OpenaiChat => "data: [DONE]\n\n".into(),
+                    Api::OpenaiResponses => unreachable!("covered in tests/responses.rs"),
                 },
                 ErrorKind::Decode,
             ),
@@ -172,6 +174,7 @@ async fn malformed_tool_json_is_decode_error_for_each_adapter() {
                 json!({"tool_calls":[{"index":0,"id":"call","function":{"name":"read","arguments":"{bad"}}]}),
                 Some("tool_calls"),
             )]),
+            Api::OpenaiResponses => unreachable!("covered in tests/responses.rs"),
         };
         mock(&server, api, body).await;
         let provider = provider(&server, api, "test-model", false, Auth::None);
@@ -217,6 +220,7 @@ async fn stop_reasons_are_not_conflated() {
                 match api {
                     Api::AnthropicMessages => anthropic_text(reason),
                     Api::OpenaiChat => openai_text(reason),
+                    Api::OpenaiResponses => unreachable!("covered in tests/responses.rs"),
                 },
             )
             .await;

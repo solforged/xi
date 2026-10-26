@@ -39,16 +39,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api: Api::OpenaiChat,
                 base_url,
                 auth: Auth::None,
+                compat: Default::default(),
             },
         )]),
-        model: vec![ModelInfo {
-            provider: "live".into(),
-            id: model.clone(),
-            context_window: 262144,
-            max_output: 4096,
-            reasoning: true,
-            pricing: None,
-        }],
+        model: vec![
+            ModelInfo {
+                provider: "live".into(),
+                id: model.clone(),
+                context_window: 262144,
+                max_output: 4096,
+                reasoning: true,
+                pricing: None,
+            }
+            .into(),
+        ],
     });
     let provider = registry.connect(&ModelRef {
         provider: "live".into(),

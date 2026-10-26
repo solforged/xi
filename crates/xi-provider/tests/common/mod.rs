@@ -54,16 +54,20 @@ pub fn registry(base_url: String, api: Api, model: &str, reasoning: bool, auth: 
                 api,
                 base_url,
                 auth,
+                compat: Default::default(),
             },
         )]),
-        model: vec![ModelInfo {
-            provider: "test".into(),
-            id: model.into(),
-            context_window: 32768,
-            max_output: 8192,
-            reasoning,
-            pricing: None,
-        }],
+        model: vec![
+            ModelInfo {
+                provider: "test".into(),
+                id: model.into(),
+                context_window: 32768,
+                max_output: 8192,
+                reasoning,
+                pricing: None,
+            }
+            .into(),
+        ],
     });
     registry
 }
@@ -72,6 +76,7 @@ pub fn endpoint(api: Api) -> &'static str {
     match api {
         Api::AnthropicMessages => "/v1/messages",
         Api::OpenaiChat => "/chat/completions",
+        Api::OpenaiResponses => "/responses",
     }
 }
 

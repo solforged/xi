@@ -82,6 +82,18 @@ enum Command {
         /// Directory to trust (default: workspace).
         dir: Option<PathBuf>,
     },
+    /// Sign in to a provider account and save its tokens.
+    Login {
+        /// Account to sign in to.
+        #[arg(value_enum)]
+        account: LoginAccount,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LoginAccount {
+    /// A ChatGPT plan, for the `chatgpt/…` models.
+    Chatgpt,
 }
 
 #[derive(Subcommand)]
@@ -189,6 +201,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 let root = paths.trust(&dir.unwrap_or(cwd))?;
                 println!("Trusted {}", root.display());
             }
+            Command::Login { account } => login(&paths, account).await?,
         }
         return Ok(0);
     }
@@ -283,6 +296,50 @@ fn executable() -> std::io::Result<PathBuf> {
         Some(path) => Ok(std::env::current_dir()?.join(path)),
         None => std::env::current_exe(),
     }
+}
+
+/// Runs the browser sign-in. A browser on another machine can't reach the
+/// loopback callback, so the URL it lands on may be pasted instead.
+async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
+    let LoginAccount::Chatgpt = account;
+    let login = xi_provider::Login::start().await?;
+    eprintln!(
+        "Opening the ChatGPT sign-in page. If it doesn't open, visit:\n\n  {}\n\n\
+         Signing in on another machine? Paste the address the browser ends up on here.",
+        login.url()
+    );
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(login.url())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    // A detached thread, so an unanswered stdin read never holds up exit.
+    let (pasted, line) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if std::io::stdin()
+            .read_line(&mut text)
+            .is_ok_and(|read| read > 0)
+        {
+            let _ = pasted.send(text);
+        }
+    });
+    let file = xi_provider::chatgpt_file(&paths.credentials());
+    let account = login.finish(&file, async { line.await.ok() }).await?;
+    let who = match (account.email, account.plan) {
+        (Some(email), Some(plan)) => format!(" as {email} ({plan})"),
+        (Some(email), None) => format!(" as {email}"),
+        (None, Some(plan)) => format!(" ({plan})"),
+        (None, None) => String::new(),
+    };
+    println!("Signed in to ChatGPT{who}. `xi` now uses chatgpt/gpt-6.1-sol by default.");
+    Ok(())
 }
 
 async fn open_or_create(

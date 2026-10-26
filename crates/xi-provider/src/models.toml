@@ -17,6 +17,18 @@ api = "openai-chat"
 base_url = "https://api.openai.com/v1"
 auth = { env = "OPENAI_API_KEY" }
 
+# A ChatGPT plan through the Codex backend (`xi login chatgpt`). Usage counts
+# against the plan's limits, so these models carry no per-token pricing.
+# The backend takes no output limit, offers no `none` effort and keys its
+# prompt cache by session. Its current models all need Responses Lite.
+# Context windows are the account's `/models` values.
+# https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
+[provider.chatgpt]
+api = "openai-responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+auth = { login = "chatgpt" }
+compat = { output_limit = false, reasoning_off = "low", session_header = "session-id" }
+
 [[model]]
 provider = "anthropic"
 id = "claude-opus-5-5"
@@ -72,3 +84,43 @@ context_window = 400000
 max_output = 128000
 reasoning = true
 pricing = { input = 0.75, output = 4.50, cache_read = 0.075 }
+
+[[model]]
+provider = "chatgpt"
+id = "gpt-6.1-sol"
+context_window = 500000
+max_output = 128000
+reasoning = true
+compat = { responses_lite = true }
+
+[[model]]
+provider = "chatgpt"
+id = "gpt-6.1-terra"
+context_window = 500000
+max_output = 128000
+reasoning = true
+compat = { responses_lite = true }
+
+[[model]]
+provider = "chatgpt"
+id = "gpt-6-sol"
+context_window = 272000
+max_output = 128000
+reasoning = true
+compat = { responses_lite = true }
+
+[[model]]
+provider = "chatgpt"
+id = "gpt-6-astra"
+context_window = 272000
+max_output = 128000
+reasoning = true
+compat = { responses_lite = true }
+
+[[model]]
+provider = "chatgpt"
+id = "gpt-6-luna"
+context_window = 272000
+max_output = 128000
+reasoning = true
+compat = { responses_lite = true }
