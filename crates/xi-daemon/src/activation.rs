@@ -3,7 +3,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::UnixListener as StdUnixListener;
+use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::Path;
 
 use nix::unistd::getuid;
@@ -12,8 +12,8 @@ use xi_protocol::runtime;
 
 /// Takes the socket-activated listener, or binds `daemon.sock` with mode 0600.
 ///
-/// The caller must hold the daemon lock. Only a stale socket is removed before
-/// binding; an existing non-socket path is left untouched and causes an error.
+/// The caller must hold the daemon lock. Only a socket refusing connections is
+/// removed before binding; live listeners and non-socket paths are left untouched.
 pub fn listener(dir: &Path) -> io::Result<UnixListener> {
     #[cfg(target_os = "macos")]
     if let Some(listener) = launchd_listener()? {
@@ -30,7 +30,18 @@ pub fn listener(dir: &Path) -> io::Result<UnixListener> {
 
     let path = runtime::socket(dir);
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(&path)?,
+        Ok(metadata) if metadata.file_type().is_socket() => match StdUnixStream::connect(&path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("refusing to replace live daemon socket {}", path.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                fs::remove_file(&path)?;
+            }
+            Err(error) => return Err(error),
+        },
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -108,4 +119,81 @@ fn launchd_listener() -> io::Result<Option<StdUnixListener>> {
     // SAFETY: All descriptors are owned or closed; only the allocated array is freed.
     unsafe { libc::free(fds.cast()) };
     Ok(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn refuses_to_replace_live_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let _lock = crate::runtime_dir::try_lock(temp.path()).unwrap().unwrap();
+        let path = runtime::socket(temp.path());
+        let existing = StdUnixListener::bind(&path).unwrap();
+        let inode = fs::symlink_metadata(&path).unwrap().ino();
+
+        let error = listener(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains("live daemon socket"));
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+        existing.set_nonblocking(true).unwrap();
+        assert!(existing.accept().is_ok());
+        let _connection = StdUnixStream::connect(&path).unwrap();
+        assert!(existing.accept().is_ok());
+    }
+
+    #[tokio::test]
+    async fn replaces_socket_that_refuses_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let _lock = crate::runtime_dir::try_lock(temp.path()).unwrap().unwrap();
+        let path = runtime::socket(temp.path());
+        let stale = StdUnixListener::bind(&path).unwrap();
+        drop(stale);
+        assert_eq!(
+            StdUnixStream::connect(&path).unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+
+        let replacement = listener(temp.path()).unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let _connection = UnixStream::connect(&path).await.unwrap();
+        assert!(replacement.accept().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn preserves_non_socket_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = runtime::socket(temp.path());
+        fs::write(&path, b"keep").unwrap();
+
+        let error = listener(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn preserves_symlink_to_stale_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("other.sock");
+        drop(StdUnixListener::bind(&target).unwrap());
+        let path = runtime::socket(temp.path());
+        symlink(&target, &path).unwrap();
+
+        let error = listener(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_link(&path).unwrap(), target);
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
 }

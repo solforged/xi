@@ -121,6 +121,20 @@ impl Peer {
     /// # Errors
     /// Fails on closure, a remote RPC error, or a serialization error.
     pub async fn request_value(&self, method: &str, params: Value) -> Result<Value, PeerError> {
+        self.start_request_value(method, params)?.await
+    }
+
+    /// Enqueues a request immediately and returns its independent response wait.
+    /// Dropping the returned future stops waiting without cancelling the request.
+    ///
+    /// # Errors
+    /// Fails on closure or a serialization error before the request is queued.
+    pub fn start_request_value(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<impl Future<Output = Result<Value, PeerError>> + Send + 'static + use<>, PeerError>
+    {
         let (id, receiver) = {
             let mut state = self.inner.state.lock().expect("peer state");
             if state.outgoing.is_none() {
@@ -152,12 +166,14 @@ impl Peer {
             (id, receiver)
         };
         let pending = Pending {
-            inner: &self.inner,
+            inner: self.inner.clone(),
             id,
         };
-        let result = receiver.await.map_err(|_| PeerError::Closed)?;
-        drop(pending);
-        result
+        Ok(async move {
+            let result = receiver.await.map_err(|_| PeerError::Closed)?;
+            drop(pending);
+            result
+        })
     }
 
     /// Sends a typed notification.
@@ -251,12 +267,12 @@ impl State {
     }
 }
 
-struct Pending<'a> {
-    inner: &'a Inner,
+struct Pending {
+    inner: Arc<Inner>,
     id: RequestId,
 }
 
-impl Drop for Pending<'_> {
+impl Drop for Pending {
     fn drop(&mut self) {
         self.inner
             .state

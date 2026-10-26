@@ -93,6 +93,7 @@ fn snapshot() -> AttachResult {
         partial: Vec::new(),
         running: false,
         pending_approvals: Vec::new(),
+        stream_sequence: 0,
     }
 }
 
@@ -425,10 +426,12 @@ async fn notifications_are_typed_and_unknown_methods_are_ignored() {
             text: "partial".into(),
         },
         attempt: 0,
+        sequence: 1,
     };
     let reset = ResetParams {
         session,
         attempt: 1,
+        sequence: 2,
     };
     let exited = ExitedParams {
         session,

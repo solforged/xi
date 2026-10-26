@@ -958,6 +958,7 @@ impl Session {
                 self.0.bus.send(Notification::Reset(ResetParams {
                     session: self.id(),
                     attempt,
+                    sequence: 0,
                 }));
             }
             let mut partial = Vec::<Block>::new();
@@ -974,6 +975,7 @@ impl Session {
                     session: self.id(),
                     delta,
                     attempt,
+                    sequence: 0,
                 }));
             };
             let result = tokio::select! {

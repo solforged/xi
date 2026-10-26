@@ -33,6 +33,7 @@ const ENDPOINT: &str = "http://worker.test/v1";
 struct Step {
     text: String,
     gate: Option<Arc<Semaphore>>,
+    error: Option<Error>,
 }
 
 struct Script {
@@ -68,6 +69,9 @@ impl Provider for Script {
             });
             if let Some(gate) = step.gate {
                 gate.acquire().await.unwrap().forget();
+            }
+            if let Some(error) = step.error {
+                return Err(error);
             }
             Ok(Response {
                 content: text(&step.text),
@@ -255,8 +259,9 @@ async fn request<M: RequestMethod>(
 }
 
 fn assert_code<T: std::fmt::Debug>(result: Result<T, PeerError>, code: i64) {
-    let PeerError::Rpc(error) = result.unwrap_err() else {
-        panic!("expected RPC error")
+    let error = match result.unwrap_err() {
+        PeerError::Rpc(error) => error,
+        other => panic!("expected RPC error, got {other:?}"),
     };
     assert_eq!(error.code, code);
 }
@@ -280,6 +285,7 @@ fn reply(value: &str) -> Step {
     Step {
         text: value.into(),
         gate: None,
+        error: None,
     }
 }
 
@@ -314,6 +320,7 @@ async fn requires_start_and_create_returns_root_and_config_details() {
     assert!(attached.info.parent_session.is_none());
     assert!(attached.info.path.is_absolute());
     assert!(attached.partial.is_empty());
+    assert_eq!(attached.stream_sequence, 0);
     assert!(!attached.running);
     assert!(attached.pending_approvals.is_empty());
     assert!(matches!(
@@ -380,6 +387,7 @@ async fn prompt_leases_before_provider_streams_releases_and_replays_since() {
                 let params: DeltaParams = serde_json::from_value(params).unwrap();
                 assert_eq!(params.session, session);
                 assert_eq!(params.attempt, 0);
+                assert_eq!(params.sequence, 1);
                 assert_eq!(
                     params.delta,
                     Delta::Text {
@@ -439,6 +447,7 @@ async fn attach_partial_and_cancel_stay_responsive_during_prompt() {
     let script = Script::new(vec![Step {
         text: "partial".into(),
         gate: Some(Arc::new(Semaphore::new(0))),
+        error: None,
     }]);
     let mut harness = fixture.worker(script);
     let attached = harness.start(&fixture).await;
@@ -510,6 +519,181 @@ async fn attach_partial_and_cancel_stay_responsive_during_prompt() {
 }
 
 #[tokio::test]
+async fn failed_provider_discards_partial_before_attach_and_the_next_turn() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![
+        Step {
+            error: Some(Error::new(ErrorKind::InvalidRequest, "provider failed")),
+            ..reply("discarded")
+        },
+        Step {
+            gate: Some(Arc::new(Semaphore::new(0))),
+            ..reply("current")
+        },
+    ]);
+    let mut harness = fixture.worker(script);
+    let attached = harness.start(&fixture).await;
+    let session = attached.info.session;
+    let peer = harness.peer.clone();
+    let prompt = tokio::spawn(async move {
+        request::<SessionPrompt>(
+            &peer,
+            &PromptParams {
+                session,
+                content: text("first"),
+            },
+        )
+        .await
+        .unwrap()
+    });
+    harness.lease().await;
+    let mut released = false;
+    let mut failed = false;
+    let mut first_sequence = 0;
+    while !released || !failed {
+        let Incoming::Notification { method, params } = harness.next().await else {
+            panic!("unexpected second model lease")
+        };
+        match method.as_str() {
+            "model/release" => released = true,
+            "event/appended" => {
+                let params: EventParams = serde_json::from_value(params).unwrap();
+                failed |= matches!(params.event.kind, EventKind::TurnFailed { .. });
+            }
+            "stream/delta" => {
+                let params: DeltaParams = serde_json::from_value(params).unwrap();
+                assert_eq!(
+                    params.delta,
+                    Delta::Text {
+                        text: "discarded".into(),
+                    },
+                );
+                first_sequence = params.sequence;
+            }
+            other => panic!("unexpected notification {other}"),
+        }
+    }
+    assert!(prompt.await.unwrap().failed);
+    let snapshot = request::<SessionAttach>(
+        &harness.peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!snapshot.running);
+    assert!(snapshot.partial.is_empty());
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .all(|event| !matches!(event.kind, EventKind::AssistantMessage { .. },))
+    );
+    assert!(first_sequence > 0);
+    assert_eq!(snapshot.stream_sequence, first_sequence);
+    let peer = harness.peer.clone();
+    let prompt = tokio::spawn(async move {
+        request::<SessionPrompt>(
+            &peer,
+            &PromptParams {
+                session,
+                content: text("second"),
+            },
+        )
+        .await
+        .unwrap()
+    });
+    harness.lease().await;
+    loop {
+        if let Incoming::Notification { method, .. } = harness.next().await
+            && method == "stream/delta"
+        {
+            break;
+        }
+    }
+    let snapshot = request::<SessionAttach>(
+        &harness.peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(snapshot.running);
+    assert_eq!(snapshot.partial, text("current"));
+    assert!(snapshot.stream_sequence > first_sequence);
+    request::<SessionCancel>(&harness.peer, &SessionRef { session })
+        .await
+        .unwrap();
+    assert!(prompt.await.unwrap().cancelled);
+    harness.close(session).await;
+}
+
+#[tokio::test]
+async fn close_rejects_steering_retained_after_cancellation() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.worker(Script::new(vec![Step {
+        gate: Some(Arc::new(Semaphore::new(0))),
+        ..reply("partial")
+    }]));
+    let attached = harness.start(&fixture).await;
+    let session = attached.info.session;
+    let peer = harness.peer.clone();
+    let prompt = tokio::spawn(async move {
+        request::<SessionPrompt>(
+            &peer,
+            &PromptParams {
+                session,
+                content: text("first"),
+            },
+        )
+        .await
+        .unwrap()
+    });
+    harness.lease().await;
+    loop {
+        if let Incoming::Notification { method, .. } = harness.next().await
+            && method == "stream/delta"
+        {
+            break;
+        }
+    }
+    let params = PromptParams {
+        session,
+        content: text("steering"),
+    };
+    let peer = harness.peer.clone();
+    let steering = request::<SessionPrompt>(&peer, &params);
+    tokio::pin!(steering);
+    let attach = AttachParams {
+        session,
+        since: None,
+    };
+    let session_ref = SessionRef { session };
+    tokio::select! {
+        biased;
+        result = &mut steering => panic!("steering completed before cancellation: {result:?}"),
+        snapshot = request::<SessionAttach>(&harness.peer, &attach) => {
+            assert!(snapshot.unwrap().running);
+        }
+    }
+    request::<SessionCancel>(&harness.peer, &session_ref)
+        .await
+        .unwrap();
+    assert!(prompt.await.unwrap().cancelled);
+    let (closed, steering_result) = tokio::join!(
+        request::<SessionClose>(&harness.peer, &session_ref),
+        &mut steering,
+    );
+    closed.unwrap();
+    assert_code(steering_result, RpcError::INTERNAL_ERROR);
+    harness.finish().await;
+}
+
+#[tokio::test]
 async fn rejects_each_relative_session_option_path() {
     let fixture = Fixture::new();
     let harness = fixture.worker(Script::new(vec![]));
@@ -533,6 +717,30 @@ async fn rejects_each_relative_session_option_path() {
             model: None,
             options,
         });
+        assert_code(
+            request::<WorkerStart>(&harness.peer, &params).await,
+            RpcError::INVALID_PARAMS,
+        );
+    }
+    let attached = harness.start(&fixture).await;
+    harness.close(attached.info.session).await;
+}
+
+#[tokio::test]
+async fn rejects_relative_create_cwd_and_open_path() {
+    let fixture = Fixture::new();
+    let harness = fixture.worker(Script::new(vec![]));
+    for params in [
+        WorkerStartParams::Create(CreateParams {
+            cwd: ".".into(),
+            model: None,
+            options: SessionOptions::default(),
+        }),
+        WorkerStartParams::Open(OpenParams {
+            path: "missing-session.jsonl".into(),
+            options: SessionOptions::default(),
+        }),
+    ] {
         assert_code(
             request::<WorkerStart>(&harness.peer, &params).await,
             RpcError::INVALID_PARAMS,
@@ -577,6 +785,7 @@ async fn eof_stops_an_in_flight_model_request_and_records_failure() {
     let mut harness = fixture.worker(Script::new(vec![Step {
         text: "partial".into(),
         gate: Some(Arc::new(Semaphore::new(0))),
+        error: None,
     }]));
     let attached = harness.start(&fixture).await;
     let peer = harness.peer.clone();
@@ -689,11 +898,13 @@ async fn retry_resets_partial_output_and_keeps_one_model_lease() {
                 let params: ResetParams = serde_json::from_value(params).unwrap();
                 assert_eq!(params.session, session);
                 assert_eq!(params.attempt, 1);
+                assert_eq!(params.sequence, 2);
                 reset = true;
             }
             "stream/delta" => {
                 let params: DeltaParams = serde_json::from_value(params).unwrap();
                 if params.attempt == 1 {
+                    assert_eq!(params.sequence, 3);
                     assert!(reset);
                     assert_eq!(
                         params.delta,
@@ -704,6 +915,7 @@ async fn retry_resets_partial_output_and_keeps_one_model_lease() {
                     break;
                 }
                 assert_eq!(params.attempt, 0);
+                assert_eq!(params.sequence, 1);
             }
             "event/appended" => {}
             other => panic!("unexpected notification {other}"),
@@ -719,6 +931,7 @@ async fn retry_resets_partial_output_and_keeps_one_model_lease() {
     .await
     .unwrap();
     assert_eq!(snapshot.partial, text("current"));
+    assert_eq!(snapshot.stream_sequence, 3);
     assert!(snapshot.running);
     script.gate.add_permits(1);
     prompt.await.unwrap();

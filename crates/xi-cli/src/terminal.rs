@@ -31,6 +31,7 @@ pub(super) struct Renderer {
     session: Option<SessionId>,
     head: Option<EventId>,
     seen: HashSet<EventId>,
+    stream_sequence: u64,
     approvals: HashSet<ToolCallId>,
     pending_input: VecDeque<ToolCallId>,
     line_mode: bool,
@@ -45,6 +46,7 @@ impl Renderer {
             session: None,
             head: None,
             seen: HashSet::new(),
+            stream_sequence: 0,
             approvals: HashSet::new(),
             pending_input: VecDeque::new(),
             line_mode: false,
@@ -57,6 +59,7 @@ impl Renderer {
         self.session = Some(attached.info.session);
         self.head = Some(attached.info.head);
         self.seen.clear();
+        self.stream_sequence = attached.stream_sequence;
         if !matches!(self.mode, Render::Json) {
             self.seen
                 .extend(attached.events.iter().map(|event| event.id));
@@ -84,6 +87,17 @@ impl Renderer {
         };
         if self.session != Some(session) {
             return Ok(());
+        }
+        let sequence = match &notification {
+            ClientNotification::Delta(params) => params.sequence,
+            ClientNotification::Reset(params) => params.sequence,
+            _ => 0,
+        };
+        if sequence != 0 {
+            if sequence <= self.stream_sequence {
+                return Ok(());
+            }
+            self.stream_sequence = sequence;
         }
         if let ClientNotification::Event(params) = &notification {
             if !self.seen.insert(params.event.id) {
@@ -427,11 +441,12 @@ mod tests {
         assert_eq!(
             notification_json(ClientNotification::Reset(ResetParams {
                 session,
-                attempt: 2
+                attempt: 2,
+                sequence: 3,
             })),
             serde_json::json!({
                 "jsonrpc": "2.0", "method": "stream/reset",
-                "params": {"session": session, "attempt": 2},
+                "params": {"session": session, "attempt": 2, "sequence": 3},
             }),
         );
     }

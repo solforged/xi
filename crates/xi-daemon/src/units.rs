@@ -13,8 +13,9 @@ use crate::runtime_dir::prepare_runtime_dir;
 
 /// Writes and loads the current user's launchd or systemd socket-activation units.
 ///
-/// The daemon runs as `<exe> daemon`, without a restart policy. The installed
-/// runtime directory is preserved in the daemon's environment.
+/// The daemon runs as `<exe> daemon`, without a restart policy. Service-manager
+/// shutdown signals only the daemon so workers can finish their EOF cleanup.
+/// The installed runtime directory is preserved in the daemon's environment.
 pub fn install_units(exe: &Path) -> io::Result<Vec<PathBuf>> {
     let dir = prepare_runtime_dir()?;
 
@@ -252,6 +253,7 @@ WantedBy=sockets.target
 fn systemd_service(exe: &Path, dir: &Path) -> io::Result<String> {
     let exe = systemd_quote(path_text(exe)?, true);
     let environment = systemd_quote(&format!("{}={}", runtime::ENV, path_text(dir)?), false);
+    // Workers own EOF cleanup, so systemd must not terminate the service cgroup.
     Ok(format!(
         "\
 [Unit]
@@ -260,6 +262,7 @@ Description=xi daemon
 [Service]
 ExecStart={exe} daemon
 Environment={environment}
+KillMode=process
 "
     ))
 }
@@ -319,6 +322,14 @@ mod tests {
         assert!(service.contains("ExecStart=\"/opt/Xi & Tools/xi\" daemon\n"));
         assert!(service.contains("Environment=\"XI_RUNTIME_DIR=/run/user/1000/Xi & Tools\"\n"));
         assert!(!service.contains("Restart="));
+    }
+
+    #[test]
+    fn systemd_service_signals_only_daemon() {
+        let service =
+            systemd_service(Path::new("/opt/xi"), Path::new("/run/user/1000/xi")).unwrap();
+
+        assert!(service.lines().any(|line| line == "KillMode=process"));
     }
 
     #[test]

@@ -72,6 +72,46 @@ async fn concurrent_requests_resolve_out_of_order() {
 }
 
 #[tokio::test]
+async fn started_requests_are_enqueued_before_their_response_futures_are_polled() {
+    let (left, right) = duplex(4096);
+    let (reader, writer) = split(left);
+    let (peer, _incoming) = Peer::spawn(reader, writer);
+    let (reader, writer) = split(right);
+    let (remote, mut incoming) = Peer::spawn(reader, writer);
+
+    let first = peer.start_request_value("first", json!(1)).unwrap();
+    let second = peer.start_request_value("second", json!(2)).unwrap();
+    let Incoming::Request {
+        id: first_id,
+        method,
+        params,
+    } = timeout(Duration::from_secs(1), incoming.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected the first request before polling its response");
+    };
+    assert_eq!(method, "first");
+    assert_eq!(params, json!(1));
+    let Incoming::Request {
+        id: second_id,
+        method,
+        params,
+    } = incoming.recv().await.unwrap()
+    else {
+        panic!("expected the second request");
+    };
+    assert_eq!(method, "second");
+    assert_eq!(params, json!(2));
+
+    remote.respond(second_id, Ok(json!(2))).unwrap();
+    assert_eq!(second.await.unwrap(), json!(2));
+    remote.respond(first_id, Ok(json!(1))).unwrap();
+    assert_eq!(first.await.unwrap(), json!(1));
+}
+
+#[tokio::test]
 async fn notifications_and_requests_arrive_in_wire_order() {
     let (left, right) = duplex(4096);
     let (reader, writer) = split(left);

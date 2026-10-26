@@ -360,6 +360,17 @@ impl App {
         if !self.mine(notification) {
             return;
         }
+        let sequence = match notification {
+            ClientNotification::Delta(params) => params.sequence,
+            ClientNotification::Reset(params) => params.sequence,
+            _ => 0,
+        };
+        if sequence != 0 {
+            if sequence <= self.launch.attached.stream_sequence {
+                return;
+            }
+            self.launch.attached.stream_sequence = sequence;
+        }
         if let ClientNotification::ApprovalPending(pending) = notification
             && self.resolved.contains(&pending.call)
         {
@@ -1106,7 +1117,9 @@ mod tests {
     use serde_json::{Value, json};
     use xi_client::peer::{Incoming, Peer};
     use xi_protocol::EventKind;
-    use xi_protocol::methods::client::{PendingApproval, SessionDetails};
+    use xi_protocol::methods::client::{
+        Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails,
+    };
 
     use super::*;
 
@@ -1141,6 +1154,7 @@ mod tests {
             },
             events: vec![root],
             partial: Vec::new(),
+            stream_sequence: 0,
             running,
             pending_approvals: Vec::new(),
         }
@@ -1240,6 +1254,59 @@ mod tests {
         }));
         assert_eq!(app.launch.attached.events.len(), 2);
         assert_eq!(app.commit.len(), committed);
+    }
+
+    #[tokio::test]
+    async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
+        let mut attached = snapshot(true);
+        attached.partial = vec![Block::Text {
+            text: "hello".into(),
+        }];
+        attached.stream_sequence = 7;
+        let (launch, _) = launch(attached).await;
+        let mut app = App::new(launch, 80, 24);
+        let session = app.session_id();
+        app.notify(&ClientNotification::Reset(ResetParams {
+            session,
+            attempt: 1,
+            sequence: 5,
+        }));
+        for (sequence, text) in [(6, "hel"), (7, "lo"), (8, " world"), (8, " world")] {
+            app.notify(&ClientNotification::Delta(DeltaParams {
+                session,
+                attempt: 1,
+                sequence,
+                delta: Delta::Text { text: text.into() },
+            }));
+        }
+        let live: Vec<_> = app.transcript.live(80, 0).iter().map(Line::plain).collect();
+        assert_eq!(
+            live.iter()
+                .filter(|line| line.contains("hello world"))
+                .count(),
+            1,
+        );
+        assert!(live.iter().all(|line| !line.contains("hello world world")));
+        app.notify(&ClientNotification::Reset(ResetParams {
+            session,
+            attempt: 2,
+            sequence: 9,
+        }));
+        assert!(app.transcript.live(80, 0).is_empty());
+        app.notify(&ClientNotification::Delta(DeltaParams {
+            session,
+            attempt: 2,
+            sequence: 10,
+            delta: Delta::Text {
+                text: "next".into(),
+            },
+        }));
+        assert!(
+            app.transcript
+                .live(80, 0)
+                .iter()
+                .any(|line| line.plain().contains("next"))
+        );
     }
 
     #[tokio::test]
