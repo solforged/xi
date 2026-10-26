@@ -17,6 +17,7 @@ xi-provider = { path = "crates/xi-provider" }
 xi-sandbox = { path = "crates/xi-sandbox" }
 xi-session = { path = "crates/xi-session" }
 xi-tools = { path = "crates/xi-tools" }
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
