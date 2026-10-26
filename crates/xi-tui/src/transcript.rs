@@ -15,7 +15,7 @@ use xi_protocol::methods::client::Delta;
 use xi_protocol::model::Pricing;
 use xi_protocol::{Block, EventKind, OutputBlock, Timestamp, ToolCallId, ToolOutput};
 
-use crate::style::{Line, Role, lr, wrap};
+use crate::style::{Line, Role, inline, lr, prose, wrap};
 
 /// Terminal spinner frames, one every 125 ms.
 pub const SPINNER: [&str; 8] = ["┤", "┘", "┴", "└", "├", "┌", "┬", "┐"];
@@ -67,18 +67,18 @@ impl Thinking {
         match self {
             Self::Hidden => Vec::new(),
             Self::Full => {
-                let rows = wrap(text, cols.saturating_sub(4));
+                let rows = prose(text, cols.saturating_sub(4), Role::Dim);
                 let skip = if live {
                     rows.len().saturating_sub(STREAM_ROWS)
                 } else {
                     0
                 };
-                rows[skip..]
-                    .iter()
+                rows.into_iter()
+                    .skip(skip)
                     .enumerate()
                     .map(|(i, row)| {
                         let lead = if i == 0 { "  ∴ " } else { "    " };
-                        Line::default().dim(lead).dim(row).truncate(cols)
+                        Line::default().dim(lead).extend(row).truncate(cols)
                     })
                     .collect()
             }
@@ -91,7 +91,7 @@ impl Thinking {
                 };
                 let Some(row) = row else { return Vec::new() };
                 let more = !live && rows.next().is_some();
-                let line = Line::default().dim("  ∴ ").dim(row);
+                let line = Line::default().dim("  ∴ ").extend(inline(row, Role::Dim));
                 vec![if more {
                     line.truncate(cols.saturating_sub(9))
                         .dim(" · ctrl+t")
@@ -274,9 +274,22 @@ fn headline_arg(name: &str, input: &Value, workspace: Option<&std::path::Path>) 
             });
             first(rest.unwrap_or(c))
         }),
-        "read" | "write" | "edit" | "hashline" => {
-            field("path").map(|p| relative(p, workspace).to_owned())
-        }
+        "read" => field("path").map(|p| {
+            let path = relative(p, workspace);
+            let number = |k: &str| input.get(k).and_then(Value::as_u64);
+            match (number("offset"), number("limit")) {
+                (None, None) => path.to_owned(),
+                (Some(from), None) => format!("{path}:{from}-"),
+                (from, Some(limit)) => {
+                    let from = from.unwrap_or(1);
+                    format!(
+                        "{path}:{from}-{}",
+                        from.saturating_add(limit.saturating_sub(1))
+                    )
+                }
+            }
+        }),
+        "write" | "edit" | "hashline" => field("path").map(|p| relative(p, workspace).to_owned()),
         "search" => field("pattern").map(|p| match field("path").map(|d| relative(d, workspace)) {
             Some(".") | None => p.to_owned(),
             Some(path) => format!("{p} in {path}"),
@@ -302,6 +315,68 @@ fn text_of(output: &ToolOutput) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `n` and the noun for that many.
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The hint for lines cut from a block.
+fn more_lines(hidden: usize) -> String {
+    format!("… {} · ctrl+o", counted(hidden, "more line", "more lines"))
+}
+
+/// A read's size: the numbered lines of a file, or a directory's entries.
+fn read_size(output: &ToolOutput) -> String {
+    if output
+        .content
+        .iter()
+        .any(|b| matches!(b, OutputBlock::Image { .. }))
+    {
+        return "image".to_owned();
+    }
+    let text = text_of(output);
+    // File lines read `12|text` or `12:ab|text`; status notes and directory
+    // entries don't.
+    let numbered = |line: &str| {
+        line.split_once('|').is_some_and(|(number, _)| {
+            let number = number.split_once(':').map_or(number, |(n, _)| n);
+            !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+        })
+    };
+    match text.lines().next() {
+        Some(first) if !numbered(first) => counted(text.lines().count(), "entry", "entries"),
+        _ => counted(
+            text.lines().filter(|l| numbered(l)).count(),
+            "line",
+            "lines",
+        ),
+    }
+}
+
+/// The lines of a failed result to set in red. A trailing bracketed status,
+/// such as a command's `[exit 1]`, is the failure and the output above it is
+/// ordinary; without one, the first line states the error and the rest is
+/// context.
+fn alarm(lines: &[&str]) -> std::ops::Range<usize> {
+    let end = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    let start = lines[..end]
+        .iter()
+        .rposition(|l| {
+            let l = l.trim();
+            !(l.starts_with('[') && l.ends_with(']'))
+        })
+        .map_or(0, |i| i + 1);
+    if start < end {
+        start..end
+    } else {
+        let first = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+        first..first + 1
+    }
 }
 
 struct Diff<'a> {
@@ -443,8 +518,11 @@ impl Call {
         }
         let quiet = !output.is_error && matches!(self.name.as_str(), "read" | "search");
         if quiet {
-            let noun = if self.name == "read" { "lines" } else { "hits" };
-            meta.push(format!("{count} {noun}"));
+            meta.push(if self.name == "read" {
+                read_size(output)
+            } else {
+                counted(count, "hit", "hits")
+            });
         }
         if let Some(from) = self.decided_at {
             meta.push(duration(at.0.saturating_sub(from.0)));
@@ -472,7 +550,7 @@ impl Call {
             if hidden > 0 {
                 lines.push(
                     Line::default()
-                        .dim(format!("    … {hidden} more lines · ctrl+o"))
+                        .dim(format!("    {}", more_lines(hidden)))
                         .truncate(cols),
                 );
                 let mut text = String::new();
@@ -501,32 +579,26 @@ impl Call {
         if quiet {
             return (lines, None);
         }
-        let shown: Vec<&str> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .take(RESULT_LINES)
-            .collect();
+        let rows: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let red = if output.is_error { alarm(&rows) } else { 0..0 };
+        let shown = &rows[..rows.len().min(RESULT_LINES)];
         for (i, row) in shown.iter().enumerate() {
             let lead = if i == 0 {
                 Line::default().dim("  └ ")
             } else {
                 Line::default().ink("    ")
             };
-            let body = if output.is_error && i == 0 {
+            let body = if red.contains(&i) {
                 Line::default().sanguine(row)
             } else {
                 Line::default().ink(row)
             };
             lines.push(lead.extend(body).truncate(cols));
         }
-        let hidden = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count()
-            .saturating_sub(shown.len());
+        let hidden = rows.len() - shown.len();
         let mut more = Vec::new();
         if hidden > 0 {
-            more.push(format!("… {hidden} more lines · ctrl+o"));
+            more.push(more_lines(hidden));
         }
         if let Some(path) = spill {
             more.push(format!("full output in {}", path.display()));
@@ -768,17 +840,19 @@ impl Transcript {
                     if !lines.is_empty() {
                         self.gap(&mut out);
                         self.push(&mut out, lines);
+                        // Thinking stands apart from the calls it led to.
+                        self.gap(&mut out);
                     }
                 }
                 for block in content {
                     match block {
                         Block::Text { text } if !text.trim().is_empty() => {
                             self.gap(&mut out);
-                            let rows = wrap(text.trim(), cols.saturating_sub(2));
-                            let lines: Vec<_> = rows
-                                .iter()
-                                .map(|r| Line::default().ink("  ").ink(r))
-                                .collect();
+                            let lines: Vec<_> =
+                                prose(text.trim(), cols.saturating_sub(2), Role::Ink)
+                                    .into_iter()
+                                    .map(|row| Line::default().ink("  ").extend(row))
+                                    .collect();
                             self.push(&mut out, lines);
                             self.blank = false;
                             self.gap(&mut out);
@@ -910,7 +984,10 @@ impl Transcript {
                 if hidden > 0 {
                     lines.push(
                         Line::default()
-                            .dim(format!("  … {hidden} more lines of summary · ctrl+o"))
+                            .dim(format!(
+                                "  … {} of summary · ctrl+o",
+                                counted(hidden, "more line", "more lines")
+                            ))
                             .truncate(cols),
                     );
                     self.details.push(Detail {
@@ -954,7 +1031,11 @@ impl Transcript {
         let count = detail.text.lines().count();
         let mut lines = vec![lr(
             detail.head.clone(),
-            Line::default().dim(format!("{} · {count} lines", detail.what)),
+            Line::default().dim(format!(
+                "{} · {}",
+                detail.what,
+                counted(count, "line", "lines")
+            )),
             cols,
         )];
         if detail.what == "full diff" {
@@ -978,21 +1059,20 @@ impl Transcript {
                 }
             }
         } else {
-            for (i, row) in wrap(&detail.text, cols.saturating_sub(4))
-                .into_iter()
-                .enumerate()
-            {
-                let lead = if i == 0 {
-                    Line::default().dim("  └ ")
-                } else {
-                    Line::default().ink("    ")
-                };
-                let body = if detail.error && i == 0 {
-                    Line::default().sanguine(row)
-                } else {
-                    Line::default().ink(row)
-                };
-                lines.push(lead.extend(body));
+            let rows: Vec<&str> = detail.text.split('\n').collect();
+            let red = if detail.error { alarm(&rows) } else { 0..0 };
+            let mut lead = Line::default().dim("  └ ");
+            for (n, source) in rows.iter().enumerate() {
+                for row in wrap(source, cols.saturating_sub(4)) {
+                    let body = if red.contains(&n) {
+                        Line::default().sanguine(row)
+                    } else {
+                        Line::default().ink(row)
+                    };
+                    lines.push(
+                        std::mem::replace(&mut lead, Line::default().ink("    ")).extend(body),
+                    );
+                }
             }
         }
         if let Some(path) = &detail.spill {
@@ -1031,10 +1111,10 @@ impl Transcript {
     pub fn live(&self, cols: usize, frame: usize) -> Vec<Line> {
         let mut lines = Vec::new();
         if !self.stream.trim().is_empty() {
-            let rows = wrap(self.stream.trim(), cols.saturating_sub(2));
+            let rows = prose(self.stream.trim(), cols.saturating_sub(2), Role::Ink);
             let skip = rows.len().saturating_sub(STREAM_ROWS);
-            for row in &rows[skip..] {
-                lines.push(Line::default().ink("  ").ink(row));
+            for row in rows.into_iter().skip(skip) {
+                lines.push(Line::default().ink("  ").extend(row));
             }
             lines.push(Line::default());
         }
@@ -1257,8 +1337,14 @@ mod tests {
         t.apply(&ev(decide("a", Decision::Allow, Some("user#1")), 1000), 60);
         t.apply(&ev(decide("b", Decision::Allow, None), 1000), 60);
         assert!(
-            t.apply(&ev(result("b", "x\ny", false), 1100), 60)
-                .is_empty()
+            t.apply(
+                &ev(
+                    result("b", "1|x\n2|y\n[More lines. Continue with read.]", false),
+                    1100
+                ),
+                60
+            )
+            .is_empty()
         );
         let live = plain(&t.live(60, 0));
         assert!(live[0].starts_with("┤ bash pytest -x"), "{live:?}");
@@ -1270,11 +1356,45 @@ mod tests {
         assert!(rows[0].starts_with("✕ bash pytest -x"), "{rows:?}");
         assert!(rows[0].ends_with("user#1 · 1.8s"), "{rows:?}");
         assert_eq!(rows[1], "  └ FAILED test_x");
-        assert_eq!(rows[4], "    … 1 more lines · ctrl+o");
+        assert_eq!(rows[4], "    … 1 more line · ctrl+o");
         assert!(rows[5].starts_with("● read policies/archive.py"));
         assert!(rows[5].ends_with("2 lines · 0.1s"));
         assert!(t.live(60, 0).is_empty());
         assert_eq!(t.context, 15_280);
+    }
+
+    #[test]
+    fn failures_redden_the_error_not_the_output_above_it() {
+        let mut t = Transcript::default();
+        let calls = assistant(vec![
+            use_("a", "bash", json!({"command": "pwd; find .."})),
+            use_("b", "read", json!({"path": "gone"})),
+            use_(
+                "c",
+                "read",
+                json!({"path": "src", "offset": 40, "limit": 10}),
+            ),
+        ]);
+        t.apply(&ev(calls, 0), 60);
+        let mut rows = t.apply(
+            &ev(result("a", "/w\nfind: ..: denied\n[exit 1]", true), 0),
+            60,
+        );
+        rows.extend(t.apply(
+            &ev(result("b", "Cannot read gone\nNo such file", true), 0),
+            60,
+        ));
+        rows.extend(t.apply(&ev(result("c", "lib.rs\nmod/", false), 0), 60));
+        let red = |line: &Line| line.0.iter().any(|s| s.role == Role::Sanguine);
+        let reds: Vec<bool> = rows.iter().map(red).collect();
+        assert_eq!(
+            plain(&rows[1..4]),
+            ["  └ /w", "    find: ..: denied", "    [exit 1]"]
+        );
+        assert_eq!(reds[1..4], [false, false, true]);
+        assert_eq!(reds[5..7], [true, false], "{:?}", plain(&rows));
+        assert!(plain(&rows)[7].starts_with("● read src:40-49"));
+        assert!(plain(&rows)[7].ends_with("2 entries"));
     }
 
     #[test]
@@ -1385,6 +1505,15 @@ mod tests {
             "/tmp/ranges-old/x"
         );
         assert_eq!(arg("read", json!({"path": "/etc/hosts"})), "/etc/hosts");
+        assert_eq!(
+            arg(
+                "read",
+                json!({"path": "/tmp/ranges/a", "offset": 120, "limit": 46})
+            ),
+            "a:120-165"
+        );
+        assert_eq!(arg("read", json!({"path": "a", "offset": 120})), "a:120-");
+        assert_eq!(arg("read", json!({"path": "a", "limit": 40})), "a:1-40");
         assert_eq!(
             arg(
                 "bash",
