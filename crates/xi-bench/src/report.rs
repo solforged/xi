@@ -40,6 +40,8 @@ struct Summary {
     passes: usize,
     wall_ms: f64,
     model_calls: Option<f64>,
+    subagent_model_calls: Option<f64>,
+    compactions: Option<f64>,
     tokens: [Option<f64>; 4],
     tools: Option<f64>,
     edits: u64,
@@ -57,6 +59,13 @@ fn summarize(records: &[&Record]) -> Summary {
         passes: records.iter().filter(|record| record.pass).count(),
         wall_ms: median(records.iter().map(|record| record.agent.wall_ms).collect()).unwrap_or(0.0),
         model_calls: median(metrics.iter().map(|m| m.model_calls as f64).collect()),
+        subagent_model_calls: median(
+            metrics
+                .iter()
+                .map(|m| m.subagent_model_calls as f64)
+                .collect(),
+        ),
+        compactions: median(metrics.iter().map(|m| m.compactions as f64).collect()),
         tokens: [
             median(metrics.iter().map(|m| m.tokens.input as f64).collect()),
             median(metrics.iter().map(|m| m.tokens.output as f64).collect()),
@@ -93,7 +102,7 @@ fn cell(value: &str) -> String {
 }
 
 fn table(output: &mut String, records: &[&Record]) {
-    output.push_str("| Arm | Model | Pass rate | Median wall | Model calls | Tokens (in/out/cache read/cache write) | Tool calls | Edit failure rate | Metrics |\n|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    output.push_str("| Arm | Model | Pass rate | Median wall | Model calls | Subagent model calls | Compactions | Tokens (in/out/cache read/cache write) | Tool calls | Edit failure rate | Metrics |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     let mut groups: BTreeMap<(&str, &str), Vec<&Record>> = BTreeMap::new();
     for record in records {
         groups
@@ -115,7 +124,7 @@ fn table(output: &mut String, records: &[&Record]) {
         };
         writeln!(
             output,
-            "| {} | {} | {}/{} ({:.1}%) | {:.2}s | {} | {} | {} | {} | {}/{} |",
+            "| {} | {} | {}/{} ({:.1}%) | {:.2}s | {} | {} | {} | {} | {} | {} | {}/{} |",
             cell(arm),
             cell(model),
             s.passes,
@@ -123,6 +132,8 @@ fn table(output: &mut String, records: &[&Record]) {
             100.0 * s.passes as f64 / s.runs as f64,
             s.wall_ms / 1000.0,
             number(s.model_calls),
+            number(s.subagent_model_calls),
+            number(s.compactions),
             s.tokens.map(number).join(" / "),
             number(s.tools),
             edit_rate,
@@ -214,7 +225,8 @@ mod tests {
         assert_eq!((s.edit_failures, s.edits), (2, 4));
         let rendered = render(&[a, b]);
         assert!(
-            rendered.contains("1/2 (50.0%) | 2.00s | 3.5 | 35 / 0 / 0 / 0 | 3.5 | 50.0% (2/4)")
+            rendered
+                .contains("1/2 (50.0%) | 2.00s | 3.5 | 0 | 0 | 35 / 0 / 0 / 0 | 3.5 | 50.0% (2/4)")
         );
         assert!(rendered.contains("### task"));
     }

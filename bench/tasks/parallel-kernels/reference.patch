@@ -1,0 +1,140 @@
+--- a/packages/csvstream/__init__.py
++++ b/packages/csvstream/__init__.py
+@@ -1,8 +1,47 @@
+ class Decoder:
+-    def __init__(self): self.buffer=''
++    def __init__(self):
++        self.state='start'
++        self.field=''
++        self.row=[]
++        self.pending=False
++        self.closed=False
+     def feed(self, chunk, final=False):
+-        self.buffer+=chunk
+-        parts=self.buffer.split('\n')
+-        self.buffer=parts.pop()
+-        if final and self.buffer: parts.append(self.buffer)
+-        return [row.split(',') for row in parts]
++        if self.closed: raise ValueError('closed')
++        rows=[]
++        def emit():
++            self.row.append(self.field)
++            rows.append(self.row)
++            self.row=[]
++            self.field=''
++            self.pending=False
++            self.state='start'
++        for char in chunk:
++            self.pending=True
++            if self.state=='cr':
++                if char!='\n': raise ValueError('bare CR')
++                emit()
++                continue
++            if self.state=='quoted':
++                if char=='"': self.state='quote'
++                else: self.field+=char
++                continue
++            if self.state=='quote' and char=='"':
++                self.field+='"'
++                self.state='quoted'
++                continue
++            if char==',':
++                self.row.append(self.field)
++                self.field=''
++                self.state='start'
++            elif char=='\n': emit()
++            elif char=='\r': self.state='cr'
++            elif char=='"' and self.state=='start': self.state='quoted'
++            elif char=='"' or self.state=='quote': raise ValueError('unexpected text')
++            else:
++                self.field+=char
++                self.state='plain'
++        if final:
++            self.closed=True
++            if self.state in ('quoted','cr'): raise ValueError('incomplete CSV')
++            if self.pending: emit()
++        return rows
+--- a/packages/overlay/__init__.py
++++ b/packages/overlay/__init__.py
+@@ -1,2 +1,19 @@
+ def paint(intervals):
+-    return sorted(intervals)
++    result=[]
++    for start,end,label in intervals:
++        if start<0 or end<start: raise ValueError('invalid interval')
++        if start==end: continue
++        clipped=[]
++        for left,right,old in result:
++            if right<=start or left>=end: clipped.append((left,right,old))
++            else:
++                if left<start: clipped.append((left,start,old))
++                if right>end: clipped.append((end,right,old))
++        clipped.append((start,end,label))
++        clipped.sort(key=lambda item:item[0])
++        result=[]
++        for item in clipped:
++            if result and result[-1][1]==item[0] and result[-1][2]==item[2]:
++                result[-1]=(result[-1][0],item[1],item[2])
++            else: result.append(item)
++    return result
+--- a/packages/waves/__init__.py
++++ b/packages/waves/__init__.py
+@@ -1,2 +1,11 @@
+ def plan(graph):
+-    return [sorted(graph)] if graph else []
++    remaining={job:set(deps) for job,deps in graph.items()}
++    if any(deps-set(remaining) for deps in remaining.values()): raise ValueError('unknown dependency')
++    waves=[]
++    while remaining:
++        ready=sorted(job for job,deps in remaining.items() if not deps)
++        if not ready: raise ValueError('cycle')
++        waves.append(ready)
++        for job in ready: del remaining[job]
++        for deps in remaining.values(): deps.difference_update(ready)
++    return waves
+--- a/packages/pointer/__init__.py
++++ b/packages/pointer/__init__.py
+@@ -1,5 +1,20 @@
++import re
++
+ def resolve(document,pointer):
++    if not isinstance(pointer,str): raise ValueError('invalid pointer')
++    if pointer=='': return document
++    if not pointer.startswith('/'): raise ValueError('invalid pointer')
+     value=document
+-    for token in pointer.strip('/').split('/'):
+-        value=value[int(token)] if isinstance(value,list) else value[token]
++    for raw in pointer[1:].split('/'):
++        if re.search('~(?![01])',raw): raise ValueError('invalid escape')
++        token=raw.replace('~1','/').replace('~0','~')
++        if isinstance(value,dict):
++            if token not in value: raise ValueError('missing key')
++            value=value[token]
++        elif isinstance(value,list):
++            if not re.fullmatch('0|[1-9][0-9]*',token): raise ValueError('invalid index')
++            index=int(token)
++            if index>=len(value): raise ValueError('missing index')
++            value=value[index]
++        else: raise ValueError('scalar traversal')
+     return value
+--- a/packages/retry/__init__.py
++++ b/packages/retry/__init__.py
+@@ -1,5 +1,16 @@
+ def schedule(delays, *, base, cap, budget):
++    def valid(value, minimum=0): return type(value) is int and value>=minimum
++    if not valid(base,1) or not valid(cap,1) or not valid(budget): raise ValueError('parameters')
+     starts=[0]
+-    for duration,retry_after in delays:
+-        starts.append(starts[-1]+duration+min(cap,base))
++    backoff=min(base,cap)
++    stopped=False
++    for item in delays:
++        try: duration,retry_after=item
++        except (TypeError,ValueError) as error: raise ValueError('item') from error
++        if not valid(duration) or (retry_after is not None and not valid(retry_after)): raise ValueError('item')
++        if not stopped:
++            next_start=starts[-1]+duration+max(backoff,retry_after or 0)
++            if next_start<=budget: starts.append(next_start)
++            else: stopped=True
++        backoff=min(cap,backoff*2)
+     return starts

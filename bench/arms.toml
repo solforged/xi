@@ -21,3 +21,15 @@ name = "pi"
 kind = "pi"
 argv = ["pi", "-p", "--mode", "json", "--model", "{model}", "--thinking", "medium", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-mcp", "--offline", "--session-dir", "{session_dir}", "{prompt}"]
 [arm.env]
+
+[[arm]]
+name = "xi-compact"
+kind = "xi"
+argv = ["xi", "--json", "--on-ask", "deny", "--config", "{arms_dir}/configs/compact.toml", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "-p", "{prompt}"]
+[arm.env]
+
+[[arm]]
+name = "xi-subagents"
+kind = "xi"
+argv = ["xi", "--json", "--on-ask", "deny", "--extension", "{arms_dir}/../extensions/subagents", "--model", "{model}", "--session-dir", "{session_dir}", "--cwd", "{workspace}", "-p", "{prompt}"]
+[arm.env]

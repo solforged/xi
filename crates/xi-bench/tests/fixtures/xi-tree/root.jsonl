@@ -1,0 +1,7 @@
+{"id":"00000000-0000-7000-8000-000000000001","at":1000,"type":"session_started","session":"00000000-0000-7000-8000-000000000010","cwd":"/workspace","model":{"provider":"fixture","model":"test"},"xi_version":"0.0.0"}
+{"id":"00000000-0000-7000-8000-000000000002","parent":"00000000-0000-7000-8000-000000000001","at":1100,"type":"assistant_message","model":{"provider":"fixture","model":"test"},"content":[{"type":"tool_use","id":"shared","name":"task","input":{}}],"stop":"tool_use","usage":{"input":100,"output":20,"cache_read":50,"cache_write":10}}
+{"id":"00000000-0000-7000-8000-000000000003","parent":"00000000-0000-7000-8000-000000000002","at":1200,"type":"tool_decision","call":"shared","action":"tool task","decision":"allow"}
+{"id":"00000000-0000-7000-8000-000000000004","parent":"00000000-0000-7000-8000-000000000003","at":1600,"type":"tool_result","call":"shared","content":[],"is_error":false}
+{"id":"00000000-0000-7000-8000-000000000005","parent":"00000000-0000-7000-8000-000000000004","at":1700,"type":"compaction","summary":"summary","tokens_before":25000,"usage":{"input":10,"output":5,"cache_read":8,"cache_write":3}}
+{"id":"00000000-0000-7000-8000-000000000006","parent":"00000000-0000-7000-8000-000000000005","at":1800,"type":"compaction","summary":"extension summary","tokens_before":24000}
+{"id":"00000000-0000-7000-8000-000000000007","parent":"00000000-0000-7000-8000-000000000006","at":1900,"type":"assistant_message","model":{"provider":"fixture","model":"test"},"content":[],"stop":"end_turn","usage":{"input":3,"output":4}}
