@@ -59,7 +59,7 @@ Self-hosting limits outside the client: tools have no network, so adding a crate
 | Item | Why |
 |---|---|
 | Egress proxy and in-namespace forwarder | Tools and extensions have no network at all today; `fetch`, package installs and `git push` need it. Extensions that declare `net` refuse to start until it exists. |
-| Harder tasks for frontier models | `gpt-6.1-sol` passes every hard task in every arm (36/36; see [Frontier model](#frontier-model)), so the suite can no longer rank harnesses or features on a frontier model. The Anthropic adapter passes mocked transcripts only; there is no API key on these machines. |
+| Harder tasks for frontier models | `gpt-6.1-sol` passes every hard task in every arm (36/36; see [Frontier model](#frontier-model)), so the suite can no longer rank harnesses or features on a frontier model. Anthropic subscription sign-in and the `claude/…` catalog are implemented. Local tests cover metadata-bearing multi-tool turns, failed and denied tools, older-log recovery and compressed streams; live-service compatibility requires manual verification. |
 | Credentials from the keychain | Only env vars and 0600 files work now. |
 | Extension package pinning | Packages load from configured directories; the content-hash lockfile is not built. |
 | PID namespace (Linux) | Other processes' command lines are visible in `/proc`. |

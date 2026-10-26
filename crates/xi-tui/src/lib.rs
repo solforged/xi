@@ -3011,6 +3011,7 @@ mod tests {
                     id: "event-ask".into(),
                     name: "bash".into(),
                     input: json!({ "command": "git push" }),
+                    extra: Default::default(),
                 }],
                 stop: StopReason::ToolUse,
                 usage: Usage::default(),

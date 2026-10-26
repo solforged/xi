@@ -17,6 +17,14 @@ api = "anthropic-messages"
 base_url = "https://api.anthropic.com"
 auth = { env = "ANTHROPIC_API_KEY" }
 
+# A Claude subscription through Claude Code's OAuth client (`xi login anthropic`).
+# Opt in by selecting claude/…; anthropic/… continues using an API key.
+# This unsupported third-party flow may be blocked by Anthropic without notice.
+[provider.claude]
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+auth = { login = "anthropic" }
+
 [provider.openai]
 api = "openai-chat"
 base_url = "https://api.openai.com/v1"
@@ -70,6 +78,37 @@ context_window = 1000000
 max_output = 128000
 reasoning = ["off", "low", "medium", "high", "max"]
 pricing = { input = 3, output = 15, cache_read = 0.30, cache_write = 3.75 }
+
+# Subscription usage counts against the plan, not the API's token prices.
+# Native 1M models need no long-context beta. Sonnet 4.6 keeps its standard
+# window: the beta-gated 1M extension requires usage credits on subscriptions.
+[[model]]
+provider = "claude"
+id = "claude-opus-5-5"
+context_window = 1000000
+max_output = 64000
+reasoning = ["low", "medium", "high", "xhigh", "max"]
+
+[[model]]
+provider = "claude"
+id = "claude-sonnet-5-5"
+context_window = 1000000
+max_output = 64000
+reasoning = ["off", "low", "medium", "high", "xhigh", "max"]
+
+[[model]]
+provider = "claude"
+id = "claude-fable-5-1"
+context_window = 1000000
+max_output = 64000
+reasoning = ["low", "medium", "high", "xhigh", "max"]
+
+[[model]]
+provider = "claude"
+id = "claude-sonnet-4-6"
+context_window = 200000
+max_output = 64000
+reasoning = ["off", "low", "medium", "high", "max"]
 
 [[model]]
 provider = "openai"

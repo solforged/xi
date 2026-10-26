@@ -142,6 +142,25 @@ fn model_override_key_includes_provider() {
 }
 
 #[test]
+fn anthropic_login_does_not_sign_other_wire_apis() {
+    let credentials = tempfile::tempdir().unwrap();
+    for api in [Api::OpenaiChat, Api::OpenaiResponses] {
+        let mut registry = registry(
+            "https://example.com".into(),
+            api,
+            "test-model",
+            &[],
+            Auth::Login(xi_provider::LoginService::Anthropic),
+        );
+        registry.set_credentials(credentials.path().into());
+        assert_eq!(
+            error_kind(&registry, &model_ref("test-model")),
+            ErrorKind::Config,
+        );
+    }
+}
+
+#[test]
 fn model_tables_split_compat_and_still_reject_unknown_fields() {
     let table = |extra: &str| {
         toml::from_str::<RegistryConfig>(&format!(

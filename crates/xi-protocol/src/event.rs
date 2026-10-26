@@ -56,6 +56,7 @@ pub enum EventKind {
         /// Model that produced the response.
         model: ModelRef,
         /// Response blocks, including tool calls.
+        #[serde(deserialize_with = "crate::content::assistant_content")]
         content: Vec<Block>,
         /// Why the model stopped.
         stop: StopReason,

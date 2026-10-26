@@ -94,6 +94,8 @@ enum Command {
 enum LoginAccount {
     /// A ChatGPT plan, for the `chatgpt/…` models.
     Chatgpt,
+    /// A Claude subscription, for the opt-in `claude/…` models.
+    Anthropic,
 }
 
 #[derive(Subcommand)]
@@ -291,15 +293,59 @@ fn executable() -> std::io::Result<PathBuf> {
     }
 }
 
-/// Runs the browser sign-in. A browser on another machine can't reach the
-/// loopback callback, so the URL it lands on may be pasted instead.
+/// Runs browser sign-in without changing the selected provider or model.
 async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
-    let LoginAccount::Chatgpt = account;
-    let login = xi_provider::Login::start().await?;
+    match account {
+        LoginAccount::Chatgpt => {
+            let login = xi_provider::Login::start().await?;
+            let line = login_input(
+                login.url(),
+                "ChatGPT",
+                "Signing in on another machine? Paste the address the browser ends up on here.",
+            );
+            let file = xi_provider::chatgpt_file(&paths.credentials());
+            let account = login.finish(&file, async { line.await.ok() }).await?;
+            let who = match (account.email, account.plan) {
+                (Some(email), Some(plan)) => format!(" as {email} ({plan})"),
+                (Some(email), None) => format!(" as {email}"),
+                (None, Some(plan)) => format!(" ({plan})"),
+                (None, None) => String::new(),
+            };
+            println!("Signed in to ChatGPT{who}. Use `xi -m chatgpt/gpt-6.1-sol`.");
+        }
+        LoginAccount::Anthropic => {
+            eprintln!(
+                "Warning: Anthropic does not support third-party subscription sign-in. \
+                 This uses Claude Code's OAuth client and may stop working or affect your account.\n\
+                 https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use"
+            );
+            let login = xi_provider::AnthropicLogin::start().await?;
+            let line = login_input(
+                login.url(),
+                "Anthropic",
+                "You may paste the final redirect URL or authorization code#state here.",
+            );
+            let file = xi_provider::anthropic_file(&paths.credentials());
+            login.finish(&file, async { line.await.ok() }).await?;
+            println!(
+                "Signed in to Anthropic. Tokens saved to {}.\n\
+                 Use `xi -m claude/claude-sonnet-5-5` for subscription requests.\n\
+                 The `anthropic/…` models still use API keys.",
+                file.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Opens the authorization page and reads an optional pasted callback.
+fn login_input(
+    url: &str,
+    service: &str,
+    instructions: &str,
+) -> tokio::sync::oneshot::Receiver<String> {
     eprintln!(
-        "Opening the ChatGPT sign-in page. If it doesn't open, visit:\n\n  {}\n\n\
-         Signing in on another machine? Paste the address the browser ends up on here.",
-        login.url()
+        "Opening the {service} sign-in page. If it doesn't open, visit:\n\n  {url}\n\n{instructions}"
     );
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -307,7 +353,7 @@ async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
         "xdg-open"
     };
     let _ = std::process::Command::new(opener)
-        .arg(login.url())
+        .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -323,16 +369,7 @@ async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
             let _ = pasted.send(text);
         }
     });
-    let file = xi_provider::chatgpt_file(&paths.credentials());
-    let account = login.finish(&file, async { line.await.ok() }).await?;
-    let who = match (account.email, account.plan) {
-        (Some(email), Some(plan)) => format!(" as {email} ({plan})"),
-        (Some(email), None) => format!(" as {email}"),
-        (None, Some(plan)) => format!(" ({plan})"),
-        (None, None) => String::new(),
-    };
-    println!("Signed in to ChatGPT{who}. `xi` now uses chatgpt/gpt-6.1-sol by default.");
-    Ok(())
+    line
 }
 
 async fn open_or_create(

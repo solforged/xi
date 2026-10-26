@@ -137,7 +137,8 @@ async fn reasoning_text_tools_and_usage_round_trip_statelessly() {
             Block::ToolUse {
                 id: "call_1".into(),
                 name: "read".into(),
-                input: json!({"path":"src/one.rs"})
+                input: json!({"path":"src/one.rs"}),
+                extra: Default::default(),
             },
         ]
     );

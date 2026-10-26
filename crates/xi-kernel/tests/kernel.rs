@@ -256,6 +256,7 @@ fn call(id: &str, name: &str, input: serde_json::Value) -> Block {
         id: id.into(),
         name: name.into(),
         input,
+        extra: Default::default(),
     }
 }
 fn batch(calls: Vec<Block>) -> Step {
@@ -354,8 +355,59 @@ async fn full_tool_loop_events_context_cache_and_usage() {
     ));
 }
 
+#[tokio::test]
+async fn metadata_bearing_calls_get_results_and_keep_metadata_in_history() {
+    let fixture = Fixture::new();
+    let mut calls = vec![
+        call("ok", "fake", json!({})),
+        call("invalid", "fake", json!({"invalid":true})),
+        call("missing", "unknown", json!({})),
+        call("denied", "fake", json!({"net":true})),
+    ];
+    for block in &mut calls {
+        let Block::ToolUse { extra, .. } = block else {
+            unreachable!();
+        };
+        extra.insert("anthropic".into(), json!({"caller":{"type":"direct"}}));
+    }
+    let script = Script::new(vec![batch(calls.clone()), Step::Reply(done())]);
+    let (session, _) = fixture.session(script.clone(), FakeTool { gate: None }, opts());
+    let result = session.prompt(input("work")).await.unwrap();
+    assert!(!result.failed);
+    let info = session.info().await;
+    let requests = script.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].messages[1], Message::Assistant(calls.clone()));
+    let Message::ToolResults(results) = &requests[1].messages[2] else {
+        panic!("missing tool results");
+    };
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (result.call.0.as_str(), result.output.is_error))
+            .collect::<Vec<_>>(),
+        [
+            ("ok", false),
+            ("invalid", true),
+            ("missing", true),
+            ("denied", true)
+        ],
+    );
+    let event = info
+        .events
+        .iter()
+        .find(|event| matches!(event.kind, EventKind::AssistantMessage { .. }))
+        .unwrap();
+    let decoded: xi_protocol::Event =
+        serde_json::from_slice(&serde_json::to_vec(event).unwrap()).unwrap();
+    let EventKind::AssistantMessage { content, .. } = decoded.kind else {
+        panic!("missing persisted assistant");
+    };
+    assert_eq!(content, calls);
+}
+
 #[test]
-fn context_groups_results_and_repairs_dangling_calls_after_compaction() {
+fn context_recovers_legacy_tool_metadata_and_groups_results_after_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let mut log = xi_session::SessionLog::create(
         dir.path().join("log.jsonl"),
@@ -390,7 +442,13 @@ fn context_groups_results_and_repairs_dangling_calls_after_compaction() {
             content: vec![
                 call("a", "fake", json!({})),
                 call("b", "fake", json!({})),
-                call("c", "fake", json!({})),
+                Block::Opaque {
+                    provider: "anthropic".into(),
+                    value: json!({
+                        "type":"tool_use", "id":"c", "name":"fake", "input":{},
+                        "caller":{"type":"direct"},
+                    }),
+                },
             ],
             stop: StopReason::ToolUse,
             usage: Usage::default(),
@@ -423,9 +481,21 @@ fn context_groups_results_and_repairs_dangling_calls_after_compaction() {
     ] {
         head = log.append(head, event).unwrap().id;
     }
+    let path = log.file_path().to_owned();
+    let original = std::fs::read(&path).unwrap();
+    drop(log);
+    let log = xi_session::SessionLog::open(&path).unwrap();
     let messages = xi_kernel::context::messages(log.context(head).unwrap());
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[0], Message::User(input("summary")));
+    let Message::Assistant(content) = &messages[1] else {
+        panic!("missing recovered assistant");
+    };
+    let Block::ToolUse { id, extra, .. } = &content[2] else {
+        panic!("legacy call was not recovered");
+    };
+    assert_eq!(id.0, "c");
+    assert_eq!(extra["anthropic"]["caller"], json!({"type":"direct"}));
     let Message::ToolResults(results) = &messages[2] else {
         panic!("missing grouped results")
     };
@@ -438,6 +508,7 @@ fn context_groups_results_and_repairs_dangling_calls_after_compaction() {
     );
     assert!(results[2].output.is_error);
     assert_eq!(log.events().len(), 8, "synthetic results are not persisted");
+    assert_eq!(std::fs::read(path).unwrap(), original);
 }
 
 #[test]

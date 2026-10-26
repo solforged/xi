@@ -6,7 +6,6 @@
 //! after a 401, and write the rotated tokens back under a lock file so
 //! several xi processes never spend the same refresh token twice.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::oauth::{client, random, save};
 use crate::transport::network;
 use crate::{Error, ErrorKind};
 
@@ -84,11 +84,7 @@ impl Login {
                 "Ports 1455 and 1457 are busy; close the other sign-in and retry",
             )
         })?;
-        let verifier = URL_SAFE_NO_PAD.encode(random::<64>()?);
-        let challenge = URL_SAFE_NO_PAD.encode(aws_lc_rs::digest::digest(
-            &aws_lc_rs::digest::SHA256,
-            verifier.as_bytes(),
-        ));
+        let (verifier, challenge) = crate::oauth::pkce()?;
         let state = URL_SAFE_NO_PAD.encode(random::<32>()?);
         let redirect = format!("http://127.0.0.1:{port}/auth/callback");
         let mut url = reqwest::Url::parse(&format!("{ISSUER}/oauth/authorize"))
@@ -229,32 +225,24 @@ async fn renew(
     stale: &str,
     url: &str,
 ) -> Result<Tokens, Error> {
-    let lock_path = lock_path(file);
-    let lock = tokio::task::spawn_blocking(move || {
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_path)?;
-        lock.lock()?;
-        Ok::<_, std::io::Error>(lock)
+    let client = client.clone();
+    let file = file.to_owned();
+    let stale = stale.to_owned();
+    let url = url.to_owned();
+    // The owned task keeps the lock until rotated tokens are saved even if
+    // the model request waiting for this refresh is cancelled.
+    tokio::spawn(async move {
+        let _lock = crate::oauth::lock(&file, "ChatGPT").await?;
+        let current = load(&file)?;
+        if current.access_token != stale {
+            return Ok(current);
+        }
+        let fresh = refresh(&client, &url, current).await?;
+        save(&file, &fresh)?;
+        Ok(fresh)
     })
     .await
-    .map_err(|_| Error::new(ErrorKind::Auth, "ChatGPT token lock task failed"))?
-    .map_err(|error| {
-        Error::new(
-            ErrorKind::Auth,
-            format!("Cannot lock the ChatGPT credential: {error}"),
-        )
-    })?;
-    let current = load(file)?;
-    if current.access_token != stale {
-        return Ok(current);
-    }
-    let fresh = refresh(client, url, current).await?;
-    save(file, &fresh)?;
-    drop(lock);
-    Ok(fresh)
+    .map_err(|_| Error::new(ErrorKind::Auth, "ChatGPT token refresh task failed"))?
 }
 
 async fn refresh(client: &reqwest::Client, url: &str, tokens: Tokens) -> Result<Tokens, Error> {
@@ -435,22 +423,6 @@ fn callback_code(text: &str, state: &str) -> Result<String, Error> {
         .ok_or_else(|| Error::new(ErrorKind::Auth, "The sign-in callback has no code"))
 }
 
-fn client() -> Result<reqwest::Client, Error> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| Error::new(ErrorKind::Config, error.to_string()))
-}
-
-fn random<const N: usize>() -> Result<[u8; N], Error> {
-    let mut bytes = [0; N];
-    aws_lc_rs::rand::fill(&mut bytes)
-        .map_err(|_| Error::new(ErrorKind::Config, "The system random source failed"))?;
-    Ok(bytes)
-}
-
 /// The unverified payload of a JWT. Only used to read our own tokens.
 fn claims(jwt: &str) -> Option<Value> {
     let payload = jwt.split('.').nth(1)?;
@@ -478,71 +450,12 @@ fn signed_out() -> String {
     "The ChatGPT sign-in has expired or was revoked; run `xi login chatgpt`".into()
 }
 
-fn lock_path(file: &Path) -> PathBuf {
-    let mut name = file.as_os_str().to_owned();
-    name.push(".lock");
-    PathBuf::from(name)
-}
-
 fn load(file: &Path) -> Result<Tokens, Error> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Error::new(
-                ErrorKind::Auth,
-                "Not signed in to ChatGPT; run `xi login chatgpt`",
-            ));
-        }
-        Err(_) => {
-            return Err(Error::new(
-                ErrorKind::Auth,
-                "Cannot read the ChatGPT credential",
-            ));
-        }
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(file)
-            .map_err(|_| Error::new(ErrorKind::Auth, "Cannot inspect the ChatGPT credential"))?;
-        if metadata.permissions().mode() & 0o7177 != 0 {
-            return Err(Error::new(
-                ErrorKind::Auth,
-                "The ChatGPT credential must have mode 0600 or stricter",
-            ));
-        }
-    }
-    serde_json::from_str(&text)
-        .map_err(|_| Error::new(ErrorKind::Auth, "The ChatGPT credential is malformed"))
-}
-
-/// Writes the tokens through a temporary file so a crash never leaves a
-/// truncated credential.
-fn save(file: &Path, tokens: &Tokens) -> Result<(), Error> {
-    let fail = |error: std::io::Error| {
-        Error::new(
-            ErrorKind::Config,
-            format!("Cannot save {}: {error}", file.display()),
-        )
-    };
-    let dir = file.parent().unwrap_or(Path::new("."));
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir).map_err(fail)?;
-    let mut temporary = file.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut out = options.open(&temporary).map_err(fail)?;
-    out.write_all(&serde_json::to_vec_pretty(tokens).expect("tokens serialize"))
-        .and_then(|()| out.sync_all())
-        .map_err(fail)?;
-    std::fs::rename(&temporary, file).map_err(fail)
+    crate::oauth::load(
+        file,
+        "ChatGPT",
+        "Not signed in to ChatGPT; run `xi login chatgpt`",
+    )
 }
 
 #[cfg(test)]

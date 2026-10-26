@@ -6,8 +6,9 @@
 //! round-trips in encrypted form; Chat Completions reasoning is exposed as
 //! [`Block::Thinking`] but is not replayed.
 //!
-//! `auth = { login = "chatgpt" }` signs requests with a ChatGPT plan instead
-//! of an API key; [`Login`] obtains the tokens and requests refresh them.
+//! `auth = { login = "chatgpt" }` or `{ login = "anthropic" }` signs
+//! requests with stored subscription tokens instead of an API key.
+//! [`Login`] and [`AnthropicLogin`] obtain them; requests refresh them.
 //! Providers that speak the same [`Api`] differently say so in [`Compat`].
 //!
 //! The [`Registry`] knows which providers and models exist. It starts from a
@@ -26,7 +27,10 @@
 //! OpenAI-compatible stream plus a tool-result round trip without credentials.
 
 mod anthropic;
+mod anthropic_login;
 mod chatgpt;
+mod claude_code;
+mod oauth;
 mod openai;
 mod registry;
 mod responses;
@@ -38,6 +42,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use anthropic_login::{Login as AnthropicLogin, anthropic_file};
 pub use chatgpt::{Account, Login, chatgpt_file};
 pub use futures::future::BoxFuture;
 use serde::de::Error as _;
@@ -203,6 +208,8 @@ pub enum Auth {
 pub enum LoginService {
     /// A ChatGPT plan, through the Codex backend.
     Chatgpt,
+    /// A Claude subscription through Claude Code's OAuth client.
+    Anthropic,
 }
 
 /// Wire differences between providers that speak the same [`Api`]. Set

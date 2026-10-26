@@ -204,6 +204,9 @@ impl Mirror {
                         Auth::Login(LoginService::Chatgpt) => {
                             xi_provider::chatgpt_file(&self.credentials).exists()
                         }
+                        Auth::Login(LoginService::Anthropic) => {
+                            xi_provider::anthropic_file(&self.credentials).exists()
+                        }
                     }),
                 info: info.clone(),
             })

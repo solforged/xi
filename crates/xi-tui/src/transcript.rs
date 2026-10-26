@@ -850,7 +850,9 @@ impl Transcript {
                             self.blank = false;
                             self.gap(&mut out);
                         }
-                        Block::ToolUse { id, name, input } => self.calls.push(Call {
+                        Block::ToolUse {
+                            id, name, input, ..
+                        } => self.calls.push(Call {
                             id: id.clone(),
                             name: name.clone(),
                             arg: headline_arg(name, input, self.workspace.as_deref()),
@@ -1286,6 +1288,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             input,
+            extra: Default::default(),
         }
     }
 
