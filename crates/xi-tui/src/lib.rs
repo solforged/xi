@@ -148,6 +148,9 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     while !app.quit {
         app.draw(&mut screen)?;
         tokio::select! {
+            // Events first: the kernel publishes a turn's last events before
+            // it replies, and the done line must land after them.
+            biased;
             Some(notification) = app.launch.notifications.recv() => {
                 app.notify(&notification);
                 while let Ok(n) = app.launch.notifications.try_recv() {
