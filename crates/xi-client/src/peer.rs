@@ -56,13 +56,20 @@ pub enum PeerError {
 
 struct Inner {
     state: Mutex<State>,
-    closed: watch::Sender<bool>,
+    closed: watch::Sender<Shutdown>,
 }
 
 struct State {
     outgoing: Option<mpsc::UnboundedSender<Vec<u8>>>,
     next_id: Option<i64>,
     pending: HashMap<RequestId, Reply>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    Open,
+    Draining,
+    Closed,
 }
 
 impl Peer {
@@ -76,7 +83,7 @@ impl Peer {
     {
         let (outgoing, writes) = mpsc::unbounded_channel();
         let (incoming, calls) = mpsc::unbounded_channel();
-        let (closed, ended) = watch::channel(false);
+        let (closed, ended) = watch::channel(Shutdown::Open);
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 outgoing: Some(outgoing),
@@ -189,35 +196,49 @@ impl Peer {
         }))
     }
 
-    /// Resolves once the connection has ended through EOF, write failure or
-    /// [`Self::close`].
+    /// Resolves at EOF or write failure, or after [`Self::close`] has drained
+    /// queued messages and shut down the writer.
     pub async fn closed(&self) {
         let mut ended = self.inner.closed.subscribe();
-        let _ = ended.wait_for(|closed| *closed).await;
+        let _ = ended
+            .wait_for(|shutdown| *shutdown == Shutdown::Closed)
+            .await;
     }
 
-    /// Stops and shuts down the writer without waiting. The reader ends at EOF.
+    /// Stops accepting writes, then drains queued messages and shuts down the
+    /// writer without waiting. The reader ends at EOF.
     pub fn close(&self) {
-        self.inner.finish();
+        self.inner.end(Shutdown::Draining);
     }
 }
 
 impl Inner {
     fn send(&self, message: &Message) -> Result<(), PeerError> {
-        let result = self.state.lock().expect("peer state").send(message);
-        if matches!(&result, Err(PeerError::Closed)) {
+        let state = self.state.lock().expect("peer state");
+        let result = state.send(message);
+        let failed = state.outgoing.is_some() && matches!(&result, Err(PeerError::Closed));
+        drop(state);
+        if failed {
             self.finish();
         }
         result
     }
 
     fn finish(&self) {
+        self.end(Shutdown::Closed);
+    }
+
+    fn end(&self, shutdown: Shutdown) {
         let mut state = self.state.lock().expect("peer state");
         state.outgoing.take();
         for (_, reply) in state.pending.drain() {
             let _ = reply.send(Err(PeerError::Closed));
         }
-        self.closed.send_replace(true);
+        self.closed.send_modify(|current| {
+            if *current != Shutdown::Closed {
+                *current = shutdown;
+            }
+        });
     }
 }
 
@@ -303,13 +324,13 @@ async fn read_messages<R: AsyncRead + Unpin>(
 async fn write_messages<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut outgoing: mpsc::UnboundedReceiver<Vec<u8>>,
-    mut ended: watch::Receiver<bool>,
+    mut ended: watch::Receiver<Shutdown>,
     inner: Weak<Inner>,
 ) {
     loop {
         let line = tokio::select! {
             biased;
-            _ = ended.wait_for(|closed| *closed) => break,
+            () = aborted(&mut ended) => break,
             line = outgoing.recv() => match line {
                 Some(line) => line,
                 None => break,
@@ -317,18 +338,31 @@ async fn write_messages<W: AsyncWrite + Unpin>(
         };
         let result = tokio::select! {
             biased;
-            _ = ended.wait_for(|closed| *closed) => break,
+            () = aborted(&mut ended) => break,
             result = async {
                 writer.write_all(&line).await?;
                 writer.flush().await
             } => result,
         };
         if result.is_err() {
+            if let Some(inner) = inner.upgrade() {
+                inner.finish();
+            }
             break;
         }
     }
+    let _ = writer.shutdown().await;
     if let Some(inner) = inner.upgrade() {
         inner.finish();
     }
-    let _ = writer.shutdown().await;
+}
+
+async fn aborted(ended: &mut watch::Receiver<Shutdown>) {
+    if ended
+        .wait_for(|shutdown| *shutdown == Shutdown::Closed)
+        .await
+        .is_err()
+    {
+        std::future::pending::<()>().await;
+    }
 }

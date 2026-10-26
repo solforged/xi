@@ -371,6 +371,11 @@ impl Transcript {
     /// Applies a notification and returns the lines it commits.
     pub fn apply(&mut self, notification: &Notification, cols: usize) -> Vec<Line> {
         match notification {
+            Notification::Reset(_) => {
+                self.stream.clear();
+                self.thinking = false;
+                Vec::new()
+            }
             Notification::Delta(params) => {
                 match &params.delta {
                     Delta::Text { text } => self.stream.push_str(text),

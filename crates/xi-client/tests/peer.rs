@@ -241,3 +241,53 @@ async fn close_signals_closure_and_shuts_down_the_writer() {
         Err(PeerError::Closed)
     ));
 }
+
+#[tokio::test]
+async fn close_drains_queued_messages_before_eof_even_when_peer_is_dropped() {
+    let (left, right) = duplex(1);
+    let (reader, writer) = split(left);
+    let (peer, _incoming) = Peer::spawn(reader, writer);
+    let mut lines = BufReader::new(right).lines();
+
+    peer.respond(RequestId::Number(1), Ok(json!("first")))
+        .unwrap();
+    peer.notify_value("middle", json!(2)).unwrap();
+    peer.respond(RequestId::Number(3), Ok(json!("last")))
+        .unwrap();
+    peer.close();
+
+    assert!(matches!(
+        peer.notify_value("rejected", Value::Null),
+        Err(PeerError::Closed)
+    ));
+    assert!(matches!(
+        peer.respond(RequestId::Number(4), Ok(Value::Null)),
+        Err(PeerError::Closed)
+    ));
+    {
+        let closed = peer.closed();
+        tokio::pin!(closed);
+        assert!(poll!(&mut closed).is_pending());
+    }
+    drop(peer);
+
+    for expected in [
+        json!({"jsonrpc": "2.0", "id": 1, "result": "first"}),
+        json!({"jsonrpc": "2.0", "method": "middle", "params": 2}),
+        json!({"jsonrpc": "2.0", "id": 3, "result": "last"}),
+    ] {
+        let line = timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), expected);
+    }
+    assert!(
+        timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+}

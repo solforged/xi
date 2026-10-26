@@ -200,15 +200,11 @@ fn kept_start(events: &[&Event], budget: u64) -> Result<usize> {
 impl Session {
     /// Compacts an idle session, even when automatic compaction is disabled.
     pub async fn compact(&self) -> Result<CompactResult> {
-        let mut state = self
-            .0
-            .state
-            .try_lock()
-            .map_err(|_| Error::Config("session is running".into()))?;
+        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
         let cancel = {
             let mut control = self.0.control.lock().expect("control lock");
             if control.running {
-                return Err(Error::Config("session is running".into()));
+                return Err(Error::Running);
             }
             control.cancel = CancellationToken::new();
             control.cancel.clone()
@@ -283,12 +279,18 @@ impl Session {
             };
             // Summary deltas are not assistant output. Only the finished durable
             // compaction is broadcast, and cancellation never publishes a partial.
-            let mut ignore_delta = |_| {};
-            let response = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Ok(None),
-                response = backend.provider.stream(&request, &mut ignore_delta) => response?,
-            };
+            let response = self
+                .stream(
+                    backend.provider.as_ref(),
+                    &request,
+                    &state.config,
+                    cancel,
+                    false,
+                )
+                .await?;
+            if response.stop == xi_protocol::event::StopReason::Cancelled {
+                return Ok(None);
+            }
             if response.stop != xi_protocol::event::StopReason::EndTurn {
                 return Err(Error::Config("compaction summary did not finish".into()));
             }

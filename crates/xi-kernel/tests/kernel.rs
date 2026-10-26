@@ -9,7 +9,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::{Notify, Semaphore};
 use xi_kernel::config::{Config, DaemonSettings, Paths, daemon_settings, sessions_root};
-use xi_kernel::{ApprovalMode, Backend, EventBus, Notification, Session, TurnOptions};
+use xi_kernel::{ApprovalMode, Backend, EventBus, Leaser, Notification, Session, TurnOptions};
 use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
@@ -34,6 +34,7 @@ impl Gate {
 enum Step {
     Reply(Response),
     Fail(Error),
+    DeltaFail(Error),
     Wait(Arc<Gate>),
 }
 struct Script {
@@ -72,6 +73,12 @@ impl Provider for Script {
                     Ok(response)
                 }
                 Step::Fail(error) => Err(error),
+                Step::DeltaFail(error) => {
+                    on_delta(Delta::Text {
+                        text: "discarded".into(),
+                    });
+                    Err(error)
+                }
                 Step::Wait(gate) => {
                     on_delta(Delta::Text {
                         text: "partial".into(),
@@ -81,6 +88,45 @@ impl Provider for Script {
                     Ok(done())
                 }
             }
+        })
+    }
+}
+
+#[derive(Clone)]
+struct TestLeaser {
+    script: Arc<Script>,
+    spans: Arc<Mutex<Vec<LeaseSpan>>>,
+}
+struct LeaseSpan {
+    endpoint: String,
+    acquired_after: usize,
+    released_after: Option<usize>,
+}
+struct TestLease {
+    leaser: TestLeaser,
+    index: usize,
+}
+impl Drop for TestLease {
+    fn drop(&mut self) {
+        let requests = self.leaser.script.requests.lock().unwrap().len();
+        self.leaser.spans.lock().unwrap()[self.index].released_after = Some(requests);
+    }
+}
+impl Leaser for TestLeaser {
+    fn lease<'a>(&'a self, endpoint: &'a str) -> BoxFuture<'a, xi_kernel::Result<Box<dyn Send>>> {
+        Box::pin(async move {
+            let requests = self.script.requests.lock().unwrap().len();
+            let mut spans = self.spans.lock().unwrap();
+            let index = spans.len();
+            spans.push(LeaseSpan {
+                endpoint: endpoint.into(),
+                acquired_after: requests,
+                released_after: None,
+            });
+            Ok(Box::new(TestLease {
+                leaser: self.clone(),
+                index,
+            }) as Box<dyn Send>)
         })
     }
 }
@@ -235,6 +281,20 @@ fn kind(event: &xi_protocol::Event) -> String {
         .as_str()
         .unwrap()
         .into()
+}
+
+async fn wait_for_ask(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Notification>) -> ToolCallId {
+    loop {
+        if let Notification::Event(params) = rx.recv().await.unwrap()
+            && let EventKind::ToolDecision {
+                call,
+                decision: Decision::Ask,
+                ..
+            } = params.event.kind
+        {
+            return call;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1203,6 +1263,16 @@ fn seeded_session(
     events: Vec<EventKind>,
     compaction: xi_kernel::compaction::Config,
 ) -> (Session, tokio::sync::mpsc::UnboundedReceiver<Notification>) {
+    seeded_session_with_options(fixture, script, events, compaction, opts())
+}
+
+fn seeded_session_with_options(
+    fixture: &Fixture,
+    script: Arc<Script>,
+    events: Vec<EventKind>,
+    compaction: xi_kernel::compaction::Config,
+    options: TurnOptions,
+) -> (Session, tokio::sync::mpsc::UnboundedReceiver<Notification>) {
     let mut log = xi_session::SessionLog::create(
         fixture.workspace.join("seed.jsonl"),
         EventKind::SessionStarted {
@@ -1229,7 +1299,7 @@ fn seeded_session(
         log,
         config,
         bus,
-        opts(),
+        options,
         Some(Backend {
             provider: script,
             model: model(),
@@ -1519,9 +1589,9 @@ async fn overflow_compacts_and_retries_once_even_when_disabled() {
 }
 
 #[tokio::test]
-async fn manual_compaction_rejects_dangling_calls_without_appending() {
+async fn manual_compaction_accepts_repaired_interrupted_calls() {
     let fixture = Fixture::new();
-    let script = Script::new(vec![]);
+    let script = Script::new(vec![Step::Reply(done())]);
     let (session, _) = seeded_session(
         &fixture,
         script,
@@ -1540,9 +1610,20 @@ async fn manual_compaction_rejects_dangling_calls_without_appending() {
         },
     );
     let before = session.info().await;
-    let error = session.compact().await.unwrap_err();
-    assert!(error.to_string().contains("pending tool calls"));
-    assert_eq!(session.info().await.events, before.events);
+    assert!(matches!(
+        &before.events.last().unwrap().kind,
+        EventKind::ToolResult { call, output, .. }
+            if call.0 == "unfinished"
+                && output.is_error
+                && output.content == vec![OutputBlock::Text { text: "interrupted".into() }]
+    ));
+    session.compact().await.unwrap();
+    let after = session.info().await;
+    assert_eq!(after.events.len(), before.events.len() + 1);
+    assert!(matches!(
+        after.events.last().unwrap().kind,
+        EventKind::Compaction { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1639,4 +1720,430 @@ async fn compaction_without_an_older_prefix_is_a_noop() {
     );
     assert!(session.compact().await.is_err());
     assert!(script.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_resets_partial_output_and_numbers_each_attempt() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![
+        Step::DeltaFail(Error::new(ErrorKind::Unavailable, "retry")),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) = fixture.session(script, FakeTool { gate: None }, opts());
+    assert_eq!(session.prompt(input("work")).await.unwrap().text, "done");
+    let stream: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|notification| {
+            matches!(
+                notification,
+                Notification::Delta(_) | Notification::Reset(_)
+            )
+        })
+        .collect();
+    assert_eq!(stream.len(), 3);
+    assert!(matches!(
+        &stream[0],
+        Notification::Delta(params)
+            if params.attempt == 0
+                && params.delta == (Delta::Text { text: "discarded".into() })
+    ));
+    assert!(matches!(
+        &stream[1],
+        Notification::Reset(params) if params.session == session.id() && params.attempt == 1
+    ));
+    assert_eq!(stream[1].json()["method"], "stream/reset");
+    assert!(matches!(
+        &stream[2],
+        Notification::Delta(params)
+            if params.attempt == 1
+                && params.delta == (Delta::Text { text: "done".into() })
+    ));
+    let info = session.info().await;
+    assert!(matches!(
+        &info.events.last().unwrap().kind,
+        EventKind::AssistantMessage { content, .. } if *content == input("done")
+    ));
+}
+
+#[tokio::test]
+async fn cancelled_ask_is_resolved_before_its_cancelled_result() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![batch(vec![call("ask", "fake", json!({"net": true}))])]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("ask"));
+    let call = wait_for_ask(&mut rx).await;
+    session.cancel();
+    assert!(reply.await.unwrap().unwrap().cancelled);
+    assert!(matches!(
+        session.approve(&call, true),
+        Err(xi_kernel::Error::NotPending)
+    ));
+    let info = session.info().await;
+    let resolved = info
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ApprovalResolved {
+                    call: actual,
+                    approved: false,
+                    by: Approver::Cancelled,
+                } if actual == &call
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        &info.events[resolved + 1].kind,
+        EventKind::ToolResult { call: actual, output, .. }
+            if actual == &call
+                && output.is_error
+                && output.content == vec![OutputBlock::Text { text: "cancelled".into() }]
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn client_approval_timeout_records_a_timeout_denial() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "[daemon]\napproval_timeout = 1\n",
+    );
+    let script = Script::new(vec![
+        batch(vec![call("ask", "fake", json!({"net": true}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("ask"));
+    let call = wait_for_ask(&mut rx).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(!reply.await.unwrap().unwrap().failed);
+    assert!(matches!(
+        session.approve(&call, true),
+        Err(xi_kernel::Error::NotPending)
+    ));
+    let info = session.info().await;
+    let resolved = info
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ApprovalResolved {
+                    call: actual,
+                    approved: false,
+                    by: Approver::Timeout,
+                } if actual == &call
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        &info.events[resolved + 1].kind,
+        EventKind::ToolResult { call: actual, output, .. }
+            if actual == &call && output.is_error
+    ));
+}
+
+#[tokio::test]
+async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
+    let fixture = Fixture::new();
+    let path = fixture.workspace.join("interrupted.jsonl");
+    let mut log = xi_session::SessionLog::create(
+        &path,
+        EventKind::SessionStarted {
+            session: xi_protocol::SessionId::generate(),
+            cwd: fixture.workspace.clone(),
+            model: fixture.config().model,
+            xi_version: "test".into(),
+            parent_session: None,
+        },
+    )
+    .unwrap();
+    let mut head = log.root().id;
+    for kind in [
+        EventKind::UserMessage {
+            content: input("work"),
+        },
+        assistant(
+            vec![
+                call("asked", "fake", json!({})),
+                call("resolved", "fake", json!({})),
+                call("undecided", "fake", json!({})),
+                call("finished", "fake", json!({})),
+            ],
+            Usage::default(),
+        ),
+        EventKind::ToolDecision {
+            call: "asked".into(),
+            action: "net example.org".into(),
+            decision: Decision::Ask,
+            rule: None,
+        },
+        EventKind::ToolDecision {
+            call: "resolved".into(),
+            action: "net example.org".into(),
+            decision: Decision::Ask,
+            rule: None,
+        },
+        EventKind::ApprovalResolved {
+            call: "resolved".into(),
+            approved: true,
+            by: Approver::User,
+        },
+        EventKind::ToolResult {
+            call: "finished".into(),
+            output: ToolOutput {
+                content: Vec::new(),
+                is_error: false,
+                untrusted: false,
+            },
+            spill: None,
+        },
+    ] {
+        head = log.append(head, kind).unwrap().id;
+    }
+    let original = log.events().to_vec();
+    drop(log);
+    let bus = EventBus::default();
+    let mut rx = bus.subscribe();
+    let session = Session::from_log(
+        xi_session::SessionLog::open(&path).unwrap(),
+        fixture.config(),
+        bus,
+        opts(),
+        None,
+    )
+    .unwrap();
+    let info = session.info().await;
+    assert_eq!(&info.events[..original.len()], &original);
+    let repaired = &info.events[original.len()..];
+    assert_eq!(repaired.len(), 4);
+    assert!(matches!(
+        &repaired[0].kind,
+        EventKind::ApprovalResolved {
+            call,
+            approved: false,
+            by: Approver::Interrupted,
+        } if call.0 == "asked"
+    ));
+    for (event, expected) in repaired[1..].iter().zip(["asked", "resolved", "undecided"]) {
+        assert!(matches!(
+            &event.kind,
+            EventKind::ToolResult { call, output, .. }
+                if call.0 == expected
+                    && output.is_error
+                    && output.content == vec![OutputBlock::Text { text: "interrupted".into() }]
+        ));
+    }
+    let broadcast: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|notification| match notification {
+            Notification::Event(params) => params.event,
+            _ => panic!("unexpected ephemeral notification"),
+        })
+        .collect();
+    assert_eq!(broadcast, repaired);
+    drop(session);
+    let resumed = Session::from_log(
+        xi_session::SessionLog::open(&path).unwrap(),
+        fixture.config(),
+        EventBus::default(),
+        opts(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(resumed.info().await.events, info.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn model_leases_cover_retries_and_end_before_the_tool_batch() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "default_model = 'test/test'\n[provider.test]\napi = 'openai-chat'\nbase_url = 'http://127.0.0.1:9876/v1'\n",
+    );
+    let gate = Gate::new();
+    let script = Script::new(vec![
+        Step::Fail(Error::new(ErrorKind::Unavailable, "retry")),
+        batch(vec![call("one", "fake", json!({}))]),
+        Step::Wait(gate.clone()),
+    ]);
+    let spans = Arc::new(Mutex::new(Vec::new()));
+    let (session, _) = fixture.session(
+        script.clone(),
+        FakeTool { gate: None },
+        TurnOptions {
+            leaser: Some(Arc::new(TestLeaser {
+                script: script.clone(),
+                spans: spans.clone(),
+            })),
+            ..opts()
+        },
+    );
+    let reply = session.submit(input("work"));
+    gate.entered.notified().await;
+    {
+        let spans = spans.lock().unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].endpoint, "http://127.0.0.1:9876/v1");
+        assert_eq!(spans[0].acquired_after, 0);
+        assert_eq!(spans[0].released_after, Some(2));
+        assert_eq!(spans[1].acquired_after, 2);
+        assert_eq!(spans[1].released_after, None);
+    }
+    gate.release.add_permits(1);
+    assert!(!reply.await.unwrap().unwrap().failed);
+    assert_eq!(spans.lock().unwrap()[1].released_after, Some(3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn summary_requests_hold_one_lease_across_retries_without_streaming() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "[provider.test]\napi = 'openai-chat'\nbase_url = 'http://127.0.0.1:9876/v1'\n",
+    );
+    let script = Script::new(vec![
+        Step::DeltaFail(Error::new(ErrorKind::Unavailable, "retry summary")),
+        Step::Reply(done()),
+    ]);
+    let spans = Arc::new(Mutex::new(Vec::new()));
+    let (session, mut rx) = seeded_session_with_options(
+        &fixture,
+        script.clone(),
+        vec![EventKind::UserMessage {
+            content: input("old context"),
+        }],
+        xi_kernel::compaction::Config {
+            keep_recent_tokens: 0,
+            ..Default::default()
+        },
+        TurnOptions {
+            leaser: Some(Arc::new(TestLeaser {
+                script: script.clone(),
+                spans: spans.clone(),
+            })),
+            ..opts()
+        },
+    );
+    session.compact().await.unwrap();
+    let spans = spans.lock().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].endpoint, "http://127.0.0.1:9876/v1");
+    assert_eq!(spans[0].acquired_after, 0);
+    assert_eq!(spans[0].released_after, Some(2));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|notification| { matches!(notification, Notification::Event(_)) })
+    );
+}
+
+#[tokio::test]
+async fn stopping_requests_finishes_the_tool_batch_then_records_daemon_loss() {
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let script = Script::new(vec![batch(vec![
+        call("one", "fake", json!({})),
+        call("two", "fake", json!({})),
+    ])]);
+    let (session, _) = fixture.session(
+        script.clone(),
+        FakeTool {
+            gate: Some(gate.clone()),
+        },
+        opts(),
+    );
+    assert!(!session.is_running());
+    let reply = session.submit(input("work"));
+    assert!(session.is_running());
+    gate.entered.notified().await;
+    let queued = session.submit(input("queued"));
+    session.stop_requests();
+    session.stop_requests();
+    assert_eq!(queued.await.unwrap().unwrap_err(), "daemon connection lost");
+    assert_eq!(
+        session
+            .submit(input("too late"))
+            .await
+            .unwrap()
+            .unwrap_err(),
+        "daemon connection lost"
+    );
+    let idle = {
+        let session = session.clone();
+        tokio::spawn(async move { session.wait_idle().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(session.is_running());
+    assert!(!idle.is_finished());
+    gate.release.add_permits(1);
+    gate.entered.notified().await;
+    assert!(!idle.is_finished());
+    gate.release.add_permits(1);
+    let outcome = reply.await.unwrap().unwrap();
+    assert!(outcome.failed);
+    assert!(!outcome.cancelled);
+    idle.await.unwrap();
+    assert!(!session.is_running());
+    assert_eq!(script.requests.lock().unwrap().len(), 1);
+    let info = session.info().await;
+    let results: Vec<_> = info
+        .events
+        .iter()
+        .filter_map(|event| {
+            if let EventKind::ToolResult { call, output, .. } = &event.kind {
+                Some((call.0.as_str(), output.is_error))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(results, [("one", false), ("two", false)]);
+    assert!(matches!(
+        &info.events.last().unwrap().kind,
+        EventKind::TurnFailed { message } if message == "daemon connection lost"
+    ));
+    assert_eq!(
+        info.events
+            .iter()
+            .filter(|event| { matches!(event.kind, EventKind::TurnFailed { .. }) })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stopping_requests_aborts_an_inflight_model_and_releases_its_lease() {
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let script = Script::new(vec![Step::Wait(gate.clone())]);
+    let spans = Arc::new(Mutex::new(Vec::new()));
+    let (session, _) = fixture.session(
+        script.clone(),
+        FakeTool { gate: None },
+        TurnOptions {
+            leaser: Some(Arc::new(TestLeaser {
+                script,
+                spans: spans.clone(),
+            })),
+            ..opts()
+        },
+    );
+    let reply = session.submit(input("work"));
+    gate.entered.notified().await;
+    session.stop_requests();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .failed
+    );
+    session.wait_idle().await;
+    assert_eq!(spans.lock().unwrap()[0].released_after, Some(1));
+    assert!(matches!(
+        &session.info().await.events.last().unwrap().kind,
+        EventKind::TurnFailed { message } if message == "daemon connection lost"
+    ));
 }

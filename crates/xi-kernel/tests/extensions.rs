@@ -151,6 +151,7 @@ impl Fixture {
             TurnOptions {
                 max_turns: 4,
                 approval: ApprovalMode::Headless(false),
+                leaser: None,
             },
             Some(Backend {
                 provider: fake.clone(),
