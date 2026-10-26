@@ -1,7 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::Path;
 
-use crate::transport::HttpProvider;
+use reqwest::header::{HeaderName, HeaderValue};
+
+use crate::transport::{HttpProvider, Key, Shape, Signer};
 use crate::*;
 
 impl Registry {
@@ -15,15 +18,19 @@ impl Registry {
         registry
     }
 
+    /// Sets the directory holding credentials that xi manages itself, such
+    /// as the ChatGPT tokens. It must not be readable inside the sandbox.
+    pub fn set_credentials(&mut self, dir: PathBuf) {
+        self.credentials = Some(dir);
+    }
+
     /// Adds or overrides providers and models from a config layer.
     pub fn extend(&mut self, config: RegistryConfig) {
         self.providers.extend(config.provider);
         for model in config.model {
-            if let Some(existing) = self
-                .models
-                .iter_mut()
-                .find(|existing| existing.provider == model.provider && existing.id == model.id)
-            {
+            if let Some(existing) = self.models.iter_mut().find(|existing| {
+                existing.info.provider == model.info.provider && existing.info.id == model.info.id
+            }) {
                 *existing = model;
             } else {
                 self.models.push(model);
@@ -36,13 +43,13 @@ impl Registry {
     pub fn model(&self, model: &ModelRef) -> Option<&ModelInfo> {
         self.models
             .iter()
+            .map(|entry| &entry.info)
             .find(|info| info.provider == model.provider && info.id == model.model)
     }
 
     /// All known models.
-    #[must_use]
-    pub fn models(&self) -> &[ModelInfo] {
-        &self.models
+    pub fn models(&self) -> impl Iterator<Item = &ModelInfo> {
+        self.models.iter().map(|entry| &entry.info)
     }
 
     /// Connection settings for a provider key.
@@ -56,7 +63,8 @@ impl Registry {
     /// Unknown model ids connect with reasoning disabled unless configured.
     ///
     /// # Errors
-    /// Returns `Config` for unknown providers or invalid URLs, and `Auth` for
+    /// Returns `Config` for unknown providers, invalid URLs, invalid compat
+    /// settings and a login without a credential directory, and `Auth` for
     /// missing, empty or unreadable credentials and insecure credential files.
     pub fn connect(&self, model: &ModelRef) -> Result<Arc<dyn Provider>, Error> {
         let config = self.providers.get(&model.provider).ok_or_else(|| {
@@ -79,7 +87,7 @@ impl Registry {
                 "Provider URL must be an HTTP(S) base URL without credentials, query or fragment",
             ));
         }
-        let credential = resolve_auth(&config.auth)?;
+        let signer = signer(config, self.credentials.as_deref())?;
         let mut clients = self
             .clients
             .lock()
@@ -96,24 +104,49 @@ impl Registry {
                 entry.insert(client).clone()
             }
         };
-        let reasoning_models: BTreeSet<_> = self
+        let shapes = self
             .models
             .iter()
-            .filter(|info| info.provider == model.provider && info.reasoning)
-            .map(|info| info.id.clone())
-            .collect();
-        Ok(Arc::new(HttpProvider::new(
-            client,
-            config,
-            credential,
-            reasoning_models,
-        )?))
+            .filter(|entry| entry.info.provider == model.provider)
+            .map(|entry| {
+                let shape = Shape::new(entry.info.reasoning, &entry.compat.or(&config.compat))?;
+                Ok((entry.info.id.clone(), shape))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        Ok(Arc::new(HttpProvider::new(client, config, signer, shapes)?))
     }
+}
+
+fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn Signer>, Error> {
+    if let Auth::Login(LoginService::Chatgpt) = config.auth {
+        let credentials = credentials.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Config,
+                "No credential directory for ChatGPT tokens",
+            )
+        })?;
+        return Ok(Box::new(chatgpt::Signer::new(chatgpt_file(credentials))));
+    }
+    let Some(credential) = resolve_auth(&config.auth)? else {
+        return Ok(Box::new(Key(None)));
+    };
+    let (name, value) = match config.api {
+        Api::AnthropicMessages => ("x-api-key", credential),
+        Api::OpenaiChat | Api::OpenaiResponses => ("authorization", format!("Bearer {credential}")),
+    };
+    let mut value = HeaderValue::from_str(&value).map_err(|_| {
+        Error::new(
+            ErrorKind::Auth,
+            "Credential contains invalid header characters",
+        )
+    })?;
+    value.set_sensitive(true);
+    Ok(Box::new(Key(Some((HeaderName::from_static(name), value)))))
 }
 
 fn resolve_auth(auth: &Auth) -> Result<Option<String>, Error> {
     let raw = match auth {
-        Auth::None => return Ok(None),
+        Auth::None | Auth::Login(_) => return Ok(None),
         Auth::Env(name) => std::env::var(name).map_err(|_| {
             Error::new(
                 ErrorKind::Auth,

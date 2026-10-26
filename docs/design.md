@@ -253,6 +253,8 @@ Built-ins currently implement the same tool schema and policy contract in-proces
 
 The provider layer converts between xi content blocks and each provider's wire format. Conversion is lossless: thinking signatures, redacted thinking and provider-specific blocks round-trip through `thinking` and `opaque` blocks. Model metadata (context window, pricing, capabilities) comes from a registry file, not code.
 
+Code grows per wire API (Anthropic Messages, OpenAI-compatible Chat, OpenAI Responses), not per provider. A new provider that speaks one of them is a `[provider.<name>]` table. Its differences go in `compat`, named for the behavior rather than the vendor: `output_limit`, `reasoning_off`, `session_header` and `responses_lite`. A `[[model]]` table may set its own `compat`, which overrides the provider's one field at a time. These settings stay in the provider crate, so the protocol's model metadata carries none of them. The credential source is `auth`: an environment variable, a `0600` file, or `{ login = "chatgpt" }` for tokens from `xi login`. Each one signs requests through the same interface, which may refresh the credential once after a 401.
+
 Context is built to keep the cached prefix stable: the system prompt has no timestamps or dynamic state, history is append-only, and compaction is the only operation that changes the prefix.
 
 ### Compaction
@@ -392,6 +394,8 @@ The optional `[daemon] notify` command is honored only from user config, never p
 
 Provider credentials live in workers, loaded from the OS keychain or a user-only file. The daemon holds none. Credentials are never placed in a tool or extension environment.
 
+`xi login chatgpt` signs in to a ChatGPT plan with the Codex CLI's OAuth flow: PKCE in the browser, a loopback callback on port 1455 or 1457, and a pasted redirect URL when the browser runs on another machine. The tokens go to `$XDG_DATA_HOME/xi/auth/chatgpt.json` with mode `0600`, outside every sandbox root. Each request refreshes them within five minutes of expiry, or once after a 401, under a lock file, so concurrent workers never spend a rotated refresh token twice. A rejected refresh asks for a new sign-in.
+
 ## Defaults
 
 - Tools: `read`, `edit`, `write`, `bash`, `search`. `edit` replaces exact text, including whitespace and indentation. Read first and include enough surrounding lines to make the match unique, unless replacing all occurrences. The opt-in `hashline` tool edits by line and content hash, rejecting stale anchors. Read and search output uses `LINE|text` by default and `LINE:HH|text` when `hashline` is active. Children inherit the parent's output format, even if their tool subset omits `hashline`. Large outputs are truncated in context and spilled to a file the model can read.
@@ -411,7 +415,7 @@ Provider credentials live in workers, loaded from the OS keychain or a user-only
 | `xi-policy` | Policy rules, layering and taint-aware evaluation. | Implemented |
 | `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock, macOS Seatbelt. | Implemented |
 | `xi-sandbox` egress proxy | Kernel-side CONNECT proxy and in-namespace forwarder. | Planned |
-| `xi-provider` | Anthropic Messages and OpenAI-compatible Chat adapters, model registry. | Implemented (Anthropic live path untested) |
+| `xi-provider` | Anthropic Messages, OpenAI-compatible Chat and OpenAI Responses adapters, ChatGPT sign-in, model registry. Responses replays encrypted reasoning statelessly and speaks Responses Lite for the GPT-6 models. | Implemented (Anthropic live path untested; ChatGPT `gpt-6.1-sol` verified live) |
 | `xi-tools` | `read`, exact-string `edit`, `write`, `bash`, `search`, plus opt-in `hashline` edits. | Implemented |
 | `xi-kernel` | Agent loop, context builder, layered config, workspace trust, sandboxed extension host and worker entry point over the daemon pipe. | Implemented |
 | `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler, socket activation, unit installation and private-instance mode. | Implemented |
