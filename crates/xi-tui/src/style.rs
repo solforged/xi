@@ -52,17 +52,57 @@ pub struct Span {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Line(pub Vec<Span>);
 
-/// Replaces tabs and drops control characters, so the width is what prints.
+/// Replaces tabs and drops escape sequences and control characters, so the
+/// width is what prints. A carriage return followed by more text keeps only
+/// what comes after it, the way a progress bar ends up on screen.
 fn clean(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    let mut returned = false;
+    while let Some(c) = chars.next() {
         match c {
-            '\t' => out.push_str("    "),
-            c if c.is_control() => {}
-            c => out.push(c),
+            '\x1b' => skip_escape(&mut chars),
+            '\r' => returned = true,
+            c if c.is_control() && c != '\t' => {}
+            c => {
+                if std::mem::take(&mut returned) {
+                    out.clear();
+                }
+                if c == '\t' {
+                    out.push_str("    ");
+                } else {
+                    out.push(c);
+                }
+            }
         }
     }
     out
+}
+
+/// Skips the rest of an escape sequence: CSI to its final byte, OSC and the
+/// other string sequences to BEL or ST, anything else one character.
+fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        Some('[') => {
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        }
+        Some(']' | 'P' | 'X' | '^' | '_') => {
+            while let Some(c) = chars.next() {
+                if c == '\x07' {
+                    break;
+                }
+                if c == '\x1b' {
+                    chars.next_if_eq(&'\\');
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 macro_rules! role_methods {
@@ -195,25 +235,31 @@ pub fn rule(cols: usize) -> Line {
     Line::default().dim("─".repeat(cols))
 }
 
-/// Word-wraps text to `cols` cells, keeping its own line breaks. Words wider
-/// than a line are split.
+/// Word-wraps text to `cols` cells, keeping its own line breaks and each
+/// line's indentation. Words wider than a line are split.
 #[must_use]
 pub fn wrap(text: &str, cols: usize) -> Vec<String> {
     let cols = cols.max(1);
     let mut rows = Vec::new();
     for para in clean_lines(text) {
-        let mut row = String::new();
-        let mut used = 0;
-        for word in para.split(' ') {
+        let body = para.trim_start_matches(' ');
+        let indent = (para.len() - body.len()).min(cols / 2);
+        let mut row = " ".repeat(indent);
+        let mut used = indent;
+        // Whether the row holds a word yet, so the first one needs no space.
+        let mut started = false;
+        for word in body.split(' ') {
             let w = word.width();
-            if used > 0 && used + 1 + w > cols {
+            if started && used + 1 + w > cols {
                 rows.push(std::mem::take(&mut row));
                 used = 0;
+                started = false;
             }
-            if used > 0 {
+            if started {
                 row.push(' ');
                 used += 1;
             }
+            started = true;
             for c in word.chars() {
                 let cw = c.width().unwrap_or(0);
                 if used + cw > cols {
@@ -249,9 +295,12 @@ mod tests {
     }
 
     #[test]
-    fn control_characters_never_reach_the_terminal() {
+    fn escape_sequences_and_control_characters_never_reach_the_terminal() {
         let line = Line::default().ink("a\x1b[2Jb\tc\r");
-        assert_eq!(line.plain(), "a[2Jb    c");
+        assert_eq!(line.plain(), "ab    c");
+        let colored = "\x1b[1;31merror\x1b[0m: \x1b]8;;https://x\x07link\x1b]8;;\x1b\\ done";
+        assert_eq!(Line::default().ink(colored).plain(), "error: link done");
+        assert_eq!(Line::default().ink("10%\r55%\r100%").plain(), "100%");
     }
 
     #[test]
@@ -279,10 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn wrap_breaks_on_words_and_keeps_paragraphs() {
+    fn wrap_breaks_on_words_and_keeps_paragraphs_and_indentation() {
         assert_eq!(
             wrap("archive.py still registers\nunder the old key", 12),
             ["archive.py", "still", "registers", "under the", "old key"]
+        );
+        assert_eq!(
+            wrap("  fn main() {\n\tlet answer = 42;", 12),
+            ["  fn main()", "{", "    let", "answer = 42;"]
         );
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
     }
