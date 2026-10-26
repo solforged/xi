@@ -372,6 +372,8 @@ The footer shows workspace, model, reasoning, context use, cache hit rate, cost 
 
 Tool results show a headline and at most three lines; `ctrl+o` expands the rest. A successful `edit` renders as a diff instead: the lines shared by the start and end of the old and new text are cut to one line of context on each side, then the removed and added lines, at most eight rows, with `+N −M` in the headline; `hashline` edits show their added lines. Thinking blocks follow the thinking display setting, `first` by default: `full` shows the whole text dimmed, `first` its first line, and `hidden` nothing; streaming thinking follows the same setting in the live region. `ctrl+t` changes it for output from then on. Images show as a placeholder.
 
+A `read` headline carries the requested line range, such as `lib.rs:120-165`, and counts the lines read, or the entries of a directory. A failed result sets its error in red: a trailing bracketed status such as a command's `[exit 1]`, since the output above it is ordinary, or else the first line. Assistant prose sets `**strong**` in bold and `` `code` `` in cyan; thinking drops the same markers and stays dim. Lines inside a fenced code block, and markers without a partner on the same line, stay literal.
+
 ## Security model
 
 Threats, in order of likelihood:
