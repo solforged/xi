@@ -38,6 +38,8 @@ pub struct Capabilities {
     pub env: Vec<String>,
     /// Whether the extension may spawn subprocesses.
     pub exec: bool,
+    /// Whether the extension may run child sessions through `agent/run`.
+    pub subagents: bool,
 }
 
 /// What an extension registers, returned from `initialize`.
@@ -82,4 +84,6 @@ pub enum HookPoint {
     PostTool,
     /// After a turn ends. Observe only.
     TurnEnd,
+    /// Before the kernel summarises older context. May supply the summary.
+    Compact,
 }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::content::{Block, ToolOutput};
-use crate::event::{Event, ModelRef};
+use crate::event::{Event, ModelRef, Usage};
 use crate::ids::{EventId, SessionId, ToolCallId};
 use crate::rpc::{NotificationMethod, RequestMethod};
 
@@ -66,6 +66,10 @@ pub mod client {
     request!(
         /// Client → kernel: answer a pending `ask` decision.
         ApprovalResolve, "approval/resolve", ResolveParams => ()
+    );
+    request!(
+        /// Client → kernel: summarise older context now, at an idle prompt.
+        SessionCompact, "session/compact", SessionRef => CompactResult
     );
     notification!(
         /// Kernel → client: an event was persisted.
@@ -128,6 +132,15 @@ pub mod client {
     pub struct PromptResult {
         /// The head after the turn.
         pub head: EventId,
+    }
+
+    /// Result of [`SessionCompact`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CompactResult {
+        /// The `compaction` event, now the head.
+        pub head: EventId,
+        /// Context size before compaction.
+        pub tokens_before: u64,
     }
 
     /// Parameters for [`SessionCheckout`].
@@ -224,6 +237,13 @@ pub mod extension {
         /// the session head.
         AppendCustom, "session/append_custom", AppendCustomParams => EventId
     );
+    request!(
+        /// Extension → kernel: run a child session to completion and return
+        /// its final answer. Needs the `subagents` capability. Requests may
+        /// run concurrently, including while a `tool/invoke` from the same
+        /// session is pending.
+        AgentRun, "agent/run", AgentRunParams => AgentRunResult
+    );
     notification!(
         /// Extension → kernel: diagnostic output.
         Log, "log", LogParams
@@ -292,6 +312,14 @@ pub mod extension {
             /// The head after the turn.
             head: EventId,
         },
+        /// Before older context is summarised.
+        Compact {
+            /// Context size before compaction.
+            tokens_before: u64,
+            /// The previous summary on this branch, if any.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            previous_summary: Option<String>,
+        },
     }
 
     /// A hook's answer. The kernel rejects outcomes that do not fit the hook
@@ -316,6 +344,12 @@ pub mod extension {
         ReplaceOutput {
             /// The new output.
             output: ToolOutput,
+        },
+        /// Supply the compaction summary (`compact` only). The kernel skips
+        /// its own summary request.
+        ReplaceSummary {
+            /// The summary.
+            summary: String,
         },
     }
 
@@ -347,6 +381,38 @@ pub mod extension {
         pub kind: String,
         /// Extension-defined payload.
         pub data: Value,
+    }
+
+    /// Parameters for [`AgentRun`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentRunParams {
+        /// The parent session.
+        pub session: SessionId,
+        /// The child's first user message.
+        pub prompt: String,
+        /// Built-in tools the child may use, a subset of the parent's.
+        /// Absent means all of the parent's built-in tools. Extension tools
+        /// are never offered to a child, so subagents do not nest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tools: Option<Vec<String>>,
+        /// Model for the child; the parent's when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<ModelRef>,
+    }
+
+    /// Result of [`AgentRun`].
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct AgentRunResult {
+        /// The child session.
+        pub session: SessionId,
+        /// The child log file.
+        pub path: PathBuf,
+        /// Text of the child's final assistant message.
+        pub text: String,
+        /// Whether a failure or request limit ended the child's turn.
+        pub failed: bool,
+        /// Summed token use of every child request.
+        pub usage: Usage,
     }
 
     /// Parameters for [`Log`].

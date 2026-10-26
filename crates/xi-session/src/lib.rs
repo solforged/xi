@@ -75,6 +75,9 @@ pub enum Violation {
     /// Event ids are unique within a session.
     #[error("event id {0} is already in the session")]
     DuplicateId(EventId),
+    /// A compaction's `kept` must be a strict ancestor that starts a message.
+    #[error("compaction {0} keeps {1}, which is not a message on its path")]
+    BadKept(EventId, EventId),
 }
 
 /// The context visible from one event: the latest compaction summary on its
@@ -265,7 +268,7 @@ impl SessionLog {
     }
 
     /// The context visible from `id`: the latest compaction summary on its
-    /// path, then the events after that compaction.
+    /// path, the events it kept, then the events after that compaction.
     #[must_use]
     pub fn context(&self, id: EventId) -> Option<Context<'_>> {
         let mut path = self.lineage(id)?;
@@ -278,10 +281,15 @@ impl SessionLog {
                 events: path,
             });
         };
-        let events = path.split_off(at + 1);
-        let EventKind::Compaction { summary, .. } = &path[at].kind else {
+        let after = path.split_off(at + 1);
+        let EventKind::Compaction { summary, kept, .. } = &path[at].kind else {
             unreachable!("position matched a compaction");
         };
+        let kept = kept
+            .and_then(|kept| path[..at].iter().position(|event| event.id == kept))
+            .map_or(&[][..], |start| &path[start..at]);
+        let mut events = kept.to_vec();
+        events.extend(after);
         Some(Context {
             summary: Some(summary),
             events,
@@ -330,7 +338,28 @@ impl SessionLog {
             Some(parent) if !self.index.contains_key(&parent) => {
                 Err(Violation::UnknownParent(parent))
             }
-            Some(_) => Ok(()),
+            Some(parent) => match event.kind {
+                EventKind::Compaction {
+                    kept: Some(kept), ..
+                } => {
+                    let on_path = self.lineage(parent).is_some_and(|path| {
+                        path.iter().any(|ancestor| {
+                            ancestor.id == kept
+                                && matches!(
+                                    ancestor.kind,
+                                    EventKind::UserMessage { .. }
+                                        | EventKind::AssistantMessage { .. }
+                                )
+                        })
+                    });
+                    if on_path {
+                        Ok(())
+                    } else {
+                        Err(Violation::BadKept(event.id, kept))
+                    }
+                }
+                _ => Ok(()),
+            },
         }
     }
 
