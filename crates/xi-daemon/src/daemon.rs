@@ -528,8 +528,17 @@ impl Router {
                 self.respond(client, id, Ok(Value::Null));
                 self.begin_shutdown(shutdown.when);
             }
-            "session/close" | "session/prompt" | "session/cancel" | "session/checkout"
-            | "session/compact" | "session/set_model" | "session/command" | "approval/resolve" => {
+            "session/close"
+            | "session/prompt"
+            | "session/cancel"
+            | "session/checkout"
+            | "session/compact"
+            | "session/set_model"
+            | "session/set_reasoning"
+            | "session/models"
+            | "session/commands"
+            | "session/command"
+            | "approval/resolve" => {
                 let session: SessionRef = decode_ref(&params)?;
                 let worker = self.require_worker(session.session)?;
                 self.forward(Some(client), Some(id), worker, method, params);
@@ -932,8 +941,10 @@ impl Router {
             remember_tools(&mut worker.tools, &event.event);
             if let Some(info) = &mut worker.info {
                 info.head = event.event.id;
-                if let EventKind::ModelChanged { model } = &event.event.kind {
-                    info.model = model.clone();
+                match &event.event.kind {
+                    EventKind::ModelChanged { model } => info.model = model.clone(),
+                    EventKind::ReasoningChanged { reasoning } => info.reasoning = *reasoning,
+                    _ => {}
                 }
             }
             match &event.event.kind {

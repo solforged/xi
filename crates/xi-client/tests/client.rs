@@ -11,8 +11,10 @@ use xi_client::peer::{Incoming, Peer, PeerError};
 use xi_protocol::content::Block;
 use xi_protocol::event::{Event, EventKind, ModelRef};
 use xi_protocol::ids::{EventId, SessionId, Timestamp};
+use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::*;
 use xi_protocol::methods::extension::CommandResult;
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestId, RequestMethod, RpcError};
 
 async fn request(incoming: &mut mpsc::UnboundedReceiver<Incoming>) -> (RequestId, String, Value) {
@@ -86,6 +88,7 @@ fn snapshot() -> AttachResult {
                 provider: "test".into(),
                 model: "model".into(),
             },
+            reasoning: Reasoning::Medium,
             model_info: None,
             parent_session: None,
         },
@@ -283,6 +286,57 @@ async fn routes_remaining_typed_requests() {
         &mut incoming,
         SetModelParams { session, model },
         ()
+    );
+    exchange!(
+        client.set_reasoning(session, Reasoning::High),
+        SessionSetReasoning,
+        &daemon,
+        &mut incoming,
+        SetReasoningParams {
+            session,
+            reasoning: Reasoning::High
+        },
+        ()
+    );
+    exchange!(
+        client.models(session),
+        SessionModels,
+        &daemon,
+        &mut incoming,
+        SessionRef { session },
+        ModelsResult {
+            current: ModelRef {
+                provider: "test".into(),
+                model: "model".into()
+            },
+            reasoning: Reasoning::High,
+            models: vec![ModelEntry {
+                model: ModelRef {
+                    provider: "test".into(),
+                    model: "model".into()
+                },
+                info: ModelInfo {
+                    provider: "test".into(),
+                    id: "model".into(),
+                    context_window: 1000,
+                    max_output: 100,
+                    reasoning: true,
+                    pricing: None,
+                },
+                available: false,
+            }],
+        }
+    );
+    exchange!(
+        client.commands(session),
+        SessionCommands,
+        &daemon,
+        &mut incoming,
+        SessionRef { session },
+        vec![CommandSpec {
+            name: "hello".into(),
+            description: "Greet.".into()
+        }]
     );
     exchange!(
         client.command(session, "hello", "world"),

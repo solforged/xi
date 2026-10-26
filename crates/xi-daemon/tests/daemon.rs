@@ -14,7 +14,7 @@ use xi_kernel::Backend;
 use xi_kernel::config::{DaemonSettings, Paths};
 use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::methods::client::*;
-use xi_protocol::model::ModelInfo;
+use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestMethod, RpcError};
 use xi_protocol::{Block, EventId, EventKind, SessionId};
 use xi_provider::{Provider, Request, Response};
@@ -622,6 +622,70 @@ async fn create_attach_detach_and_live_session_index() {
 }
 
 #[tokio::test]
+async fn reasoning_and_catalog_requests_are_forwarded_to_the_worker() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], false);
+    let (peer, mut events) = connection(&daemon);
+    initialize(&peer).await;
+    let attached = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap();
+    let session = attached.info.session;
+    request::<SessionSetReasoning>(
+        &peer,
+        &SetReasoningParams {
+            session,
+            reasoning: Reasoning::High,
+        },
+    )
+    .await
+    .unwrap();
+    loop {
+        let event: EventParams =
+            serde_json::from_value(notification(&mut events, "event/appended").await).unwrap();
+        if let EventKind::ReasoningChanged { reasoning } = event.event.kind {
+            assert_eq!(reasoning, Reasoning::High);
+            break;
+        }
+    }
+    let models = request::<SessionModels>(&peer, &SessionRef { session })
+        .await
+        .unwrap();
+    assert_eq!(models.current, attached.info.model);
+    assert_eq!(models.reasoning, Reasoning::High);
+    assert!(!models.models.is_empty());
+    assert!(
+        request::<SessionCommands>(&peer, &SessionRef { session })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let attached = request::<SessionAttach>(
+        &peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(attached.info.reasoning, Reasoning::High);
+    assert_eq!(
+        error_code(
+            request::<SessionModels>(
+                &peer,
+                &SessionRef {
+                    session: SessionId::generate()
+                }
+            )
+            .await
+        ),
+        RpcError::UNKNOWN_SESSION,
+    );
+    stop(&peer, &daemon).await;
+}
+
+#[tokio::test]
 async fn asks_enter_inbox_broadcast_and_resolve_once() {
     let fixture = Fixture::new();
     let call = Response {
@@ -968,6 +1032,7 @@ async fn stubborn_workers_are_killed_and_closing_sessions_are_not_live() {
                                 provider: "test".into(),
                                 model: "test".into(),
                             },
+                            reasoning: Reasoning::Medium,
                             model_info: None,
                             parent_session: None,
                         },

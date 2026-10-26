@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use xi_protocol::manifest::{HookPoint, PackageManifest, Registration, ToolSpec};
+use xi_protocol::manifest::{CommandSpec, HookPoint, PackageManifest, Registration, ToolSpec};
 use xi_protocol::methods::extension::*;
 use xi_protocol::rpc::{self, Message, RequestId, RequestMethod};
 use xi_protocol::{ExtensionId, SessionId, ToolOutput};
@@ -67,16 +67,63 @@ impl ExtensionHost {
         log: &Path,
         builtins: &[ToolSpec],
     ) -> Result<Extensions> {
+        self.load_inner(config, context, log, builtins, false)
+            .await
+            .map(|(extensions, _)| extensions)
+    }
+
+    /// Starts the catalog without making a failed extension prevent attachment.
+    pub(crate) async fn startup(
+        &self,
+        config: &Config,
+        context: &xi_tools::Context,
+        log: &Path,
+        builtins: &[ToolSpec],
+    ) -> Result<(Extensions, bool)> {
+        self.load_inner(config, context, log, builtins, true).await
+    }
+
+    async fn load_inner(
+        &self,
+        config: &Config,
+        context: &xi_tools::Context,
+        log: &Path,
+        builtins: &[ToolSpec],
+        startup: bool,
+    ) -> Result<(Extensions, bool)> {
         let mut peers = self.peers.lock().await;
         let mut selected = Vec::new();
+        let mut complete = true;
         let mut tools: HashSet<_> = builtins.iter().map(|s| s.name.clone()).collect();
         let mut names = HashSet::new();
-        let mut commands: HashSet<String> = ["quit", "new", "model", "compact"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let mut commands: HashSet<String> = [
+            "help",
+            "hotkeys",
+            "quit",
+            "exit",
+            "new",
+            "resume",
+            "tree",
+            "model",
+            "reasoning",
+            "compact",
+            "approvals",
+            "settings",
+            "copy",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         for root in &config.extensions {
-            let root = root.canonicalize()?;
+            let root = match root.canonicalize() {
+                Ok(root) => root,
+                Err(error) if startup => {
+                    eprintln!("xi: extension {}: {error}", root.display());
+                    complete = false;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let key = (config.workspace.clone(), root.clone());
             // A peer stops when it crashes or when a cancelled invocation
             // retires it; the next load starts a fresh process.
@@ -84,7 +131,15 @@ impl ExtensionHost {
                 Some(peer) if !peer.stop.is_cancelled() => peer.clone(),
                 _ => {
                     let peer =
-                        Peer::start(&root, config, context, log, self.routes.clone()).await?;
+                        match Peer::start(&root, config, context, log, self.routes.clone()).await {
+                            Ok(peer) => peer,
+                            Err(error) if startup => {
+                                eprintln!("xi: extension {}: {error}", root.display());
+                                complete = false;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                     peers.insert(key, peer.clone());
                     peer
                 }
@@ -117,7 +172,7 @@ impl ExtensionHost {
             }
             selected.push(peer);
         }
-        Ok(Extensions(selected.into()))
+        Ok((Extensions(selected.into()), complete))
     }
 
     pub(crate) fn scope(&self, session: SessionId, extensions: &Extensions) -> Scope {
@@ -161,6 +216,10 @@ impl ExtensionHost {
 impl Extensions {
     pub(crate) fn specs(&self) -> impl Iterator<Item = &ToolSpec> {
         self.0.iter().flat_map(|peer| &peer.registration.tools)
+    }
+
+    pub(crate) fn commands(&self) -> impl Iterator<Item = &CommandSpec> {
+        self.0.iter().flat_map(|peer| &peer.registration.commands)
     }
 
     /// Whether every extension process in the catalog is still running.

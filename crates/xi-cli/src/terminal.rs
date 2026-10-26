@@ -9,6 +9,7 @@ use xi_client::client::{Client, ClientError, ClientNotification};
 use xi_kernel::config::{Paths, parse_model};
 use xi_protocol::event::{Decision, EventKind};
 use xi_protocol::methods::client::{AttachResult, Delta, PromptResult};
+use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::RpcError;
 use xi_protocol::{Block, EventId, OutputBlock, SessionId, ToolCallId};
 
@@ -274,6 +275,7 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
         mut notifications,
         template,
         attached,
+        ..
     } = launch;
     let mut session = attached.info.session;
     let mut renderer = Renderer::new(Render::Interactive);
@@ -373,6 +375,39 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                 }
                 continue;
             }
+            if line == "/reasoning" {
+                match client.models(session).await {
+                    Ok(result) => println!(
+                        "Reasoning: {}",
+                        match result.reasoning {
+                            Reasoning::Off => "off",
+                            Reasoning::Low => "low",
+                            Reasoning::Medium => "medium",
+                            Reasoning::High => "high",
+                        }
+                    ),
+                    Err(error) => eprintln!("xi: {error}"),
+                }
+                continue;
+            }
+            if let Some(level) = line.strip_prefix("/reasoning ") {
+                let reasoning = match level.trim() {
+                    "off" => Some(Reasoning::Off),
+                    "low" => Some(Reasoning::Low),
+                    "medium" => Some(Reasoning::Medium),
+                    "high" => Some(Reasoning::High),
+                    _ => None,
+                };
+                match reasoning {
+                    Some(reasoning) => {
+                        if let Err(error) = client.set_reasoning(session, reasoning).await {
+                            eprintln!("xi: {error}");
+                        }
+                    }
+                    None => eprintln!("xi: usage: /reasoning [off|low|medium|high]"),
+                }
+                continue;
+            }
             if let Some(command) = line.strip_prefix('/') {
                 let (name, args) = command
                     .split_once(char::is_whitespace)
@@ -384,7 +419,7 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                         }
                     }
                     Ok(None) => eprintln!(
-                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /model PROVIDER/MODEL"
+                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /model PROVIDER/MODEL, /reasoning [off|low|medium|high]"
                     ),
                     Err(error) => eprintln!("xi: {error}"),
                 }

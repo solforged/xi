@@ -25,6 +25,36 @@ impl Editor {
         &self.text
     }
 
+    /// The cursor's byte offset in the composed text.
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Replaces the draft and leaves history browsing, placing the cursor at the end.
+    pub fn set_text(&mut self, text: &str) {
+        self.text.clear();
+        self.text.push_str(text);
+        self.cursor = self.text.len();
+        self.browsing = None;
+    }
+
+    /// Replaces a byte range, placing the cursor after the inserted text.
+    ///
+    /// Panics if the range is out of bounds or not on UTF-8 character boundaries.
+    pub fn replace(&mut self, range: std::ops::Range<usize>, with: &str) {
+        let start = range.start;
+        self.text.replace_range(range, with);
+        self.cursor = start + with.len();
+        self.browsing = None;
+    }
+
+    /// Replaces the prompt history, oldest first, and leaves history browsing.
+    pub fn set_history(&mut self, entries: Vec<String>) {
+        self.history = entries;
+        self.browsing = None;
+    }
+
     /// Whether nothing has been typed.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -248,6 +278,26 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_text_and_history_preserves_byte_cursor_boundaries() {
+        let mut e = Editor::default();
+        e.set_history(vec!["old".into(), "new".into()]);
+        e.set_text("draft ξ");
+        assert_eq!(e.cursor(), "draft ξ".len());
+        assert!(e.history_back());
+        e.set_text("look @ξ.rs tail");
+        assert!(!e.history_forward());
+        e.replace(5..11, "@other.rs ");
+        assert_eq!(e.text(), "look @other.rs  tail");
+        assert_eq!(e.cursor(), "look @other.rs ".len());
+        assert!(e.text().is_char_boundary(e.cursor()));
+        assert!(e.history_back());
+        e.set_history(vec!["replacement".into()]);
+        assert!(!e.history_forward());
+        assert!(e.history_back());
+        assert_eq!(e.text(), "replacement");
+    }
 
     #[test]
     fn editing_moves_by_characters_not_bytes() {

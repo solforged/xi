@@ -9,7 +9,11 @@
 //!
 //! The client attaches to a daemon session over the typed JSON-RPC connection.
 
+pub mod complete;
 pub mod editor;
+pub mod external;
+pub mod history;
+pub mod picker;
 pub mod screen;
 pub mod status;
 pub mod style;
@@ -30,11 +34,16 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
 use xi_client::client::{Client, ClientError, ClientNotification};
 use xi_protocol::event::ModelRef;
+use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::{AttachResult, CreateParams, EventParams, PromptResult};
+use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::RpcError;
 use xi_protocol::{Block, Event, EventId, SessionId, Timestamp, ToolCallId};
 
+use crate::complete::{FileIndex, Menu};
 use crate::editor::Editor;
+use crate::history::{History, Search};
+use crate::picker::Picker;
 use crate::screen::Screen;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
@@ -54,6 +63,8 @@ pub struct Launch {
     pub template: CreateParams,
     /// The initial session snapshot.
     pub attached: AttachResult,
+    /// Shared prompt history, or in-memory history when absent.
+    pub history: Option<PathBuf>,
 }
 
 /// Whether the client can run here: both stdin and stdout are terminals.
@@ -68,8 +79,9 @@ struct Raw;
 impl Raw {
     fn enter() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        let raw = Self;
         crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
-        Ok(Self)
+        Ok(raw)
     }
 }
 
@@ -80,11 +92,312 @@ impl Drop for Raw {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Action {
+    Send,
+    Queue,
+    Newline,
+    Escape,
+    Interrupt,
+    DeleteOrQuit,
+    Up,
+    Down,
+    Complete,
+    Search,
+    External,
+    Models,
+    Reasoning,
+    Expand,
+    Home,
+    End,
+    Left,
+    Right,
+    KillBefore,
+    KillAfter,
+    KillWord,
+    Backspace,
+    Delete,
+}
+
+// Both help and composer dispatch use these effective bindings.
+const KEYS: &[(KeyCode, KeyModifiers, Action, &str, &str)] = &[
+    (
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+        Action::Send,
+        "enter",
+        "send; during a turn, steer; accept a completion",
+    ),
+    (
+        KeyCode::Enter,
+        KeyModifiers::ALT,
+        Action::Queue,
+        "alt+enter",
+        "queue a follow-up for after the turn",
+    ),
+    (
+        KeyCode::Enter,
+        KeyModifiers::SHIFT,
+        Action::Newline,
+        "shift+enter",
+        "new line",
+    ),
+    (
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL,
+        Action::Newline,
+        "ctrl+j",
+        "new line",
+    ),
+    (
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+        Action::Escape,
+        "esc",
+        "close a menu or overlay; otherwise stop the turn",
+    ),
+    (
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        Action::Interrupt,
+        "ctrl+c",
+        "close overlay, stop turn, clear composer, or quit",
+    ),
+    (
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL,
+        Action::DeleteOrQuit,
+        "ctrl+d",
+        "quit when empty and idle; otherwise delete forward",
+    ),
+    (
+        KeyCode::Up,
+        KeyModifiers::NONE,
+        Action::Up,
+        "up",
+        "previous completion or workspace prompt",
+    ),
+    (
+        KeyCode::Down,
+        KeyModifiers::NONE,
+        Action::Down,
+        "down",
+        "next completion or workspace prompt",
+    ),
+    (
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+        Action::Complete,
+        "tab",
+        "accept a completion; otherwise answer a waiting approval",
+    ),
+    (
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+        Action::Search,
+        "ctrl+r",
+        "search prompt history; repeat for older matches",
+    ),
+    (
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL,
+        Action::External,
+        "ctrl+g",
+        "edit the prompt in the external editor",
+    ),
+    (
+        KeyCode::Char('m'),
+        KeyModifiers::ALT,
+        Action::Models,
+        "alt+m",
+        "open the model picker",
+    ),
+    (
+        KeyCode::BackTab,
+        KeyModifiers::NONE,
+        Action::Reasoning,
+        "shift+tab",
+        "cycle reasoning: off, low, medium, high",
+    ),
+    (
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+        Action::Expand,
+        "ctrl+o",
+        "expand the newest collapsed result; repeat for older",
+    ),
+    (
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL,
+        Action::Home,
+        "ctrl+a",
+        "line start",
+    ),
+    (
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL,
+        Action::End,
+        "ctrl+e",
+        "line end",
+    ),
+    (
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL,
+        Action::Left,
+        "ctrl+b",
+        "previous character",
+    ),
+    (
+        KeyCode::Char('f'),
+        KeyModifiers::CONTROL,
+        Action::Right,
+        "ctrl+f",
+        "next character",
+    ),
+    (
+        KeyCode::Left,
+        KeyModifiers::NONE,
+        Action::Left,
+        "left",
+        "previous character",
+    ),
+    (
+        KeyCode::Right,
+        KeyModifiers::NONE,
+        Action::Right,
+        "right",
+        "next character",
+    ),
+    (
+        KeyCode::Home,
+        KeyModifiers::NONE,
+        Action::Home,
+        "home",
+        "line start",
+    ),
+    (
+        KeyCode::End,
+        KeyModifiers::NONE,
+        Action::End,
+        "end",
+        "line end",
+    ),
+    (
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL,
+        Action::KillBefore,
+        "ctrl+u",
+        "delete to line start",
+    ),
+    (
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+        Action::KillAfter,
+        "ctrl+k",
+        "delete to line end",
+    ),
+    (
+        KeyCode::Char('w'),
+        KeyModifiers::CONTROL,
+        Action::KillWord,
+        "ctrl+w",
+        "delete previous word",
+    ),
+    (
+        KeyCode::Backspace,
+        KeyModifiers::ALT,
+        Action::KillWord,
+        "alt+backspace",
+        "delete previous word",
+    ),
+    (
+        KeyCode::Backspace,
+        KeyModifiers::NONE,
+        Action::Backspace,
+        "backspace",
+        "delete previous character",
+    ),
+    (
+        KeyCode::Delete,
+        KeyModifiers::NONE,
+        Action::Delete,
+        "delete",
+        "delete next character",
+    ),
+];
+
+fn action(key: KeyEvent) -> Option<Action> {
+    let modifiers = if key.code == KeyCode::BackTab {
+        key.modifiers - KeyModifiers::SHIFT
+    } else {
+        key.modifiers
+    };
+    KEYS.iter()
+        .find(|(code, mods, ..)| *code == key.code && *mods == modifiers)
+        .map(|(_, _, action, ..)| *action)
+}
+
+#[derive(Clone, Copy)]
+enum Builtin {
+    Help,
+    Quit,
+    New,
+    Tree,
+    Model,
+    Reasoning,
+    Compact,
+}
+
+const COMMANDS: &[(&str, &str, Builtin)] = &[
+    ("help", "show keys and commands", Builtin::Help),
+    ("hotkeys", "show keys and commands", Builtin::Help),
+    ("quit", "leave; a running turn keeps running", Builtin::Quit),
+    ("exit", "leave; a running turn keeps running", Builtin::Quit),
+    ("new", "start a session in this workspace", Builtin::New),
+    (
+        "tree",
+        "browse branches and check out an earlier point",
+        Builtin::Tree,
+    ),
+    (
+        "model",
+        "switch PROVIDER/MODEL; without an argument, open the picker",
+        Builtin::Model,
+    ),
+    (
+        "reasoning",
+        "set off, low, medium, high; without an argument, show it",
+        Builtin::Reasoning,
+    ),
+    ("compact", "summarize older context now", Builtin::Compact),
+];
+
+fn builtin_commands() -> Vec<CommandSpec> {
+    COMMANDS
+        .iter()
+        .map(|(name, description, _)| CommandSpec {
+            name: (*name).into(),
+            description: (*description).into(),
+        })
+        .collect()
+}
+
+fn reasoning_name(reasoning: Reasoning) -> &'static str {
+    match reasoning {
+        Reasoning::Off => "off",
+        Reasoning::Low => "low",
+        Reasoning::Medium => "medium",
+        Reasoning::High => "high",
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Composer,
     Approval,
     Tree,
+    Models,
+    Search,
 }
 
 type Reply = oneshot::Receiver<Result<PromptResult, ClientError>>;
@@ -96,6 +409,14 @@ struct App {
     focus: Focus,
     /// The session tree overlay, while it is open.
     tree: Option<Tree>,
+    picker: Option<Picker>,
+    search: Option<Search>,
+    history: History,
+    commands: Vec<CommandSpec>,
+    completion: Option<Menu>,
+    files: Option<FileIndex>,
+    file_cwd: Option<PathBuf>,
+    external_requested: bool,
     /// Option selected in the approval: 0 allow, 1 deny.
     choice: usize,
     /// Replies of prompts sent to the running turn.
@@ -131,11 +452,34 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     let (cols, rows) = crossterm::terminal::size()?;
     let color = std::env::var_os("NO_COLOR").is_none();
     let mut app = App::new(launch, usize::from(cols), usize::from(rows));
-    let raw = Raw::enter()?;
+    app.initialize_composer().await;
+    let mut raw = Some(Raw::enter()?);
     let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     while !app.quit {
+        if app.external_requested {
+            app.external_requested = false;
+            screen.finish()?;
+            drop(keys);
+            drop(raw.take());
+            let edited = external::edit(app.editor.text());
+            raw = Some(Raw::enter()?);
+            crossterm::execute!(
+                std::io::stdout(),
+                crossterm::cursor::MoveToColumn(0),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+            )?;
+            keys = EventStream::new();
+            match edited {
+                Ok(Some(text)) => app.editor.set_text(&text),
+                Ok(None) => {}
+                Err(error) => app.note(vec![
+                    Line::default().dim(format!("  external editor: {error}")),
+                ]),
+            }
+            app.update_completion();
+        }
         if app.refresh {
             app.refresh_details().await;
         }
@@ -163,7 +507,10 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
             Some(reply) = app.pending.next(), if !app.pending.is_empty() => app.replied(reply),
             event = keys.next() => match event {
                 Some(Ok(TermEvent::Key(key))) if key.kind != KeyEventKind::Release => app.key(key).await?,
-                Some(Ok(TermEvent::Paste(text))) if app.focus == Focus::Composer => app.editor.insert(&text),
+                Some(Ok(TermEvent::Paste(text))) if app.focus == Focus::Composer => {
+                    app.editor.insert(&text);
+                    app.update_completion();
+                }
                 Some(Ok(TermEvent::Resize(c, r))) => {
                     app.cols = usize::from(c).max(20);
                     app.rows = usize::from(r).max(4);
@@ -216,12 +563,24 @@ fn lineage(events: &[Event], head: EventId) -> Vec<Event> {
 
 impl App {
     fn new(launch: Launch, cols: usize, rows: usize) -> Self {
+        let (history, history_error) =
+            History::load(launch.history.clone(), &launch.attached.info.cwd);
+        let mut editor = Editor::default();
+        editor.set_history(history.workspace());
         let mut app = Self {
             launch,
             transcript: Transcript::default(),
-            editor: Editor::default(),
+            editor,
             focus: Focus::Composer,
             tree: None,
+            picker: None,
+            search: None,
+            history,
+            commands: builtin_commands(),
+            completion: None,
+            files: None,
+            file_cwd: None,
+            external_requested: false,
             choice: 0,
             pending: FuturesUnordered::new(),
             started: None,
@@ -239,7 +598,140 @@ impl App {
             exited: false,
         };
         app.attach();
+        if let Some(error) = history_error {
+            app.note(vec![
+                Line::default().dim(format!("  prompt history: {error}")),
+            ]);
+        }
         app
+    }
+
+    async fn initialize_composer(&mut self) {
+        self.commands = builtin_commands();
+        match self.launch.client.commands(self.session_id()).await {
+            Ok(commands) => {
+                for command in commands {
+                    if !self.commands.iter().any(|known| known.name == command.name) {
+                        self.commands.push(command);
+                    }
+                }
+            }
+            Err(error) => self.note(vec![
+                Line::default().dim(format!("  command completion: {error}")),
+            ]),
+        }
+        let cwd = &self.launch.attached.info.cwd;
+        if self.file_cwd.as_ref() != Some(cwd) {
+            let root = cwd.clone();
+            match tokio::task::spawn_blocking(move || FileIndex::build(&root, 20_000)).await {
+                Ok(files) => {
+                    self.files = Some(files);
+                    self.file_cwd = Some(self.launch.attached.info.cwd.clone());
+                }
+                Err(error) => self.note(vec![
+                    Line::default().dim(format!("  file completion: {error}")),
+                ]),
+            }
+        }
+        self.update_completion();
+    }
+
+    fn update_completion(&mut self) {
+        self.completion =
+            complete::trigger(self.editor.text(), self.editor.cursor()).and_then(|trigger| {
+                match trigger.kind {
+                    complete::Kind::Command => Menu::commands(&trigger, &self.commands),
+                    complete::Kind::File => self
+                        .files
+                        .as_ref()
+                        .and_then(|files| Menu::files(&trigger, files)),
+                }
+            });
+    }
+
+    fn accept_completion(&mut self) {
+        if let Some(menu) = self.completion.take()
+            && let Some(item) = menu.selected()
+        {
+            self.editor.replace(menu.range(), &item.insert);
+        }
+        self.update_completion();
+    }
+
+    fn close_overlay(&mut self) {
+        if let Some(search) = self.search.take() {
+            self.editor.set_text(search.draft());
+        }
+        self.tree = None;
+        self.picker = None;
+        self.focus = Focus::Composer;
+        self.completion = None;
+    }
+
+    async fn open_models(&mut self) {
+        match self.launch.client.models(self.session_id()).await {
+            Ok(models) => {
+                self.launch.attached.info.model = models.current.clone();
+                self.launch.attached.info.reasoning = models.reasoning;
+                self.launch.attached.info.model_info = models
+                    .models
+                    .iter()
+                    .find(|entry| entry.model == models.current)
+                    .map(|entry| entry.info.clone());
+                self.picker = Some(Picker::new(models));
+                self.completion = None;
+                self.focus = Focus::Models;
+            }
+            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+        }
+    }
+
+    fn idle_only(&mut self, action: &str) -> bool {
+        if !self.running() {
+            return true;
+        }
+        self.note(vec![Line::default().dim(format!(
+            "  {action} waits for the turn to end · esc stops it"
+        ))]);
+        false
+    }
+
+    async fn set_model(&mut self, model: ModelRef) -> bool {
+        if !self.idle_only("model selection") {
+            return false;
+        }
+        match self
+            .launch
+            .client
+            .set_model(self.session_id(), model.clone())
+            .await
+        {
+            Ok(()) => {
+                self.launch.attached.info.model = model;
+                self.launch.attached.info.model_info = None;
+                self.refresh = true;
+                true
+            }
+            Err(error) => {
+                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                false
+            }
+        }
+    }
+
+    async fn set_reasoning(&mut self, reasoning: Reasoning) {
+        if !self.idle_only("reasoning") {
+            return;
+        }
+        match self
+            .launch
+            .client
+            .set_reasoning(self.session_id(), reasoning)
+            .await
+        {
+            Ok(()) => self.launch.attached.info.reasoning = reasoning,
+            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+        }
     }
 
     fn session_id(&self) -> SessionId {
@@ -417,6 +909,9 @@ impl App {
                     self.launch.attached.info.model_info = None;
                     self.refresh = true;
                 }
+                xi_protocol::EventKind::ReasoningChanged { reasoning } => {
+                    self.launch.attached.info.reasoning = *reasoning;
+                }
                 _ => {}
             },
             ClientNotification::Exited(_) => {
@@ -429,7 +924,7 @@ impl App {
             _ => {}
         }
         let now = self.transcript.asks().len();
-        if now > asks && self.editor.is_empty() {
+        if now > asks && self.editor.is_empty() && self.focus == Focus::Composer {
             self.focus = Focus::Approval;
             self.choice = 0;
         }
@@ -468,7 +963,9 @@ impl App {
     fn finish_turn(&mut self, outcome: Option<PromptResult>) {
         self.launch.attached.running = false;
         self.transcript.end_turn();
-        self.focus = Focus::Composer;
+        if self.focus == Focus::Approval {
+            self.focus = Focus::Composer;
+        }
         let elapsed = self.started.take().map_or(0, |s| {
             u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)
         });
@@ -588,13 +1085,39 @@ impl App {
     }
 
     async fn command(&mut self, line: &str) -> Result<(), Error> {
-        let (name, rest) = line.split_once(' ').unwrap_or((line, ""));
-        match name {
-            "/quit" | "/exit" => self.quit = true,
-            "/new" if self.running() => self.note(vec![
-                Line::default().dim("  /new waits for the turn to end · esc stops it"),
-            ]),
-            "/new" => {
+        let (name, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let name = name.trim_start_matches('/');
+        let rest = rest.trim();
+        let builtin = COMMANDS
+            .iter()
+            .find(|(command, ..)| *command == name)
+            .map(|(_, _, kind)| *kind);
+        match builtin {
+            Some(Builtin::Help) => {
+                let mut lines = vec![Line::default().strong(Role::Ink, "  keys")];
+                for (_, _, _, key, description) in KEYS {
+                    lines.push(Line::default().ink(format!("  {key:<22}")).dim(description));
+                }
+                lines.push(Line::default().strong(Role::Ink, "  commands"));
+                for (command, description, _) in COMMANDS {
+                    lines.push(
+                        Line::default()
+                            .ink(format!("  /{command:<21}"))
+                            .dim(description),
+                    );
+                }
+                lines.push(
+                    Line::default()
+                        .ink("  /name args            ")
+                        .dim("run an extension command"),
+                );
+                self.note(lines);
+            }
+            Some(Builtin::Quit) => self.quit = true,
+            Some(Builtin::New) => {
+                if !self.idle_only("/new") {
+                    return Ok(());
+                }
                 let attached = self
                     .launch
                     .client
@@ -608,94 +1131,124 @@ impl App {
                 self.started = None;
                 self.pending = FuturesUnordered::new();
                 self.transcript = Transcript::default();
+                self.close_overlay();
+                self.steering.clear();
+                self.queued.clear();
                 self.note(vec![style::rule(self.cols)]);
                 self.attach();
+                self.initialize_composer().await;
             }
-            "/tree" if self.running() => self.note(vec![
-                Line::default().dim("  /tree waits for the turn to end · esc stops it"),
-            ]),
-            "/tree" => {
+            Some(Builtin::Tree) => {
+                if !self.idle_only("/tree") {
+                    return Ok(());
+                }
                 self.tree = Some(Tree::new(
                     &self.launch.attached.events,
                     self.launch.attached.info.head,
                 ));
+                self.completion = None;
                 self.focus = Focus::Tree;
             }
-            "/model" if rest.trim().is_empty() => {
-                let selected = &self.launch.attached.info.model;
-                let model = format!("{}/{}", selected.provider, selected.model);
-                self.note(vec![
-                    Line::default()
-                        .dim(format!("  model {model} · /model PROVIDER/MODEL switches")),
-                ]);
+            Some(Builtin::Model) if rest.is_empty() => self.open_models().await,
+            Some(Builtin::Model) => match rest.split_once('/') {
+                Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+                    self.set_model(ModelRef {
+                        provider: provider.into(),
+                        model: model.into(),
+                    })
+                    .await;
+                }
+                _ => self.note(vec![Line::default().dim("  /model expects PROVIDER/MODEL")]),
+            },
+            Some(Builtin::Reasoning) if rest.is_empty() => {
+                self.note(vec![Line::default().dim(format!(
+                    "  reasoning {} · /reasoning off|low|medium|high",
+                    reasoning_name(self.launch.attached.info.reasoning)
+                ))]);
             }
-            "/model" => {
-                let result = match rest.trim().split_once('/') {
-                    Some((provider, model)) if !provider.is_empty() && !model.is_empty() => self
-                        .launch
-                        .client
-                        .set_model(
-                            self.session_id(),
-                            ModelRef {
-                                provider: provider.into(),
-                                model: model.into(),
-                            },
-                        )
-                        .await
-                        .map_err(|e| e.to_string()),
-                    _ => Err(format!(
-                        "invalid model {:?}; expected PROVIDER/MODEL",
-                        rest.trim()
-                    )),
+            Some(Builtin::Reasoning) => {
+                let reasoning = match rest {
+                    "off" => Some(Reasoning::Off),
+                    "low" => Some(Reasoning::Low),
+                    "medium" => Some(Reasoning::Medium),
+                    "high" => Some(Reasoning::High),
+                    _ => None,
                 };
-                if let Err(message) = result {
-                    self.note(vec![Line::default().sanguine("✕ ").ink(message)]);
+                if let Some(reasoning) = reasoning {
+                    self.set_reasoning(reasoning).await;
                 } else {
-                    self.refresh = true;
+                    self.note(vec![
+                        Line::default().dim("  /reasoning expects off, low, medium, or high"),
+                    ]);
                 }
             }
-            _ => {
-                let rows = [
-                    ("/new", "start a new session"),
-                    (
-                        "/tree",
-                        "browse branches; check out a point to branch from it",
-                    ),
-                    ("/model PROVIDER/MODEL", "switch models"),
-                    ("/quit", "leave; ctrl+d on an empty line does the same"),
-                    ("enter", "send; during a turn, steer it"),
-                    ("alt+enter", "queue a follow-up for after the turn"),
-                    ("ctrl+j", "new line"),
-                    ("esc", "stop the turn"),
-                    ("tab", "answer a waiting approval"),
-                    (
-                        "ctrl+o",
-                        "show the newest cut-short result whole; again for older",
-                    ),
-                ];
-                let mut lines = Vec::new();
-                if name != "/help" {
-                    lines.push(Line::default().dim(format!("  unknown command {name}")));
+            Some(Builtin::Compact) => {
+                if !self.idle_only("/compact") {
+                    return Ok(());
                 }
-                for (k, v) in rows {
-                    lines.push(Line::default().ink(format!("  {k:<22}")).dim(v));
+                match self.launch.client.compact(self.session_id()).await {
+                    Ok(result) => self.note(vec![Line::default().dim(format!(
+                        "  compacted · {} tokens before",
+                        tokens(result.tokens_before)
+                    ))]),
+                    Err(error) => {
+                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
+                    }
                 }
-                self.note(lines);
+            }
+            None => {
+                match self
+                    .launch
+                    .client
+                    .command(self.session_id(), name, rest)
+                    .await
+                {
+                    Ok(Some(result)) => {
+                        if let Some(message) = result.message {
+                            self.note(
+                                message
+                                    .lines()
+                                    .map(|line| Line::default().dim(format!("  {line}")))
+                                    .collect(),
+                            );
+                        }
+                    }
+                    Ok(None) => self.note(vec![
+                        Line::default().dim(format!("  unknown command /{name} · /help")),
+                    ]),
+                    Err(error) => {
+                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
+                    }
+                }
             }
         }
         Ok(())
     }
 
     async fn submit(&mut self, queue: bool) -> Result<(), Error> {
-        let text = self.editor.take();
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
+        let text = self.editor.text().trim().to_owned();
+        self.editor.clear();
+        self.completion = None;
+        if text.is_empty() {
             return Ok(());
         }
-        if trimmed.starts_with('/') && !trimmed.contains('\n') {
-            return self.command(trimmed).await;
+        if text.starts_with('/') && !text.contains('\n') {
+            return self.command(&text).await;
         }
-        let text = trimmed.to_owned();
+        if self.exited {
+            self.note(vec![
+                Line::default().dim("  session exited · /new starts another"),
+            ]);
+            self.editor.set_text(&text);
+            self.update_completion();
+            return Ok(());
+        }
+        if let Err(error) = self.history.push(&text) {
+            self.note(vec![
+                Line::default().dim(format!("  prompt history: {error}")),
+            ]);
+        }
+        self.editor.set_history(self.history.workspace());
         if queue && self.running() {
             self.queued.push(text);
         } else {
@@ -770,6 +1323,7 @@ impl App {
             }
             None => "your next prompt continues from here",
         };
+        self.update_completion();
         let mut line = Line::default()
             .brass("  ↳ ")
             .ink("checked out · ")
@@ -799,44 +1353,204 @@ impl App {
         }
     }
 
+    async fn model_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Enter {
+            let entry = self.picker.as_ref().and_then(Picker::selected).cloned();
+            if let Some(entry) = entry {
+                if !self.idle_only("model selection") {
+                    return;
+                }
+                if !entry.available {
+                    let hint = if entry.model.provider == "chatgpt" {
+                        " · xi login chatgpt"
+                    } else {
+                        ""
+                    };
+                    self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
+                } else if self.set_model(entry.model).await {
+                    self.launch.attached.info.model_info = Some(entry.info);
+                    self.close_overlay();
+                }
+            }
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.close_overlay();
+            return;
+        }
+        if let Some(picker) = self.picker.as_mut() {
+            match key.code {
+                KeyCode::Up => picker.up(),
+                KeyCode::Down => picker.down(),
+                KeyCode::Backspace => picker.backspace(),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    picker.input(c)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_overlay(),
+            KeyCode::Enter => {
+                let selected = self
+                    .search
+                    .as_ref()
+                    .and_then(|search| search.current(&self.history))
+                    .map(str::to_owned);
+                if let Some(selected) = selected {
+                    self.editor.set_text(&selected);
+                    self.search = None;
+                    self.focus = Focus::Composer;
+                    self.update_completion();
+                }
+            }
+            _ => {
+                if let Some(search) = self.search.as_mut() {
+                    match key.code {
+                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            search.older()
+                        }
+                        KeyCode::Backspace => search.backspace(),
+                        KeyCode::Char(c)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            search.input(c)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        if ctrl && key.code == KeyCode::Char('c') {
-            if self.focus == Focus::Tree {
-                self.close_tree();
+        let action = action(key);
+        if matches!(action, Some(Action::Interrupt)) {
+            if self.focus != Focus::Composer || self.completion.is_some() {
+                self.close_overlay();
             } else if self.running() {
                 self.cancel().await;
             } else if !self.editor.is_empty() {
                 self.editor.clear();
+                self.update_completion();
             } else {
                 self.quit = true;
             }
             return Ok(());
         }
-        if self.focus == Focus::Tree {
-            self.tree_key(key).await;
-            return Ok(());
+        match self.focus {
+            Focus::Tree => {
+                self.tree_key(key).await;
+                return Ok(());
+            }
+            Focus::Models => {
+                self.model_key(key).await;
+                return Ok(());
+            }
+            Focus::Search => {
+                self.search_key(key);
+                return Ok(());
+            }
+            Focus::Approval => {
+                match key.code {
+                    KeyCode::Char('1' | 'y') => self.answer(true).await,
+                    KeyCode::Char('2' | 'n') => self.answer(false).await,
+                    KeyCode::Up | KeyCode::Down => self.choice = 1 - self.choice,
+                    KeyCode::Enter => self.answer(self.choice == 0).await,
+                    KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Composer,
+                    _ => {}
+                }
+                return Ok(());
+            }
+            Focus::Composer => {}
         }
-        if self.focus == Focus::Approval {
-            match key.code {
-                KeyCode::Char('1' | 'y') => self.answer(true).await,
-                KeyCode::Char('2' | 'n') => self.answer(false).await,
-                KeyCode::Up | KeyCode::Down => self.choice = 1 - self.choice,
-                KeyCode::Enter => self.answer(self.choice == 0).await,
-                KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Composer,
+        if let Some(menu) = self.completion.as_mut() {
+            match action {
+                Some(Action::Up) => {
+                    menu.up();
+                    return Ok(());
+                }
+                Some(Action::Down) => {
+                    menu.down();
+                    return Ok(());
+                }
+                // A token that already equals the selection is complete, so
+                // enter sends it instead of accepting the same text again.
+                Some(Action::Send)
+                    if menu.selected().is_some_and(|item| {
+                        self.editor.text().get(menu.range()) == Some(item.insert.trim_end())
+                    }) =>
+                {
+                    self.completion = None;
+                }
+                Some(Action::Send | Action::Complete) => {
+                    self.accept_completion();
+                    return Ok(());
+                }
+                Some(Action::Escape) => {
+                    self.completion = None;
+                    return Ok(());
+                }
                 _ => {}
             }
-            return Ok(());
         }
-        let running = self.running();
-        let e = &mut self.editor;
-        match key.code {
-            KeyCode::Enter if alt => self.submit(true).await?,
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => e.insert("\n"),
-            KeyCode::Enter => self.submit(false).await?,
-            KeyCode::Char('j') if ctrl => e.insert("\n"),
-            KeyCode::Char('o') if ctrl => {
+        match action {
+            Some(Action::Send) => {
+                self.submit(false).await?;
+                return Ok(());
+            }
+            Some(Action::Queue) => {
+                self.submit(true).await?;
+                return Ok(());
+            }
+            Some(Action::Newline) => self.editor.insert("\n"),
+            Some(Action::Escape) => {
+                if self.running() {
+                    self.cancel().await;
+                }
+                return Ok(());
+            }
+            Some(Action::Complete) => {
+                if !self.transcript.asks().is_empty() {
+                    self.focus = Focus::Approval;
+                    self.choice = 0;
+                }
+                return Ok(());
+            }
+            Some(Action::Search) => {
+                self.search = Some(Search::new(self.editor.text().to_owned()));
+                self.completion = None;
+                self.focus = Focus::Search;
+                return Ok(());
+            }
+            Some(Action::External) => {
+                self.external_requested = true;
+                return Ok(());
+            }
+            Some(Action::Models) => {
+                self.open_models().await;
+                return Ok(());
+            }
+            Some(Action::Reasoning) => {
+                let next = match self.launch.attached.info.reasoning {
+                    Reasoning::Off => Reasoning::Low,
+                    Reasoning::Low => Reasoning::Medium,
+                    Reasoning::Medium => Reasoning::High,
+                    Reasoning::High => Reasoning::Off,
+                };
+                self.set_reasoning(next).await;
+                return Ok(());
+            }
+            Some(Action::Expand) => {
                 let lines = self.transcript.expand(self.cols).unwrap_or_else(|| {
                     let why = if self.transcript.collapsed() {
                         "  that was the oldest cut-short result · ctrl+o starts again from the newest"
@@ -846,45 +1560,49 @@ impl App {
                     self.transcript.note(vec![Line::default().dim(why)])
                 });
                 self.commit.extend(lines);
+                return Ok(());
             }
-            KeyCode::Tab if !self.transcript.asks().is_empty() => {
-                self.focus = Focus::Approval;
-                self.choice = 0;
-            }
-            KeyCode::Esc if running => self.cancel().await,
-            KeyCode::Char('d') if ctrl => {
-                if e.is_empty() && !running {
+            Some(Action::DeleteOrQuit) => {
+                if self.editor.is_empty() && !self.running() {
                     self.quit = true;
-                } else {
-                    e.delete();
+                    return Ok(());
+                }
+                self.editor.delete();
+            }
+            Some(Action::Home) => self.editor.home(),
+            Some(Action::End) => self.editor.end(),
+            Some(Action::Left) => self.editor.left(),
+            Some(Action::Right) => self.editor.right(),
+            Some(Action::KillBefore) => self.editor.kill_before(),
+            Some(Action::KillAfter) => self.editor.kill_after(),
+            Some(Action::KillWord) => self.editor.kill_word(),
+            Some(Action::Backspace) => self.editor.backspace(),
+            Some(Action::Delete) => self.editor.delete(),
+            Some(Action::Up) => {
+                if !self.editor.text().contains('\n') {
+                    self.editor.history_back();
                 }
             }
-            KeyCode::Char('a') if ctrl => e.home(),
-            KeyCode::Char('e') if ctrl => e.end(),
-            KeyCode::Char('u') if ctrl => e.kill_before(),
-            KeyCode::Char('k') if ctrl => e.kill_after(),
-            KeyCode::Char('w') if ctrl => e.kill_word(),
-            KeyCode::Backspace if alt => e.kill_word(),
-            KeyCode::Char('b') if ctrl => e.left(),
-            KeyCode::Char('f') if ctrl => e.right(),
-            KeyCode::Char(c) if !ctrl => {
-                let mut buf = [0; 4];
-                e.insert(c.encode_utf8(&mut buf));
+            Some(Action::Down) => {
+                if !self.editor.text().contains('\n') {
+                    self.editor.history_forward();
+                }
             }
-            KeyCode::Backspace => e.backspace(),
-            KeyCode::Delete => e.delete(),
-            KeyCode::Left => e.left(),
-            KeyCode::Right => e.right(),
-            KeyCode::Home => e.home(),
-            KeyCode::End => e.end(),
-            KeyCode::Up if !e.text().contains('\n') => {
-                e.history_back();
+            None => {
+                if let KeyCode::Char(c) = key.code
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    let mut buf = [0; 4];
+                    self.editor.insert(c.encode_utf8(&mut buf));
+                } else {
+                    return Ok(());
+                }
             }
-            KeyCode::Down if !e.text().contains('\n') => {
-                e.history_forward();
-            }
-            _ => {}
+            Some(Action::Interrupt) => return Ok(()),
         }
+        self.update_completion();
         Ok(())
     }
 
@@ -978,6 +1696,21 @@ impl App {
             )
             .short(Line::default().ink(&model.model)),
         );
+        let reasoning = if info
+            .model_info
+            .as_ref()
+            .is_some_and(|model| !model.reasoning)
+        {
+            "no think"
+        } else {
+            match info.reasoning {
+                Reasoning::Off => "think off",
+                Reasoning::Low => "think low",
+                Reasoning::Medium => "think med",
+                Reasoning::High => "think high",
+            }
+        };
+        segs.push(Segment::new("reasoning", d(reasoning.into())));
         if let Some(model) = &info.model_info {
             let window = model.context_window.max(1);
             segs.push(Segment::new(
@@ -1085,7 +1818,30 @@ impl App {
                 cols,
             ));
         }
-        let border = if matches!(self.focus, Focus::Approval | Focus::Tree) {
+        let overlay_rows = self
+            .rows
+            .saturating_sub(self.editor.render(cols, Role::Dim, "").0.len() + 3);
+        if self.focus == Focus::Models
+            && let Some(picker) = &self.picker
+        {
+            lines.extend(picker.render(cols, overlay_rows));
+        }
+        if self.focus == Focus::Search
+            && let Some(search) = &self.search
+        {
+            lines.extend(
+                search
+                    .render(&self.history, cols)
+                    .into_iter()
+                    .take(overlay_rows),
+            );
+        }
+        if self.focus == Focus::Composer
+            && let Some(menu) = &self.completion
+        {
+            lines.extend(menu.render(cols, overlay_rows.min(8)));
+        }
+        let border = if self.focus != Focus::Composer {
             Role::Dim
         } else if self.transcript.tainted {
             Role::Murex
@@ -1149,7 +1905,8 @@ mod tests {
                 cwd: "/tmp/xi-tui-demo".into(),
                 trusted: true,
                 model,
-                model_info: None,
+                reasoning: Reasoning::Medium,
+                model_info: Some(model_info()),
                 parent_session: None,
             },
             events: vec![root],
@@ -1160,7 +1917,18 @@ mod tests {
         }
     }
 
-    async fn launch(attached: AttachResult) -> (Launch, mpsc::UnboundedReceiver<String>) {
+    fn model_info() -> xi_protocol::model::ModelInfo {
+        xi_protocol::model::ModelInfo {
+            provider: "demo".into(),
+            id: "script".into(),
+            context_window: 256_000,
+            max_output: 4_096,
+            reasoning: true,
+            pricing: None,
+        }
+    }
+
+    async fn launch(attached: AttachResult) -> (Launch, mpsc::UnboundedReceiver<(String, Value)>) {
         let (connection, server) = tokio::io::duplex(16 * 1024);
         let (reader, writer) = tokio::io::split(server);
         let (peer, mut incoming) = Peer::spawn(reader, writer);
@@ -1168,15 +1936,38 @@ mod tests {
         let response = attached.clone();
         tokio::spawn(async move {
             while let Some(message) = incoming.recv().await {
-                if let Incoming::Request { id, method, .. } = message {
-                    let _ = requests.send(method.clone());
+                if let Incoming::Request { id, method, params } = message {
+                    let _ = requests.send((method.clone(), params.clone()));
                     let result = match method.as_str() {
                         "initialize" => Ok(json!({
                             "protocol_version": xi_protocol::PROTOCOL_VERSION,
                             "daemon_version": "test",
                             "capabilities": { "private": true },
                         })),
-                        "session/attach" => Ok(serde_json::to_value(&response).unwrap()),
+                        "session/attach" | "session/create" => {
+                            Ok(serde_json::to_value(&response).unwrap())
+                        }
+                        "session/models" => Ok(json!({
+                            "current": response.info.model,
+                            "reasoning": response.info.reasoning,
+                            "models": [
+                                { "model": response.info.model, "info": model_info(), "available": true },
+                                {
+                                    "model": { "provider": "demo", "model": "second" },
+                                    "info": (xi_protocol::model::ModelInfo { id: "second".into(), ..model_info() }),
+                                    "available": true,
+                                },
+                            ],
+                        })),
+                        "session/commands" => {
+                            Ok(json!([{ "name": "known", "description": "an extension command" }]))
+                        }
+                        "session/command" if params["name"] == "known" => {
+                            Ok(json!({ "message": "extension result" }))
+                        }
+                        "session/compact" => {
+                            Ok(json!({ "head": response.info.head, "tokens_before": 42_000 }))
+                        }
                         "session/prompt" => Ok(serde_json::to_value(PromptResult {
                             head: response.info.head,
                             failed: false,
@@ -1207,6 +1998,7 @@ mod tests {
                 notifications,
                 template,
                 attached,
+                history: None,
             },
             observed,
         )
@@ -1366,7 +2158,7 @@ mod tests {
             let app = App::new(launch, 80, 24);
             app.release().await.unwrap();
             let mut methods = Vec::new();
-            while let Ok(method) = requests.try_recv() {
+            while let Ok((method, _)) = requests.try_recv() {
                 methods.push(method);
             }
             assert!(methods.iter().any(|method| method == "session/detach"));
@@ -1376,5 +2168,294 @@ mod tests {
             );
             assert!(methods.iter().all(|method| method != "session/cancel"));
         }
+    }
+
+    fn request(requests: &mut mpsc::UnboundedReceiver<(String, Value)>, wanted: &str) -> Value {
+        while let Ok((method, params)) = requests.try_recv() {
+            if method == wanted {
+                return params;
+            }
+        }
+        panic!("missing request {wanted}");
+    }
+
+    #[tokio::test]
+    async fn shift_tab_sets_reasoning_and_updates_the_footer() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 160, 24);
+        assert!(app.footer(160).plain().contains("think med"));
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "session/set_reasoning");
+        assert_eq!(params["session"], json!(app.session_id()));
+        assert_eq!(params["reasoning"], "high");
+        assert_eq!(app.launch.attached.info.reasoning, Reasoning::High);
+        assert!(app.footer(160).plain().contains("think high"));
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.footer(160).plain().contains("think off"));
+        app.launch
+            .attached
+            .info
+            .model_info
+            .as_mut()
+            .unwrap()
+            .reasoning = false;
+        assert!(app.footer(160).plain().contains("no think"));
+    }
+
+    #[tokio::test]
+    async fn model_command_opens_the_picker_and_enter_selects_a_model() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 120, 24);
+        app.command("/model").await.unwrap();
+        assert!(app.focus == Focus::Models);
+        assert_eq!(
+            request(&mut requests, "session/models")["session"],
+            json!(app.session_id())
+        );
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&mut requests, "session/set_model")["model"],
+            json!({
+                "provider": "demo", "model": "second",
+            })
+        );
+        assert_eq!(app.launch.attached.info.model.model, "second");
+        assert!(app.focus == Focus::Composer);
+    }
+
+    #[tokio::test]
+    async fn unknown_commands_are_sent_to_extensions_and_point_to_help() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 80, 24);
+        app.command("/missing raw arguments").await.unwrap();
+        let params = request(&mut requests, "session/command");
+        assert_eq!(params["name"], "missing");
+        assert_eq!(params["args"], "raw arguments");
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain().contains("unknown command /missing · /help"))
+        );
+        app.command("/known argument").await.unwrap();
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain().contains("extension result"))
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_command_completion_replaces_the_composer_without_submitting() {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 80, 24);
+        for c in "/rea".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert!(app.completion.is_some());
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.text(), "/reasoning ");
+        assert!(app.completion.is_none());
+        assert!(app.pending.is_empty());
+        assert!(!app.running());
+        while let Ok((method, _)) = requests.try_recv() {
+            assert_eq!(method, "initialize");
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_fully_typed_command_runs_it() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 80, 24);
+        app.commit.clear();
+        for c in "/help".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert!(app.completion.is_some());
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.editor.is_empty());
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain().contains("show keys and commands"))
+        );
+    }
+
+    #[tokio::test]
+    async fn submitted_prompts_are_persisted_but_commands_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prompts.jsonl");
+        let (mut launch, _) = launch(snapshot(false)).await;
+        launch.history = Some(path.clone());
+        let mut app = App::new(launch, 80, 24);
+        app.editor.set_text("persist this prompt");
+        app.submit(false).await.unwrap();
+        let reply = app.pending.next().await.unwrap();
+        app.replied(reply);
+        app.editor.set_text("/reasoning");
+        app.submit(false).await.unwrap();
+        let lines = std::fs::read_to_string(path).unwrap();
+        let entries: Vec<Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["text"], "persist this prompt");
+        assert_eq!(entries[0]["cwd"], json!(app.launch.attached.info.cwd));
+        app.editor.history_back();
+        assert_eq!(app.editor.text(), "persist this prompt");
+    }
+
+    #[tokio::test]
+    async fn history_search_walks_older_matches_and_restores_the_draft() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 80, 24);
+        app.history.push("first matching prompt").unwrap();
+        app.history.push("second matching prompt").unwrap();
+        app.editor.set_text("unfinished draft");
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.search.as_ref().unwrap().current(&app.history),
+            Some("first matching prompt")
+        );
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.text(), "unfinished draft");
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.text(), "second matching prompt");
+        assert!(app.focus == Focus::Composer);
+    }
+
+    #[tokio::test]
+    async fn model_reasoning_and_compaction_changes_are_refused_while_running() {
+        let (launch, mut requests) = launch(snapshot(true)).await;
+        let mut app = App::new(launch, 80, 24);
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        app.command("/model demo/second").await.unwrap();
+        app.command("/compact").await.unwrap();
+        app.command("/new").await.unwrap();
+        assert_eq!(app.launch.attached.info.reasoning, Reasoning::Medium);
+        assert_eq!(app.launch.attached.info.model.model, "script");
+        while let Ok((method, _)) = requests.try_recv() {
+            assert_eq!(method, "initialize");
+        }
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain().contains("waits for the turn to end"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_model_events_from_other_clients_update_metadata() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 160, 24);
+        for kind in [
+            EventKind::ReasoningChanged {
+                reasoning: Reasoning::Low,
+            },
+            EventKind::ModelChanged {
+                model: ModelRef {
+                    provider: "demo".into(),
+                    model: "other".into(),
+                },
+            },
+        ] {
+            app.notify(&ClientNotification::Event(EventParams {
+                session: app.session_id(),
+                event: Event {
+                    id: EventId::generate(),
+                    parent: Some(app.launch.attached.info.head),
+                    at: Timestamp(1),
+                    kind,
+                },
+            }));
+        }
+        assert_eq!(app.launch.attached.info.reasoning, Reasoning::Low);
+        assert_eq!(app.launch.attached.info.model.model, "other");
+        assert!(app.refresh);
+        assert!(app.footer(160).plain().contains("think low"));
+    }
+
+    #[tokio::test]
+    async fn help_uses_dispatch_bindings_and_only_implemented_commands() {
+        let (launch, _) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 80, 24);
+        app.commit.clear();
+        app.command("/hotkeys").await.unwrap();
+        let help = app
+            .commit
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (code, modifiers, _, label, _) in KEYS {
+            assert!(action(KeyEvent::new(*code, *modifiers)).is_some());
+            assert!(help.contains(label));
+        }
+        for later in ["/resume", "/approvals", "/settings", "/copy", "ctrl+t"] {
+            assert!(!help.contains(later));
+            assert!(
+                !app.commands
+                    .iter()
+                    .any(|command| format!("/{}", command.name) == later)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_completion_loads_extension_commands_and_workspace_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source.rs"), "content").unwrap();
+        let mut attached = snapshot(false);
+        attached.info.cwd = temp.path().to_path_buf();
+        let (launch, mut requests) = launch(attached).await;
+        let mut app = App::new(launch, 80, 24);
+        app.initialize_composer().await;
+        request(&mut requests, "session/commands");
+        app.editor.set_text("/kno");
+        app.update_completion();
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.text(), "/known ");
+        app.editor.set_text("read @sour");
+        app.update_completion();
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.text(), "read @source.rs ");
     }
 }

@@ -254,6 +254,7 @@ async fn main() -> Result<(), xi_tui::Error> {
         notifications,
         template,
         attached,
+        history: None,
     })
     .await
 }
