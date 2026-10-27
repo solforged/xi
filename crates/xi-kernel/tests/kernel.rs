@@ -616,6 +616,53 @@ fn explicit_config_order_and_sandbox_field_layering() {
 }
 
 #[test]
+fn sandbox_global_instructions_are_readable_without_granting_config_access() {
+    let fixture = Fixture::new();
+    let agents = fixture.paths.config.join("AGENTS.md");
+    let sibling = fixture.paths.config.join("config.toml");
+    let tools = xi_tools::toolset(&["read", "write"]).unwrap();
+    for exists in [false, true] {
+        if exists {
+            write(&agents, "Global instructions");
+        }
+        let spill = fixture.paths.data.join("spill");
+        let sandbox = fixture
+            .config()
+            .sandbox_spec(
+                &fixture.workspace.join("tmp"),
+                &spill,
+                &[],
+                &fixture.paths.data.join("git"),
+            )
+            .unwrap();
+        let ctx = Context {
+            workspace: fixture.workspace.clone(),
+            sandbox,
+            helper: Default::default(),
+            spill_dir: spill,
+            output_limit: 4096,
+            cancel: Default::default(),
+        };
+        assert!(
+            tools[0]
+                .crossings(&json!({"path": agents}), &ctx)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            tools[1]
+                .crossings(&json!({"path": agents, "content": "replacement"}), &ctx)
+                .unwrap(),
+            vec![Crossing::Write(agents.clone())]
+        );
+        assert_eq!(
+            tools[0].crossings(&json!({"path": sibling}), &ctx).unwrap(),
+            vec![Crossing::Read(sibling.clone())]
+        );
+    }
+}
+
+#[test]
 fn daemon_defaults_and_global_settings() {
     let fixture = Fixture::new();
     let defaults = daemon_settings(&fixture.paths).unwrap();
