@@ -1552,6 +1552,64 @@ async fn untrusted_approval_hides_workspace_scope_and_uses_session_details_for_e
 }
 
 #[tokio::test]
+async fn egress_asks_open_the_overlay_with_the_parent_tool_and_resolve_the_connection() {
+    let (launch, mut requests) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 120, 32);
+    append(
+        &mut app,
+        EventKind::AssistantMessage {
+            model: ModelRef {
+                provider: "demo".into(),
+                model: "script".into(),
+            },
+            content: vec![Block::ToolUse {
+                id: "bash-call".into(),
+                name: "bash".into(),
+                input: json!({"command": "curl github.com"}),
+                extra: Default::default(),
+            }],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+        },
+    );
+    append(
+        &mut app,
+        EventKind::ToolDecision {
+            call: "connection".into(),
+            action: "net github.com:443".into(),
+            decision: xi_protocol::event::Decision::Ask,
+            rule: None,
+            taint: false,
+            during: Some("bash-call".into()),
+            extension: None,
+        },
+    );
+    assert_eq!(app.transcript.asks()[0].tool, "bash");
+    assert!(app.overlays.on_top::<Approvals>());
+    let overlay = live_text(&app);
+    assert!(overlay.contains("approval · bash"), "{overlay}");
+    assert!(overlay.contains("net github.com:443"), "{overlay}");
+    app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "approval/resolve");
+    assert_eq!(params["call"], "connection");
+    assert_eq!(params["approved"], true);
+    append(
+        &mut app,
+        EventKind::ApprovalResolved {
+            call: "connection".into(),
+            approved: true,
+            by: xi_protocol::event::Approver::User,
+            remember: Remember::Once,
+        },
+    );
+    assert!(app.transcript.asks().is_empty());
+    assert!(app.overlays.is_empty());
+    assert!(live_text(&app).contains("⇄ net github.com:443 · allowed"));
+}
+
+#[tokio::test]
 async fn workspace_approval_sends_workspace_scope_and_errors_keep_the_overlay() {
     for reject in [false, true] {
         let mut attached = snapshot(true);

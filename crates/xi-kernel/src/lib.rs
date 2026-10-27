@@ -13,6 +13,7 @@
 pub mod compaction;
 pub mod config;
 pub mod context;
+mod egress;
 mod extension_session;
 pub mod extensions;
 pub mod settings;
@@ -273,6 +274,15 @@ struct State {
     backend: Option<ActiveBackend>,
     extensions: Option<extensions::Extensions>,
     grants: HashSet<(String, String)>,
+    egress: EgressState,
+}
+/// The session's egress proxy for tool processes. Extensions have their own
+/// listeners.
+struct EgressState {
+    listener: Option<egress::Listener>,
+    tx: mpsc::UnboundedSender<egress::Connect>,
+    /// Taken by [`Session::service`] while it waits, and put back after.
+    rx: Option<mpsc::UnboundedReceiver<egress::Connect>>,
 }
 
 impl State {
@@ -393,6 +403,7 @@ impl Session {
         // defaults fill logs that have no reasoning change on this lineage.
         let restore_reasoning = config.reasoning_override.is_none();
         let mut pending = Vec::<(ToolCallId, bool)>::new();
+        let mut asks = Vec::<ToolCallId>::new();
         for event in log.lineage(head).expect("known head") {
             match &event.kind {
                 EventKind::ModelChanged { model } => config.model = model.clone(),
@@ -409,12 +420,16 @@ impl Session {
                 EventKind::ToolDecision { call, decision, .. } => {
                     if let Some((_, unresolved)) = pending.iter_mut().find(|(id, _)| id == call) {
                         *unresolved = *decision == Decision::Ask;
+                    } else if *decision == Decision::Ask {
+                        // An egress ask: it has no tool result of its own.
+                        asks.push(call.clone());
                     }
                 }
                 EventKind::ApprovalResolved { call, .. } => {
                     if let Some((_, unresolved)) = pending.iter_mut().find(|(id, _)| id == call) {
                         *unresolved = false;
                     }
+                    asks.retain(|id| id != call);
                 }
                 EventKind::ToolResult { call, .. } => pending.retain(|(id, _)| id != call),
                 _ => {}
@@ -431,7 +446,15 @@ impl Session {
         let git = log.file_path().with_extension("git");
         config::write_sandbox_git(&git, &config.paths)?;
         let git = git.canonicalize()?;
-        let sandbox = config.sandbox_spec(&tmp, &spill, &system.skill_roots, &git)?;
+        let mut sandbox = config.sandbox_spec(&tmp, &spill, &system.skill_roots, &git)?;
+        let listener = if sandbox.enabled {
+            let listener = egress::Listener::bind("tools")?;
+            sandbox.egress = Some(listener.egress().clone());
+            Some(listener)
+        } else {
+            None
+        };
+        let (egress_tx, egress_rx) = mpsc::unbounded_channel();
         let executable = std::env::current_exe()?;
         let binary_dir = executable.parent().expect("executable directory");
         let binary_dir = if binary_dir.file_name().is_some_and(|name| name == "deps") {
@@ -463,6 +486,11 @@ impl Session {
                 backend,
                 extensions: None,
                 grants,
+                egress: EgressState {
+                    listener,
+                    tx: egress_tx,
+                    rx: Some(egress_rx),
+                },
             }),
             control: Mutex::new(Control::default()),
             commands: Mutex::new(Vec::new()),
@@ -473,6 +501,17 @@ impl Session {
         }));
         {
             let mut state = session.0.state.try_lock().expect("new session state");
+            for call in asks {
+                session.append(
+                    &mut state,
+                    EventKind::ApprovalResolved {
+                        call,
+                        approved: false,
+                        by: Approver::Interrupted,
+                        remember: Remember::Once,
+                    },
+                )?;
+            }
             for (call, unresolved) in pending {
                 if unresolved {
                     session.append(
@@ -932,7 +971,12 @@ impl Session {
         {
             let event = xi_protocol::methods::extension::HookEvent::TurnEnd { head: state.head };
             if let Err(error) = self
-                .extension_wait(state, extensions.hook(self.id(), event, cancel), cancel)
+                .service(
+                    state,
+                    extensions.hook(self.id(), event, cancel),
+                    cancel,
+                    None,
+                )
                 .await
             {
                 self.append(
@@ -1114,6 +1158,10 @@ impl Session {
     ) -> Result<()> {
         use xi_protocol::methods::extension::{HookEvent, HookOutcome, InvokeParams};
         let extensions = state.extensions.clone().unwrap_or_default();
+        let current = extension_session::Current {
+            call: &call,
+            tool: name,
+        };
         if extensions.has_hook(xi_protocol::manifest::HookPoint::PreTool) {
             let event = HookEvent::PreTool {
                 call: call.clone(),
@@ -1121,7 +1169,12 @@ impl Session {
                 input: input.clone(),
             };
             match self
-                .extension_wait(state, extensions.hook(self.id(), event, cancel), cancel)
+                .service(
+                    state,
+                    extensions.hook(self.id(), event, cancel),
+                    cancel,
+                    Some(current),
+                )
                 .await
             {
                 Ok(HookOutcome::RewriteInput { input: rewritten }) => input = rewritten,
@@ -1368,11 +1421,20 @@ impl Session {
             .has_hook(xi_protocol::manifest::HookPoint::PostTool)
             .then(|| input.clone());
         let mut result = if let Some(tool) = tool {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => xi_tools::Ran { output: error_output("cancelled"), spill: None },
-                result = tool.run(&call, input, &state.tools_context) => result,
-            }
+            let context = state.tools_context.clone();
+            let run = async {
+                Ok(tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => xi_tools::Ran { output: error_output("cancelled"), spill: None },
+                    result = tool.run(&call, input, &context) => result,
+                })
+            };
+            self.service(state, run, cancel, Some(current))
+                .await
+                .unwrap_or_else(|error| xi_tools::Ran {
+                    output: error_output(error.to_string()),
+                    spill: None,
+                })
         } else {
             let params = InvokeParams {
                 session: self.id(),
@@ -1381,7 +1443,12 @@ impl Session {
                 input,
             };
             let output = self
-                .extension_wait(state, extensions.invoke(&params, cancel), cancel)
+                .service(
+                    state,
+                    extensions.invoke(&params, cancel),
+                    cancel,
+                    Some(current),
+                )
                 .await
                 .unwrap_or_else(|error| error_output(error.to_string()));
             xi_tools::Ran {
@@ -1399,7 +1466,12 @@ impl Session {
                 output: result.output.clone(),
             };
             match self
-                .extension_wait(state, extensions.hook(self.id(), event, cancel), cancel)
+                .service(
+                    state,
+                    extensions.hook(self.id(), event, cancel),
+                    cancel,
+                    Some(current),
+                )
                 .await
             {
                 Ok(HookOutcome::ReplaceOutput { output }) => {
@@ -1471,7 +1543,7 @@ impl Session {
 }
 
 fn lineage_grants(log: &SessionLog, head: EventId) -> HashSet<(String, String)> {
-    let mut tools = HashMap::new();
+    let mut tools: HashMap<&ToolCallId, &String> = HashMap::new();
     let mut actions = HashMap::new();
     let mut grants = HashSet::new();
     for event in log.lineage(head).expect("known head") {
@@ -1483,8 +1555,23 @@ fn lineage_grants(log: &SessionLog, head: EventId) -> HashSet<(String, String)> 
                     }
                 }
             }
-            EventKind::ToolDecision { call, action, .. } => {
+            EventKind::ToolDecision {
+                call,
+                action,
+                during,
+                extension,
+                ..
+            } => {
                 actions.insert(call, action);
+                // An egress decision is keyed by the tool or extension that
+                // connected, like the grant it may create.
+                if let Some(name) = during
+                    .as_ref()
+                    .and_then(|during| tools.get(during).copied())
+                    .or(extension.as_ref())
+                {
+                    tools.insert(call, name);
+                }
             }
             EventKind::ApprovalResolved {
                 call,

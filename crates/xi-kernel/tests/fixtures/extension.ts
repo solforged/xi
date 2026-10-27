@@ -25,6 +25,14 @@ defineExtension({
       }
       if (mode === "unknown_child") return text((await ctx.agentRun({ prompt: "child one", tools: ["probe"] })).text);
       if (mode === "slow_child") return text((await ctx.agentRun({ prompt: "slow child" })).text);
+      if (mode === "fetch") {
+        try {
+          const response = await fetch(String(field(input, "url")));
+          return text(`${response.status} ${(await response.text()).trim()}`);
+        } catch (error) {
+          return text(`error ${error}`, true);
+        }
+      }
       if (mode === "sandbox") {
         let readable = false;
         try { readFileSync(`${workspace}/secret`); readable = true; } catch {}

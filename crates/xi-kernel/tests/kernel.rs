@@ -2205,6 +2205,15 @@ async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
             during: None,
             extension: None,
         },
+        EventKind::ToolDecision {
+            call: "net-open".into(),
+            action: "net example.org:443".into(),
+            decision: Decision::Ask,
+            rule: None,
+            taint: false,
+            during: Some("undecided".into()),
+            extension: None,
+        },
         EventKind::ApprovalResolved {
             call: "resolved".into(),
             approved: true,
@@ -2238,17 +2247,19 @@ async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
     let info = session.info().await;
     assert_eq!(&info.events[..original.len()], &original);
     let repaired = &info.events[original.len()..];
-    assert_eq!(repaired.len(), 4);
-    assert!(matches!(
-        &repaired[0].kind,
-        EventKind::ApprovalResolved {
-            call,
-            approved: false,
-            by: Approver::Interrupted,
-            remember: Remember::Once,
-        } if call.0 == "asked"
-    ));
-    for (event, expected) in repaired[1..].iter().zip(["asked", "resolved", "undecided"]) {
+    assert_eq!(repaired.len(), 5);
+    for (event, expected) in repaired[..2].iter().zip(["net-open", "asked"]) {
+        assert!(matches!(
+            &event.kind,
+            EventKind::ApprovalResolved {
+                call,
+                approved: false,
+                by: Approver::Interrupted,
+                remember: Remember::Once,
+            } if call.0 == expected
+        ));
+    }
+    for (event, expected) in repaired[2..].iter().zip(["asked", "resolved", "undecided"]) {
         assert!(matches!(
             &event.kind,
             EventKind::ToolResult { call, output, .. }

@@ -42,7 +42,7 @@ defineExtension({
 });
 ```
 
-Paths in the manifest resolve against the package directory. They are literal existing filesystem roots, not globs. The package is readable but not writable by default. Add `fs_write` only for required roots. The SDK import needs explicit `fs_read` access when it is outside the package. `env` names opt in to passthrough beyond the sandbox's baseline runtime environment. Any nonempty `net` list is refused until xi has an egress proxy. Subprocesses inherit the OS sandbox; there is no separate `exec` capability.
+Paths in the manifest resolve against the package directory. They are literal existing filesystem roots, not globs. The package is readable but not writable by default. Add `fs_write` only for required roots. The SDK import needs explicit `fs_read` access when it is outside the package. `env` names opt in to passthrough beyond the sandbox's baseline runtime environment. `net` lists the hosts the extension may reach, as case-insensitive globs such as `api.example.org` or `*.github.com`; every connection goes through the session's egress proxy, is refused with `403` when the host is outside the list, and otherwise follows the user's `net` policy rules and approvals. The process gets `HTTP_PROXY` and friends plus `NODE_USE_ENV_PROXY=1`, so `fetch` works unchanged in Node 24+ and Bun. Without `net` the extension has no network. Subprocesses inherit the OS sandbox; there is no separate `exec` capability.
 
 ## API
 
