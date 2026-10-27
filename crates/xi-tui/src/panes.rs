@@ -29,6 +29,9 @@ use crate::{App, lineage};
 /// How long the sessions and asks lists stay fresh.
 const REFRESH: Duration = Duration::from_secs(5);
 
+/// The title of a session with no prompt yet.
+const UNTITLED: &str = "new session";
+
 /// What the deck's header carries beside the title.
 const HEADER: [&str; 6] = [
     "model",
@@ -476,7 +479,7 @@ impl App {
                 .title
                 .as_deref()
                 .filter(|title| !title.trim().is_empty())
-                .unwrap_or("(no prompt yet)");
+                .unwrap_or(UNTITLED);
             let detail = if entry.pending_approvals > 0 {
                 format!(
                     "{} waiting · {}",
@@ -528,7 +531,7 @@ impl App {
                     _ if ask.pending.session == info.session => "this session".to_owned(),
                     Some(entry) => format!(
                         "{} · {}",
-                        entry.title.as_deref().unwrap_or("(no prompt yet)"),
+                        entry.title.as_deref().unwrap_or(UNTITLED),
                         age(entry.updated, now)
                     ),
                     None => ask
@@ -548,14 +551,20 @@ impl App {
             elsewhere,
             selected: deck.session,
         };
-        let current = deck
-            .sessions
-            .iter()
-            .find(|entry| entry.session == info.session);
-        let title = current
-            .and_then(|entry| entry.title.as_deref())
+        // The client's own log is fresher than `session/list`, which the
+        // deck refreshes every five seconds.
+        let title = self
+            .title
+            .as_deref()
+            .or(self.prompt.as_deref())
+            .or_else(|| {
+                deck.sessions
+                    .iter()
+                    .find(|entry| entry.session == info.session)
+                    .and_then(|entry| entry.title.as_deref())
+            })
             .filter(|title| !title.trim().is_empty())
-            .unwrap_or("(no prompt yet)");
+            .unwrap_or(UNTITLED);
         let log = LogPane {
             title,
             meta,

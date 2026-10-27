@@ -39,6 +39,7 @@ impl App {
     /// Prints the header and replays the head's branch, for resumed sessions.
     pub(crate) fn attach(&mut self) {
         self.title = crate::latest_title(&self.launch.attached.events);
+        self.prompt = crate::first_prompt(&self.launch.attached.events);
         self.title_written = false;
         let cols = self.measure().out;
         let info = &self.launch.attached.info;
