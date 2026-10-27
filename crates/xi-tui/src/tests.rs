@@ -308,7 +308,7 @@ async fn attach_keeps_partial_and_deduplicates_events_after_interleaved_appends(
     assert_eq!(app.launch.attached.events.len(), 1);
     assert!(
         app.transcript
-            .live(80, 0)
+            .live(app.measure(), 0)
             .iter()
             .any(|line| line.plain().contains("in flight"))
     );
@@ -362,7 +362,12 @@ async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
             delta: Delta::Text { text: text.into() },
         }));
     }
-    let live: Vec<_> = app.transcript.live(80, 0).iter().map(Line::plain).collect();
+    let live: Vec<_> = app
+        .transcript
+        .live(app.measure(), 0)
+        .iter()
+        .map(Line::plain)
+        .collect();
     assert_eq!(
         live.iter()
             .filter(|line| line.contains("hello world"))
@@ -375,7 +380,7 @@ async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
         attempt: 2,
         sequence: 9,
     }));
-    assert!(app.transcript.live(80, 0).is_empty());
+    assert!(app.transcript.live(app.measure(), 0).is_empty());
     app.notify(&ClientNotification::Delta(DeltaParams {
         session,
         attempt: 2,
@@ -386,7 +391,7 @@ async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
     }));
     assert!(
         app.transcript
-            .live(80, 0)
+            .live(app.measure(), 0)
             .iter()
             .any(|line| line.plain().contains("next"))
     );
@@ -1890,7 +1895,7 @@ async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live
             assert_eq!(app.transcript.asks().len(), 1);
             assert!(
                 app.transcript
-                    .live(160, 0)
+                    .live(app.measure(), 0)
                     .iter()
                     .any(|line| line.plain().contains("target in flight"))
             );
