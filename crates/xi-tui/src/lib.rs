@@ -162,6 +162,8 @@ struct App {
     cols: usize,
     rows: usize,
     commit: Vec<Line>,
+    /// Clears the terminal before drawing the fresh session.
+    clear_scrollback: bool,
     quit: bool,
     /// Whether a prompt of the running turn was rejected.
     failed: bool,
@@ -368,6 +370,7 @@ impl App {
             cols: cols.max(20),
             rows: rows.max(4),
             commit: Vec::new(),
+            clear_scrollback: false,
             quit: false,
             failed: false,
             seen: HashSet::new(),

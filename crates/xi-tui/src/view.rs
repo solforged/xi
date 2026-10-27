@@ -380,6 +380,9 @@ impl App {
         &mut self,
         screen: &mut Screen<W>,
     ) -> std::io::Result<()> {
+        if std::mem::take(&mut self.clear_scrollback) {
+            screen.clear();
+        }
         for control in self.controls.drain(..) {
             screen.control(&control)?;
         }

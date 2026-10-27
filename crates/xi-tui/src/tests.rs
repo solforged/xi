@@ -123,6 +123,7 @@ struct FakeData {
     summaries: Vec<SessionSummary>,
     approvals: Vec<PendingApproval>,
     held: bool,
+    reject_create: bool,
     reject_resolve: bool,
     settings: Option<SettingsReport>,
     reject_settings: bool,
@@ -158,6 +159,9 @@ async fn launch_with(
                         "daemon_version": "test",
                         "capabilities": { "private": true },
                     })),
+                    "session/create" if data.reject_create => {
+                        Err(RpcError::new(RpcError::INVALID_PARAMS, "creation rejected"))
+                    }
                     "session/create" => Ok(serde_json::to_value(&response).unwrap()),
                     "session/attach" => {
                         let session: SessionId =
@@ -996,6 +1000,64 @@ async fn draft_images_can_be_removed_and_do_not_count_as_an_empty_composer() {
 }
 
 #[tokio::test]
+async fn new_clears_scrollback_and_pending_output_before_drawing_one_fresh_header() {
+    for already_drawn in [false, true] {
+        let (launch, mut requests) = launch(snapshot(false)).await;
+        let mut app = App::new(launch, 100, 24);
+        let mut output = Vec::new();
+        {
+            let mut screen = Screen::new(&mut output, false, 100);
+            app.note(vec![Line::default().ink("old output")]);
+            if already_drawn {
+                app.draw(&mut screen).unwrap();
+            }
+            app.note(vec![Line::default().ink("pending old output")]);
+            app.editor.set_text("/new");
+            app.submit(false).await.unwrap();
+            request(&mut requests, "session/create");
+            assert!(app.clear_scrollback);
+            assert_eq!(app.commit.len(), 1);
+            assert!(app.commit[0].plain().starts_with("ξ xi "));
+            app.draw(&mut screen).unwrap();
+            assert!(!app.clear_scrollback);
+            app.draw(&mut screen).unwrap();
+        }
+        let output = String::from_utf8(output).unwrap();
+        let frames: Vec<_> = output.split("\x1b[?2026h").skip(1).collect();
+        let fresh = frames[frames.len() - 2];
+        assert!(fresh.starts_with("\x1b[?25l\x1b[H\x1b[2J\x1b[3Jξ xi "));
+        assert_eq!(fresh.matches("ξ xi ").count(), 1);
+        assert!(!fresh.contains("old output"));
+        assert!(fresh.contains("enter sends"));
+        assert_eq!(output.matches("\x1b[3J").count(), 1);
+        assert!(!frames.last().unwrap().contains("ξ xi "));
+    }
+}
+
+#[tokio::test]
+async fn new_keeps_the_screen_when_session_creation_fails() {
+    let (launch, _) = launch_with(
+        snapshot(false),
+        FakeData {
+            reject_create: true,
+            ..FakeData::default()
+        },
+    )
+    .await;
+    let mut app = App::new(launch, 100, 24);
+    app.note(vec![Line::default().ink("keep this output")]);
+    let committed: Vec<_> = app.commit.iter().map(Line::plain).collect();
+    let session = app.session_id();
+    assert!(app.command("/new").await.is_err());
+    assert_eq!(app.session_id(), session);
+    assert!(!app.clear_scrollback);
+    assert_eq!(
+        app.commit.iter().map(Line::plain).collect::<Vec<_>>(),
+        committed
+    );
+}
+
+#[tokio::test]
 async fn commands_keep_draft_images_but_switching_sessions_clears_them() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 100, 24);
@@ -1066,6 +1128,7 @@ async fn model_reasoning_and_compaction_changes_are_refused_while_running() {
     app.command("/model demo/second").await.unwrap();
     app.command("/compact").await.unwrap();
     app.command("/new").await.unwrap();
+    assert!(!app.clear_scrollback);
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::Medium);
     assert_eq!(app.launch.attached.info.model.model, "script");
     while let Ok((method, _)) = requests.try_recv() {

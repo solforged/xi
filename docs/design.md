@@ -390,7 +390,7 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 |---|---|
 | `/help`, `/hotkeys` | Show keys and commands. |
 | `/quit`, `/exit` | Leave. A running turn keeps running in its worker. |
-| `/new` | Start a session in the same workspace. |
+| `/new` | Clear the screen and scrollback, then start a session in the same workspace. |
 | `/resume` | Open the session picker. |
 | `/tree` | Open the branch overlay and check out an earlier point. |
 | `/model [PROVIDER/MODEL \| @ROLE]` | Switch model; without an argument, open the model picker. A role prints the model it resolved to in line mode. |
