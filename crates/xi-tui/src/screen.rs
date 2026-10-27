@@ -98,6 +98,11 @@ impl<W: Write> Screen<W> {
         self.surface = surface;
     }
 
+    /// Whether the deck draws raised spans on a surface.
+    pub fn surfaced(&self) -> bool {
+        self.surface.is_some()
+    }
+
     /// Writes a terminal control sequence before the next frame flushes it.
     ///
     /// # Errors

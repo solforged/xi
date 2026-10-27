@@ -300,7 +300,7 @@ impl App {
     ) -> std::io::Result<()> {
         let (live, cursor, dock) = self.live();
         let meta = self.log_meta();
-        let scene = self.scene(&live, cursor, dock, &meta);
+        let scene = self.scene(&live, cursor, dock, &meta, screen.surfaced());
         let (rows, cursor) = deck::render(&scene, self.cols, self.rows);
         screen.draw_deck(&rows, cursor)
     }
@@ -441,13 +441,15 @@ impl App {
         line
     }
 
-    /// The scene the deck draws from.
+    /// The scene the deck draws from; `surfaces` says whether the screen
+    /// tints raised spans.
     fn scene<'a>(
         &'a self,
         live: &'a [Line],
         cursor: Option<(usize, usize)>,
         dock: usize,
         meta: &'a str,
+        surfaces: bool,
     ) -> Scene<'a> {
         let deck = self.deck.as_ref().expect("scene needs the deck");
         let info = &self.launch.attached.info;
@@ -614,7 +616,7 @@ impl App {
             log,
             panel,
             focus: deck.focus,
-            surfaces: self.surfaces,
+            surfaces,
         }
     }
 

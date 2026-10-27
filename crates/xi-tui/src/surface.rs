@@ -3,13 +3,38 @@
 //! xi asks the terminal for its background with OSC 11 and then for its
 //! primary device attributes, which every terminal answers. The second
 //! answer ends the wait, so a terminal that ignores OSC 11 costs one round
-//! trip, not the timeout. Without an answer the deck draws no surfaces.
+//! trip, not the timeout. Without an answer the deck draws no surfaces, and
+//! `[display] surfaces = "off"` skips the question.
 
 use crate::style::Rgb;
 
 /// How far the surface moves from the background: toward white on a dark
 /// theme, toward black on a light one, in parts of 255.
 const LIFT: u16 = 16;
+
+/// Whether the deck tints its raised surfaces, from `[display] surfaces` in
+/// `tui.toml`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Surfaces {
+    /// Tint them when the terminal reports its background.
+    #[default]
+    Auto,
+    /// Never tint them, for terminals that report a background but draw
+    /// another, such as a transparent window.
+    Off,
+}
+
+impl Surfaces {
+    /// Parses a config value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
 
 /// Asks the terminal on stdin and stdout for its background and returns
 /// the raised surface. Needs raw mode and nothing else reading stdin.
