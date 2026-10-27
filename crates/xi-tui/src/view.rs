@@ -525,7 +525,7 @@ impl App {
 }
 
 /// Key hints as `key verb` pairs two cells apart: the key muted, a step
-/// above its dim verb, as `alt+1 sessions` reads under the panel.
+/// above its dim verb, as `enter sends` reads under the composer.
 fn key_hints(pairs: &[(&str, &str)]) -> Line {
     let mut line = Line::default();
     for (i, (key, verb)) in pairs.iter().enumerate() {

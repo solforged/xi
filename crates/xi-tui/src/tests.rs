@@ -3946,6 +3946,7 @@ async fn deck_focus_keys_are_in_help_and_noop_inline() {
         ('1', Action::FocusSessions, "focus_sessions"),
         ('2', Action::FocusLog, "focus_log"),
         ('3', Action::FocusInspector, "focus_inspector"),
+        ('4', Action::FocusAgents, "focus_agents"),
     ] {
         let key = KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT);
         assert_eq!(app.keymap.action(key), Some(action));
@@ -3963,9 +3964,60 @@ async fn deck_focus_keys_are_in_help_and_noop_inline() {
         .map(Line::plain)
         .collect::<Vec<_>>()
         .join("\n");
-    for key in ["alt+1", "alt+2", "alt+3"] {
+    for key in ["alt+1", "alt+2", "alt+3", "alt+4"] {
         assert!(help.contains(key), "{help}");
     }
+}
+
+#[tokio::test]
+async fn deck_agents_tab_lists_this_sessions_children_and_opens_one() {
+    let attached = snapshot(false);
+    let mut child = snapshot(false);
+    child.info.session = SessionId::generate();
+    child.info.path = "/tmp/xi-tui-demo/child.jsonl".into();
+    let mut row = summary(&child, false, "Map the egress callers", 4);
+    row.parent_session = Some(attached.info.session);
+    let mut stranger = snapshot(false);
+    stranger.info.session = SessionId::generate();
+    let data = FakeData {
+        sessions: vec![child.clone()],
+        summaries: vec![row, summary(&stranger, false, "Unrelated work", 3)],
+        ..Default::default()
+    };
+    let (launch, mut requests) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 250, 36);
+    app.refresh_deck().await;
+    let draw = |app: &mut App| {
+        let mut out = Vec::new();
+        app.draw(&mut Screen::new(&mut out, false, 250)).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let text = draw(&mut app);
+    assert!(
+        text.contains("overview  sessions  inspect  agents"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Map the egress"),
+        "agents wait for their tab"
+    );
+    app.key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT))
+        .await
+        .unwrap();
+    let text = draw(&mut app);
+    for expected in ["Agents", "› ● Map the egress callers", "enter opens"] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+    assert!(
+        !text.contains("Unrelated work"),
+        "top-level sessions stay out"
+    );
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "session/open");
+    assert_eq!(params["path"], json!(child.info.path));
+    assert_eq!(app.session_id(), child.info.session);
 }
 
 #[tokio::test]
@@ -4015,7 +4067,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
         "context",
         "changes",
         "+1 −1",
-        "alt+1 sessions",
+        "overview  sessions  inspect  agents",
         "● edit    src/a.rs",
         "● read    docs/policies.md",
         "/tmp/xi-tui-demo",
