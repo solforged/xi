@@ -3406,16 +3406,17 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     let mut screen = Screen::new(&mut out, false, 250);
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
+    // Nerd Font icons are the default.
     for expected in [
         "ξ xi",
+        "\u{f413} /tmp/xi-tui-demo",
         "Route sandboxed bash",
-        "Sessions",
-        "1 other · alt+1",
-        "nothing else running",
+        "\u{f442} Sessions",
+        "1 idle",
         "● edit src/a.rs",
         "● read docs/policies.md",
-        "Changes · 1 file",
-        "alt+1 sessions · alt+2 log · alt+3 inspector",
+        "\u{f440} Changes · 1 file",
+        "\u{f442} alt+1  \u{f451} alt+2  \u{f441} alt+3",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
@@ -3427,9 +3428,9 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
     for expected in [
-        "› ● Route sandboxed bash",
+        "› \u{f444} Route sandboxed bash",
         "Other workspaces",
-        "· OTHER-workspace · Fix export",
+        "\u{f4c3} OTHER-workspace · Fix export",
         "enter resumes",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");

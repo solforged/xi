@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::icons::Icons;
 use crate::keys::{Action, Binding, Keymap};
 use crate::layout::Layout;
 use crate::transcript::Thinking;
@@ -16,6 +17,8 @@ pub struct TuiConfig {
     pub thinking: Thinking,
     /// How the client owns the terminal.
     pub layout: Layout,
+    /// Which glyphs the deck draws.
+    pub icons: Icons,
 }
 
 impl TuiConfig {
@@ -114,6 +117,10 @@ impl TuiConfig {
                 "layout" => match value.as_str().and_then(Layout::parse) {
                     Some(layout) => self.layout = layout,
                     None => warnings.push("display.layout must be inline, deck or auto".into()),
+                },
+                "icons" => match value.as_str().and_then(Icons::parse) {
+                    Some(icons) => self.icons = icons,
+                    None => warnings.push("display.icons must be nerd or unicode".into()),
                 },
                 _ => warnings.push(format!("unknown setting display.{name}")),
             }
@@ -352,6 +359,21 @@ mod tests {
             save_layout(&path, layout).unwrap();
             assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
         }
+    }
+
+    #[test]
+    fn icons_load_from_display_and_invalid_values_keep_nerd_and_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        assert_eq!(TuiConfig::load(None).0.icons, Icons::Nerd);
+        std::fs::write(&path, "[display]\nicons = 'unicode'\n").unwrap();
+        let (config, warnings) = TuiConfig::load(Some(&path));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.icons, Icons::Unicode);
+        std::fs::write(&path, "[display]\nicons = 'emoji'\n").unwrap();
+        let (config, warnings) = TuiConfig::load(Some(&path));
+        assert_eq!(config.icons, Icons::Nerd);
+        assert_eq!(warnings, ["display.icons must be nerd or unicode"]);
     }
 
     #[test]
