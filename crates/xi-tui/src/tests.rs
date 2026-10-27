@@ -13,7 +13,7 @@ use crate::picker::Picker;
 use crate::sessions::Sessions;
 use crate::settings::Settings;
 use serde_json::{Value, json};
-use xi_protocol::event::{Remember, StopReason, Usage};
+use xi_protocol::event::{Remember, StopReason, TitleSource, Usage};
 use xi_protocol::methods::client::{
     ChildEvents, ConfigFiles, Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails,
     Setting, SettingLayer, SettingsReport,
@@ -2258,6 +2258,48 @@ async fn copy_queues_osc52_until_the_next_draw_on_the_frame_writer() {
     assert!(output.starts_with(sequence.as_bytes()));
     assert!(app.controls.is_empty());
     assert!(String::from_utf8(output).unwrap().contains("\x1b[?2026h"));
+}
+
+#[tokio::test]
+async fn terminal_title_follows_the_latest_session_title_and_writes_once() {
+    let titled = |title: &str, by| EventKind::SessionTitled {
+        title: title.into(),
+        by,
+        model: None,
+        usage: None,
+    };
+    let draw = |app: &mut App| {
+        let mut output = Vec::new();
+        {
+            let mut screen = Screen::new(&mut output, false, 120);
+            app.draw(&mut screen).unwrap();
+        }
+        String::from_utf8(output).unwrap()
+    };
+    let (fresh, _) = launch(snapshot(false)).await;
+    let mut app = App::new(fresh, 120, 24);
+    assert!(draw(&mut app).contains("\x1b]0;ξ\x07"));
+    append(&mut app, titled("Prompt title", TitleSource::FirstPrompt));
+    append(&mut app, titled("Turn\x1b title", TitleSource::FirstTurn));
+    let first = draw(&mut app);
+    assert!(first.contains("\x1b]0;ξ: Turn title\x07"), "{first:?}");
+    assert!(!first.contains("Prompt title"));
+    assert!(!draw(&mut app).contains("\x1b]0;"));
+
+    // A resumed log shows its latest title, whatever the branch.
+    let mut attached = snapshot(false);
+    let root = attached.events[0].id;
+    for title in ["Old", "Renamed"] {
+        attached.events.push(Event {
+            id: EventId::generate(),
+            parent: Some(root),
+            at: Timestamp::now(),
+            kind: titled(title, TitleSource::User),
+        });
+    }
+    let (resumed, _) = launch(attached).await;
+    let mut app = App::new(resumed, 120, 24);
+    assert!(draw(&mut app).contains("\x1b]0;ξ: Renamed\x07"));
 }
 
 async fn settings_down(app: &mut App, count: usize) {

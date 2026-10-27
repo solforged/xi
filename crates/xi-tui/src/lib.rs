@@ -39,7 +39,7 @@ pub mod tree;
 mod view;
 
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -115,6 +115,27 @@ impl Drop for Raw {
     }
 }
 
+/// Saves the terminal's title and restores it however the client exits.
+/// Terminals without the xterm title stack keep the last `ξ` title.
+struct TitleStack;
+
+impl TitleStack {
+    fn push() -> std::io::Result<Self> {
+        let mut out = std::io::stdout();
+        out.write_all(b"\x1b[22;0t")?;
+        out.flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TitleStack {
+    fn drop(&mut self) {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[23;0t");
+        let _ = out.flush();
+    }
+}
+
 type Reply = oneshot::Receiver<Result<PromptResult, ClientError>>;
 
 enum ExternalRequest {
@@ -145,6 +166,10 @@ struct App {
     deck: Option<Deck>,
     /// Terminal controls written before the next frame.
     controls: Vec<String>,
+    /// The session's latest title, from its log.
+    title: Option<String>,
+    /// Whether the terminal shows `title`; frames write it only when not.
+    title_written: bool,
     history: History,
     commands: Vec<CommandSpec>,
     completion: Option<Menu>,
@@ -187,6 +212,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     let color = std::env::var_os("NO_COLOR").is_none();
     let mut app = App::new(launch, usize::from(cols), usize::from(rows));
     app.initialize().await;
+    let _title_stack = TitleStack::push()?;
     let mut raw = Some(Raw::enter()?);
     let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
     let mut settle = Settle::new(cols);
@@ -205,6 +231,8 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
                 ExternalRequest::Settings(path) => external::edit_file(&path).map(|()| None),
             };
             raw = Some(Raw::enter()?);
+            // The editor may have set its own title.
+            app.title_written = false;
             crossterm::execute!(
                 std::io::stdout(),
                 crossterm::cursor::MoveToColumn(0),
@@ -332,6 +360,28 @@ fn lineage(events: &[Event], head: EventId) -> Vec<Event> {
     out
 }
 
+/// The latest title in `events`, in file order and whatever the branch, as
+/// `session/list` reports it.
+fn latest_title(events: &[Event]) -> Option<String> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        xi_protocol::EventKind::SessionTitled { title, .. } => Some(title.clone()),
+        _ => None,
+    })
+}
+
+/// The OSC 0 sequence that titles the terminal `ξ: title`, or `ξ` before
+/// the session has a title. Control characters are dropped so a title
+/// cannot end the sequence early.
+fn title_control(title: Option<&str>) -> String {
+    let mut control = String::from("\x1b]0;ξ");
+    if let Some(title) = title {
+        control.push_str(": ");
+        control.extend(title.chars().filter(|c| !c.is_control()));
+    }
+    control.push('\x07');
+    control
+}
+
 impl App {
     fn new(mut launch: Launch, cols: usize, rows: usize) -> Self {
         launch.template.cwd = launch.attached.info.cwd.clone();
@@ -356,6 +406,8 @@ impl App {
             layout: config.layout,
             deck: config.layout.deck_at(cols, rows).then(Deck::default),
             controls: Vec::new(),
+            title: None,
+            title_written: false,
             history,
             commands: builtin_commands(),
             completion: None,
@@ -589,7 +641,9 @@ impl App {
                     self.launch.attached.info.reasoning = *reasoning;
                 }
                 // The deck lists titles from `session/list`; fetch it now.
-                xi_protocol::EventKind::SessionTitled { .. } => {
+                xi_protocol::EventKind::SessionTitled { title, .. } => {
+                    self.title = Some(title.clone());
+                    self.title_written = false;
                     if let Some(deck) = self.deck.as_mut() {
                         deck.refreshed = None;
                     }
