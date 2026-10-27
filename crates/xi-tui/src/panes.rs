@@ -220,7 +220,10 @@ impl App {
     ) -> std::io::Result<()> {
         let (live, cursor, dock) = self.live();
         if let Some(deck) = self.display.deck.as_mut() {
-            deck.log.set_live_rows(live.len().saturating_sub(dock));
+            deck.log.set_viewport(
+                live.len().saturating_sub(dock),
+                deck::log_height(self.display.cols, self.display.rows).saturating_sub(dock),
+            );
         }
         let meta = self.log_meta();
         let scene = self.scene(&live, cursor, dock, &meta, screen.surfaced());
