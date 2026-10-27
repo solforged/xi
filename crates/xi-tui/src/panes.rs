@@ -213,7 +213,6 @@ impl App {
         deck.refreshed = Some(Instant::now());
     }
 
-
     /// Draws the deck.
     pub(crate) fn draw_deck<W: std::io::Write>(
         &mut self,
@@ -229,7 +228,8 @@ impl App {
     /// The session's meta row: when it started.
     fn log_meta(&self) -> String {
         let info = &self.launch.attached.info;
-        self.display.deck
+        self.display
+            .deck
             .as_ref()
             .and_then(|deck| deck.sessions.iter().find(|e| e.session == info.session))
             .and_then(|entry| entry.started)

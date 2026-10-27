@@ -13,8 +13,8 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::oauth;
 use crate::network;
+use crate::oauth;
 use crate::{Error, ErrorKind};
 
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";

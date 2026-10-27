@@ -705,7 +705,8 @@ async fn alt_s_toggles_the_live_sandbox_without_saving_a_default() {
     app.command("/sandbox invalid").await.unwrap();
     assert!(requests.try_recv().is_err());
     assert!(
-        app.display.commit
+        app.display
+            .commit
             .iter()
             .any(|line| line.plain().contains("expects on or off"))
     );
@@ -729,7 +730,8 @@ async fn rejected_sandbox_changes_keep_the_active_state() {
     assert!(app.launch.attached.info.sandbox_enabled);
     assert!(app.footer(160).plain().contains("◇ sandbox"));
     assert!(
-        app.display.commit
+        app.display
+            .commit
             .iter()
             .any(|line| line.plain().contains("session is running"))
     );
@@ -1344,14 +1346,16 @@ async fn reasoning_model_and_sandbox_events_from_other_clients_update_metadata()
     assert!(!app.launch.attached.info.sandbox_enabled);
     assert!(app.footer(160).plain().contains("sandbox off"));
     assert!(
-        app.display.commit
+        app.display
+            .commit
             .iter()
             .any(|line| line.plain().contains("unrestricted host files and network"))
     );
     assert!(app.turn.refresh);
     assert!(app.footer(160).plain().contains("think low"));
     assert!(
-        app.display.commit
+        app.display
+            .commit
             .iter()
             .all(|line| !line.plain().contains("reasoning →"))
     );
