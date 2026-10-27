@@ -1,10 +1,11 @@
+use crossterm::event::KeyEvent;
 use futures::stream::FuturesUnordered;
 use xi_client::client::{ClientError, ClientNotification};
 use xi_protocol::SessionId;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
-    AttachResult, EventParams, ListParams, OpenParams, PendingApproval, SessionSummary,
-    SettingsParams,
+    AttachResult, EventParams, ListParams, ModelEntry, OpenParams, PendingApproval, SessionSummary,
+    SetSettingParams, SettingsParams,
 };
 use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::RpcError;
@@ -12,15 +13,168 @@ use xi_protocol::rpc::RpcError;
 use crate::approvals::{Approval, Approvals, Choice};
 use crate::editor::Editor;
 use crate::history::History;
+use crate::keys::Action;
+use crate::overlay::{Command, Outcome};
 use crate::picker::Picker;
 use crate::sessions::Sessions;
-use crate::settings::Settings;
-use crate::style::Line;
+use crate::settings::{self, Settings};
+use crate::style::{Line, Role};
 use crate::transcript::Transcript;
-use crate::tree::Tree;
-use crate::{App, Error, Focus, lineage, style};
+use crate::tree::{Node, Tree};
+use crate::{App, Error, ExternalRequest, config, lineage, style};
+
+/// Borrows what overlays read, field by field, so the stack can be
+/// borrowed mutably beside it.
+macro_rules! ctx {
+    ($app:ident) => {
+        $crate::overlay::Ctx {
+            keys: &$app.keymap,
+            history: &$app.history,
+            info: &$app.launch.attached.info,
+            thinking: $app.transcript.thinking_display(),
+            tui_path: $app.launch.tui_config.as_deref(),
+            now: ::xi_protocol::Timestamp::now(),
+            rows: $app.rows,
+            parent: None,
+        }
+    };
+}
+pub(crate) use ctx;
 
 impl App {
+    /// This session's asks that still wait.
+    pub(crate) fn waiting(&self) -> usize {
+        self.transcript
+            .asks()
+            .iter()
+            .filter(|ask| !self.resolved.contains(&ask.call))
+            .count()
+    }
+
+    /// Hands a key to the top overlay and carries out what it asks for.
+    /// `tab` from any other overlay opens this session's waiting asks on
+    /// top, and `esc` there returns to it.
+    pub(crate) async fn overlay_key(&mut self, key: KeyEvent, action: Option<Action>) {
+        if action == Some(Action::Complete)
+            && !self.overlays.on_top::<Approvals>()
+            && self.waiting() > 0
+        {
+            self.open_own_approvals();
+            return;
+        }
+        let mut ctx = ctx!(self);
+        match self.overlays.key(key, action, &mut ctx) {
+            Outcome::Stay => {}
+            Outcome::Close => self.overlays.pop(),
+            Outcome::Send(command) => self.run(*command).await,
+        }
+    }
+
+    async fn run(&mut self, command: Command) {
+        match command {
+            Command::Answer(choice) => self.answer(choice).await,
+            Command::Checkout(node) => self.checkout(node).await,
+            Command::SetModel(entry) => self.choose_model(entry).await,
+            Command::Resume(session) => {
+                if let Err(error) = self.resume(session).await {
+                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                }
+            }
+            Command::Sessions { all } => {
+                let cwd = (!all).then(|| self.launch.attached.info.cwd.clone());
+                match self
+                    .launch
+                    .client
+                    .list(ListParams { cwd, running: None })
+                    .await
+                {
+                    Ok(sessions) => {
+                        if let Some(picker) = self.overlays.get_mut::<Sessions>() {
+                            picker.replace(sessions, all);
+                        }
+                    }
+                    Err(error) => {
+                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                    }
+                }
+            }
+            Command::Setting(action) => self.setting(action).await,
+            Command::UsePrompt(prompt) => {
+                self.overlays.pop();
+                self.editor.set_text(&prompt);
+                self.update_completion();
+            }
+        }
+    }
+
+    async fn setting(&mut self, action: settings::Action) {
+        match action {
+            settings::Action::None | settings::Action::Close => {}
+            settings::Action::Models => self.open_models().await,
+            settings::Action::Reasoning => self.cycle_reasoning().await,
+            settings::Action::Thinking => {
+                let thinking = self.transcript.thinking_display().next();
+                self.transcript.set_thinking(thinking);
+                let saved = self
+                    .launch
+                    .tui_config
+                    .as_deref()
+                    .map(|path| config::save_thinking(path, thinking));
+                match saved {
+                    Some(Ok(())) => self.settings_note("saved · thinking display"),
+                    Some(Err(error)) => self.settings_note(error.to_string()),
+                    None => self.settings_note("not saved: no config path"),
+                }
+            }
+            settings::Action::Set { key, value } => {
+                let params = self.settings_params();
+                match self
+                    .launch
+                    .client
+                    .set_setting(SetSettingParams {
+                        cwd: params.cwd,
+                        configs: params.configs,
+                        key: key.into(),
+                        value,
+                    })
+                    .await
+                {
+                    Ok(report) => {
+                        if let Some(settings) = self.overlays.get_mut::<Settings>() {
+                            settings.saved(report);
+                        }
+                    }
+                    Err(error) => self.settings_note(error.to_string()),
+                }
+            }
+            settings::Action::EditFile => {
+                if let Some(settings) = self.overlays.get::<Settings>() {
+                    self.external_requested = Some(ExternalRequest::Settings(
+                        settings.report.files.global.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn choose_model(&mut self, entry: ModelEntry) {
+        if !self.idle_only("model selection") {
+            return;
+        }
+        if !entry.available {
+            let hint = if entry.model.provider == "chatgpt" {
+                " · xi login chatgpt"
+            } else {
+                ""
+            };
+            self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
+        } else if self.set_model(entry.model).await {
+            // The model change event records the switch in scrollback.
+            self.launch.attached.info.model_info = Some(entry.info);
+            self.overlays.close::<Picker>();
+        }
+    }
+
     pub(crate) fn own_approvals(&self) -> Vec<Approval> {
         let info = &self.launch.attached.info;
         self.transcript
@@ -47,19 +201,21 @@ impl App {
         if entries.is_empty() {
             return;
         }
-        self.approvals = Some(Approvals::new(entries, false));
+        let session = self.session_id();
+        match self.overlays.get_mut::<Approvals>() {
+            Some(approvals) => approvals.replace_current(entries, session),
+            None => self.overlays.push(Box::new(Approvals::new(entries, false))),
+        }
         self.completion = None;
-        self.focus = Focus::Approval;
     }
 
     pub(crate) fn close_empty_approvals(&mut self) {
         if self
-            .approvals
-            .as_ref()
+            .overlays
+            .get::<Approvals>()
             .is_some_and(|approvals| approvals.current().is_none())
         {
-            self.approvals = None;
-            self.focus = Focus::Composer;
+            self.overlays.close::<Approvals>();
         }
     }
 
@@ -101,13 +257,11 @@ impl App {
                     Approval { pending, cwd }
                 }),
         );
-        if let Some(approvals) = self.approvals.as_mut() {
-            approvals.replace(entries);
-        } else {
-            self.approvals = Some(Approvals::new(entries, true));
+        match self.overlays.get_mut::<Approvals>() {
+            Some(approvals) => approvals.replace(entries),
+            None => self.overlays.push(Box::new(Approvals::new(entries, true))),
         }
         self.completion = None;
-        self.focus = Focus::Approval;
         self.close_empty_approvals();
     }
 
@@ -125,9 +279,9 @@ impl App {
             .await
         {
             Ok(sessions) => {
-                self.sessions = Some(Sessions::new(sessions, self.session_id()));
+                self.overlays
+                    .push(Box::new(Sessions::new(sessions, self.session_id())));
                 self.completion = None;
-                self.focus = Focus::Sessions;
             }
             Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
         }
@@ -217,8 +371,7 @@ impl App {
         match self.launch.client.settings(self.settings_params()).await {
             Ok(report) => {
                 self.close_overlay();
-                self.settings = Some(Settings::new(report));
-                self.focus = Focus::Settings;
+                self.overlays.push(Box::new(Settings::new(report)));
             }
             Err(error) => {
                 self.close_overlay();
@@ -228,7 +381,7 @@ impl App {
     }
 
     pub(crate) fn settings_note(&mut self, note: impl Into<String>) {
-        if let Some(settings) = self.settings.as_mut() {
+        if let Some(settings) = self.overlays.get_mut::<Settings>() {
             settings.note(note);
         }
     }
@@ -236,7 +389,7 @@ impl App {
     pub(crate) async fn refresh_settings(&mut self) {
         match self.launch.client.settings(self.settings_params()).await {
             Ok(report) => {
-                if let Some(settings) = self.settings.as_mut() {
+                if let Some(settings) = self.overlays.get_mut::<Settings>() {
                     settings.replace(report);
                 }
             }
@@ -244,15 +397,8 @@ impl App {
         }
     }
 
-    pub(crate) fn close_models(&mut self) {
-        if self.settings.is_some() {
-            self.picker = None;
-            self.focus = Focus::Settings;
-        } else {
-            self.close_overlay();
-        }
-    }
-
+    /// Opens the model picker on top of whatever is open, so settings
+    /// gets it as a step deeper.
     pub(crate) async fn open_models(&mut self) {
         match self.launch.client.models(self.session_id()).await {
             Ok(models) => {
@@ -263,9 +409,8 @@ impl App {
                     .iter()
                     .find(|entry| entry.model == models.current)
                     .map(|entry| entry.info.clone());
-                self.picker = Some(Picker::new(models));
+                self.overlays.push(Box::new(Picker::new(models)));
                 self.completion = None;
-                self.focus = Focus::Models;
             }
             Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
         }
@@ -322,17 +467,21 @@ impl App {
         }
     }
 
+    /// Answers the shown ask and records the answer in scrollback, such as
+    /// `? allowed for this session · bash exec cargo test`.
     pub(crate) async fn answer(&mut self, choice: Choice) {
         let Some(ask) = self
-            .approvals
-            .as_ref()
+            .overlays
+            .get::<Approvals>()
             .and_then(Approvals::current)
             .cloned()
         else {
             return;
         };
         let pending = ask.pending;
-        match self
+        // An ask answered elsewhere first is not this client's answer, so
+        // it leaves no record.
+        let answered = match self
             .launch
             .client
             .resolve(
@@ -343,27 +492,40 @@ impl App {
             )
             .await
         {
-            Ok(())
-            | Err(ClientError::Rpc {
+            Ok(()) => true,
+            Err(ClientError::Rpc {
                 code: RpcError::APPROVAL_NOT_PENDING,
                 ..
-            }) => {}
+            }) => false,
             Err(error) => {
                 self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
                 return;
             }
-        }
+        };
         if pending.session == self.session_id() {
             self.resolved.insert(pending.call.clone());
         } else {
             self.answered
                 .insert((pending.session, pending.call.clone()));
         }
-        let inbox = self
-            .approvals
-            .as_ref()
-            .is_some_and(|approvals| approvals.inbox);
-        if let Some(approvals) = self.approvals.as_mut() {
+        if answered {
+            let role = if choice.approved() {
+                Role::Ink
+            } else {
+                Role::Sanguine
+            };
+            self.note(vec![
+                Line::default()
+                    .brass("? ")
+                    .span(role, false, choice.record())
+                    .dim(" · ")
+                    .ink(format!("{} {}", pending.tool, pending.action))
+                    .truncate(self.cols),
+            ]);
+        }
+        let mut inbox = false;
+        if let Some(approvals) = self.overlays.get_mut::<Approvals>() {
+            inbox = approvals.inbox;
             approvals.remove(pending.session, &pending.call);
         }
         if inbox {
@@ -373,18 +535,10 @@ impl App {
         }
     }
 
-    pub(crate) fn close_tree(&mut self) {
-        self.tree = None;
-        self.focus = Focus::Composer;
-    }
-
-    /// Checks out the selected tree node and rebuilds what the client knows
-    /// from the new head's branch. Scrollback stays as it was.
-    pub(crate) async fn checkout(&mut self) {
-        let Some(node) = self.tree.as_ref().and_then(Tree::current).cloned() else {
-            return;
-        };
-        self.close_tree();
+    /// Checks out a tree node and rebuilds what the client knows from the
+    /// new head's branch. Scrollback stays as it was.
+    pub(crate) async fn checkout(&mut self, node: Node) {
+        self.overlays.close::<Tree>();
         if let Err(error) = self
             .launch
             .client

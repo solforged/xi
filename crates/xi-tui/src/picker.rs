@@ -3,8 +3,11 @@
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{ModelEntry, ModelsResult};
 
+use crossterm::event::KeyEvent;
+
 use crate::frame::{Body, Cursor, Frame, Hint, Tone};
 use crate::keys::{Action, Keymap};
+use crate::overlay::{Command, Ctx, ListKey, Outcome, Overlay, list_key};
 use crate::style::{Line, Role, row};
 
 /// The model-selection overlay.
@@ -181,6 +184,37 @@ impl Picker {
             cursor,
             ..Body::default()
         }
+    }
+}
+
+impl Overlay for Picker {
+    fn name(&self) -> &'static str {
+        "models"
+    }
+
+    fn frame(&self, ctx: &Ctx) -> Frame {
+        Self::frame(self, ctx.keys, ctx.parent)
+    }
+
+    fn body(&self, inner: usize, _: &Ctx) -> Body {
+        Self::body(self, inner)
+    }
+
+    fn key(&mut self, key: KeyEvent, action: Option<Action>, _: &Ctx) -> Outcome {
+        match list_key(key, action) {
+            ListKey::Choose => {
+                if let Some(entry) = self.selected() {
+                    return Outcome::Send(Box::new(Command::SetModel(entry.clone())));
+                }
+            }
+            ListKey::Close => return Outcome::Close,
+            ListKey::Up => self.up(),
+            ListKey::Down => self.down(),
+            ListKey::Backspace => self.backspace(),
+            ListKey::Type(c) => self.input(c),
+            _ => {}
+        }
+        Outcome::Stay
     }
 }
 

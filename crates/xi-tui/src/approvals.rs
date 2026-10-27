@@ -6,8 +6,11 @@ use xi_protocol::event::Remember;
 use xi_protocol::methods::client::PendingApproval;
 use xi_protocol::{SessionId, ToolCallId};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 use crate::frame::{Body, Frame, Hint, Note, Tone};
 use crate::keys::{Action, Keymap};
+use crate::overlay::{Command, Ctx, Outcome, Overlay};
 use crate::style::{Line, Role, row};
 
 /// An ask with the workspace information needed by the inbox.
@@ -78,6 +81,17 @@ impl Choice {
                 "Also saves an allow rule for this exact action, which new sessions in this workspace read."
             }
             Self::Deny => "The call is refused and the model sees why.",
+        }
+    }
+
+    /// The answer as the scrollback records it.
+    #[must_use]
+    pub fn record(self) -> &'static str {
+        match self {
+            Self::Once => "allowed once",
+            Self::Session => "allowed for this session",
+            Self::Workspace => "always allowed in this workspace",
+            Self::Deny => "denied",
         }
     }
 }
@@ -366,6 +380,46 @@ impl Approvals {
             foot,
             cursor: None,
         }
+    }
+}
+
+impl Overlay for Approvals {
+    fn name(&self) -> &'static str {
+        "approvals"
+    }
+
+    fn frame(&self, ctx: &Ctx) -> Frame {
+        Self::frame(self, ctx.keys)
+    }
+
+    fn body(&self, inner: usize, ctx: &Ctx) -> Body {
+        Self::body(self, inner, ctx.info.session)
+    }
+
+    fn key(&mut self, key: KeyEvent, action: Option<Action>, _: &Ctx) -> Outcome {
+        let choice = match (action, key.code) {
+            (Some(Action::Send), _) => self.selected(),
+            (Some(direction @ (Action::Up | Action::Down)), _) => {
+                self.step(direction == Action::Down);
+                None
+            }
+            (Some(Action::Complete), _) => {
+                self.next();
+                None
+            }
+            (Some(Action::Escape), _) => return Outcome::Close,
+            (_, KeyCode::Char(c))
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.shortcut(c)
+            }
+            _ => None,
+        };
+        choice.map_or(Outcome::Stay, |choice| {
+            Outcome::Send(Box::new(Command::Answer(choice)))
+        })
     }
 }
 

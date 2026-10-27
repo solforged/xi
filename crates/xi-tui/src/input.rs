@@ -1,243 +1,15 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use xi_protocol::methods::client::{ListParams, SetSettingParams};
 
-use crate::approvals::Approvals;
 use crate::history::Search;
 use crate::keys::Action;
-use crate::picker::Picker;
-use crate::sessions::Sessions;
 use crate::style::Line;
-use crate::{App, Error, ExternalRequest, Focus, config, settings};
-
-/// What a key does in a filtered list overlay.
-enum ListKey {
-    Choose,
-    Close,
-    Tab,
-    Up,
-    Down,
-    Older,
-    Backspace,
-    Type(char),
-    Other,
-}
+use crate::{App, Error, ExternalRequest};
 
 impl App {
-    /// Plain characters type into the filter; everything else goes through
-    /// the keymap, so the frame's hints and the keys agree.
-    fn list_key(&self, key: KeyEvent) -> ListKey {
-        if let KeyCode::Char(c) = key.code
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return ListKey::Type(c);
-        }
-        match self.keymap.action(key) {
-            Some(Action::Send) => ListKey::Choose,
-            Some(Action::Escape) => ListKey::Close,
-            Some(Action::Complete) => ListKey::Tab,
-            Some(Action::Up) => ListKey::Up,
-            Some(Action::Down) => ListKey::Down,
-            Some(Action::Search) => ListKey::Older,
-            Some(Action::Backspace) => ListKey::Backspace,
-            _ => ListKey::Other,
-        }
-    }
-
-    async fn sessions_key(&mut self, key: KeyEvent) {
-        let key = self.list_key(key);
-        match key {
-            ListKey::Close => self.close_overlay(),
-            ListKey::Choose => {
-                if let Some(session) = self.sessions.as_ref().and_then(Sessions::selected).cloned()
-                    && let Err(error) = self.resume(session).await
-                {
-                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
-                }
-            }
-            ListKey::Tab => {
-                let all = self.sessions.as_ref().is_some_and(|picker| !picker.all);
-                let cwd = (!all).then(|| self.launch.attached.info.cwd.clone());
-                match self
-                    .launch
-                    .client
-                    .list(ListParams { cwd, running: None })
-                    .await
-                {
-                    Ok(sessions) => {
-                        if let Some(picker) = self.sessions.as_mut() {
-                            picker.replace(sessions, all);
-                        }
-                    }
-                    Err(error) => {
-                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
-                    }
-                }
-            }
-            _ => {
-                if let Some(picker) = self.sessions.as_mut() {
-                    match key {
-                        ListKey::Up => picker.up(),
-                        ListKey::Down => picker.down(),
-                        ListKey::Backspace => picker.backspace(),
-                        ListKey::Type(c) => picker.input(c),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    async fn settings_key(&mut self, key: KeyEvent) {
-        let action = self.keymap.action(key);
-        let info = &self.launch.attached.info;
-        let Some(settings) = self.settings.as_mut() else {
-            self.focus = Focus::Composer;
-            return;
-        };
-        match settings.key(key, action, &info.model, info.reasoning) {
-            settings::Action::None => {}
-            settings::Action::Close => self.close_overlay(),
-            settings::Action::Models => self.open_models().await,
-            settings::Action::Reasoning => self.cycle_reasoning().await,
-            settings::Action::Thinking => {
-                let thinking = self.transcript.thinking_display().next();
-                self.transcript.set_thinking(thinking);
-                let saved = self
-                    .launch
-                    .tui_config
-                    .as_deref()
-                    .map(|path| config::save_thinking(path, thinking));
-                match saved {
-                    Some(Ok(())) => self.settings_note("saved · thinking display"),
-                    Some(Err(error)) => self.settings_note(error.to_string()),
-                    None => self.settings_note("not saved: no config path"),
-                }
-            }
-            settings::Action::Set { key, value } => {
-                let params = self.settings_params();
-                match self
-                    .launch
-                    .client
-                    .set_setting(SetSettingParams {
-                        cwd: params.cwd,
-                        configs: params.configs,
-                        key: key.into(),
-                        value,
-                    })
-                    .await
-                {
-                    Ok(report) => {
-                        if let Some(settings) = self.settings.as_mut() {
-                            settings.saved(report);
-                        }
-                    }
-                    Err(error) => self.settings_note(error.to_string()),
-                }
-            }
-            settings::Action::EditFile => {
-                if let Some(settings) = &self.settings {
-                    self.external_requested = Some(ExternalRequest::Settings(
-                        settings.report.files.global.clone(),
-                    ));
-                }
-            }
-        }
-    }
-
-    async fn tree_key(&mut self, key: KeyEvent) {
-        let action = self.keymap.action(key);
-        let Some(tree) = self.tree.as_mut() else {
-            self.focus = Focus::Composer;
-            return;
-        };
-        let page = isize::try_from(self.rows / 2).unwrap_or(1).max(1);
-        match (action, key.code) {
-            (Some(Action::Up), _) | (_, KeyCode::Char('k')) => tree.step(-1),
-            (Some(Action::Down), _) | (_, KeyCode::Char('j')) => tree.step(1),
-            (Some(Action::Send), _) => self.checkout().await,
-            (Some(Action::Escape), _) | (_, KeyCode::Char('q')) => self.close_tree(),
-            (_, KeyCode::PageUp) => tree.step(-page),
-            (_, KeyCode::PageDown) => tree.step(page),
-            (_, KeyCode::Home) => tree.jump(false),
-            (_, KeyCode::End) => tree.jump(true),
-            _ => {}
-        }
-    }
-
-    async fn model_key(&mut self, key: KeyEvent) {
-        let key = self.list_key(key);
-        match key {
-            ListKey::Choose => {
-                let entry = self.picker.as_ref().and_then(Picker::selected).cloned();
-                if let Some(entry) = entry {
-                    if !self.idle_only("model selection") {
-                        return;
-                    }
-                    if !entry.available {
-                        let hint = if entry.model.provider == "chatgpt" {
-                            " · xi login chatgpt"
-                        } else {
-                            ""
-                        };
-                        self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
-                    } else if self.set_model(entry.model).await {
-                        self.launch.attached.info.model_info = Some(entry.info);
-                        self.close_models();
-                    }
-                }
-            }
-            ListKey::Close => self.close_models(),
-            _ => {
-                if let Some(picker) = self.picker.as_mut() {
-                    match key {
-                        ListKey::Up => picker.up(),
-                        ListKey::Down => picker.down(),
-                        ListKey::Backspace => picker.backspace(),
-                        ListKey::Type(c) => picker.input(c),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    fn search_key(&mut self, key: KeyEvent) {
-        let key = self.list_key(key);
-        match key {
-            ListKey::Close => self.close_overlay(),
-            ListKey::Choose => {
-                let selected = self
-                    .search
-                    .as_ref()
-                    .and_then(|search| search.current(&self.history))
-                    .map(str::to_owned);
-                if let Some(selected) = selected {
-                    self.editor.set_text(&selected);
-                    self.search = None;
-                    self.focus = Focus::Composer;
-                    self.update_completion();
-                }
-            }
-            _ => {
-                if let Some(search) = self.search.as_mut() {
-                    match key {
-                        ListKey::Older | ListKey::Down => search.older(),
-                        ListKey::Up => search.newer(&self.history),
-                        ListKey::Backspace => search.backspace(),
-                        ListKey::Type(c) => search.input(c),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
     pub(crate) async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
         let action = self.keymap.action(key);
         if matches!(action, Some(Action::Interrupt)) {
-            if self.focus != Focus::Composer || self.completion.is_some() {
+            if !self.overlays.is_empty() || self.completion.is_some() {
                 self.close_overlay();
             } else if self.running() {
                 self.cancel().await;
@@ -250,65 +22,9 @@ impl App {
             }
             return Ok(());
         }
-        match self.focus {
-            Focus::Tree => {
-                self.tree_key(key).await;
-                return Ok(());
-            }
-            Focus::Models => {
-                self.model_key(key).await;
-                return Ok(());
-            }
-            Focus::Search => {
-                self.search_key(key);
-                return Ok(());
-            }
-            Focus::Sessions => {
-                self.sessions_key(key).await;
-                return Ok(());
-            }
-            Focus::Settings => {
-                self.settings_key(key).await;
-                return Ok(());
-            }
-            Focus::Approval => {
-                let choice = match (action, key.code) {
-                    (Some(Action::Send), _) => {
-                        self.approvals.as_ref().and_then(Approvals::selected)
-                    }
-                    (Some(direction @ (Action::Up | Action::Down)), _) => {
-                        if let Some(approvals) = self.approvals.as_mut() {
-                            approvals.step(direction == Action::Down);
-                        }
-                        None
-                    }
-                    (Some(Action::Complete), _) => {
-                        if let Some(approvals) = self.approvals.as_mut() {
-                            approvals.next();
-                        }
-                        None
-                    }
-                    (Some(Action::Escape), _) => {
-                        self.close_overlay();
-                        None
-                    }
-                    (_, KeyCode::Char(c))
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        self.approvals
-                            .as_ref()
-                            .and_then(|approvals| approvals.shortcut(c))
-                    }
-                    _ => None,
-                };
-                if let Some(choice) = choice {
-                    self.answer(choice).await;
-                }
-                return Ok(());
-            }
-            Focus::Composer => {}
+        if !self.overlays.is_empty() {
+            self.overlay_key(key, action).await;
+            return Ok(());
         }
         if let Some(menu) = self.completion.as_mut() {
             match action {
@@ -361,9 +77,8 @@ impl App {
                 return Ok(());
             }
             Some(Action::Search) => {
-                self.search = Some(Search::new(self.editor.text().to_owned()));
+                self.overlays.push(Box::new(Search::default()));
                 self.completion = None;
-                self.focus = Focus::Search;
                 return Ok(());
             }
             Some(Action::External) => {

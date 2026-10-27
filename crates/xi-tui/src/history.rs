@@ -7,8 +7,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crossterm::event::KeyEvent;
+
 use crate::frame::{Body, Cursor, Frame, Hint, Tone};
 use crate::keys::{Action, Keymap};
+use crate::overlay::{Command, Ctx, ListKey, Outcome, Overlay, list_key};
 use crate::style::{Line, Role, row};
 
 const MAX_ENTRIES: usize = 5_000;
@@ -143,24 +146,15 @@ fn write_entry(writer: &mut impl Write, entry: &Entry) -> io::Result<()> {
     writer.write_all(b"\n")
 }
 
-/// An incremental history search, preserving the draft for cancellation.
+/// An incremental history search. The composer stays untouched until a
+/// match is used, so closing the search leaves the draft as it was.
+#[derive(Default)]
 pub struct Search {
     query: String,
     index: usize,
-    draft: String,
 }
 
 impl Search {
-    /// Starts a search with an empty query and saves the current draft.
-    #[must_use]
-    pub fn new(draft: String) -> Search {
-        Self {
-            query: String::new(),
-            index: 0,
-            draft,
-        }
-    }
-
     /// The substring being searched for.
     #[must_use]
     pub fn query(&self) -> &str {
@@ -197,12 +191,6 @@ impl Search {
         matches
             .get(self.index.min(matches.len().saturating_sub(1)))
             .copied()
-    }
-
-    /// The draft saved when search opened.
-    #[must_use]
-    pub fn draft(&self) -> &str {
-        &self.draft
     }
 
     /// The border, the match count and the keys.
@@ -279,6 +267,37 @@ impl Search {
             cursor,
             ..Body::default()
         }
+    }
+}
+
+impl Overlay for Search {
+    fn name(&self) -> &'static str {
+        "history"
+    }
+
+    fn frame(&self, ctx: &Ctx) -> Frame {
+        Self::frame(self, ctx.history, ctx.keys)
+    }
+
+    fn body(&self, inner: usize, ctx: &Ctx) -> Body {
+        Self::body(self, ctx.history, inner)
+    }
+
+    fn key(&mut self, key: KeyEvent, action: Option<Action>, ctx: &Ctx) -> Outcome {
+        match list_key(key, action) {
+            ListKey::Choose => {
+                if let Some(prompt) = self.current(ctx.history) {
+                    return Outcome::Send(Box::new(Command::UsePrompt(prompt.to_owned())));
+                }
+            }
+            ListKey::Close => return Outcome::Close,
+            ListKey::Older | ListKey::Down => self.older(),
+            ListKey::Up => self.newer(ctx.history),
+            ListKey::Backspace => self.backspace(),
+            ListKey::Type(c) => self.input(c),
+            _ => {}
+        }
+        Outcome::Stay
     }
 }
 
@@ -416,7 +435,7 @@ mod tests {
         let (mut history, _) = History::load(None, Path::new("/here"));
         history.push("old ξ").unwrap();
         history.push("new ξ").unwrap();
-        let mut search = Search::new("saved draft".into());
+        let mut search = Search::default();
         search.input('ξ');
         assert_eq!(search.current(&history), Some("new ξ"));
         search.older();
@@ -425,7 +444,6 @@ mod tests {
         search.backspace();
         assert_eq!(search.query(), "");
         assert_eq!(search.current(&history), Some("new ξ"));
-        assert_eq!(search.draft(), "saved draft");
         search.input('x');
         assert_eq!(search.current(&history), None);
     }
@@ -438,7 +456,7 @@ mod tests {
             cwd: "/elsewhere".into(),
             text: "ξ elsewhere".into(),
         });
-        let mut search = Search::new(String::new());
+        let mut search = Search::default();
         search.input('ξ');
         let body = search.body(&history, 40);
         let rows: Vec<String> = body.list.iter().map(Line::plain).collect();
