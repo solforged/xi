@@ -64,7 +64,7 @@ The topology is one daemon per OS user per machine, with one worker process per 
 
 The client socket and worker pipes carry NDJSON JSON-RPC 2.0 with the same framing and method types. The daemon forwards session requests; workers hold credentials and call providers. `agent/run` children run inside the parent's worker. Socket paths and access checks are in [Daemon socket](#daemon-socket); method names, routing and approvals are in [Protocol](#protocol).
 
-Line mode and the TUI connect through `xi-client`, which autostarts the per-user daemon if needed. They create a session or open its log for `--resume`. Quitting detaches and closes the worker only if its session is idle.
+Line mode and the TUI connect through `xi-client`, which autostarts the per-user daemon if needed. They create a session or open its log for `--resume <PATH>`. Bare `xi --resume` opens the TUI's session picker for this workspace, focused on the most recently active previous session; `tab` includes all workspaces. Picking a session requires the TUI; headless and line-mode clients must supply a path. Quitting detaches and closes the worker only if its session is idle.
 
 Each worker runs the kernel with these responsibilities:
 

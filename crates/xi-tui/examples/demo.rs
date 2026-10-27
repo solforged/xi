@@ -321,6 +321,7 @@ async fn main() -> Result<(), xi_tui::Error> {
         notifications,
         template,
         attached,
+        pick_session: false,
         history: None,
         tui_config: None,
     })

@@ -43,6 +43,15 @@ impl Sessions {
         picker
     }
 
+    /// Focuses the most recently active session other than the current one.
+    pub(crate) fn select_previous(&mut self) {
+        self.selected = self
+            .matches
+            .iter()
+            .position(|index| self.sessions[*index].session != self.current)
+            .unwrap_or(0);
+    }
+
     /// Replaces the fetched rows, keeping the filter and selected session.
     pub fn replace(&mut self, mut sessions: Vec<SessionSummary>, all: bool) {
         let selected = self.selected().map(|entry| entry.session);

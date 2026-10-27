@@ -45,9 +45,9 @@ struct Cli {
     /// Session log directory.
     #[arg(long, global = true)]
     session_dir: Option<PathBuf>,
-    /// Resume a session file at its latest leaf.
-    #[arg(long)]
-    resume: Option<PathBuf>,
+    /// Open the session picker, or resume a session file at its latest leaf.
+    #[arg(long, num_args = 0..=1, value_name = "PATH")]
+    resume: Option<Option<PathBuf>>,
     /// Emit each protocol notification as one JSON line.
     #[arg(long, requires = "prompt")]
     json: bool,
@@ -150,6 +150,14 @@ async fn run(cli: Cli) -> Result<u8> {
     if cli.command.is_some() && (cli.prompt.is_some() || cli.resume.is_some()) {
         return Err("-p and --resume cannot be used with a subcommand".into());
     }
+    let tui = !cli.plain && xi_tui::available();
+    let pick_session = matches!(cli.resume, Some(None));
+    if pick_session && (cli.prompt.is_some() || !tui) {
+        return Err(
+            "--resume without a path requires the terminal UI; use --resume <PATH> with -p, --plain, or redirected input/output"
+                .into(),
+        );
+    }
     let paths = Paths::discover()?;
     if let Some(command) = cli.command {
         match command {
@@ -220,7 +228,7 @@ async fn run(cli: Cli) -> Result<u8> {
             },
         },
     };
-    let resume = cli.resume.as_deref().map(absolute);
+    let resume = cli.resume.flatten().as_deref().map(absolute);
     if let Some(prompt) = cli.prompt {
         let start = match &resume {
             Some(path) => WorkerStartParams::Open(OpenParams {
@@ -275,10 +283,11 @@ async fn run(cli: Cli) -> Result<u8> {
         notifications,
         template,
         attached,
+        pick_session,
         history: Some(paths.state.join("prompts.jsonl")),
         tui_config: Some(paths.config.join("tui.toml")),
     };
-    if !cli.plain && xi_tui::available() {
+    if tui {
         xi_tui::run(launch).await?;
     } else {
         terminal::run(launch, &paths).await?;
@@ -406,4 +415,30 @@ async fn open_or_create(
         attached = client.attach(attached.info.session, None).await?;
     }
     Ok(attached)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_accepts_a_picker_or_an_explicit_path() {
+        assert_eq!(Cli::try_parse_from(["xi"]).unwrap().resume, None);
+        assert_eq!(
+            Cli::try_parse_from(["xi", "--resume"]).unwrap().resume,
+            Some(None)
+        );
+        let cli = Cli::try_parse_from(["xi", "--resume", "--model", "demo/model"]).unwrap();
+        assert_eq!(cli.resume, Some(None));
+        assert_eq!(cli.model.as_deref(), Some("demo/model"));
+        for args in [
+            vec!["xi", "--resume", "saved.jsonl", "-p", "continue"],
+            vec!["xi", "--resume=saved.jsonl", "--plain"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap().resume,
+                Some(Some(PathBuf::from("saved.jsonl")))
+            );
+        }
+    }
 }

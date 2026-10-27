@@ -58,6 +58,28 @@ fn help_and_config_errors_have_documented_exit_status() {
 }
 
 #[test]
+fn resume_picker_requires_the_terminal_ui_without_starting_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--resume"],
+        vec!["--resume", "--plain"],
+        vec!["--resume", "-p", "continue"],
+    ] {
+        let output = command(dir.path())
+            .args(args)
+            .env("XI_BIN", dir.path().join("must-not-start"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("--resume without a path requires the terminal UI"));
+        assert!(error.contains("--resume <PATH>"));
+    }
+    assert!(!dir.path().join("data/xi/sessions").exists());
+    assert!(!dir.path().join("state/xi").exists());
+}
+
+#[test]
 fn trust_is_canonical_idempotent_and_external_to_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
