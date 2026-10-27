@@ -560,8 +560,10 @@ impl Router {
                         let _guard = edits.lock().map_err(internal)?;
                         xi_kernel::settings::set_global(&paths, &params.key, &params.value)
                             .map_err(|error| match error {
-                                xi_kernel::Error::Config(message) => {
-                                    RpcError::new(RpcError::INVALID_PARAMS, message)
+                                error @ (xi_kernel::Error::Config(_)
+                                | xi_kernel::Error::Model { .. }
+                                | xi_kernel::Error::UnknownEvent(_)) => {
+                                    RpcError::new(RpcError::INVALID_PARAMS, error.to_string())
                                 }
                                 error => internal(error),
                             })?;

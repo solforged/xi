@@ -147,7 +147,9 @@ impl Tool for FakeTool {
         if input.get("invalid").is_some() {
             return Err("invalid input".into());
         }
-        if let Some(net) = input.get("net") {
+        if let Some(path) = input.get("read") {
+            Ok(vec![Crossing::Read(path.as_str().unwrap().into())])
+        } else if let Some(net) = input.get("net") {
             Ok(vec![Crossing::Net(
                 net.as_str().unwrap_or("example.org").into(),
             )])
@@ -816,8 +818,8 @@ fn sandbox_runtime_directory_guard() {
     }
 }
 
-#[test]
-fn sandbox_runtime_directory_guard_child() {
+#[tokio::test]
+async fn sandbox_runtime_directory_guard_child() {
     let Some(root) = std::env::var_os("XI_TEST_RUNTIME_GUARD_ROOT") else {
         return;
     };
@@ -1109,7 +1111,7 @@ async fn skill_invocations_carry_the_body_and_unknown_names_fail() {
 }
 
 #[tokio::test]
-async fn approvals_resolve_both_ways_and_record_user() {
+async fn approvals_resolve_during_running_turn_both_ways_and_record_user() {
     for approved in [false, true] {
         let fixture = Fixture::new();
         let script = Script::new(vec![
@@ -1132,14 +1134,20 @@ async fn approvals_resolve_both_ways_and_record_user() {
                 break;
             }
         }
-        session
-            .approve(&"ask".into(), approved, Remember::Once)
-            .unwrap();
-        assert!(
+        assert!(session.is_running());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            session.approve(&"ask".into(), approved, Remember::Once),
+        )
+        .await
+        .expect("approval must resolve while the turn is running")
+        .unwrap();
+        assert!(matches!(
             session
                 .approve(&"ask".into(), approved, Remember::Once)
-                .is_err()
-        );
+                .await,
+            Err(xi_kernel::Error::NotPending)
+        ));
         reply.await.unwrap().unwrap();
         let info = session.info().await;
         assert!(info.events.iter().any(|e| matches!(e.kind, EventKind::ApprovalResolved { approved: value, by: Approver::User, .. } if value == approved)));
@@ -1215,6 +1223,17 @@ async fn invalid_and_unknown_calls_return_errors_without_running_tools() {
     );
 }
 
+#[test]
+fn unknown_configured_tool_returns_typed_tool_error() {
+    let fixture = Fixture::new();
+    let mut config = fixture.config();
+    config.tools = vec!["missing".into()];
+    assert!(matches!(
+        xi_kernel::toolset(&config),
+        Err(xi_kernel::Error::Tool(_))
+    ));
+}
+
 #[tokio::test]
 async fn retries_retryable_failure_then_success() {
     let fixture = Fixture::new();
@@ -1267,6 +1286,32 @@ async fn nonretryable_failure_and_turn_limit_are_persisted() {
         session.info().await.events.last().unwrap().kind,
         EventKind::TurnFailed { .. }
     ));
+}
+
+#[tokio::test]
+async fn info_returns_promptly_during_a_gate_held_turn() {
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let script = Script::new(vec![Step::Wait(gate.clone())]);
+    let (session, _) = fixture.session(script, FakeTool { gate: None }, opts());
+    let reply = session.submit(input("work"));
+    gate.entered.notified().await;
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(1), session.info())
+        .await
+        .expect("info must not wait for the running turn");
+    assert!(session.is_running());
+    assert_eq!(snapshot.session, session.id());
+    assert_eq!(snapshot.partial, input("partial"));
+    assert!(snapshot.stream_sequence > 0);
+    assert!(snapshot.pending_approvals.is_empty());
+    assert!(matches!(
+        &snapshot.events.last().unwrap().kind,
+        EventKind::UserMessage { content } if *content == input("work")
+    ));
+
+    gate.release.add_permits(1);
+    assert!(!reply.await.unwrap().unwrap().failed);
 }
 
 #[tokio::test]
@@ -1346,6 +1391,11 @@ async fn cancellation_keeps_queued_steering_for_the_next_turn() {
     let mut steering = session.submit(input("keep me"));
     session.cancel();
     assert!(first.await.unwrap().unwrap().cancelled);
+    // Maintenance must not turn retained steering into a new submission.
+    session.rename("Paused steering").await.unwrap();
+    session.set_reasoning(Reasoning::Off).await.unwrap();
+    let head = session.info().await.head;
+    session.checkout(head).await.unwrap();
     assert!(matches!(
         steering.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -1366,6 +1416,45 @@ async fn cancellation_keeps_queued_steering_for_the_next_turn() {
             .messages
             .contains(&Message::User(input("resume")))
     );
+}
+
+#[tokio::test]
+async fn submitted_turn_outlives_the_last_session_handle() {
+    let fixture = Fixture::new();
+    let (session, _) = fixture.session(
+        Script::new(vec![Step::Reply(done())]),
+        FakeTool { gate: None },
+        opts(),
+    );
+    let reply = session.submit(input("accepted"));
+    drop(session);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), reply)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!outcome.failed);
+}
+
+#[tokio::test]
+async fn running_turn_outlives_the_last_session_handle() {
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let (session, _) = fixture.session(
+        Script::new(vec![Step::Wait(gate.clone())]),
+        FakeTool { gate: None },
+        opts(),
+    );
+    let reply = session.submit(input("accepted"));
+    gate.entered.notified().await;
+    drop(session);
+    gate.release.add_permits(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), reply)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!outcome.failed);
 }
 
 #[tokio::test]
@@ -1407,7 +1496,11 @@ async fn resume_latest_leaf_and_checkout_branch_without_rewriting() {
     session.checkout(info.events[1].id).await.unwrap();
     assert_eq!(session.info().await.head, info.events[1].id);
     assert_eq!(session.info().await.events, info.events);
-    drop(session);
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
     let log = xi_session::SessionLog::open(&info.path).unwrap();
     let resumed =
         Session::from_log(log, fixture.config(), EventBus::default(), opts(), None).unwrap();
@@ -1567,7 +1660,11 @@ async fn reasoning_reopens_from_the_head_lineage_and_explicit_override_wins() {
     session.checkout(root).await.unwrap();
     session.set_reasoning(Reasoning::Low).await.unwrap();
     let path = session.info().await.path;
-    drop(session);
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
 
     let reopen = |config: Config, script: Arc<Script>| {
         Session::from_log(
@@ -1599,7 +1696,11 @@ async fn reasoning_reopens_from_the_head_lineage_and_explicit_override_wins() {
         Reasoning::High
     );
     session.set_reasoning(Reasoning::Low).await.unwrap();
-    drop(session);
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
 
     let mut config = fixture.config();
     config.reasoning = Reasoning::Off;
@@ -2111,7 +2212,11 @@ async fn summary_includes_previous_summary_and_resume_rebuilds_identical_context
     let compacted = session.info().await;
     assert!(!session.prompt(input("continue")).await.unwrap().failed);
     let resumed_at = session.info().await;
-    drop(session);
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
     let expected = {
         let script_requests = script.requests.lock().unwrap();
         assert_eq!(script_requests.len(), 2);
@@ -2353,7 +2458,7 @@ async fn retry_resets_partial_output_and_numbers_each_attempt() {
         &stream[1],
         Notification::Reset(params) if params.session == session.id() && params.attempt == 1
     ));
-    assert_eq!(stream[1].json()["method"], "stream/reset");
+    assert_eq!(stream[1].method(), "stream/reset");
     assert!(matches!(
         &stream[2],
         Notification::Delta(params)
@@ -2378,7 +2483,7 @@ async fn cancelled_ask_is_resolved_before_its_cancelled_result() {
     session.cancel();
     assert!(reply.await.unwrap().unwrap().cancelled);
     assert!(matches!(
-        session.approve(&call, true, Remember::Once),
+        session.approve(&call, true, Remember::Once).await,
         Err(xi_kernel::Error::NotPending)
     ));
     let info = session.info().await;
@@ -2424,7 +2529,7 @@ async fn client_approval_timeout_records_a_timeout_denial() {
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(!reply.await.unwrap().unwrap().failed);
     assert!(matches!(
-        session.approve(&call, true, Remember::Once),
+        session.approve(&call, true, Remember::Once).await,
         Err(xi_kernel::Error::NotPending)
     ));
     let info = session.info().await;
@@ -2567,7 +2672,11 @@ async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
         })
         .collect();
     assert_eq!(broadcast, repaired);
-    drop(session);
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
     let resumed = Session::from_log(
         xi_session::SessionLog::open(&path).unwrap(),
         fixture.config(),
@@ -2664,6 +2773,20 @@ async fn summary_requests_hold_one_lease_across_retries_without_streaming() {
 }
 
 #[tokio::test]
+async fn stopped_prompt_returns_typed_stopped_error() {
+    let fixture = Fixture::new();
+    let script = Script::new(vec![]);
+    let (session, _) = fixture.session(script.clone(), FakeTool { gate: None }, opts());
+    session.stop_requests();
+    assert!(matches!(
+        session.prompt(input("too late")).await,
+        Err(xi_kernel::Error::Stopped)
+    ));
+    assert!(script.requests.lock().unwrap().is_empty());
+    assert_eq!(session.info().await.events.len(), 1);
+}
+
+#[tokio::test]
 async fn stopping_requests_finishes_the_tool_batch_then_records_daemon_loss() {
     let fixture = Fixture::new();
     let gate = Gate::new();
@@ -2685,15 +2808,14 @@ async fn stopping_requests_finishes_the_tool_batch_then_records_daemon_loss() {
     let queued = session.submit(input("queued"));
     session.stop_requests();
     session.stop_requests();
-    assert_eq!(queued.await.unwrap().unwrap_err(), "daemon connection lost");
-    assert_eq!(
-        session
-            .submit(input("too late"))
-            .await
-            .unwrap()
-            .unwrap_err(),
-        "daemon connection lost"
-    );
+    assert!(matches!(
+        queued.await.unwrap(),
+        Err(xi_kernel::Error::Stopped)
+    ));
+    assert!(matches!(
+        session.submit(input("too late")).await.unwrap(),
+        Err(xi_kernel::Error::Stopped)
+    ));
     let idle = {
         let session = session.clone();
         tokio::spawn(async move { session.wait_idle().await })
@@ -2786,7 +2908,10 @@ async fn session_grant_skips_the_same_action_and_survives_reopen() {
         fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
     let reply = session.submit(input("first ask"));
     let asked = wait_for_ask(&mut rx).await;
-    session.approve(&asked, true, Remember::Session).unwrap();
+    session
+        .approve(&asked, true, Remember::Session)
+        .await
+        .unwrap();
     reply.await.unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(2), session.prompt(input("same action")))
         .await
@@ -2807,7 +2932,11 @@ async fn session_grant_skips_the_same_action_and_survives_reopen() {
         }
     )));
     session.wait_idle().await;
-    drop(session);
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
     let script = Script::new(vec![
         batch(vec![call("reopened", "fake", json!({"net": true}))]),
         Step::Reply(done()),
@@ -2839,6 +2968,77 @@ async fn session_grant_skips_the_same_action_and_survives_reopen() {
 }
 
 #[tokio::test]
+async fn remembered_session_grant_restores_a_path_with_spaces() {
+    let fixture = Fixture::new();
+    let path = fixture.paths.home.join("private files/report notes.txt");
+    write(&path, "private");
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "[[rule]]\naction='read'\npattern='**'\neffect='ask'\n",
+    );
+    let script = Script::new(vec![
+        batch(vec![call("first", "fake", json!({"read": path}))]),
+        Step::Reply(done()),
+    ]);
+    let (session, mut rx) =
+        fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
+    let reply = session.submit(input("remember the path"));
+    let asked = wait_for_ask(&mut rx).await;
+    session
+        .approve(&asked, true, Remember::Session)
+        .await
+        .unwrap();
+    reply.await.unwrap().unwrap();
+    session.wait_idle().await;
+    let before = session.info().await;
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
+
+    let resumed = Session::from_log(
+        xi_session::SessionLog::open(&before.path).unwrap(),
+        fixture.config(),
+        EventBus::default(),
+        TurnOptions::default(),
+        Some(Backend {
+            provider: Script::new(vec![
+                batch(vec![call("restored", "fake", json!({"read": path}))]),
+                Step::Reply(done()),
+            ]),
+            model: model(),
+            tools: vec![Arc::new(FakeTool { gate: None })],
+        }),
+    )
+    .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        resumed.prompt(input("read the same path")),
+    )
+    .await
+    .expect("the restored grant must avoid another approval")
+    .unwrap();
+    assert!(!outcome.failed);
+    let restored = resumed.info().await;
+    let events = &restored.events[before.events.len()..];
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ToolDecision {
+            call,
+            decision: Decision::Allow,
+            rule: Some(rule),
+            ..
+        } if call.0 == "restored" && rule == "session"
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ApprovalResolved { .. }))
+    );
+}
+
+#[tokio::test]
 async fn session_grants_do_not_cross_a_checkout_branch() {
     let fixture = Fixture::new();
     let script = Script::new(vec![
@@ -2852,13 +3052,16 @@ async fn session_grants_do_not_cross_a_checkout_branch() {
     let root = session.info().await.events[0].id;
     let reply = session.submit(input("grant branch"));
     let call = wait_for_ask(&mut rx).await;
-    session.approve(&call, true, Remember::Session).unwrap();
+    session
+        .approve(&call, true, Remember::Session)
+        .await
+        .unwrap();
     reply.await.unwrap().unwrap();
     session.checkout(root).await.unwrap();
     let reply = session.submit(input("sibling branch"));
     let call = wait_for_ask(&mut rx).await;
     assert_eq!(call.0, "sibling");
-    session.approve(&call, false, Remember::Once).unwrap();
+    session.approve(&call, false, Remember::Once).await.unwrap();
     reply.await.unwrap().unwrap();
 }
 
@@ -2883,11 +3086,11 @@ async fn remembered_scopes_reject_taint_asks_without_consuming_them() {
     let call = wait_for_ask(&mut rx).await;
     for remember in [Remember::Session, Remember::Workspace] {
         assert!(matches!(
-            session.approve(&call, true, remember),
+            session.approve(&call, true, remember).await,
             Err(xi_kernel::Error::InvalidRemember(_))
         ));
     }
-    session.approve(&call, true, Remember::Once).unwrap();
+    session.approve(&call, true, Remember::Once).await.unwrap();
     reply.await.unwrap().unwrap();
     assert!(session.info().await.events.iter().any(|event| matches!(
         &event.kind,
@@ -2913,12 +3116,12 @@ async fn remembered_denials_and_untrusted_workspace_scopes_leave_the_ask_pending
         (true, Remember::Workspace),
     ] {
         assert!(matches!(
-            session.approve(&call, approved, remember),
+            session.approve(&call, approved, remember).await,
             Err(xi_kernel::Error::InvalidRemember(_))
         ));
     }
     assert!(!fixture.workspace.join(".xi/config.local.toml").exists());
-    session.approve(&call, false, Remember::Once).unwrap();
+    session.approve(&call, false, Remember::Once).await.unwrap();
     reply.await.unwrap().unwrap();
     assert!(session.info().await.events.iter().any(|event| matches!(
         event.kind,
@@ -2948,7 +3151,10 @@ async fn workspace_grant_appends_an_exact_rule_and_fresh_sessions_use_policy() {
         fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
     let reply = session.submit(input("remember here"));
     let asked = wait_for_ask(&mut rx).await;
-    session.approve(&asked, true, Remember::Workspace).unwrap();
+    session
+        .approve(&asked, true, Remember::Workspace)
+        .await
+        .unwrap();
     reply.await.unwrap().unwrap();
     let text = std::fs::read_to_string(&local).unwrap();
     assert!(text.starts_with(&format!("{original}\n")));
@@ -3031,10 +3237,10 @@ async fn workspace_rule_write_failure_keeps_the_ask_pending() {
     let call = wait_for_ask(&mut rx).await;
     std::fs::create_dir_all(fixture.workspace.join(".xi/config.local.toml")).unwrap();
     assert!(matches!(
-        session.approve(&call, true, Remember::Workspace),
+        session.approve(&call, true, Remember::Workspace).await,
         Err(xi_kernel::Error::Io(_))
     ));
-    session.approve(&call, true, Remember::Once).unwrap();
+    session.approve(&call, true, Remember::Once).await.unwrap();
     reply.await.unwrap().unwrap();
 }
 
@@ -3054,12 +3260,15 @@ async fn a_clean_network_grant_cannot_bypass_taint_on_a_later_ask() {
         fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
     let reply = session.submit(input("clean grant"));
     let call = wait_for_ask(&mut rx).await;
-    session.approve(&call, true, Remember::Session).unwrap();
+    session
+        .approve(&call, true, Remember::Session)
+        .await
+        .unwrap();
     reply.await.unwrap().unwrap();
     let reply = session.submit(input("tainted branch"));
     let call = wait_for_ask(&mut rx).await;
     assert_eq!(call.0, "dirty");
-    session.approve(&call, false, Remember::Once).unwrap();
+    session.approve(&call, false, Remember::Once).await.unwrap();
     reply.await.unwrap().unwrap();
 }
 
@@ -3075,7 +3284,10 @@ async fn workspace_grants_create_a_missing_local_config() {
         fixture.session(script, FakeTool { gate: None }, TurnOptions::default());
     let reply = session.submit(input("remember here"));
     let call = wait_for_ask(&mut rx).await;
-    session.approve(&call, true, Remember::Workspace).unwrap();
+    session
+        .approve(&call, true, Remember::Workspace)
+        .await
+        .unwrap();
     reply.await.unwrap().unwrap();
     let config = fixture.config();
     assert!(fixture.workspace.join(".xi/config.local.toml").is_file());

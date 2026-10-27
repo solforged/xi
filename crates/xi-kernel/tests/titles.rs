@@ -269,7 +269,11 @@ async fn titles_come_from_the_prompt_then_once_from_the_first_turn() {
         .await
         .unwrap();
     let path = session.info().await.path;
-    drop(session);
+    {
+        session.close();
+        session.wait_idle().await;
+        drop(session);
+    };
     let reopened = Session::from_log(
         xi_session::SessionLog::open(&path).unwrap(),
         fixture.config(),

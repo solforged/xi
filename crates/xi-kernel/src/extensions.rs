@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -21,6 +21,13 @@ use xi_protocol::{ExtensionId, SessionId, ToolOutput};
 use crate::{Error, Result, config::Config, egress};
 
 type Reply = oneshot::Sender<Result<Value>>;
+
+/// Locks extension bookkeeping even if an earlier holder panicked.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// What a session services for its extensions while it waits.
 pub(crate) enum Incoming {
@@ -61,10 +68,7 @@ pub(crate) struct Scope {
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        self.routes
-            .lock()
-            .expect("extension routes")
-            .remove(&self.session);
+        lock(&self.routes).remove(&self.session);
     }
 }
 
@@ -113,7 +117,7 @@ impl ExtensionHost {
     ) -> Result<(Extensions, bool)> {
         let _loading = self.loading.lock().await;
         if self.closed.load(Ordering::Relaxed) {
-            return Err(Error::Config("session extension host closed".into()));
+            return Err(Error::Extension("session extension host closed".into()));
         }
         let mut selected = Vec::new();
         let mut complete = true;
@@ -150,12 +154,7 @@ impl ExtensionHost {
             let key = (self.session, config.workspace.clone(), root.clone());
             // A peer stops when it crashes or when a cancelled invocation
             // retires it; the next load starts a fresh process.
-            let cached = self
-                .peers
-                .lock()
-                .expect("extension peers")
-                .get(&key)
-                .cloned();
+            let cached = lock(&self.peers).get(&key).cloned();
             let peer = match cached {
                 Some(peer) if !peer.stop.is_cancelled() => peer,
                 _ => {
@@ -177,14 +176,11 @@ impl ExtensionHost {
                         }
                         Err(error) => return Err(error),
                     };
-                    let mut peers = self.peers.lock().expect("extension peers");
+                    let mut peers = lock(&self.peers);
                     if self.closed.load(Ordering::Relaxed) {
                         peer.stop.cancel();
-                        self.reaping
-                            .lock()
-                            .expect("extension exits")
-                            .push(peer.exited.clone());
-                        return Err(Error::Config("session extension host closed".into()));
+                        lock(&self.reaping).push(peer.exited.clone());
+                        return Err(Error::Extension("session extension host closed".into()));
                     }
                     peers.insert(key, peer.clone());
                     peer
@@ -231,10 +227,7 @@ impl ExtensionHost {
                 .collect(),
             sender,
         };
-        self.routes
-            .lock()
-            .expect("extension routes")
-            .insert(self.session, route);
+        lock(&self.routes).insert(self.session, route);
         Scope {
             session: self.session,
             routes: self.routes.clone(),
@@ -244,28 +237,22 @@ impl ExtensionHost {
 
     /// Evicts the session's peers and immediately stops their process groups.
     pub(crate) fn close(&self) {
-        let mut peers = self.peers.lock().expect("extension peers");
+        let mut peers = lock(&self.peers);
         self.closed.store(true, Ordering::Relaxed);
-        let mut reaping = self.reaping.lock().expect("extension exits");
+        let mut reaping = lock(&self.reaping);
         for (_, peer) in peers.drain() {
             peer.wire.closing.store(true, Ordering::Relaxed);
             peer.stop.cancel();
             reaping.push(peer.exited.clone());
         }
-        self.routes.lock().expect("extension routes").clear();
+        lock(&self.routes).clear();
     }
 
     /// Requests shutdown, then terminates each process group and reaps it.
     pub(crate) async fn shutdown(&self) {
         self.closed.store(true, Ordering::Relaxed);
         let _loading = self.loading.lock().await;
-        let peers: Vec<_> = self
-            .peers
-            .lock()
-            .expect("extension peers")
-            .drain()
-            .map(|(_, p)| p)
-            .collect();
+        let peers: Vec<_> = lock(&self.peers).drain().map(|(_, p)| p).collect();
         futures::future::join_all(peers.iter().map(|peer| async move {
             peer.wire.closing.store(true, Ordering::Relaxed);
             let _ = tokio::time::timeout(
@@ -277,9 +264,9 @@ impl ExtensionHost {
             peer.exited.cancelled().await;
         }))
         .await;
-        let reaping = std::mem::take(&mut *self.reaping.lock().expect("extension exits"));
+        let reaping = std::mem::take(&mut *lock(&self.reaping));
         futures::future::join_all(reaping.iter().map(CancellationToken::cancelled)).await;
-        self.routes.lock().expect("extension routes").clear();
+        lock(&self.routes).clear();
     }
 }
 
@@ -327,7 +314,7 @@ impl Extensions {
                     .iter()
                     .any(|tool| tool.name == params.tool)
             })
-            .ok_or_else(|| Error::Config(format!("unknown extension tool {}", params.tool)))?;
+            .ok_or_else(|| Error::Extension(format!("unknown extension tool {}", params.tool)))?;
         peer.request::<ToolInvoke>(params, cancel).await
     }
 
@@ -364,6 +351,8 @@ impl Extensions {
             if !peer.registration.hooks.contains(&point) {
                 continue;
             }
+            // Each peer sees prior rewrites, so the owned request needs the
+            // current event rather than one serialization shared by all peers.
             let outcome = peer
                 .request::<HookRun>(
                     &HookParams {
@@ -389,7 +378,7 @@ impl Extensions {
                 }
                 (HookEvent::Compact { .. }, HookOutcome::ReplaceSummary { .. }) => {}
                 _ => {
-                    return Err(Error::Config(format!(
+                    return Err(Error::Extension(format!(
                         "extension {} returned an invalid outcome for {point:?}",
                         peer.manifest.name
                     )));
@@ -455,21 +444,19 @@ impl Wire {
     async fn send(&self, message: Message) -> Result<()> {
         let result = tokio::select! {
             biased;
-            () = self.stop.cancelled() => return Err(Error::Config("extension connection closed".into())),
+            () = self.stop.cancelled() => return Err(Error::Extension("extension connection closed".into())),
             result = self.sender.send(message) => result,
         };
         result.map_err(|_| {
-            Error::Config(
-                self.failure
-                    .lock()
-                    .expect("peer failure")
+            Error::Extension(
+                lock(&self.failure)
                     .clone()
                     .unwrap_or_else(|| "extension connection closed".into()),
             )
         })
     }
     fn fail(&self, message: String) {
-        let mut failure = self.failure.lock().expect("peer failure");
+        let mut failure = lock(&self.failure);
         if failure.is_some() {
             return;
         }
@@ -478,12 +465,12 @@ impl Wire {
             eprintln!("xi: {message}");
         }
         *failure = Some(message.clone());
-        for (_, reply) in self.pending.lock().expect("pending RPC").drain() {
-            let _ = reply.send(Err(Error::Config(message.clone())));
+        for (_, reply) in lock(&self.pending).drain() {
+            let _ = reply.send(Err(Error::Extension(message.clone())));
         }
     }
     fn log(&self, message: &str) {
-        let _ = writeln!(self.log.lock().expect("extension log"), "{message}");
+        let _ = writeln!(lock(&self.log), "{message}");
     }
 }
 
@@ -522,7 +509,7 @@ impl Peer {
                 Some(name.clone()),
                 Some(hosts),
                 Box::new(move |connect| {
-                    let routes = routes.lock().expect("extension routes");
+                    let routes = lock(&routes);
                     let Some(route) = routes
                         .get(&session)
                         .filter(|route| route.peers.contains(&extension))
@@ -683,12 +670,13 @@ impl Peer {
                 match message {
                     Message::Response(response) => {
                         if let Some(id) = &response.id
-                            && let Some(reply) =
-                                reader_wire.pending.lock().expect("pending RPC").remove(id)
+                            && let Some(reply) = lock(&reader_wire.pending).remove(id)
                         {
                             let result = match response.outcome {
                                 rpc::Outcome::Ok(value) => Ok(value),
-                                rpc::Outcome::Err(error) => Err(Error::Config(error.to_string())),
+                                rpc::Outcome::Err(error) => {
+                                    Err(Error::Extension(error.to_string()))
+                                }
                             };
                             let _ = reply.send(result);
                         }
@@ -729,7 +717,9 @@ impl Peer {
                             let _permit = permit;
                             let result = match routed {
                                 Ok(reply) => reply.await.unwrap_or_else(|_| {
-                                    Err(Error::Config("session extension request cancelled".into()))
+                                    Err(Error::Extension(
+                                        "session extension request cancelled".into(),
+                                    ))
                                 }),
                                 Err(error) => Err(error),
                             };
@@ -800,7 +790,7 @@ impl Peer {
             }
             Err(_) => {
                 peer.stop.cancel();
-                return Err(Error::Config(format!(
+                return Err(Error::Extension(format!(
                     "extension {name} initialize timed out"
                 )));
             }
@@ -817,15 +807,11 @@ impl Peer {
         let request = rpc::Request::new::<M>(id.clone(), params)?;
         let (reply, receiver) = oneshot::channel();
         {
-            let failure = self.wire.failure.lock().expect("peer failure");
+            let failure = lock(&self.wire.failure);
             if let Some(error) = &*failure {
-                return Err(Error::Config(error.clone()));
+                return Err(Error::Extension(error.clone()));
             }
-            self.wire
-                .pending
-                .lock()
-                .expect("pending RPC")
-                .insert(id.clone(), reply);
+            lock(&self.wire.pending).insert(id.clone(), reply);
         }
         let guard = Pending {
             id: id.clone(),
@@ -838,15 +824,15 @@ impl Peer {
                 // A process may ignore cooperative cancellation. Retire it so
                 // no cancelled invocation continues changing the workspace.
                 self.stop.cancel();
-                return Err(Error::Config("extension invocation cancelled".into()));
+                return Err(Error::Extension("extension invocation cancelled".into()));
             }
             result = async {
                 self.wire.send(Message::Request(request)).await?;
-                receiver.await.map_err(|_| Error::Config("extension response channel closed".into()))?
+                receiver.await.map_err(|_| Error::Extension("extension response channel closed".into()))?
             } => result?,
         };
         drop(guard);
-        Ok(serde_json::from_value(value)?)
+        serde_json::from_value(value).map_err(|error| Error::Extension(error.to_string()))
     }
 }
 
@@ -862,11 +848,7 @@ struct Pending<'a> {
 }
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        self.wire
-            .pending
-            .lock()
-            .expect("pending RPC")
-            .remove(&self.id);
+        lock(&self.wire.pending).remove(&self.id);
     }
 }
 
@@ -906,19 +888,20 @@ fn route(
 ) -> Result<oneshot::Receiver<Result<Value>>> {
     let (reply, receiver) = oneshot::channel();
     if request.method == "log" {
-        let params: LogParams = serde_json::from_value(request.params)?;
+        let params: LogParams = serde_json::from_value(request.params)
+            .map_err(|error| Error::Extension(error.to_string()))?;
         wire.log(&format!("{:?}: {}", params.level, params.message));
         let _ = reply.send(Ok(Value::Null));
         return Ok(receiver);
     }
     if request.method != AppendCustom::METHOD && request.method != AgentRun::METHOD {
-        return Err(Error::Config(format!(
+        return Err(Error::Extension(format!(
             "unknown extension request {}",
             request.method
         )));
     }
     if request.method == AgentRun::METHOD && !subagents {
-        return Err(Error::Config(format!(
+        return Err(Error::Extension(format!(
             "extension {extension} requires the subagents capability for agent/run"
         )));
     }
@@ -928,17 +911,18 @@ fn route(
             .get("session")
             .cloned()
             .unwrap_or(Value::Null),
-    )?;
+    )
+    .map_err(|error| Error::Extension(error.to_string()))?;
     if session != bound_session {
-        return Err(Error::Config(
+        return Err(Error::Extension(
             "extension request names a different session".into(),
         ));
     }
-    let routes = routes.lock().expect("extension routes");
+    let routes = lock(routes);
     let route = routes
         .get(&session)
         .filter(|route| route.peers.contains(&extension))
-        .ok_or_else(|| Error::Config("session is not serving this extension".into()))?;
+        .ok_or_else(|| Error::Extension("session is not serving this extension".into()))?;
     route
         .sender
         .send(Incoming::Request {
@@ -946,6 +930,6 @@ fn route(
             request,
             reply,
         })
-        .map_err(|_| Error::Config("session extension scope closed".into()))?;
+        .map_err(|_| Error::Extension("session extension scope closed".into()))?;
     Ok(receiver)
 }

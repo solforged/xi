@@ -92,20 +92,14 @@ impl Session {
     }
 
     async fn deliver(&self, update: Update) -> Result<()> {
-        {
-            let mut control = self.0.control.lock().expect("control lock");
-            if control.running {
-                control.titles.push(update);
-                return Ok(());
-            }
-        }
-        let mut state = self.0.state.lock().await;
-        self.apply_title(&mut state, update)
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.idle_operation(super::actor::IdleCommand::Title(update, reply), rx)
+            .await
     }
 
     /// Appends titles that arrived while a turn held the log.
-    pub(crate) fn apply_titles(&self, state: &mut State) -> Result<()> {
-        let updates = std::mem::take(&mut self.0.control.lock().expect("control lock").titles);
+    pub(crate) async fn apply_titles(&self, state: &mut State) -> Result<()> {
+        let updates = self.title_updates().await;
         updates
             .into_iter()
             .try_for_each(|update| self.apply_title(state, update))

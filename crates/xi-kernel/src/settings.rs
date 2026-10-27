@@ -164,7 +164,7 @@ pub fn set_global(paths: &Paths, key: &str, value: &Value) -> Result<()> {
     file.write_all(text.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(&path)
-        .map_err(|error| Error::Io(error.error))?;
+        .map_err(|error| Error::from(error.error))?;
     Ok(())
 }
 

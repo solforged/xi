@@ -256,7 +256,7 @@ fn kept_start(events: &[&Event], budget: u64) -> Result<usize> {
         size = size.saturating_add(event_chars(event));
     }
     if !pending.is_empty() {
-        return Err(Error::Config("cannot compact pending tool calls".into()));
+        return Err(Error::Operation("cannot compact pending tool calls".into()));
     }
     if budget == 0 {
         return Ok(events.len());
@@ -271,22 +271,29 @@ fn kept_start(events: &[&Event], budget: u64) -> Result<usize> {
 impl Session {
     /// Compacts an idle session, even when automatic compaction is disabled.
     pub async fn compact(&self) -> Result<CompactResult> {
-        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
-        let cancel = {
-            let mut control = self.0.control.lock().expect("control lock");
-            if control.running {
-                return Err(Error::Running);
-            }
-            control.cancel = CancellationToken::new();
-            control.cancel.clone()
-        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.idle_operation(super::actor::IdleCommand::Compact(reply), rx)
+            .await
+    }
+
+    pub(crate) async fn compact_state(
+        &self,
+        state: &mut State,
+        cancel: &CancellationToken,
+    ) -> Result<CompactResult> {
         if state.backend.is_none() {
-            state.backend = Some(Backend::connect(&state.config)?.into());
+            let config = state.config.clone();
+            state.backend = Some(
+                tokio::task::spawn_blocking(move || Backend::connect(&config))
+                    .await
+                    .map_err(|_| Error::Stopped)??
+                    .into(),
+            );
         }
-        self.compact_at_boundary(&mut state, &cancel)
+        self.compact_at_boundary(state, cancel)
             .await?
             .ok_or_else(|| {
-                Error::Config(
+                Error::Operation(
                     if cancel.is_cancelled() {
                         "compaction cancelled"
                     } else {
@@ -365,7 +372,7 @@ impl Session {
                 return Ok(None);
             }
             if response.stop != xi_protocol::event::StopReason::EndTurn {
-                return Err(Error::Config("compaction summary did not finish".into()));
+                return Err(Error::Operation("compaction summary did not finish".into()));
             }
             let summary: String = response
                 .content
@@ -378,7 +385,7 @@ impl Session {
             (summary, Some(response.usage))
         };
         if summary.trim().is_empty() {
-            return Err(Error::Config("compaction summary is empty".into()));
+            return Err(Error::Operation("compaction summary is empty".into()));
         }
         if cancel.is_cancelled() {
             return Ok(None);
