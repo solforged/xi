@@ -12,12 +12,13 @@ use xi_kernel::compaction::Trigger;
 use xi_kernel::config::{Config, DaemonSettings, Paths, daemon_settings, sessions_root};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Leaser, Notification, Session, TurnOptions};
 use xi_policy::{Action, Taint};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{Approver, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::{ModelInfo, ModelRole, Reasoning};
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, ToolCallId, ToolOutput};
-use xi_provider::{BoxFuture, Error, ErrorKind, Message, Provider, Request, Response};
+use xi_provider::{Error, ErrorKind, Message, Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 struct Gate {

@@ -19,9 +19,15 @@ pub mod rpc;
 pub mod runtime;
 pub mod skill;
 
+use std::pin::Pin;
+
 pub use content::{Block, OutputBlock, ToolOutput};
 pub use event::{Decision, Event, EventKind, Remember};
 pub use ids::{EventId, ExtensionId, SessionId, Timestamp, ToolCallId};
 
 /// Protocol version spoken by this crate. Version 0 makes no compatibility promises.
 pub const PROTOCOL_VERSION: u32 = 0;
+
+/// A boxed, sendable future, the return type of the object-safe async
+/// traits (`Provider`, `Tool`, `Spawner`) that span crates.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

@@ -18,11 +18,12 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use xi_client::client::ClientNotification;
 use xi_kernel::config::{Config, Paths};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::{CreateParams, Delta};
 use xi_protocol::{Block, OutputBlock, ToolCallId, ToolOutput};
-use xi_provider::{BoxFuture, Error, ErrorKind, Provider, Request, Response};
+use xi_provider::{Error, ErrorKind, Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 struct Turn {

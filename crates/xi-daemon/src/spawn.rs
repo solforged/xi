@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use tokio::io::{AsyncRead, AsyncWrite};
 use xi_kernel::config::Paths;
+use xi_protocol::BoxFuture;
 
 /// Creates a worker's transport and lifetime controls.
 pub trait Spawner: Send + Sync {

@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use xi_kernel::Backend;
 use xi_kernel::config::Paths;
 use xi_kernel::worker::{WorkerSetup, run};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{ModelRef, Remember, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::{
@@ -25,7 +26,7 @@ use xi_protocol::methods::worker::{LeaseParams, WorkerStart, WorkerStartParams};
 use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestMethod, RpcError};
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput};
-use xi_provider::{BoxFuture, Error, ErrorKind, Provider, Request, Response};
+use xi_provider::{Error, ErrorKind, Provider, Request, Response};
 use xi_rpc::{Incoming, Peer, PeerError};
 use xi_tools::{Context, Crossing, Ran, Tool};
 

@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xi_policy::{Action, ActionKind, Taint};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{Approver, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, ResetParams};
 use xi_protocol::model::{ModelInfo, ModelSelector, Reasoning};

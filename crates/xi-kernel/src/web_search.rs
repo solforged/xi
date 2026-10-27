@@ -14,12 +14,13 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{ModelRef, StopReason};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::model::Reasoning;
 use xi_protocol::{Block, OutputBlock, ToolCallId, ToolOutput};
 use xi_provider::{Api, ExaResult, Message, Request, WebResults};
-use xi_tools::{BoxFuture, Context, Crossing, Ran, Tool};
+use xi_tools::{Context, Crossing, Ran, Tool};
 
 use crate::config::{Config, SearchBackend};
 use crate::{Session, State, error_output};

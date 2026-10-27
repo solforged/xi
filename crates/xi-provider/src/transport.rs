@@ -5,9 +5,11 @@ use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
+use xi_protocol::BoxFuture;
+
 use crate::{
-    Api, Auth, BoxFuture, Compat, Delta, Error, ErrorKind, LoginService, Provider, ProviderConfig,
-    Reasoning, Request, Response,
+    Api, Auth, Compat, Delta, Error, ErrorKind, LoginService, Provider, ProviderConfig, Reasoning,
+    Request, Response,
 };
 
 /// Adds a provider's credential to each request.

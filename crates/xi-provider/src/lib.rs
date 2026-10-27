@@ -46,11 +46,11 @@ use std::time::Duration;
 
 pub use anthropic_login::{Login as AnthropicLogin, anthropic_file};
 pub use chatgpt::{Account, Login, chatgpt_file};
-pub use futures::future::BoxFuture;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 pub use web::{EXA_HOST, ExaResult, Source, WebResults, exa_search, web_results};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;

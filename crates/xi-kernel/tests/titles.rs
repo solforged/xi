@@ -10,12 +10,13 @@ use tempfile::TempDir;
 use tokio::sync::{Notify, Semaphore};
 use xi_kernel::config::{Config, Paths};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Notification, Session, TurnOptions};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{StopReason, TitleSource, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::{Block, Event, EventKind, OutputBlock, ToolCallId, ToolOutput};
-use xi_provider::{BoxFuture, Error, Message, Provider, Request, Response};
+use xi_provider::{Error, Message, Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 /// Answers title requests from `titles` and the agent loop from `main`.

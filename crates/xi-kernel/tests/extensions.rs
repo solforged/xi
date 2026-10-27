@@ -8,11 +8,12 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use xi_kernel::config::{Config, Paths};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Session, TurnOptions};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{Approver, StopReason, Usage};
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::ModelInfo;
 use xi_protocol::{Block, Decision, EventKind, OutputBlock};
-use xi_provider::{BoxFuture, Provider, Request, Response};
+use xi_provider::{Provider, Request, Response};
 
 struct Fake {
     input: Value,
