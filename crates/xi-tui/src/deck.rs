@@ -2,7 +2,8 @@
 //!
 //! The log keeps the sheet at the left: retained rows from the top, the
 //! composer against the bottom. A side panel on the raised surface takes
-//! every column beside it: the session's title, what waits on you, its
+//! at most [`PANEL_MAX`] columns against the right edge, and the log takes
+//! every column left of it: the session's title, what waits on you, its
 //! context, what changed and its running agents while nothing has the keys; the
 //! selected log row while you walk the log; every session while you pick
 //! one. Without room for the panel, a header row carries the session's facts
@@ -11,7 +12,7 @@
 use unicode_width::UnicodeWidthChar;
 
 use crate::icons::{Icon, Icons};
-use crate::layout::{PANEL_MIN, SHEET};
+use crate::layout::{PANEL_MAX, PANEL_MIN, SHEET};
 use crate::log::Inspect;
 use crate::style::{Line, Role, Span, lr, wrap};
 use crate::transcript::{counted, tokens};
@@ -145,9 +146,9 @@ pub struct Panel<'a> {
     pub sessions: SessionsPane,
     /// Context occupancy and cache.
     pub context: ContextGauge,
-    /// The workspace and branch, at the panel's foot.
+    /// The workspace and branch, on the shared footer baseline.
     pub place: Line,
-    /// Approvals, sandbox, trust, taint and running agents, under `place`.
+    /// Approvals, sandbox, trust, taint and running agents, at the panel's foot.
     pub facts: Line,
     /// Which glyphs mark sessions, asks and tools.
     pub icons: Icons,
@@ -186,15 +187,19 @@ pub struct Columns {
     pub panel: Option<usize>,
 }
 
-/// Measures the columns: the sheet and the panel beside it when at least
-/// [`PANEL_MIN`] columns are left, else the log alone.
+/// Measures the columns. Once at least [`PANEL_MIN`] columns remain beside
+/// the sheet, a side panel sits against the right edge, no wider than
+/// [`PANEL_MAX`], and the log takes the rest. Otherwise the log takes the
+/// terminal.
 #[must_use]
 pub fn columns(cols: usize) -> Columns {
-    let log = SHEET + 2;
-    if cols > log + PANEL_MIN {
+    let sheet = SHEET + 2;
+    let room = cols.saturating_sub(sheet + 1);
+    if room >= PANEL_MIN {
+        let panel = room.min(PANEL_MAX);
         Columns {
-            log,
-            panel: Some(cols - log - 1),
+            log: cols - panel - 1,
+            panel: Some(panel),
         }
     } else {
         Columns {
@@ -214,25 +219,37 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
     let Some(panel) = columns.panel else {
         return folded(scene, cols, rows);
     };
+    // Both panes end above one unraised workspace / navigation baseline.
+    let body = rows - 1;
     // A blank row above the log, when there is room, matches the panel's.
-    let top = usize::from(rows >= 8);
-    let (log, cursor) = log_rows(&scene.log, columns.log - 2, rows - top);
+    let top = usize::from(body >= 8);
+    let (log, cursor) = log_rows(&scene.log, columns.log - 2, body - top);
     let rule = if scene.surfaces {
         Line::default().ink(" ")
     } else {
         Line::default().dim("│")
     };
-    let out = blank(top)
+    let mut out: Vec<Line> = blank(top)
         .into_iter()
         .chain(log)
-        .zip(panel_column(scene, panel, rows))
+        .zip(panel_column(scene, panel, body))
         .map(|(log, side)| {
-            pad(log, columns.log)
-                .extend(rule.clone())
-                .extend(side)
-                .truncate(cols)
+            // The panel is the last columns; pad only if a row came up short.
+            pad(
+                pad(log, columns.log).extend(rule.clone()).extend(side),
+                cols,
+            )
         })
         .collect();
+    let place = Line::default().ink("    ").extend(elide_left(
+        scene.panel.place.clone(),
+        columns.log.saturating_sub(5),
+    ));
+    let keys = Line::default()
+        .ink(" ".repeat(PANEL_PAD))
+        .ink("alt+1")
+        .dim(" sessions");
+    out.push(pad(pad(place, columns.log).ink(" ").extend(keys), cols));
     (out, cursor.map(|(row, col)| (top + row, col + 1)))
 }
 
@@ -539,17 +556,10 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
             top.push(Line::default().dim(format!("… {} more", panel.agents.len() - AGENT_ROWS)));
         }
     }
-    let foot: Vec<Line> = [
-        lr(
-            elide_left(panel.place.clone(), w.saturating_sub(16)),
-            Line::default().dim("alt+1 sessions"),
-            w,
-        ),
-        panel.facts.clone().truncate(w),
-    ]
-    .into_iter()
-    .filter(|line| !line.plain().trim().is_empty())
-    .collect();
+    let foot: Vec<Line> = [panel.facts.clone().truncate(w)]
+        .into_iter()
+        .filter(|line| !line.plain().trim().is_empty())
+        .collect();
     // The foot keeps its rows; the sections above it are cut first, with
     // a gap between the two.
     let foot = &foot[foot.len().saturating_sub(height)..];
@@ -944,7 +954,7 @@ mod tests {
                     place: Line::default()
                         .dim("~/src/")
                         .ink("xi")
-                        .dim(":")
+                        .dim("  ")
                         .ink("main*"),
                     facts: Line::default().dim("ask · sandboxed · trusted"),
                     icons: Icons::Unicode,
@@ -961,26 +971,43 @@ mod tests {
 
     /// The panel's text: what follows the log, the rule and the panel's
     /// margin.
-    fn side(text: &[String]) -> Vec<String> {
+    fn side(text: &[String], cols: usize) -> Vec<String> {
+        let skip = columns(cols).log + 1 + PANEL_PAD;
         text.iter()
-            .map(|line| line.chars().skip(123 + PANEL_PAD).collect::<String>())
+            .map(|line| line.chars().skip(skip).collect::<String>())
             .collect()
     }
 
     #[test]
-    fn the_panel_takes_every_column_beside_the_sheet_once_it_fits() {
+    fn the_panel_stays_at_its_max_against_the_right_edge() {
         assert_eq!(
             columns(250),
             Columns {
+                log: 250 - 1 - PANEL_MAX,
+                panel: Some(PANEL_MAX)
+            }
+        );
+        assert_eq!(
+            columns(SHEET + 2 + 1 + PANEL_MAX),
+            Columns {
+                log: SHEET + 2,
+                panel: Some(PANEL_MAX)
+            }
+        );
+        // Between the minimum and the maximum the panel still takes the room
+        // and the log stays on the sheet.
+        assert_eq!(
+            columns(176),
+            Columns {
                 log: 122,
-                panel: Some(127)
+                panel: Some(53)
             }
         );
         assert_eq!(
             columns(159),
             Columns {
                 log: 122,
-                panel: Some(36)
+                panel: Some(PANEL_MIN)
             }
         );
         assert_eq!(
@@ -993,7 +1020,49 @@ mod tests {
         for cols in 0..400 {
             let c = columns(cols);
             assert_eq!(c.log + c.panel.map_or(0, |panel| panel + 1), cols);
+            if let Some(panel) = c.panel {
+                assert!(c.log >= SHEET + 2);
+                assert!((PANEL_MIN..=PANEL_MAX).contains(&panel), "{cols}");
+                assert_eq!(panel, (cols - (SHEET + 2) - 1).min(PANEL_MAX));
+                assert_eq!(c.log, cols - panel - 1);
+            } else {
+                assert_eq!(c.log, cols);
+            }
         }
+    }
+
+    #[test]
+    fn a_wide_terminal_keeps_the_panel_against_the_right_edge() {
+        let fixture = Fixture::new();
+        let scene = fixture.scene();
+        let cols = 250;
+        let (lines, _) = render(&scene, cols, 40);
+        let measured = columns(cols);
+        let start = measured.log + 1;
+        assert_eq!(measured.panel, Some(PANEL_MAX));
+        assert_eq!(start + PANEL_MAX, cols);
+        assert!(lines.iter().all(|line| line.width() == cols));
+        for line in &lines[..lines.len() - 1] {
+            let mut raised = Vec::new();
+            for span in &line.0 {
+                raised.extend(std::iter::repeat_n(span.raised, span.text.chars().count()));
+            }
+            assert_eq!(raised.len(), cols, "{}", line.plain());
+            assert!(raised[start..].iter().all(|r| *r), "{}", line.plain());
+            assert!(!raised[measured.log]);
+        }
+        // A raised prompt fills the log, so the composer meets the panel.
+        let prompt = lines
+            .iter()
+            .find(|line| line.plain().contains("route sandboxed"))
+            .unwrap();
+        let raised = prompt
+            .0
+            .iter()
+            .filter(|span| span.raised)
+            .map(|span| span.text.chars().count())
+            .sum::<usize>();
+        assert!(raised >= measured.log - 1, "{}", prompt.plain());
     }
 
     #[test]
@@ -1004,9 +1073,9 @@ mod tests {
             let (lines, cursor) = render(&scene, cols, 40);
             assert_eq!(lines.len(), 40);
             assert!(lines.iter().all(|line| line.width() == cols));
-            // The dock's draft row sits four rows above the status row.
-            assert_eq!(cursor, Some((36, 8)));
-            let side = side(&plain(&lines));
+            // The dock stays above the shared footer.
+            assert_eq!(cursor, Some((35, 8)));
+            let side = side(&plain(&lines), cols);
             assert_eq!(side[0].trim_end(), "");
             assert_eq!(
                 side[1].trim_end(),
@@ -1044,10 +1113,12 @@ mod tests {
             assert!(!side.iter().any(|line| line.contains("Port footer")));
             // The newest tool row stays in the log and the inspector.
             assert!(!side.iter().any(|line| line.contains("edit ×5")));
-            assert!(side[37].starts_with("~/src/xi:main*"));
-            assert!(side[37].trim_end().ends_with("alt+1 sessions"));
-            assert_eq!(side[38].trim_end(), "ask · sandboxed · trusted");
-            assert_eq!(side[39].trim_end(), "");
+            assert_eq!(side[37].trim_end(), "ask · sandboxed · trusted");
+            assert_eq!(side[38].trim_end(), "");
+            assert_eq!(side[39].trim_end(), "alt+1 sessions");
+            assert!(lines[39].plain().starts_with("    ~/src/xi  main*"));
+            assert!(lines[39].0.iter().all(|span| !span.raised));
+            assert!(!side.iter().any(|line| line.contains("~/src/xi")));
         }
     }
 
@@ -1056,7 +1127,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut scene = fixture.scene();
         let (lines, _) = render(&scene, 176, 40);
-        for line in &lines {
+        for line in &lines[..lines.len() - 1] {
             let (mut col, mut raised) = (0, Vec::new());
             for span in &line.0 {
                 raised.extend(std::iter::repeat_n(span.raised, span.text.chars().count()));
@@ -1085,7 +1156,12 @@ mod tests {
         assert_eq!(text[0].chars().nth(122), Some(' '));
         scene.surfaces = false;
         let text = plain(&render(&scene, 176, 40).0);
-        assert!(text.iter().all(|line| line.chars().nth(122) == Some('│')));
+        assert!(
+            text[..text.len() - 1]
+                .iter()
+                .all(|line| line.chars().nth(122) == Some('│'))
+        );
+        assert_eq!(text.last().unwrap().chars().nth(122), Some(' '));
     }
 
     #[test]
@@ -1115,9 +1191,8 @@ mod tests {
         let scene = fixture.scene();
         let text = plain(&overview(&scene, 60, 12));
         assert_eq!(text.len(), 12);
-        assert_eq!(text[8], "…");
-        assert_eq!(text[9], "");
-        assert!(text[10].starts_with("~/src/xi:main*"));
+        assert_eq!(text[9], "…");
+        assert_eq!(text[10], "");
         assert_eq!(text[11], "ask · sandboxed · trusted");
         assert_eq!(
             plain(&overview(&scene, 60, 1)),
@@ -1237,7 +1312,7 @@ mod tests {
         );
         scene.focus = Focus::Log;
         let text = plain(&render(&scene, 176, 36).0);
-        assert!(text[34].trim_end().ends_with("esc back"));
+        assert!(text[33].trim_end().ends_with("esc back"));
     }
 
     #[test]
@@ -1369,7 +1444,7 @@ mod tests {
         scene.focus = Focus::Log;
         let text = plain(&render(&scene, 200, 30).0);
         assert!(text[1].contains("   edit ×5 crates/xi-tools/src/bash.rs"));
-        assert!(text[28].trim_end().ends_with("esc back"));
+        assert!(text[27].trim_end().ends_with("esc back"));
         scene.focus = Focus::Sessions;
         scene.panel.sessions.selected = 4;
         let (lines, cursor) = render(&scene, 200, 30);
@@ -1379,7 +1454,7 @@ mod tests {
                 .any(|line| line.contains("   › · ledger · Fix export offsets"))
         );
         assert!(text.iter().any(|line| line.contains("   Other workspaces")));
-        assert_eq!(cursor, Some((26, 8)));
+        assert_eq!(cursor, Some((25, 8)));
         let (folded, cursor) = render(&scene, 120, 30);
         let text = plain(&folded);
         assert!(text[0].ends_with("think xhigh · ctx 11% · cache 94%"));

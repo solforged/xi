@@ -34,6 +34,14 @@ const NAME_WIDTH: usize = 6;
 /// two spaces. Diffs and output hang under the argument.
 const ARG_COLUMN: usize = 2 + NAME_WIDTH + 2;
 
+/// Where in-flight output is drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveView {
+    Inline,
+    Log,
+    Frame,
+}
+
 /// How visible model reasoning is displayed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Thinking {
@@ -68,7 +76,7 @@ impl Thinking {
         }
     }
 
-    fn live_rows(self, text: &str, m: Measure) -> Vec<Line> {
+    fn live_rows(self, text: &str, m: Measure, limit: usize) -> Vec<Line> {
         if text.trim().is_empty() {
             return Vec::new();
         }
@@ -76,7 +84,7 @@ impl Thinking {
             Self::Hidden => Vec::new(),
             Self::Full => {
                 let rows = thought(text, m);
-                let skip = rows.len().saturating_sub(m.stream_rows());
+                let skip = rows.len().saturating_sub(limit);
                 rows.into_iter()
                     .skip(skip)
                     .enumerate()
@@ -112,9 +120,15 @@ impl Thinking {
     /// A block under `∴` and the summary's title, or `thinking` when it has
     /// none, with the reasoning in dim italics behind a bar. First keeps two
     /// rows of text and counts the rest.
-    fn committed_rows(self, text: &str, m: Measure, elapsed: u64, output: u64) -> Vec<Line> {
+    fn committed_rows(
+        self,
+        text: &str,
+        m: Measure,
+        elapsed: u64,
+        output: u64,
+    ) -> (Vec<Line>, Option<Detail>) {
         if self == Self::Hidden || text.trim().is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let (title, body) = titled(text);
         let head = Line::default().rubric("∴ ");
@@ -128,6 +142,7 @@ impl Thinking {
             duration(elapsed)
         };
         let mut rows = thought(body, m);
+        let mut detail = None;
         if self == Self::First {
             let mut seen = 0;
             let keep = rows
@@ -143,13 +158,18 @@ impl Thinking {
                 rows.pop();
             }
             if hidden > 0 {
-                rows.push(Line::default().dim(format!(
-                    "… {} · ctrl+t",
-                    counted(hidden, "more line", "more lines")
-                )));
+                rows.push(Line::default().dim(more_lines(hidden)));
+                detail = Some(Detail {
+                    title: format!("∴ {}", title.unwrap_or("thinking")),
+                    diff: false,
+                    text: body.trim().to_owned(),
+                    thinking: true,
+                    error: false,
+                    spill: None,
+                });
             }
         }
-        callout::Block {
+        let lines = callout::Block {
             head,
             meta: Line::default().dim(meta),
             bar: Role::Dim,
@@ -158,7 +178,8 @@ impl Thinking {
         .lines(m.out.saturating_sub(2))
         .into_iter()
         .map(|line| Line::default().ink("  ").extend(line))
-        .collect()
+        .collect();
+        (lines, detail)
     }
 }
 
@@ -278,6 +299,8 @@ pub(crate) struct Detail {
     pub(crate) title: String,
     pub(crate) diff: bool,
     pub(crate) text: String,
+    /// Reasoning uses its dim italic prose renderer when expanded.
+    pub(crate) thinking: bool,
     pub(crate) error: bool,
     pub(crate) spill: Option<std::path::PathBuf>,
 }
@@ -450,9 +473,15 @@ pub(crate) fn headline_arg(
             }
         }),
         "write" | "edit" | "hashline" => field("path").map(|p| relative(p, workspace).to_owned()),
-        "search" => field("pattern").map(|p| match field("path").map(|d| relative(d, workspace)) {
-            Some(".") | None => p.to_owned(),
-            Some(path) => format!("{p} in {path}"),
+        "search" => field("pattern").or_else(|| field("glob")).map(|query| {
+            let query = match (field("pattern"), field("glob")) {
+                (Some(pattern), Some(glob)) => format!("{pattern} [{glob}]"),
+                _ => query.to_owned(),
+            };
+            match field("path").map(|path| relative(path, workspace)) {
+                Some(".") | None => query,
+                Some(path) => format!("{query} in {path}"),
+            }
         }),
         // The built-in `task` tool; its children show in their own rows.
         "task" => input
@@ -893,6 +922,7 @@ impl Call {
                         title: self.detail_title(),
                         diff: false,
                         text,
+                        thinking: false,
                         error: output.is_error,
                         spill: spill.clone(),
                     },
@@ -919,6 +949,7 @@ impl Call {
                         title: self.detail_title(),
                         diff: true,
                         text,
+                        thinking: false,
                         error: false,
                         spill: spill.clone(),
                     }],
@@ -985,6 +1016,7 @@ impl Call {
                 title: self.detail_title(),
                 diff: false,
                 text,
+                thinking: false,
                 error: output.is_error,
                 spill: spill.clone(),
             }]
@@ -1172,6 +1204,7 @@ impl Transcript {
                     },
                     diff_text,
                 ),
+                thinking: false,
                 error: false,
                 spill: call.result.as_ref().and_then(|(_, spill, _)| spill.clone()),
             });
@@ -1448,7 +1481,7 @@ impl Transcript {
                     self.context = context;
                 }
                 for block in content {
-                    let lines = match block {
+                    let (lines, detail) = match block {
                         Block::Thinking { text, .. } => {
                             self.thinking_display
                                 .committed_rows(text, m, elapsed, usage.output)
@@ -1456,16 +1489,23 @@ impl Transcript {
                         Block::RedactedThinking { .. }
                             if self.thinking_display != Thinking::Hidden =>
                         {
-                            vec![
-                                Line::default()
-                                    .ink("  ")
-                                    .rubric("∴ ")
-                                    .dim("redacted thinking")
-                                    .truncate(cols),
-                            ]
+                            (
+                                vec![
+                                    Line::default()
+                                        .ink("  ")
+                                        .rubric("∴ ")
+                                        .dim("redacted thinking")
+                                        .truncate(cols),
+                                ],
+                                None,
+                            )
                         }
-                        _ => Vec::new(),
+                        _ => (Vec::new(), None),
                     };
+                    if let Some(detail) = detail {
+                        self.details.push(detail);
+                        self.expanded = 0;
+                    }
                     if !lines.is_empty() {
                         self.gap(&mut out);
                         self.push(&mut out, lines);
@@ -1682,6 +1722,7 @@ impl Transcript {
                         title: "≡ compacted · summary".to_owned(),
                         diff: false,
                         text: summary.trim().to_owned(),
+                        thinking: false,
                         error: false,
                         spill: None,
                     });
@@ -1719,19 +1760,23 @@ impl Transcript {
         let detail = &self.details[at];
         let count = detail.text.lines().count();
         let mut lines = vec![detail_rule(&detail.title, cols)];
-        let rows: Vec<&str> = detail.text.lines().collect();
-        let red = if detail.error { alarm(&rows) } else { 0..0 };
-        for (index, row) in rows.iter().enumerate() {
-            let role = if detail.diff && row.starts_with("- ") || red.contains(&index) {
-                Role::Sanguine
-            } else if detail.diff && row.starts_with("+ ") {
-                Role::Verdigris
-            } else if detail.diff {
-                Role::Dim
-            } else {
-                Role::Ink
-            };
-            lines.push(Line::default().span(role, false, row).truncate(cols));
+        if detail.thinking {
+            lines.extend(thought(&detail.text, m));
+        } else {
+            let rows: Vec<&str> = detail.text.lines().collect();
+            let red = if detail.error { alarm(&rows) } else { 0..0 };
+            for (index, row) in rows.iter().enumerate() {
+                let role = if detail.diff && row.starts_with("- ") || red.contains(&index) {
+                    Role::Sanguine
+                } else if detail.diff && row.starts_with("+ ") {
+                    Role::Verdigris
+                } else if detail.diff {
+                    Role::Dim
+                } else {
+                    Role::Ink
+                };
+                lines.push(Line::default().span(role, false, row).truncate(cols));
+            }
         }
         lines.push(detail_rule(
             &format!("end · {}", counted(count, "line", "lines")),
@@ -1771,7 +1816,14 @@ impl Transcript {
     /// Calls still in flight, then the newest streamed rows.
     #[must_use]
     pub fn live(&self, m: Measure, frame: usize) -> Vec<Line> {
-        self.live_rows(m, frame, false)
+        self.live_rows(m, frame, LiveView::Inline)
+    }
+
+    /// All in-flight rows for the deck's scrollable log. The viewport, not
+    /// the transcript, clips them so earlier streamed rows remain reachable.
+    #[must_use]
+    pub fn live_in_log(&self, m: Measure, frame: usize) -> Vec<Line> {
+        self.live_rows(m, frame, LiveView::Log)
     }
 
     /// [`Self::live`] while a frame holds the keys: streamed text shrinks
@@ -1779,12 +1831,36 @@ impl Transcript {
     /// so the frame keeps its room. Calls, asks and children stay.
     #[must_use]
     pub fn live_under_frame(&self, m: Measure, frame: usize) -> Vec<Line> {
-        self.live_rows(m, frame, true)
+        self.live_rows(m, frame, LiveView::Frame)
     }
 
-    fn live_rows(&self, m: Measure, frame: usize, collapse: bool) -> Vec<Line> {
+    fn live_rows(&self, m: Measure, frame: usize, view: LiveView) -> Vec<Line> {
         let cols = m.out;
+        let collapse = view == LiveView::Frame;
+        let limit = if view == LiveView::Log {
+            usize::MAX
+        } else {
+            m.stream_rows()
+        };
         let mut lines = Vec::new();
+        // The scrollable log keeps reasoning above the answer while both
+        // are in flight. Inline and framed views only show current activity.
+        if self.thinking && (view == LiveView::Log || self.thinking()) {
+            let display = match self.thinking_display {
+                Thinking::Full if collapse => Thinking::First,
+                display => display,
+            };
+            lines.extend(display.live_rows(&self.stream_thinking, m, limit));
+            if self.redacted_thinking && display != Thinking::Hidden {
+                lines.push(
+                    Line::default()
+                        .ink("  ")
+                        .rubric("∴ ")
+                        .dim("redacted thinking")
+                        .truncate(cols),
+                );
+            }
+        }
         if !self.stream.trim().is_empty() {
             let rows = markdown(self.stream.trim(), m.prose, Role::Ink);
             if collapse {
@@ -1796,27 +1872,11 @@ impl Transcript {
                         .truncate(cols),
                 );
             } else {
-                let skip = rows.len().saturating_sub(m.stream_rows());
+                let skip = rows.len().saturating_sub(limit);
                 for row in rows.into_iter().skip(skip) {
                     lines.push(Line::default().ink("  ").extend(row).truncate(cols));
                 }
                 lines.push(Line::default());
-            }
-        }
-        if self.thinking() {
-            let display = match self.thinking_display {
-                Thinking::Full if collapse => Thinking::First,
-                display => display,
-            };
-            lines.extend(display.live_rows(&self.stream_thinking, m));
-            if self.redacted_thinking && display != Thinking::Hidden {
-                lines.push(
-                    Line::default()
-                        .ink("  ")
-                        .rubric("∴ ")
-                        .dim("redacted thinking")
-                        .truncate(cols),
-                );
             }
         }
         if !self.edits.is_empty() {
@@ -2383,6 +2443,28 @@ mod tests {
     }
 
     #[test]
+    fn search_headlines_show_globs_instead_of_json_and_keep_filters() {
+        let workspace = Some(std::path::Path::new("/tmp/ranges"));
+        for (input, expected) in [
+            (json!({"glob": "**/AGENTS.md"}), "**/AGENTS.md"),
+            (
+                json!({"glob": "**/AGENTS.md", "path": "/tmp/ranges"}),
+                "**/AGENTS.md",
+            ),
+            (
+                json!({"glob": "*.rs", "path": "/tmp/ranges/src"}),
+                "*.rs in src",
+            ),
+            (
+                json!({"pattern": "fn ", "glob": "*.rs", "path": "/tmp/ranges/src"}),
+                "fn  [*.rs] in src",
+            ),
+        ] {
+            assert_eq!(headline_arg("search", &input, workspace), expected);
+        }
+    }
+
+    #[test]
     fn compaction_commits_a_digest_and_keeps_the_summary_for_ctrl_o() {
         let summary = "## User goal and constraints\n- Fix covered_length.\n- Keep tests.\n\n## Decisions\n- Skip empty ranges.\n\n## Commands run and results\n- cargo test: ok\n\n## Open questions\n- None.\n";
         let mut t = Transcript::default();
@@ -2491,6 +2573,72 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_thinking_keeps_its_hidden_text_for_ctrl_o() {
+        let text = "**Checking the renderer**\nfirst thought\nsecond thought\nthird thought";
+        let mut transcript = Transcript::default();
+        let rows = plain(&transcript.apply(
+            &ev(
+                assistant(vec![Block::Thinking {
+                    text: text.into(),
+                    signature: None,
+                }]),
+                0,
+            ),
+            m(60),
+        ));
+        assert!(rows.iter().any(|row| row == "  │ … 1 more line · ctrl+o"));
+        assert!(!rows.iter().any(|row| row.contains("third thought")));
+        transcript.end_turn();
+        let expanded = plain(&transcript.expand(m(60)).unwrap());
+        assert!(
+            expanded
+                .iter()
+                .any(|row| row.contains("Checking the renderer"))
+        );
+        assert!(expanded.iter().any(|row| row == "third thought"));
+        assert!(transcript.expand(m(60)).is_none());
+
+        for mode in [Thinking::Full, Thinking::Hidden] {
+            let mut transcript = Transcript::default();
+            transcript.set_thinking(mode);
+            transcript.apply(
+                &ev(
+                    assistant(vec![Block::Thinking {
+                        text: text.into(),
+                        signature: None,
+                    }]),
+                    0,
+                ),
+                m(60),
+            );
+            assert!(!transcript.collapsed());
+        }
+    }
+
+    #[test]
+    fn expanded_thinking_wraps_long_lines_instead_of_discarding_their_ends() {
+        let text = "abcdefghijklmnopqrstuvwxyz".repeat(4);
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            &ev(
+                assistant(vec![Block::Thinking {
+                    text: text.clone(),
+                    signature: None,
+                }]),
+                0,
+            ),
+            m(24),
+        );
+        let expanded = transcript.expand(m(16)).unwrap();
+        assert!(expanded.iter().all(|row| row.width() <= 16));
+        let body: String = plain(&expanded)
+            .into_iter()
+            .filter(|row| !row.starts_with("──"))
+            .collect();
+        assert_eq!(body, text);
+    }
+
+    #[test]
     fn committed_thinking_wraps_or_truncates_and_redacted_respects_modes() {
         let text = "abcdefghijklmnopqrstuvwxyz\nsecond";
         let mut t = Transcript::default();
@@ -2540,6 +2688,56 @@ mod tests {
                 mode != Thinking::Hidden,
             );
         }
+    }
+
+    #[test]
+    fn scrollable_live_output_keeps_all_thinking_before_the_answer() {
+        use xi_protocol::methods::client::DeltaParams;
+
+        let mut t = Transcript::default();
+        t.set_thinking(Thinking::Full);
+        let session = SessionId::generate();
+        for n in 0..30 {
+            t.apply(
+                &ClientNotification::Delta(DeltaParams {
+                    session,
+                    attempt: 0,
+                    sequence: n,
+                    delta: Delta::Thinking {
+                        text: format!("thought {n}\n"),
+                    },
+                }),
+                m(60),
+            );
+            let rows = plain(&t.live_in_log(m(60), 0));
+            assert_eq!(rows.len(), n as usize + 1);
+            assert_eq!(rows[0], "  ∴ thought 0");
+            assert!(rows.last().unwrap().ends_with(&format!("thought {n}")));
+        }
+        t.apply(
+            &ClientNotification::Delta(DeltaParams {
+                session,
+                attempt: 0,
+                sequence: 30,
+                delta: Delta::Text {
+                    text: (0..30).map(|n| format!("answer {n}\n")).collect(),
+                },
+            }),
+            m(60),
+        );
+        assert!(!t.thinking(), "the activity now describes answering");
+        let rows = plain(&t.live_in_log(m(60), 0));
+        assert_eq!(rows[0], "  ∴ thought 0");
+        assert_eq!(rows[29], "  │ thought 29");
+        assert_eq!(rows[30], "  answer 0");
+        assert_eq!(rows[59], "  answer 29");
+        assert!(t.live_in_log(m(60), 0).iter().all(|row| row.width() <= 60));
+        t.set_thinking(Thinking::First);
+        assert_eq!(plain(&t.live_in_log(m(60), 0))[0], "  ∴ thought 29");
+        t.set_thinking(Thinking::Hidden);
+        assert_eq!(plain(&t.live_in_log(m(60), 0))[0], "  answer 0");
+        t.end_turn();
+        assert!(t.live_in_log(m(60), 0).is_empty());
     }
 
     #[test]
@@ -3449,7 +3647,7 @@ mod tests {
             }));
             assert_eq!(rows[head + 1].plain(), "  │ First body row.");
             assert_eq!(rows[head + 2].plain(), "  │ Second body row.");
-            assert_eq!(rows[head + 3].plain(), "  │ … 1 more line · ctrl+t");
+            assert_eq!(rows[head + 3].plain(), "  │ … 1 more line · ctrl+o");
             assert!(!plain(&rows).iter().any(|row| row.contains("Hidden")));
             assert_eq!(prior.last().unwrap().plain(), "");
             assert_eq!(head, 0);

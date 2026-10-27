@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use xi_client::client::ClientNotification;
 use xi_protocol::Timestamp;
 use xi_protocol::methods::client::{EventParams, ListParams, SessionSummary, SettingsReport};
@@ -219,6 +219,9 @@ impl App {
         screen: &mut Screen<W>,
     ) -> std::io::Result<()> {
         let (live, cursor, dock) = self.live();
+        if let Some(deck) = self.display.deck.as_mut() {
+            deck.log.set_live_rows(live.len().saturating_sub(dock));
+        }
         let meta = self.log_meta();
         let scene = self.scene(&live, cursor, dock, &meta, screen.surfaced());
         let (rows, cursor) = deck::render(&scene, self.display.cols, self.display.rows);
@@ -301,7 +304,7 @@ impl App {
         line
     }
 
-    /// The approval mode, sandbox and trust in words after their icons,
+    /// The approval mode, sandbox and trust in words,
     /// with what differs from the usual in brass: approvals other than
     /// `ask`, the sandbox off, an untrusted workspace.
     fn facts(&self) -> Line {
@@ -315,35 +318,29 @@ impl App {
             .and_then(|setting| setting.value.as_str().map(str::to_owned));
         let facts = [
             match mode.as_deref() {
-                None | Some("ask") => (Icon::Approvals, "approvals ask".to_owned(), false),
-                Some(mode) => (Icon::Approvals, format!("approvals {mode}"), true),
+                None | Some("ask") => ("approvals ask".to_owned(), false),
+                Some(mode) => (format!("approvals {mode}"), true),
             },
             if info.sandbox_enabled {
-                (Icon::Sandbox, "sandboxed".to_owned(), false)
+                ("sandboxed".to_owned(), false)
             } else {
-                (Icon::SandboxOff, "sandbox off".to_owned(), true)
+                ("sandbox off".to_owned(), true)
             },
             if info.trusted {
-                (Icon::Trusted, "trusted".to_owned(), false)
+                ("trusted".to_owned(), false)
             } else {
-                (Icon::Untrusted, "untrusted".to_owned(), true)
+                ("untrusted".to_owned(), true)
             },
         ];
         let mut line = Line::default();
-        for (icon, words, unusual) in facts {
+        for (words, unusual) in facts {
             if !line.0.is_empty() {
                 line = line.dim(" · ");
             }
-            let glyph = self.display.icons.get(icon);
-            let text = if glyph.is_empty() {
-                words
-            } else {
-                format!("{glyph} {words}")
-            };
             line = if unusual {
-                line.brass(text)
+                line.brass(words)
             } else {
-                line.dim(text)
+                line.dim(words)
             };
         }
         line
@@ -362,7 +359,7 @@ impl App {
         }
         line = line.ink(base);
         if let Some(branch) = self.git.label(cwd) {
-            line = line.dim(":").ink(branch);
+            line = line.dim("  ").ink(branch);
         }
         line
     }
@@ -550,6 +547,25 @@ impl App {
 }
 
 impl Display {
+    /// Scrolls the log under the pointer without taking keys from the composer.
+    pub(crate) fn deck_mouse(&mut self, mouse: MouseEvent) {
+        let columns = deck::columns(self.cols);
+        if usize::from(mouse.column) >= columns.log || usize::from(mouse.row) >= self.rows {
+            return;
+        }
+        let Some(deck) = self.deck.as_mut() else {
+            return;
+        };
+        if columns.panel.is_none() && matches!(deck.focus, Focus::Sessions | Focus::Inspector) {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => deck.log.scroll_up(3),
+            MouseEventKind::ScrollDown => deck.log.scroll_down(3),
+            _ => {}
+        }
+    }
+
     /// Handles the deck's focus and pane keys, leaving owner work to the client.
     pub(crate) fn deck_key(
         &mut self,
@@ -581,6 +597,12 @@ impl Display {
             return Some(Outcome::Stay);
         }
         match (deck.focus, key.code) {
+            (Focus::Composer | Focus::Log, KeyCode::PageUp) if action.is_none() => {
+                deck.log.scroll_up(self.rows / 2);
+            }
+            (Focus::Composer | Focus::Log, KeyCode::PageDown) if action.is_none() => {
+                deck.log.scroll_down(self.rows / 2);
+            }
             (Focus::Composer, _) => return None,
             (_, KeyCode::Esc) => {
                 // Back at the composer the panel follows the newest row.
@@ -617,8 +639,7 @@ impl Display {
                 deck.log.down();
                 deck.inspector = 0;
             }
-            (Focus::Log, KeyCode::PageUp) => deck.log.scroll_up(self.rows / 2),
-            (Focus::Log, KeyCode::PageDown) => deck.log.scroll_down(self.rows / 2),
+
             (Focus::Log, KeyCode::Enter) => {
                 if let Some(inspect) = self.deck.as_ref().and_then(|deck| deck.log.selected()) {
                     let lines = open(inspect, self.measure());

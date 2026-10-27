@@ -32,8 +32,10 @@ pub struct Log {
     anchors: Vec<(usize, Inspect)>,
     /// Index into `anchors` of the selected row; the newest when `None`.
     selected: Option<usize>,
-    /// Rows scrolled up from the bottom.
-    scrolled: usize,
+    /// Exclusive end of a scrolled viewport; `None` follows new rows.
+    end: Option<usize>,
+    /// Live rows that flow after the retained rows, excluding the dock.
+    live_rows: usize,
     /// Whether the rows shown follow the selection, after it moved.
     reveal: bool,
 }
@@ -57,7 +59,8 @@ impl Log {
     pub fn take(&mut self) -> Vec<Line> {
         self.anchors.clear();
         self.selected = None;
-        self.scrolled = 0;
+        self.end = None;
+        self.live_rows = 0;
         self.reveal = false;
         std::mem::take(&mut self.rows)
     }
@@ -98,7 +101,7 @@ impl Log {
     }
 
     fn follow(&mut self) {
-        self.scrolled = 0;
+        self.end = None;
         self.reveal = true;
     }
 
@@ -108,28 +111,46 @@ impl Log {
         self.reveal
     }
 
-    /// Rows scrolled up from the bottom.
+    /// Updates the live extent without moving a scrolled viewport as text
+    /// arrives or moves from the stream into retained rows.
+    pub fn set_live_rows(&mut self, rows: usize) {
+        self.live_rows = rows;
+        if self.end.is_some_and(|end| end >= self.len()) {
+            self.end = None;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len() + self.live_rows
+    }
+
+    /// Rows scrolled up from the bottom, including live output.
     #[must_use]
     pub fn scrolled(&self) -> usize {
-        self.scrolled
+        self.end.map_or(0, |end| self.len().saturating_sub(end))
     }
 
     /// Scrolls `by` rows up, keeping at least one row visible, and lets
     /// the selection leave the rows shown.
     pub fn scroll_up(&mut self, by: usize) {
-        self.scrolled = (self.scrolled + by).min(self.rows.len().saturating_sub(1));
+        let len = self.len();
+        let end = self.end.unwrap_or(len).saturating_sub(by).max(1);
+        self.end = (end < len).then_some(end);
         self.reveal = false;
     }
 
-    /// Scrolls `by` rows back down.
+    /// Scrolls `by` rows back down; at the bottom, follows new output.
     pub fn scroll_down(&mut self, by: usize) {
-        self.scrolled = self.scrolled.saturating_sub(by);
+        if let Some(end) = self.end {
+            let end = end.saturating_add(by);
+            self.end = (end < self.len()).then_some(end);
+        }
         self.reveal = false;
     }
 
     /// Follows the newest rows again.
     pub fn scroll_end(&mut self) {
-        self.scrolled = 0;
+        self.end = None;
         self.reveal = false;
     }
 
@@ -182,6 +203,31 @@ mod tests {
         assert_eq!(rows.len(), 7);
         assert!(log.selected().is_none());
         assert!(log.rows().is_empty());
+    }
+
+    #[test]
+    fn scrolling_holds_the_viewport_through_stream_growth_and_commit() {
+        let mut log = Log::default();
+        log.set_live_rows(20);
+        log.scroll_up(5);
+        assert_eq!(log.scrolled(), 5);
+        log.set_live_rows(25);
+        assert_eq!(log.scrolled(), 10, "new lines do not move the viewport");
+        log.extend(vec![Line::default(); 25], Vec::new());
+        log.set_live_rows(0);
+        assert_eq!(log.scrolled(), 10, "committing the stream does not move it");
+        log.extend(vec![Line::default(); 3], Vec::new());
+        assert_eq!(log.scrolled(), 13);
+        log.scroll_down(100);
+        assert_eq!(log.scrolled(), 0);
+        log.set_live_rows(5);
+        assert_eq!(log.scrolled(), 0, "reaching the bottom resumes following");
+        log.scroll_up(10);
+        log.set_live_rows(0);
+        assert_eq!(log.scrolled(), 5);
+        log.take();
+        log.scroll_up(10);
+        assert_eq!(log.scrolled(), 0);
     }
 
     #[test]

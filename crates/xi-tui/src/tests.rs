@@ -1012,6 +1012,55 @@ async fn image_only_and_mixed_prompts_send_all_blocks_without_storing_images_in_
 }
 
 #[tokio::test]
+async fn deck_composer_groups_attachments_and_leaves_room_after_completion() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 250, 36);
+    app.finish_turn(None);
+    assert!(
+        committed(&app)
+            .iter()
+            .any(|row| row.starts_with("✓ done  "))
+    );
+
+    for count in [0, 1, 2] {
+        app.composer.images = vec![pasted_image(); count];
+        app.composer.editor.set_text("draft\nsecond line");
+        let (lines, cursor, dock) = app.live();
+        let text: Vec<_> = lines.iter().map(Line::plain).collect();
+        let start = lines.len() - dock;
+        assert_eq!(
+            text[start], "",
+            "a gap separates the summary from the composer"
+        );
+        assert!(lines[start].0.iter().all(|span| !span.raised));
+        let draft = text.iter().position(|row| row == "┃  draft").unwrap();
+        if count > 0 {
+            let noun = if count == 1 { "image" } else { "images" };
+            assert_eq!(text[draft - 1], format!("┃  {count} {noun} attached"));
+            assert!(lines[draft - 1].0.iter().all(|span| span.raised));
+            assert_eq!(lines[draft - 1].0.last().unwrap().role, Role::Dim);
+        }
+        let (row, col) = cursor.unwrap();
+        assert_eq!(text[row], "┃  second line");
+        assert_eq!(col, 3 + "second line".len());
+        let model = lines
+            .iter()
+            .find(|line| {
+                line.plain()
+                    .starts_with(&format!("┃  {}/", app.launch.attached.info.model.provider))
+            })
+            .unwrap();
+        assert!(model.0.iter().any(|span| {
+            span.text == format!("{}/", app.launch.attached.info.model.provider)
+                && span.role == Role::Dim
+        }));
+        assert!(model.0.iter().any(|span| {
+            span.text == app.launch.attached.info.model.model && span.role == Role::Ink
+        }));
+    }
+}
+
+#[tokio::test]
 async fn queued_images_survive_until_the_next_turn() {
     let (launch, mut requests) = launch(snapshot(true)).await;
     let mut app = App::new(launch, 100, 24);
@@ -3669,6 +3718,120 @@ async fn layout_config_loads_and_invalid_layout_warns_once() {
 }
 
 #[tokio::test]
+async fn modified_enter_keeps_a_multiline_draft_editable_during_a_turn() {
+    for running in [false, true] {
+        for cols in [80, 250] {
+            let (launch, _) = launch(snapshot(running)).await;
+            let mut app = App::new(launch, cols, 36);
+            app.composer.editor.set_text("first");
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+                .await
+                .unwrap();
+            app.key(KeyEvent::new(KeyCode::Char('ξ'), KeyModifiers::NONE))
+                .await
+                .unwrap();
+            assert_eq!(app.composer.editor.text(), "first\nξ");
+            assert_eq!(app.composer.editor.cursor(), "first\nξ".len());
+            assert_eq!(app.turn.running(), running);
+            assert!(app.turn.pending.is_empty());
+            assert!(app.turn.steering.is_empty());
+            assert!(app.turn.queued.is_empty());
+            let (rows, cursor, _) = app.live();
+            let (row, _) = cursor.unwrap();
+            assert!(rows[row].plain().contains('ξ'));
+            // The fallback remains usable on terminals with legacy input.
+            app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+            assert_eq!(app.composer.editor.text(), "first\nξ\n");
+        }
+    }
+}
+
+#[tokio::test]
+async fn deck_wheel_scrolls_live_output_without_touching_prompt_history() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+
+    let (launch, _) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 250, 18);
+    // Force the deck on a short screen, too.
+    app.enter_deck();
+    app.composer
+        .editor
+        .set_history(vec!["previous prompt".into()]);
+    app.composer.editor.set_text("unsent draft");
+    app.transcript.set_thinking(transcript::Thinking::Full);
+    let session = app.session_id();
+    let delta = |sequence, text| {
+        ClientNotification::Delta(DeltaParams {
+            session,
+            attempt: 0,
+            sequence,
+            delta: Delta::Thinking { text },
+        })
+    };
+    app.notify(&delta(
+        1,
+        (0..40).map(|n| format!("thought {n}\n")).collect(),
+    ));
+    let draw = |app: &mut App| {
+        let mut out = Vec::new();
+        let mut screen = Screen::new(&mut out, false, 250);
+        app.draw(&mut screen).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let (live, cursor, dock) = app.live();
+    assert!(
+        live.len() - dock >= 40,
+        "the deck receives the whole stream"
+    );
+    assert!(live[cursor.unwrap().0].plain().contains("unsent draft"));
+    let bottom = draw(&mut app);
+    assert!(bottom.contains("thought 39"));
+    assert!(!bottom.contains("thought 0"));
+    let mouse = |kind, column| MouseEvent {
+        kind,
+        column,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.display.deck_mouse(mouse(MouseEventKind::ScrollUp, 4));
+    assert_eq!(app.display.deck.as_ref().unwrap().log.scrolled(), 3);
+    let before = draw(&mut app);
+    assert!(before.contains("thought 36"));
+    assert!(!before.contains("thought 39"));
+    app.notify(&delta(2, "thought 40\nthought 41\n".into()));
+    let after = draw(&mut app);
+    assert_eq!(app.display.deck.as_ref().unwrap().log.scrolled(), 5);
+    assert!(after.contains("thought 36"));
+    assert!(!after.contains("thought 39"));
+    app.display.deck_mouse(mouse(MouseEventKind::ScrollDown, 4));
+    app.display.deck_mouse(mouse(MouseEventKind::ScrollDown, 4));
+    assert!(draw(&mut app).contains("thought 41"));
+    assert_eq!(app.display.deck.as_ref().unwrap().log.scrolled(), 0);
+    app.display.deck_mouse(mouse(MouseEventKind::ScrollUp, 249));
+    assert_eq!(app.display.deck.as_ref().unwrap().log.scrolled(), 0);
+    assert_eq!(
+        app.display.deck.as_ref().unwrap().focus,
+        deck::Focus::Composer
+    );
+    assert_eq!(app.composer.editor.text(), "unsent draft");
+    app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.display.deck.as_ref().unwrap().log.scrolled() > 0);
+    app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.display.deck.as_ref().unwrap().log.scrolled(), 0);
+    // Actual arrow keys still browse history.
+    app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.composer.editor.text(), "previous prompt");
+}
+
+#[tokio::test]
 async fn deck_focus_keys_are_in_help_and_noop_inline() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 120, 36);
@@ -3751,7 +3914,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
         "● edit    src/a.rs",
         "● read    docs/policies.md",
         "/tmp/xi-tui-demo",
-        "\u{f45e} approvals ask · \u{f49c} sandboxed · \u{f4a1} trusted",
+        "approvals ask · sandboxed · trusted",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
@@ -3766,7 +3929,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains("approvals ask · \u{f513} sandbox off · \u{f4a3} untrusted"),
+        text.contains("approvals ask · sandbox off · untrusted"),
         "{text}"
     );
     // alt+1 lists every session; idle ones stay out of the live view.
