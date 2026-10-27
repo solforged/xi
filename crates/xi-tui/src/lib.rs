@@ -17,6 +17,7 @@ pub mod complete;
 pub mod config;
 pub mod editor;
 pub mod external;
+mod git;
 pub mod history;
 mod input;
 pub mod keys;
@@ -127,6 +128,7 @@ enum ExternalRequest {
 
 struct App {
     launch: Launch,
+    git: git::Status,
     transcript: Transcript,
     editor: Editor,
     focus: Focus,
@@ -190,6 +192,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
+    let mut git_tick = tokio::time::interval(Duration::from_secs(1));
     while !app.quit {
         if let Some(request) = app.external_requested.take() {
             let settings_file = matches!(&request, ExternalRequest::Settings(_));
@@ -234,6 +237,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
         if let Ok((c, _)) = crossterm::terminal::size() {
             screen.resize(usize::from(c));
         }
+        app.git.refresh(&app.launch.attached.info.cwd).await;
         app.draw(&mut screen)?;
         tokio::select! {
             // The worker sends a turn's last events before its reply.
@@ -265,6 +269,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
             },
+            _ = git_tick.tick() => {},
             _ = tick.tick(), if app.started.is_some() => {
                 app.frame += 1;
                 if app.pending.is_empty() && app.frame.is_multiple_of(8) {
@@ -306,6 +311,7 @@ impl App {
         editor.set_history(history.workspace());
         let mut app = Self {
             launch,
+            git: git::Status::default(),
             transcript,
             editor,
             focus: Focus::Composer,
