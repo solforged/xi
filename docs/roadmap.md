@@ -21,7 +21,7 @@ The arm everything is compared against: `read`, `edit` (exact replacement), `wri
 
 ## Feature queue
 
-Rows 1 to 5 are done; their results are below. Row 8 is built and waits for its measurement.
+Rows 1 to 5 and 8 are done; their results are below.
 
 | # | Feature | Home | Outcome or deciding measurement |
 |---|---|---|---|
@@ -32,7 +32,7 @@ Rows 1 to 5 are done; their results are below. Row 8 is built and waits for its 
 | 5 | Subagents | Opt-in built-in `task` tool | Done; moved from the `extensions/subagents` package into the kernel, still off by default. Not used unprompted by Qwen 3.8. |
 | 6 | LSP diagnostics after edits | package | Calls and time to green on the Rust and TypeScript tasks. |
 | 7 | Todo or plan tool | package | Pass rate on multi-step tasks (`invoice-rounding`, `revision-store`), prompt size. |
-| 8 | `fetch` and web search, with taint wired in | Opt-in built-in `fetch` and `web_search` tools | Built: hosted search on the `@tiny` model's provider or Exa, every call a `net` crossing, output untrusted (see [design](design.md#web-search-and-fetch)). Still to measure: pass rate and cost on tasks that need current docs, which the suite does not have yet. |
+| 8 | `fetch` and web search, with taint wired in | Opt-in built-in `fetch` and `web_search` tools | Done; stays opt-in. On two post-cutoff tasks every web arm passes 6/6 against 0/6 without network, but the tools barely beat `curl` through `bash`. See [Web tools](#web-tools). |
 | 9 | Memory | package | Last: needs multi-session tasks to measure. |
 | 10 | TUI | client | Daemon client with event replay and deduplication, streaming retry resets and a `/tree` checkout overlay. The surface for daily use is tracked in [Terminal client](#terminal-client). Not benchmarked. |
 
@@ -127,6 +127,30 @@ The four harder tasks on `gpt-6.1-sol` through a ChatGPT plan, at medium reasoni
 - omp made fewer model calls but nearly twice the tool calls. The ChatGPT backend's Lite request shape requires `parallel_tool_calls: false`, so xi gets one tool call per response there.
 - `hashline` made no edit errors in 55 edits; exact replacement failed 2 of 52, both in one run where the model repeated a stale snippet. Anchors failed 23% to 93% of edits on the local models, and pass rate and time are equal here, so exact replacement stays the default.
 - Compaction and subagent arms were not run on this model.
+
+### Web tools
+
+The two web tasks, `zig-017-port` and `release-pins`, on `gpt-6.1-sol` at medium reasoning: xi at 49ca57c and omp 18.13.1, on hyperion, 2026-10-27. Every arm and task ran as its own runner, all at once on one ChatGPT account. `xi` denies every ask, so it has no network. `xi-net` allows asks, so `bash` can use `curl`. `xi-web` adds `web_search` (hosted search on `chatgpt/gpt-6-luna`) and `fetch`, and `xi-web-exa` sends the searches to Exa. omp searched through its configured Parallel provider and read URLs with `read`. Raw records are in `~/xi-bench-2026-10-27-web` on hyperion.
+
+| Task | Arm | Pass | Median wall | Model / tool time | Calls | Web calls per run | Tokens (input / output / cache read) |
+|---|---|---:|---:|---:|---:|---|---:|
+| `release-pins` | `xi` | 0/3 | 39 s | 38 / 0 s | 10 | none | 7,206 / 1,040 / 24,704 |
+| | `xi-net` | 3/3 | 73 s | 67 / 5 s | 13 | 5.0 `curl` | 36,575 / 2,665 / 162,688 |
+| | `xi-web` | 3/3 | 49 s | 47 / 2 s | 15 | 5.0 `fetch`, 1.3 `curl` | 51,889 / 1,390 / 259,328 |
+| | `xi-web-exa` | 3/3 | 57 s | 54 / 2 s | 15 | 5.0 `fetch`, 1.3 `curl` | 50,750 / 1,449 / 299,008 |
+| | `omp` | 3/3 | 37 s | 35 / 2 s | 10 | 6.3 URL reads | 51,836 / 1,332 / 219,008 |
+| `zig-017-port` | `xi` | 0/3 | 337 s | 337 / 1 s | 27 | none | 21,535 / 12,748 / 212,480 |
+| | `xi-net` | 3/3 | 121 s | 119 / 2 s | 30 | 1.3 `curl` | 40,750 / 3,581 / 529,408 |
+| | `xi-web` | 3/3 | 139 s | 118 / 21 s | 30 | 1.0 search, 1.3 `fetch` | 30,541 / 3,389 / 491,392 |
+| | `xi-web-exa` | 3/3 | 117 s | 114 / 6 s | 31 | 1.3 search, 4.3 `fetch` | 51,711 / 3,979 / 637,184 |
+| | `omp` | 3/3 | 49 s | 46 / 2 s | 13 | 1.0 search, 1.0 URL read | 32,275 / 1,920 / 238,848 |
+
+- Network access decides both tasks: 0/6 without it, 6/6 in every arm with it. Without network, `xi` spent 5 to 6 minutes guessing Zig 0.17 names and still failed every hidden check.
+- A first round, with the checks' salted hashes visible in the protected tests, was discarded: offline `xi` brute-forced the hashes and passed `zig-017-port` 2/3. The answers now live in each task's `hidden/` directory, which the runner copies in only for the check.
+- Given `bash` and an allowed network, the model already knows the URLs: `curl` on official release metadata does the job, and neither web arm called `web_search` on `release-pins`. The tools help through `fetch`, which turns pages into Markdown: on `release-pins`, `xi-web` was 24 s faster than `xi-net`. On `zig-017-port` they were even.
+- A hosted search took 14 to 20 s on `gpt-6-luna`, because the search model reads pages and answers. An Exa search took 0.5 to 2 s, and its results led the model to `fetch` more pages.
+- omp is 2 to 3 times faster on `zig-017-port` with the same web access. The gap is edits, not the web: xi made about 14 exact-string edits per run, while omp made one whole-file `write` and one or two `edit` calls. With one tool call per response on the Lite shape, that is 30 model calls against 13.
+- Decision: `web_search` and `fetch` stay opt-in. These tasks name their sources, so a model with `curl` needs neither; the tools matter for toolsets without `bash` and for questions whose source the model doesn't know, which this suite doesn't measure yet. Getting xi's `zig-017-port` time down is an edit-strategy problem (whole-file writes for many-site ports, or parallel tool calls), not a web one.
 
 ### Edit format
 
