@@ -298,6 +298,19 @@ The summary is the first user-side content after the unchanged system prompt. Th
 
 The surface below is the target for daily use, including developing xi with xi. [Roadmap](roadmap.md#terminal-client) tracks which parts exist.
 
+#### Layout
+
+Inline is the default. Scrollback stays append-only, and Slit, Pane and Sheet follow every resize. The live region and overlays use the same output measure as the transcript.
+
+| Tier | Columns | Rows | What changes |
+|---|---|---|---|
+| Slit | Under 72 | Any | The composer becomes a rule and a prompt without side borders. Tool headlines keep the file name and outcome but drop durations. The activity row drops token counts. The footer keeps context, trust, taint and waiting asks before the model. |
+| Pane | 72–119 | Any | The composer keeps its box and output uses the pane's width. |
+| Sheet | 120 and up | Any | Output stays on a 120-column sheet at the left. Prose and thinking wrap at 88 columns, outcomes align to the sheet's edge, and the composer and footer sit on the sheet. Consecutive successful edits on one target fold into a run. |
+| Short | Any | Under 20 | Applies on top of the width tier. The live region takes at most half the rows. Frames get five body rows plus their title and hints. The composer shows at most three text rows and disappears while a frame holds the keys; full thinking streams one row. |
+
+`[display] layout` in `tui.toml` accepts `inline`, `deck` or `auto`. Inline never enters the alternate screen by itself. Deck owns the alternate screen with sessions, the log and an inspector. Auto chooses Deck when xi starts at 180×30 or larger, otherwise Inline. `/layout` reports the choice, width tier and pane size; `/layout inline`, `/layout deck` and `/layout auto` change and save it.
+
 #### Keys
 
 Composer keys are unique. Keys inside an overlay apply only while it has focus.
@@ -319,9 +332,12 @@ Composer keys are unique. Keys inside an overlay apply only while it has focus.
 | `shift+tab` | Cycle reasoning through the levels the model accepts and save the level as the global default. |
 | `ctrl+o` | Expand the newest collapsed result; repeat to walk back. |
 | `ctrl+t` | Cycle thinking display: full, first line, hidden. |
+| `alt+1` | Focus sessions. Deck key; does nothing inline. |
+| `alt+2` | Focus the log. Deck key; does nothing inline. |
+| `alt+3` | Focus the inspector. Deck key; does nothing inline. |
 | Editing | `ctrl+a`/`ctrl+e` line start and end, `ctrl+b`/`ctrl+f` and arrows by character, `ctrl+w` and `alt+backspace` delete a word, `ctrl+u`/`ctrl+k` delete to line start and end. |
 
-Alt keys need the terminal to send Option as Meta on macOS; every alt binding also has a slash command. `/help` lists the effective bindings from the same table the client dispatches on. `$XDG_CONFIG_HOME/xi/tui.toml` holds client settings:
+Alt keys need the terminal to send Option as Meta on macOS; every alt binding except the deck focus keys also has a slash command. `/help` lists the effective bindings from the same table the client dispatches on. `$XDG_CONFIG_HOME/xi/tui.toml` holds client settings:
 
 ```toml
 [keys]
@@ -330,6 +346,7 @@ kill_word = ["ctrl+w", "alt+backspace"]
 
 [display]
 thinking = "first"                         # full | first | hidden
+layout = "inline"                          # inline | deck | auto
 ```
 
 Action names are the snake_case names `/help` shows. A key string is `[ctrl+][alt+][shift+]KEY`, where `KEY` is one character or `enter`, `tab`, `esc`, `backspace`, `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `space` or `f1` to `f12`. A key bound to a new action leaves the action that had it by default. Unknown actions, keys and values are reported once at startup and skipped; the client always starts.
@@ -345,6 +362,7 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 | `/tree` | Open the branch overlay and check out an earlier point. |
 | `/model [PROVIDER/MODEL]` | Switch model; without an argument, open the model picker. |
 | `/reasoning [LEVEL]` | Set reasoning and save it as the global default; without an argument, show it and the levels the model accepts. |
+| `/layout [inline\|deck\|auto]` | Change and save the client layout; without an argument, show the choice, tier and pane size. |
 | `/compact` | Summarize older context now. |
 | `/approvals` | Open the approvals inbox for all sessions. |
 | `/settings` | Open the settings view. |
@@ -379,12 +397,13 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 
 #### Settings view
 
-`/settings` opens a view of the settings that matter day to day, in four sections: this session, defaults, tools and read only. Each row shows the effective value and, at the right, the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted. `up` and `down` move, `enter` or `space` changes the selected row, `e` opens the global `config.toml` in the external editor and reloads the view afterwards, and `esc` closes. The top border names the global config file; results and errors show as a note under the rows. In an inline token field, `enter` saves and `esc` cancels the edit.
+`/settings` opens a view of the settings that matter day to day, in five sections: this session, client, defaults, tools and read only. Each row shows the effective value and, at the right, the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted. `up` and `down` move, `enter` or `space` changes the selected row, `e` opens the global `config.toml` in the external editor and reloads the view afterwards, and `esc` closes. The top border names the global config file; results and errors show as a note under the rows. In an inline token field, `enter` saves and `esc` cancels the edit.
 
 | Row | Scope | Change |
 |---|---|---|
 | Model, reasoning | Session | `enter` opens the model picker or cycles reasoning through the protocol methods; a reasoning change also saves the global default. `ctrl+s` saves the session's value as the global default. |
 | Thinking display | Client | Cycles `full`, `first`, `hidden` and saves `[display] thinking` to `tui.toml`. |
+| Layout | Client | Cycles `inline`, `deck`, `auto` and saves `[display] layout` to `tui.toml`. |
 | Approvals | Global default | Cycles the `approvals` preset `ask`, `reads`, `auto`. |
 | One row per built-in tool, including `hashline` | Global default | Toggles the tool in `tools`, keeping the order and any other names; the last tool cannot be removed. |
 | Automatic compaction, trigger, kept tail | Global default | Toggles `enabled`, or edits a token count inline; an empty trigger means 80% of the window. |

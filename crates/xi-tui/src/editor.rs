@@ -4,8 +4,14 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::style::{Line, Role};
 
-/// Visible text rows before the composer scrolls.
-const MAX_ROWS: usize = 8;
+/// The composer's visible text rows and border form.
+#[derive(Clone, Copy, Debug)]
+pub struct Form {
+    /// Text rows shown before the composer scrolls.
+    pub rows: usize,
+    /// A rule and prompt without side borders.
+    pub bare: bool,
+}
 
 /// Text being composed, with a cursor and history.
 #[derive(Default)]
@@ -239,18 +245,29 @@ impl Editor {
         (rows, cursor)
     }
 
-    /// Draws the composer box, `cols` wide, and returns the cursor's row and
+    /// Draws the composer `cols` wide and returns the cursor's row and
     /// column within it.
     #[must_use]
-    pub fn render(&self, cols: usize, border: Role, hint: &str) -> (Vec<Line>, (usize, usize)) {
-        let inner = cols.saturating_sub(6);
+    pub fn render(
+        &self,
+        cols: usize,
+        border: Role,
+        hint: &str,
+        form: Form,
+    ) -> (Vec<Line>, (usize, usize)) {
+        let inner = cols.saturating_sub(if form.bare { 2 } else { 6 });
         let (rows, (crow, ccol)) = self.layout(inner);
+        let visible = form.rows.max(1);
         let top = crow
-            .saturating_sub(MAX_ROWS - 1)
-            .min(rows.len().saturating_sub(MAX_ROWS));
+            .saturating_sub(visible - 1)
+            .min(rows.len().saturating_sub(visible));
         let b = |s: &str| Line::default().span(border, false, s);
-        let mut lines = vec![b(&format!("╭{}╮", "─".repeat(cols.saturating_sub(2))))];
-        for (i, row) in rows.iter().enumerate().skip(top).take(MAX_ROWS) {
+        let mut lines = vec![if form.bare {
+            b(&"─".repeat(cols))
+        } else {
+            b(&format!("╭{}╮", "─".repeat(cols.saturating_sub(2))))
+        }];
+        for (i, row) in rows.iter().enumerate().skip(top).take(visible) {
             let lead = if i == 0 {
                 Line::default().brass("ξ ")
             } else {
@@ -261,17 +278,25 @@ impl Editor {
             } else {
                 Line::default().ink(row)
             };
-            let pad = inner.saturating_sub(body.width());
-            lines.push(
+            let line = if form.bare {
+                lead.extend(body)
+            } else {
+                let pad = inner.saturating_sub(body.width());
                 b("│ ")
                     .extend(lead)
                     .extend(body)
                     .ink(" ".repeat(pad))
-                    .extend(b(" │")),
-            );
+                    .extend(b(" │"))
+            };
+            lines.push(line.truncate(cols));
         }
-        lines.push(b(&format!("╰{}╯", "─".repeat(cols.saturating_sub(2)))));
-        (lines, (1 + crow - top, 4 + ccol))
+        if !form.bare {
+            lines.push(b(&format!("╰{}╯", "─".repeat(cols.saturating_sub(2)))));
+        }
+        (
+            lines,
+            (1 + crow - top, if form.bare { 2 } else { 4 } + ccol),
+        )
     }
 }
 
@@ -338,14 +363,44 @@ mod tests {
     fn the_box_is_exactly_as_wide_as_asked_and_tracks_the_cursor() {
         let mut e = Editor::default();
         e.insert("one\ntwo three four");
-        let (lines, cursor) = e.render(16, Role::Brass, "");
+        let form = Form {
+            rows: 8,
+            bare: false,
+        };
+        let (lines, cursor) = e.render(16, Role::Brass, "", form);
         assert!(lines.iter().all(|l| l.width() == 16), "{lines:?}");
         assert_eq!(lines[1].plain(), "│ ξ one        │");
         assert_eq!(lines[2].plain(), "│   two three  │");
         assert_eq!(lines[3].plain(), "│   four       │");
         assert_eq!(cursor, (3, 8));
-        let (empty, at) = Editor::default().render(30, Role::Brass, "enter sends");
+        let (empty, at) = Editor::default().render(30, Role::Brass, "enter sends", form);
         assert_eq!(empty[1].plain(), "│ ξ enter sends              │");
         assert_eq!(at, (1, 4));
+    }
+
+    #[test]
+    fn bare_composer_scrolls_to_the_cursor_without_side_borders() {
+        let mut editor = Editor::default();
+        editor.set_text("one\ntwo\nthree\nfour");
+        let form = Form {
+            rows: 3,
+            bare: true,
+        };
+        let (lines, cursor) = editor.render(16, Role::Murex, "", form);
+        assert_eq!(
+            lines.iter().map(Line::plain).collect::<Vec<_>>(),
+            [
+                "─".repeat(16),
+                "  two".into(),
+                "  three".into(),
+                "  four".into()
+            ]
+        );
+        assert_eq!(cursor, (3, 6));
+        assert_eq!(lines[0].0[0].role, Role::Murex);
+        let (empty, cursor) = Editor::default().render(60, Role::Brass, "enter sends", form);
+        assert_eq!(empty[1].plain(), "ξ enter sends");
+        assert_eq!(empty[1].0.last().unwrap().role, Role::Dim);
+        assert_eq!(cursor, (1, 2));
     }
 }

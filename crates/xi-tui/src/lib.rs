@@ -15,6 +15,7 @@ pub mod clipboard;
 mod commands;
 pub mod complete;
 pub mod config;
+pub mod deck;
 pub mod editor;
 pub mod external;
 pub mod frame;
@@ -60,7 +61,7 @@ use crate::config::TuiConfig;
 use crate::editor::Editor;
 use crate::history::History;
 use crate::keys::Keymap;
-use crate::layout::Measure;
+use crate::layout::{Layout, Measure};
 use crate::overlay::Overlays;
 use crate::screen::{Screen, Settle};
 use crate::style::{Line, Role};
@@ -136,6 +137,10 @@ struct App {
     answered: HashSet<(SessionId, ToolCallId)>,
     inbox_refresh: bool,
     keymap: Keymap,
+    /// The saved choice of terminal layout.
+    layout: Layout,
+    /// Whether the client owns the alternate screen.
+    deck: bool,
     /// Terminal controls written before the next frame.
     controls: Vec<String>,
     history: History,
@@ -323,6 +328,8 @@ impl App {
             answered: HashSet::new(),
             inbox_refresh: false,
             keymap: config.keymap,
+            layout: config.layout,
+            deck: config.layout.deck_at(cols, rows),
             controls: Vec::new(),
             history,
             commands: builtin_commands(),
@@ -534,7 +541,7 @@ impl App {
         }
         let asks = self.transcript.asks().len();
         let lines = self.transcript.apply_live(notification, self.measure());
-        self.commit.extend(lines);
+        self.commit_lines(lines);
         match notification {
             ClientNotification::Event(p) => match &p.event.kind {
                 xi_protocol::EventKind::UserMessage { content } => {
@@ -602,7 +609,7 @@ impl App {
                 let lines = self
                     .transcript
                     .note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
-                self.commit.extend(lines);
+                self.commit_lines(lines);
                 self.failed = true;
                 None
             }
@@ -614,6 +621,8 @@ impl App {
     }
 
     fn finish_turn(&mut self, outcome: Option<PromptResult>) {
+        let lines = self.transcript.flush(self.measure());
+        self.commit_lines(lines);
         self.launch.attached.running = false;
         self.transcript.end_turn();
         if let Some(approvals) = self.overlays.get_mut::<Approvals>() {
@@ -658,7 +667,7 @@ impl App {
             .span(role, false, word)
             .dim(format!(" · {}", parts.join(" · ")));
         let lines = self.transcript.note(vec![line]);
-        self.commit.extend(lines);
+        self.commit_lines(lines);
         self.steering.clear();
         if !self.exited && !self.queued.is_empty() {
             let next = self.queued.remove(0);
@@ -699,9 +708,14 @@ impl App {
         Measure::new(self.cols, self.rows)
     }
 
+    /// Commits rows to the client's log.
+    fn commit_lines(&mut self, lines: Vec<Line>) {
+        self.commit.extend(lines);
+    }
+
     fn note(&mut self, lines: Vec<Line>) {
         let lines = self.transcript.note(lines);
-        self.commit.extend(lines);
+        self.commit_lines(lines);
     }
 
     async fn cancel(&mut self) {

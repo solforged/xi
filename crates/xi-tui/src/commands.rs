@@ -3,6 +3,7 @@ use xi_protocol::manifest::CommandSpec;
 use xi_protocol::model::Reasoning;
 
 use crate::approvals::Approvals;
+use crate::layout::Layout;
 use crate::style::{Line, Role};
 use crate::transcript::tokens;
 use crate::tree::Tree;
@@ -21,6 +22,7 @@ enum Builtin {
     Model,
     Reasoning,
     Compact,
+    Layout,
 }
 
 const COMMANDS: &[(&str, &str, Builtin)] = &[
@@ -61,6 +63,11 @@ const COMMANDS: &[(&str, &str, Builtin)] = &[
         Builtin::Reasoning,
     ),
     ("compact", "summarize older context now", Builtin::Compact),
+    (
+        "layout",
+        "set inline, deck or auto; without an argument, show it",
+        Builtin::Layout,
+    ),
 ];
 
 pub(crate) fn builtin_commands() -> Vec<CommandSpec> {
@@ -86,6 +93,16 @@ fn reasoning_levels(model: &xi_protocol::model::ModelInfo, separator: &str) -> S
 }
 
 impl App {
+    /// Changes and saves the client's layout choice.
+    pub(crate) fn set_layout(&mut self, layout: Layout) -> std::io::Result<()> {
+        self.layout = layout;
+        self.deck = layout.deck_at(self.cols, self.rows);
+        self.launch
+            .tui_config
+            .as_deref()
+            .map_or(Ok(()), |path| crate::config::save_layout(path, layout))
+    }
+
     pub(crate) async fn command(&mut self, line: &str) -> Result<(), Error> {
         let (name, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let name = name.trim_start_matches('/');
@@ -190,6 +207,31 @@ impl App {
                     };
                     self.note(vec![Line::default().dim(format!("  {error}; use {names}"))]);
                 }
+            },
+            Some(Builtin::Layout) if rest.is_empty() => {
+                self.note(vec![Line::default().dim(format!(
+                    "  layout · {} ({}, {}×{})",
+                    self.layout.name(),
+                    self.measure().tier.name(),
+                    self.cols,
+                    self.rows
+                ))]);
+            }
+            Some(Builtin::Layout) => match Layout::parse(rest) {
+                Some(layout) => {
+                    let saved = self.set_layout(layout);
+                    self.note(vec![
+                        Line::default().dim(format!("  layout → {}", layout.name())),
+                    ]);
+                    if let Err(error) = saved {
+                        self.note(vec![
+                            Line::default().dim(format!("  layout not saved: {error}")),
+                        ]);
+                    }
+                }
+                None => self.note(vec![
+                    Line::default().dim("  /layout expects inline, deck or auto"),
+                ]),
             },
             Some(Builtin::Compact) => {
                 if !self.idle_only("/compact") {

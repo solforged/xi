@@ -5,6 +5,8 @@ use xi_client::client::ClientNotification;
 use xi_protocol::methods::client::EventParams;
 use xi_protocol::model::Reasoning;
 
+use crate::editor::Form;
+use crate::layout::Tier;
 use crate::screen::Screen;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
@@ -36,6 +38,7 @@ pub(crate) fn home(path: &Path) -> String {
 impl App {
     /// Prints the header and replays the head's branch, for resumed sessions.
     pub(crate) fn attach(&mut self) {
+        let cols = self.measure().out;
         let info = &self.launch.attached.info;
         let mut header = vec![
             Line::default()
@@ -46,7 +49,7 @@ impl App {
                     env!("CARGO_PKG_VERSION"),
                     home(&info.cwd)
                 ))
-                .truncate(self.cols),
+                .truncate(cols),
         ];
         if !info.trusted {
             header.push(
@@ -54,10 +57,12 @@ impl App {
                     .ink("  ")
                     .brass("untrusted")
                     .dim(" · repo config held back · xi trust")
-                    .truncate(self.cols),
+                    .truncate(cols),
             );
         }
-        self.commit.extend(header);
+        let session = info.session;
+        let head = info.head;
+        self.commit_lines(header);
         self.seen.clear();
         self.launch
             .attached
@@ -74,19 +79,18 @@ impl App {
                 _ => None,
             })
             .collect();
-        let events = lineage(&self.launch.attached.events, info.head);
+        let events = lineage(&self.launch.attached.events, head);
         let replayed = events.len().saturating_sub(1);
         for event in events {
-            let n = ClientNotification::Event(EventParams {
-                session: info.session,
-                event,
-            });
+            let n = ClientNotification::Event(EventParams { session, event });
             let lines = self.transcript.apply(&n, self.measure());
-            self.commit.extend(lines);
+            self.commit_lines(lines);
         }
         if self.launch.attached.running {
             self.started = Some(Instant::now());
         } else {
+            let lines = self.transcript.flush(self.measure());
+            self.commit_lines(lines);
             self.transcript.end_turn();
         }
         self.transcript.partial(&self.launch.attached.partial);
@@ -111,9 +115,9 @@ impl App {
         if replayed > 0 {
             let note = self.transcript.note(vec![Line::default().dim(format!(
                 "  resumed · {replayed} events · {}",
-                home(&info.path)
+                home(&self.launch.attached.info.path)
             ))]);
-            self.commit.extend(note);
+            self.commit_lines(note);
         }
         if !self.transcript.asks().is_empty() {
             self.open_own_approvals();
@@ -232,10 +236,10 @@ impl App {
     }
 
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
-        let cols = self.cols;
         let m = self.measure();
-        // While a frame holds the keys, the stream and the composer shrink
-        // to one line each so the frame keeps its room.
+        let cols = m.out;
+        // Frames keep their room by shrinking streamed rows and the composer.
+        // Short panes omit the collapsed composer so title and hints survive.
         let framed = !self.overlays.is_empty();
         let mut lines = if framed {
             self.transcript.live_under_frame(m, self.frame)
@@ -257,7 +261,7 @@ impl App {
             let mut line = Line::default()
                 .brass(SPINNER[self.frame % SPINNER.len()])
                 .dim(format!(" {what} · {elapsed}s"));
-            if turn.sent() > 0 {
+            if m.durations() && turn.sent() > 0 {
                 line = line.dim(format!(
                     " · ↑ {} ↓ {}",
                     tokens(turn.sent()),
@@ -286,7 +290,9 @@ impl App {
                 cols,
             ));
         }
-        let (composer, (row, col)) = if framed {
+        let (composer, (row, col)) = if framed && m.short {
+            (Vec::new(), (0, 0))
+        } else if framed {
             let draft = self.editor.text().lines().next().unwrap_or_default();
             let back = if self.overlays.len() == 1 {
                 "esc returns here"
@@ -310,21 +316,37 @@ impl App {
             } else {
                 "enter sends · ctrl+j new line · /help"
             };
-            self.editor.render(cols, border, hint)
+            self.editor.render(
+                cols,
+                border,
+                hint,
+                Form {
+                    rows: m.composer_rows(),
+                    bare: m.tier == Tier::Slit,
+                },
+            )
         };
         let attachment_rows = usize::from(!self.images.is_empty());
         // The frame gets what is left after the composer, the status line
         // and the turn's own rows; streamed rows above it scroll off first.
         let reserved = composer.len() + 1 + attachment_rows + lines.len() - transcript_rows;
         let overlay_rows = self.rows.saturating_sub(1 + reserved);
+        let fixed = composer.len() + 1 + attachment_rows;
+        let frame_rows = if m.short {
+            m.frame_rows(overlay_rows.max(4))
+                .min(m.live_rows().saturating_sub(fixed))
+        } else {
+            m.frame_rows(overlay_rows.max(4))
+        };
         let mut ctx = crate::overlays::ctx!(self);
-        let (rows, cursor) =
-            self.overlays
-                .draw(&mut ctx, self.waiting(), cols, overlay_rows.max(4));
+        let (rows, cursor) = self
+            .overlays
+            .draw(&mut ctx, self.waiting(), cols, frame_rows);
         let overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
         lines.extend(rows);
         if !framed && let Some(menu) = &self.completion {
-            lines.extend(menu.render(cols, overlay_rows.min(8)));
+            let menu_rows = overlay_rows.min(8).min(frame_rows);
+            lines.extend(menu.render(cols, menu_rows));
         }
         if !self.images.is_empty() {
             let count = self.images.len();
@@ -339,6 +361,11 @@ impl App {
         lines.extend(composer);
         lines.push(self.footer(cols));
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
+        let hidden = lines.len().saturating_sub(m.live_rows());
+        if hidden > 0 {
+            lines.drain(..hidden);
+        }
+        let cursor = cursor.and_then(|(row, col)| row.checked_sub(hidden).map(|row| (row, col)));
         (lines, cursor)
     }
 
@@ -351,6 +378,6 @@ impl App {
         }
         let (live, cursor) = self.live();
         let commit = std::mem::take(&mut self.commit);
-        screen.draw(&commit, &live, cursor, self.rows.saturating_sub(1))
+        screen.draw(&commit, &live, cursor, self.measure().live_rows())
     }
 }

@@ -1,5 +1,4 @@
-//! Main-screen rendering: print what's committed once, redraw only the live
-//! region.
+//! Main-screen and alternate-screen rendering.
 //!
 //! The live region is the last few rows of the screen. Each frame moves the
 //! cursor back to its first row, clears to the end of the screen, prints any
@@ -88,6 +87,56 @@ impl<W: Write> Screen<W> {
     /// Returns the writer's I/O error.
     pub fn control(&mut self, sequence: &str) -> io::Result<()> {
         self.out.write_all(sequence.as_bytes())
+    }
+
+    /// Enters the deck's alternate screen and forgets the inline live region.
+    ///
+    /// # Errors
+    /// Returns the writer's I/O error.
+    pub fn enter_deck(&mut self) -> io::Result<()> {
+        self.out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J")?;
+        self.widths.clear();
+        self.cursor = (0, 0);
+        self.out.flush()
+    }
+
+    /// Restores the main screen and forgets the deck's cursor.
+    ///
+    /// # Errors
+    /// Returns the writer's I/O error.
+    pub fn leave_deck(&mut self) -> io::Result<()> {
+        self.out.write_all(b"\x1b[?1049l")?;
+        self.widths.clear();
+        self.cursor = (0, 0);
+        self.out.flush()
+    }
+
+    /// Redraws the deck from the screen's origin without scrolling its last row.
+    /// `cursor` is an absolute zero-based screen position.
+    ///
+    /// # Errors
+    /// Returns the writer's I/O error.
+    pub fn draw_deck(&mut self, rows: &[Line], cursor: Option<(usize, usize)>) -> io::Result<()> {
+        let mut buf = String::from("\x1b[?2026h\x1b[?25l\x1b[H");
+        for (i, line) in rows.iter().enumerate() {
+            if i > 0 {
+                buf.push_str("\r\n");
+            }
+            if line.width() > self.cols {
+                line.clone()
+                    .truncate(self.cols)
+                    .write_ansi(&mut buf, self.color);
+            } else {
+                line.write_ansi(&mut buf, self.color);
+            }
+            buf.push_str("\x1b[K");
+        }
+        if let Some((row, col)) = cursor {
+            buf.push_str(&format!("\x1b[{};{}H\x1b[?25h", row + 1, col + 1));
+        }
+        buf.push_str("\x1b[?2026l");
+        self.out.write_all(buf.as_bytes())?;
+        self.out.flush()
     }
 
     fn rewind(&self, buf: &mut String) {
@@ -190,6 +239,54 @@ mod tests {
 
     fn text(screen: &Screen<Vec<u8>>) -> String {
         String::from_utf8(screen.output().clone()).unwrap()
+    }
+
+    #[test]
+    fn deck_switches_forget_inline_widths_and_cursor() {
+        let mut s = Screen::new(Vec::new(), false, 80);
+        s.draw(&[], &[Line::default().ink("ξ draft")], Some((0, 2)), 24)
+            .unwrap();
+        assert!(!s.widths.is_empty());
+        s.enter_deck().unwrap();
+        assert!(text(&s).ends_with("\x1b[?1049h\x1b[H\x1b[2J"));
+        assert!(s.widths.is_empty());
+        assert_eq!(s.cursor, (0, 0));
+        s.draw_deck(&[Line::default().ink("deck")], Some((0, 2)))
+            .unwrap();
+        s.leave_deck().unwrap();
+        assert!(text(&s).ends_with("\x1b[?1049l"));
+        assert!(s.widths.is_empty());
+        assert_eq!(s.cursor, (0, 0));
+        s.draw(&[], &[Line::default().ink("inline")], None, 24)
+            .unwrap();
+        assert!(text(&s).ends_with("\x1b[?2026h\x1b[?25linline\x1b[?2026l"));
+    }
+
+    #[test]
+    fn deck_draws_from_home_erases_rows_and_places_an_absolute_cursor() {
+        let mut s = Screen::new(Vec::new(), false, 8);
+        s.draw_deck(
+            &[
+                Line::default().ink("first"),
+                Line::default().ink("界界界界界"),
+                Line::default(),
+            ],
+            Some((1, 3)),
+        )
+        .unwrap();
+        assert_eq!(
+            text(&s),
+            "\x1b[?2026h\x1b[?25l\x1b[Hfirst\x1b[K\r\n界界界…\x1b[K\r\n\x1b[K\x1b[2;4H\x1b[?25h\x1b[?2026l"
+        );
+    }
+
+    #[test]
+    fn deck_without_a_cursor_stays_hidden_and_never_adds_a_trailing_newline() {
+        let mut s = Screen::new(Vec::new(), false, 4);
+        s.draw_deck(&[Line::default().ink("full")], None).unwrap();
+        assert_eq!(text(&s), "\x1b[?2026h\x1b[?25l\x1b[Hfull\x1b[K\x1b[?2026l");
+        s.draw_deck(&[], None).unwrap();
+        assert!(text(&s).ends_with("\x1b[?2026h\x1b[?25l\x1b[H\x1b[?2026l"));
     }
 
     #[test]

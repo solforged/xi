@@ -12,6 +12,7 @@ use std::path::Path;
 use xi_protocol::event::StopReason;
 use xi_protocol::{Block, Event, EventKind, SessionId, Timestamp, ToolCallId};
 
+use crate::layout::Measure;
 use crate::style::{Line, Role, inline, lr, prose};
 use crate::transcript::{
     Detail, RESULT_LINES, SPINNER, Totals, blocks_text, clock, counted, duration, headline_arg,
@@ -158,7 +159,8 @@ impl Child {
         lr(left, right, cols)
     }
 
-    fn slip(&self, number: usize, cols: usize) -> Option<(Vec<Line>, Detail)> {
+    fn slip(&self, number: usize, m: Measure) -> Option<(Vec<Line>, Detail)> {
+        let cols = m.out;
         let (text, error) = match &self.state {
             State::Running => return None,
             State::Done(text) => (text.as_str(), false),
@@ -183,7 +185,7 @@ impl Child {
         ];
         let rows = prose(
             text.trim(),
-            cols.saturating_sub(2),
+            m.prose,
             if error { Role::Sanguine } else { Role::Ink },
         );
         let hidden = rows.len().saturating_sub(RESULT_LINES);
@@ -308,11 +310,11 @@ impl Children {
     }
 
     /// Open-sided slips and complete answers for the call's finished children.
-    pub(crate) fn committed(&self, cols: usize) -> (Vec<Line>, Vec<Detail>) {
+    pub(crate) fn committed(&self, m: Measure) -> (Vec<Line>, Vec<Detail>) {
         let mut lines = Vec::new();
         let mut details = Vec::new();
         for (index, child) in self.0.iter().enumerate() {
-            if let Some((slip, detail)) = child.slip(index + 1, cols) {
+            if let Some((slip, detail)) = child.slip(index + 1, m) {
                 lines.extend(slip);
                 details.push(detail);
             }
@@ -372,7 +374,7 @@ mod tests {
         assert!(rows[6].starts_with("  ├─ ✕ 10"), "{rows:#?}");
         assert_eq!(rows[7], "  └─ … 3 more · 3 running");
         assert_eq!(children.running(), 9);
-        let (slips, details) = children.committed(100);
+        let (slips, details) = children.committed(Measure::new(100, 36));
         assert_eq!(slips.len(), 2);
         assert_eq!(details.len(), 1);
     }
@@ -423,7 +425,7 @@ mod tests {
         child.event(&answer, None);
         let live = child.row(1, 1, true, 0, 96).plain();
         assert!(live.starts_with("  └─ ● 1  one"), "{live}");
-        let (lines, detail) = child.slip(1, 96).unwrap();
+        let (lines, detail) = child.slip(1, Measure::new(96, 36)).unwrap();
         let text: Vec<_> = lines.iter().map(Line::plain).collect();
         assert_eq!(
             text,
@@ -448,13 +450,13 @@ mod tests {
             ended: Some(Timestamp(60_000)),
             ..child()
         };
-        let (lines, detail) = child.slip(2, 4).unwrap();
+        let (lines, detail) = child.slip(2, Measure::new(4, 36)).unwrap();
         let text: Vec<_> = lines.iter().map(Line::plain).collect();
         assert_eq!(text[1..4], ["  ab", "  cd", "  ef"]);
         assert!(lines.iter().all(|line| line.width() <= 4));
         assert_eq!(detail.text, "abcdefghij");
         assert_eq!(detail.title, "from child 2");
-        let (lines, _) = child.slip(2, 28).unwrap();
+        let (lines, _) = child.slip(2, Measure::new(28, 36)).unwrap();
         assert_eq!(lines[0].plain(), "» from child 2 · 00:01");
         assert_eq!(lines[1].plain(), "  abcdefghij");
     }
@@ -462,14 +464,14 @@ mod tests {
     #[test]
     fn failed_children_keep_a_sanguine_mark_and_reason_and_running_children_do_not_commit() {
         let mut child = child();
-        assert!(child.slip(1, 80).is_none());
+        assert!(child.slip(1, Measure::new(80, 36)).is_none());
         child.event(
             &event(EventKind::TurnFailed {
                 message: "first reason\nsecond reason".into(),
             }),
             None,
         );
-        let (lines, detail) = child.slip(1, 80).unwrap();
+        let (lines, detail) = child.slip(1, Measure::new(80, 36)).unwrap();
         assert!(lines[0].plain().starts_with("✕ from child 1 · "));
         assert_eq!(lines[0].0[0].role, Role::Sanguine);
         assert_eq!(lines[1].plain(), "  first reason");
