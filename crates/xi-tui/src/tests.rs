@@ -287,6 +287,7 @@ async fn launch_with(
             notifications,
             template,
             attached,
+            pick_session: false,
             history: None,
             tui_config: None,
         },
@@ -1671,6 +1672,92 @@ async fn approvals_inbox_keeps_current_asks_before_the_daemons_oldest_first_orde
         );
     }
     assert!(app.overlays.is_empty());
+}
+
+#[tokio::test]
+async fn startup_picker_focuses_the_latest_previous_session_only_when_requested() {
+    for pick_session in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut attached = snapshot(false);
+        attached.info.cwd = temp.path().into();
+        let mut target = snapshot(false);
+        target.info.cwd = temp.path().into();
+        target.info.path = temp.path().join("previous.jsonl");
+        let mut older = snapshot(false);
+        older.info.cwd = temp.path().into();
+        let mut child = summary(&target, false, "hidden child", 400);
+        child.session = SessionId::generate();
+        child.parent_session = Some(attached.info.session);
+        let data = FakeData {
+            sessions: vec![target.clone()],
+            summaries: vec![
+                summary(&target, false, "previous prompt", 200),
+                summary(&attached, true, "", 300),
+                summary(&older, false, "older prompt", 100),
+                child,
+            ],
+            ..FakeData::default()
+        };
+        let (mut launch, mut requests) = launch_with(attached, data).await;
+        launch.pick_session = pick_session;
+        let mut app = App::new(launch, 160, 32);
+        app.initialize().await;
+        if !pick_session {
+            assert!(app.overlays.is_empty());
+            while let Ok((method, _)) = requests.try_recv() {
+                assert_ne!(method, "session/list");
+            }
+            continue;
+        }
+        assert_eq!(
+            request(&mut requests, "session/list")["cwd"],
+            json!(temp.path())
+        );
+        assert!(app.overlays.on_top::<Sessions>());
+        assert_eq!(
+            app.overlays
+                .get::<Sessions>()
+                .unwrap()
+                .selected()
+                .unwrap()
+                .session,
+            target.info.session
+        );
+        assert!(!live_text(&app).contains("hidden child"));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&mut requests, "session/open")["path"],
+            json!(target.info.path)
+        );
+        assert_eq!(app.session_id(), target.info.session);
+        assert!(app.overlays.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn empty_startup_picker_can_be_closed_without_opening_a_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut attached = snapshot(false);
+    attached.info.cwd = temp.path().into();
+    let (mut launch, mut requests) = launch(attached).await;
+    launch.pick_session = true;
+    let mut app = App::new(launch, 120, 32);
+    let session = app.session_id();
+    app.initialize().await;
+    request(&mut requests, "session/list");
+    assert!(live_text(&app).contains("no matching sessions"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.overlays.on_top::<Sessions>());
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.overlays.is_empty());
+    assert_eq!(app.session_id(), session);
+    assert!(requests.try_recv().is_err());
 }
 
 #[tokio::test]

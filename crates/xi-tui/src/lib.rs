@@ -76,6 +76,8 @@ pub struct Launch {
     pub template: CreateParams,
     /// The initial session snapshot.
     pub attached: AttachResult,
+    /// Open the session picker on startup, focused on the latest other session.
+    pub pick_session: bool,
     /// Shared prompt history, or in-memory history when absent.
     pub history: Option<PathBuf>,
     /// Client key and display settings, or defaults when absent.
@@ -172,7 +174,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     let (cols, rows) = crossterm::terminal::size()?;
     let color = std::env::var_os("NO_COLOR").is_none();
     let mut app = App::new(launch, usize::from(cols), usize::from(rows));
-    app.initialize_composer().await;
+    app.initialize().await;
     let mut raw = Some(Raw::enter()?);
     let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
     let mut keys = EventStream::new();
@@ -337,6 +339,16 @@ impl App {
             ]);
         }
         app
+    }
+
+    async fn initialize(&mut self) {
+        self.initialize_composer().await;
+        if self.launch.pick_session {
+            self.open_sessions().await;
+            if let Some(picker) = self.overlays.get_mut::<sessions::Sessions>() {
+                picker.select_previous();
+            }
+        }
     }
 
     async fn initialize_composer(&mut self) {
