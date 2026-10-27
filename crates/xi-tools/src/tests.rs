@@ -910,6 +910,20 @@ mod shell {
         assert!(text(&ran).contains("125"));
         assert!(!text(&ran).contains("MUST_NOT_RUN"));
     }
+
+    #[tokio::test]
+    async fn bash_missing_helper_names_its_path() {
+        let mut f = Fixture::new();
+        f.ctx.helper = f.outside.join("missing-helper");
+        let ran = f.run("bash", json!({"command":"echo MUST_NOT_RUN"})).await;
+        assert!(ran.output.is_error);
+        let text = text(&ran);
+        assert!(
+            text.starts_with("Sandbox could not start: ") && text.contains("missing-helper"),
+            "{text}"
+        );
+        assert!(!text.contains("MUST_NOT_RUN"));
+    }
 }
 
 #[tokio::test]
