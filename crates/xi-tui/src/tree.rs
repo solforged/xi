@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use xi_protocol::{Block, Event, EventId, EventKind, Timestamp};
 
+use crate::frame::{Body, Frame, Hint, Note, Tone};
+use crate::keys::{Action, Keymap};
 use crate::style::{Line, Role, lr};
 use crate::transcript::tokens;
 
@@ -285,19 +287,26 @@ impl Tree {
         };
     }
 
+    /// One node. The selected row keeps its connectors and takes a brass
+    /// `›` and brass text, so the tree's shape never changes under it.
     fn row(&self, i: usize, now: Timestamp, cols: usize) -> Line {
         let node = &self.nodes[i];
-        let cursor = if i == self.selected {
-            Line::default().brass("› ")
+        let left = if i == self.selected {
+            let mark = match node.kind {
+                Kind::Root => "○ ",
+                Kind::You => "ξ ",
+                Kind::Turn => "▸ ",
+                Kind::Compaction => "≡ ",
+            };
+            Line::default().brass(format!("› {}{mark}{}", node.prefix, node.text))
         } else {
-            Line::default().ink("  ")
-        };
-        let mut left = cursor.dim(&node.prefix);
-        left = match node.kind {
-            Kind::Root => left.dim("○ ").dim(&node.text),
-            Kind::You => left.brass("ξ ").ink(&node.text),
-            Kind::Turn => left.dim("▸ ").dim(&node.text),
-            Kind::Compaction => left.strong(Role::Ink, "≡ ").dim(&node.text),
+            let left = Line::default().ink("  ").dim(&node.prefix);
+            match node.kind {
+                Kind::Root => left.dim("○ ").dim(&node.text),
+                Kind::You => left.brass("ξ ").ink(&node.text),
+                Kind::Turn => left.dim("▸ ").dim(&node.text),
+                Kind::Compaction => left.strong(Role::Ink, "≡ ").dim(&node.text),
+            }
         };
         let mut right = Line::default();
         if node.taints {
@@ -313,66 +322,50 @@ impl Tree {
         lr(left, right, cols)
     }
 
-    /// The overlay, `cols` wide and at most `rows` tall, keeping the
-    /// selection in view.
+    /// The border, title, branch count and keys.
     #[must_use]
-    pub fn render(&self, cols: usize, rows: usize, now: Timestamp) -> Vec<Line> {
-        let inner = cols.saturating_sub(4);
-        let Some(node) = self.current() else {
-            return Vec::new();
-        };
-        let mut foot = Vec::new();
-        if node.tainted {
-            foot.push(
-                Line::default()
-                    .murex("◆")
-                    .dim(" this branch read untrusted content, so egress on it asks."),
-            );
-        }
-        foot.push(Line::default().dim(if node.prompt.is_some() {
-            "enter puts this prompt back in the composer; sending it starts a new branch."
-        } else {
-            "enter checks out this point; your next prompt continues from it."
-        }));
-        let visible = rows
-            .saturating_sub(foot.len() + 3)
-            .clamp(1, self.nodes.len().max(1));
-        let top = self
-            .selected
-            .saturating_sub(visible / 2)
-            .min(self.nodes.len() - visible);
-        let mut body: Vec<Line> = (top..top + visible)
-            .map(|i| self.row(i, now, inner))
-            .collect();
-        body.push(Line::default());
-        body.extend(foot);
-        let b = |s: &str| Line::default().span(Role::Brass, false, s);
+    pub fn frame(&self, keys: &Keymap) -> Frame {
         let branches = match self.branches {
             1 => "1 branch".to_owned(),
             n => format!("{n} branches"),
         };
-        let title = Line::default()
-            .strong(Role::Ink, "session tree")
-            .dim(format!(" · {branches}"));
-        let right = Line::default().dim("↑↓ move · enter checkout · esc");
-        let fill = cols.saturating_sub(title.width() + right.width() + 8);
-        let mut lines = vec![
-            b("╭─ ")
-                .extend(title)
-                .ink(" ")
-                .extend(b(&"─".repeat(fill)))
-                .ink(" ")
-                .extend(right)
-                .extend(b(" ─╮"))
-                .truncate(cols),
-        ];
-        for row in body {
-            let row = row.truncate(inner);
-            let pad = inner - row.width();
-            lines.push(b("│ ").extend(row).ink(" ".repeat(pad)).extend(b(" │")));
+        let mut hints: Vec<Hint> = Hint::moves(keys, 3).into_iter().collect();
+        hints.extend(Hint::key(keys, Action::Send, "checkout", 0));
+        hints.extend(Hint::key(keys, Action::Escape, "closes", 0));
+        Frame {
+            tone: Tone::Focus,
+            title: Line::default().ink("session tree"),
+            info: Some(Line::default().dim(branches)),
+            hints,
         }
-        lines.push(b(&format!("╰{}╯", "─".repeat(cols.saturating_sub(2)))));
-        lines
+    }
+
+    /// Every node, `inner` wide, and what `enter` does for the selected one.
+    #[must_use]
+    pub fn body(&self, inner: usize, now: Timestamp) -> Body {
+        let Some(node) = self.current() else {
+            return Body::default();
+        };
+        let mut foot = Vec::new();
+        if node.tainted {
+            foot.push(Note::marked(
+                Line::default().murex("◆"),
+                "This branch read untrusted content, so egress on it asks.",
+            ));
+        }
+        foot.push(Note::new(if node.prompt.is_some() {
+            "enter puts this prompt back in the composer; sending it starts a new branch."
+        } else {
+            "enter checks out this point; your next prompt continues from it."
+        }));
+        Body {
+            list: (0..self.nodes.len())
+                .map(|i| self.row(i, now, inner))
+                .collect(),
+            selected: Some(self.selected),
+            foot,
+            ..Body::default()
+        }
     }
 }
 
@@ -487,18 +480,15 @@ mod tests {
         let head = log.add(Some(u3), reply("done", &[]));
 
         let tree = Tree::new(&log.0, head);
-        let rows: Vec<String> = tree
-            .render(80, 40, Timestamp(1_000))
+        let frame = tree.frame(&Keymap::default());
+        assert_eq!(frame.title.plain(), "session tree");
+        assert_eq!(frame.info.unwrap().plain(), "2 branches");
+        let body = tree.body(76, Timestamp(1_000));
+        let rows: Vec<String> = body
+            .list
             .iter()
-            .map(|l| {
-                let p = l.plain();
-                p.trim_start_matches("│ ")
-                    .trim_end_matches(" │")
-                    .trim_end()
-                    .to_owned()
-            })
+            .map(|l| l.plain().trim_end().to_owned())
             .collect();
-        assert!(rows[0].contains("session tree · 2 branches"), "{rows:?}");
         let starts = [
             "  ○ session started · anthropic/m",
             "  ξ the export tests fail",
@@ -509,15 +499,26 @@ mod tests {
             "     ξ ok, now deleted.py",
             "›    ▸ done",
         ];
-        for (row, start) in rows[1..].iter().zip(starts) {
+        assert_eq!(rows.len(), starts.len());
+        for (row, start) in rows.iter().zip(starts) {
             assert!(row.starts_with(start), "{row:?} should start {start:?}");
         }
-        assert!(rows[4].ends_with("now"), "{rows:?}");
-        assert!(rows[5].ends_with("◆ tainted now"), "{rows:?}");
-        assert!(rows[6].ends_with("now"), "{rows:?}");
-        assert!(rows[8].ends_with("● head"), "{rows:?}");
-        assert_eq!(rows[9], "");
-        assert!(rows[10].starts_with("enter checks out"), "{rows:?}");
+        assert!(rows[3].ends_with("now"), "{rows:?}");
+        assert!(rows[4].ends_with("◆ tainted now"), "{rows:?}");
+        assert!(rows[5].ends_with("now"), "{rows:?}");
+        assert!(rows[7].ends_with("● head"), "{rows:?}");
+        assert!(
+            body.list[7]
+                .0
+                .iter()
+                .take(1)
+                .all(|span| span.role == Role::Brass && span.text.starts_with("›    ▸ done")),
+            "the selected row is brass with its connectors: {:?}",
+            body.list[7]
+        );
+        assert_eq!(body.selected, Some(7));
+        assert_eq!(body.foot.len(), 1);
+        assert!(body.foot[0].text.starts_with("enter checks out"));
 
         let mut tree = tree;
         tree.step(-4);
