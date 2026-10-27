@@ -454,6 +454,8 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("sandbox.env_command", SettingLayer::Local),
         ("daemon.idle_exit", SettingLayer::Global),
         ("sandbox.ssh_agent", SettingLayer::Default),
+        ("web_search.backend", SettingLayer::Default),
+        ("web_search.model", SettingLayer::Default),
     ];
     assert_eq!(trusted.settings.len(), expected.len());
     for (index, (row, (key, source))) in trusted.settings.iter().zip(expected).enumerate() {

@@ -2417,7 +2417,7 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
     )
     .await;
     launch.template.options.configs = vec!["/tmp/extra.toml".into()];
-    let mut app = App::new(launch, 240, 40);
+    let mut app = App::new(launch, 240, 44);
     app.command("/settings").await.unwrap();
     assert!(app.overlays.on_top::<Settings>());
     let params = request(&mut requests, "config/settings");

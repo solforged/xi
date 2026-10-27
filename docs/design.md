@@ -354,6 +354,28 @@ Each event records `by`: `first_prompt`, `first_turn` or `user`. Automatic title
 
 The TUI also sets the terminal's window and tab title with OSC 0: `ξ: TITLE` from the log's latest title, or `ξ` before the session has one. It follows live titles and session switches, saves the terminal's previous title with the xterm title stack on start and restores it on exit. Terminals without that stack keep the last `ξ` title. Inside tmux, the outer terminal shows it only with `set-titles on`.
 
+### Web search and fetch
+
+Two opt-in built-in tools reach the web. Name them in `tools` or `--tools`; children of `task` can get `fetch` but never `web_search`.
+
+- `web_search` takes one `query`. The kernel runs it as a side request that carries only the query and the short `crates/xi-kernel/src/web_search.md` prompt, never the session's history, so the search side cannot see the session's context. The search model gets no tools, so pages it reads can change only the text it returns.
+- `fetch` takes one `url` and returns the page as text: HTML becomes Markdown without scripts, styles, navigation or forms; other text types pass through; binary types fail with a hint to download them with `bash`. Bodies stop at 5 MiB, and large results spill like other tool output. Redirects on the same host are followed, at most five. A redirect to another host ends the call with its target, so the next host gets its own crossing.
+
+Both run in the worker, outside the sandbox and the egress proxy. Each call is a `net` crossing to one host and asks like other egress: a search to its service's host (`chatgpt.com`, `api.anthropic.com` or `api.exa.ai`), a fetch to the URL's host. Their output is always untrusted, so the first result taints the branch, and later searches and fetches on it ask again unless a rule with `when = "tainted"` allows the host. A query is itself egress: on a tainted branch it could carry data out, which is why it asks.
+
+`[web_search]` picks the service:
+
+```toml
+[web_search]
+backend = "auto"                 # auto | model | exa
+model = "@tiny"                  # a PROVIDER/MODEL or @ROLE
+exa = { env = "EXA_API_KEY" }    # or { file = "/path/to/0600-key" }
+```
+
+`model` uses the search model's hosted web search: Anthropic's `web_search` server tool, at most five searches per call, or the Responses `web_search` tool. Only providers that speak Anthropic Messages or OpenAI Responses have one. Responses Lite takes only function tools, so a search request to a Lite model uses the full Responses shape. The result is the answer after the model's last search, then its cited pages, or without citations the pages its searches returned, at most ten. A reply that never searched, or found no sources, is an error. `exa` sends the query to Exa's search API and returns eight ranked results with their date and relevant passages. `auto`, the default, uses `model` when the search model's provider has hosted search and `exa` otherwise, so local Chat Completions models search through Exa. The settings view shows `web_search.backend` and `web_search.model` read only.
+
+Hosted searches count against the search model's plan or API usage; Anthropic also bills per search. Their usage is not recorded in the session log, so the footer's cost leaves them out.
+
 ### Terminal client
 
 `xi-tui` is the daily interface: a daemon client that commits finished output to the terminal's native scrollback and redraws only a live region below it. The live region holds the streaming turn, any open overlay, the composer and a one-line footer. Everything about a session goes through the protocol. The client owns only local state: prompt history, key bindings and display preferences. Edits to the user's global config file go through `config/set`.
@@ -603,7 +625,7 @@ With it off, tool commands run directly without the sandbox helper, filesystem r
 
 ### Egress
 
-All network traffic from sandboxed processes goes through an HTTP proxy run by the session's worker. The proxy sees the destination of each `CONNECT` tunnel or absolute-form plain HTTP request, asks policy for `net <host>` before connecting, and resolves the name itself, so the sandbox needs no DNS. Provider API calls originate in the worker and never pass through tool processes.
+All network traffic from sandboxed processes goes through an HTTP proxy run by the session's worker. The proxy sees the destination of each `CONNECT` tunnel or absolute-form plain HTTP request, asks policy for `net <host>` before connecting, and resolves the name itself, so the sandbox needs no DNS. Provider API calls originate in the worker and never pass through tool processes. So do [`web_search` and `fetch`](#web-search-and-fetch), which ask policy for their host as a tool crossing before they connect.
 
 Each process gets `HTTP_PROXY`, `HTTPS_PROXY`, their lowercase forms, `ALL_PROXY` and `NODE_USE_ENV_PROXY=1`, so curl, git, cargo, Python, Bun and Node 24+ use the proxy without configuration. Anything that ignores those variables, including ssh, has no network. A plain HTTP request is forwarded with `Connection: close`, so one proxy connection never carries a second destination. A literal `127.0.0.1` or `localhost` destination resolves on the host, so a rule or approval can let a tool reach a server on the user's machine.
 
@@ -646,7 +668,7 @@ Inside the sandbox nothing is asked under any preset, so workspace edits and com
 
 ### Taint
 
-The kernel marks a session tainted when it ingests untrusted content: output of fetch tools, or tool output an extension flags as untrusted. A `tainted` event records the cause. Taint never clears on a branch that contains the event; it does not apply to sibling branches.
+The kernel marks a session tainted when it ingests untrusted content: output of `web_search` and `fetch`, or tool output an extension flags as untrusted. A `tainted` event records the cause. Taint never clears on a branch that contains the event; it does not apply to sibling branches.
 
 This addresses the combination of private data, untrusted content and an exfiltration channel. Rather than trusting the model to resist injected instructions, the kernel cuts the exfiltration channel back to explicit approval.
 
@@ -693,7 +715,7 @@ The subscription profile stays inside the Anthropic Messages adapter. It uses Cl
 
 ## Defaults
 
-- Tools: `read`, `edit`, `write`, `bash`, `search`. `edit` replaces exact text, including whitespace and indentation. Read first and include enough surrounding lines to make the match unique, unless replacing all occurrences. The opt-in `hashline` tool edits by line and content hash, rejecting stale anchors. The opt-in `task` tool runs child sessions. Read and search output uses `LINE|text` by default and `LINE:HH|text` when `hashline` is active. Children inherit the parent's output format, even if their tool subset omits `hashline`. Large outputs are truncated in context and spilled to a file the model can read.
+- Tools: `read`, `edit`, `write`, `bash`, `search`. `edit` replaces exact text, including whitespace and indentation. Read first and include enough surrounding lines to make the match unique, unless replacing all occurrences. The opt-in `hashline` tool edits by line and content hash, rejecting stale anchors. The opt-in `task` tool runs child sessions. The opt-in `web_search` and `fetch` tools reach the web; see [Web search and fetch](#web-search-and-fetch). Read and search output uses `LINE|text` by default and `LINE:HH|text` when `hashline` is active. Children inherit the parent's output format, even if their tool subset omits `hashline`. Large outputs are truncated in context and spilled to a file the model can read.
 - Context files: `AGENTS.md` and Agent Skills.
 - System prompt: under 1k tokens, static.
 - Compaction: automatic compaction off; a context overflow always compacts once and retries. The summary is structured (goal, decisions, touched files, open work) and visible as a `compaction` event.
@@ -713,8 +735,8 @@ The subscription profile stays inside the Anthropic Messages adapter. It uses Cl
 | `xi-policy` | Policy rules, layering and taint-aware evaluation. | Implemented |
 | `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock, macOS Seatbelt. | Implemented |
 | `xi-kernel` egress proxy | Per-session and per-extension proxy listeners in the worker, the Seatbelt port rule and the Linux in-namespace forwarder in `xi-sandbox`. | Implemented (Linux forwarder compile-checked, not run) |
-| `xi-provider` | Anthropic Messages, OpenAI-compatible Chat and OpenAI Responses adapters, ChatGPT and opt-in Anthropic subscription sign-in, model registry. Responses replays encrypted reasoning statelessly and speaks Responses Lite for the GPT-6 models. | Implemented (Anthropic subscription CLI verified against a local server; Anthropic live path untested; ChatGPT `gpt-6.1-sol` verified live) |
-| `xi-tools` | `read`, exact-string `edit`, `write`, `bash`, `search`, plus opt-in `hashline` edits. | Implemented |
+| `xi-provider` | Anthropic Messages, OpenAI-compatible Chat and OpenAI Responses adapters, ChatGPT and opt-in Anthropic subscription sign-in, model registry, hosted web search requests and the Exa search client. Responses replays encrypted reasoning statelessly and speaks Responses Lite for the GPT-6 models. | Implemented (Anthropic subscription CLI verified against a local server; Anthropic live path untested; ChatGPT `gpt-6.1-sol` verified live; hosted search verified live on `chatgpt` and `claude`; Exa verified against a mock and a live key rejection) |
+| `xi-tools` | `read`, exact-string `edit`, `write`, `bash`, `search`, plus opt-in `hashline` edits and `fetch`. | Implemented |
 | `xi-kernel` | Agent loop, context builder, layered config, workspace trust, sandboxed extension host and worker entry point over the daemon pipe. | Implemented |
 | `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler, socket activation, unit installation and private-instance mode. | Implemented |
 | `xi-cli` | The `xi` binary: daemon-backed line mode and TUI launch, private-instance headless `-p`, client-protocol `serve`, `trust`, `daemon`, `daemon install`/`uninstall` and internal `worker`. | Implemented |

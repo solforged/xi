@@ -7,6 +7,12 @@ use crate::sse::Events;
 use crate::transport::{api_error, decode};
 use crate::*;
 
+/// The hosted web search tool version.
+// https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+const WEB_SEARCH: &str = "web_search_20250305";
+/// Searches one request may run, which bounds a search's cost.
+const MAX_SEARCHES: u32 = 5;
+
 pub(crate) fn body(request: &Request, reasoning: bool, max_tokens: u32) -> Result<Value, Error> {
     let cache = json!({"type": "ephemeral"});
     let mut messages: Vec<Value> = Vec::with_capacity(request.messages.len());
@@ -66,11 +72,16 @@ pub(crate) fn body(request: &Request, reasoning: bool, max_tokens: u32) -> Resul
     if !request.system.is_empty() {
         body["system"] = json!([{"type": "text", "text": request.system, "cache_control": cache}]);
     }
-    if !request.tools.is_empty() {
-        let mut tools: Vec<_> = request.tools.iter().map(|tool| json!({
-            "name": tool.name, "description": tool.description, "input_schema": tool.input_schema,
-        })).collect();
-        tools.last_mut().expect("tools are nonempty")["cache_control"] = cache;
+    let mut tools: Vec<_> = request.tools.iter().map(|tool| json!({
+        "name": tool.name, "description": tool.description, "input_schema": tool.input_schema,
+    })).collect();
+    if request.web_search {
+        tools.push(json!({"type": WEB_SEARCH, "name": "web_search", "max_uses": MAX_SEARCHES}));
+    }
+    if let Some(last) = tools.last_mut() {
+        last["cache_control"] = cache;
+    }
+    if !tools.is_empty() {
         body["tools"] = tools.into();
     }
     if reasoning {
@@ -480,6 +491,7 @@ mod tests {
             max_tokens: 8192,
             reasoning: Reasoning::Medium,
             cache_key: None,
+            web_search: false,
         }
     }
 

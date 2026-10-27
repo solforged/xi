@@ -19,6 +19,7 @@ pub mod extensions;
 pub mod settings;
 mod task;
 pub mod title;
+mod web_search;
 pub mod worker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -194,7 +195,7 @@ impl Backend {
             ))
         })?;
         let provider = registry.connect(&config.model)?;
-        let tools = toolset(&config.tools)?;
+        let tools = toolset(config)?;
         Ok(Self {
             provider,
             model,
@@ -203,24 +204,30 @@ impl Backend {
     }
 }
 
-/// Tools in `names` order: built-ins from `xi-tools`, plus the kernel's own
-/// opt-in `task`, which runs only inside a [`Session`].
+/// The tools `config.tools` names, in order: built-ins from `xi-tools`, plus
+/// the kernel's own opt-in `task` and `web_search`, which run only inside a
+/// [`Session`].
 ///
 /// # Errors
 /// Returns `Config` for an unknown tool name.
-pub fn toolset(names: &[impl AsRef<str>]) -> Result<Vec<Arc<dyn Tool>>> {
-    let names: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
-    let builtins: Vec<_> = names.iter().filter(|&&name| name != task::NAME).collect();
+pub fn toolset(config: &Config) -> Result<Vec<Arc<dyn Tool>>> {
+    let names: Vec<&str> = config.tools.iter().map(String::as_str).collect();
+    let kernel = [task::NAME, web_search::NAME];
+    let builtins: Vec<_> = names.iter().filter(|name| !kernel.contains(name)).collect();
     let mut tools = xi_tools::toolset(&builtins).map_err(Error::Config)?;
-    if let Some(at) = names.iter().position(|&name| name == task::NAME) {
-        tools.insert(at, Arc::new(task::Task));
+    for (at, name) in names.iter().enumerate() {
+        match *name {
+            task::NAME => tools.insert(at, Arc::new(task::Task)),
+            web_search::NAME => tools.insert(at, Arc::new(web_search::WebSearch::new(config))),
+            _ => {}
+        }
     }
     Ok(tools)
 }
 
 /// Whether `name` may appear in `tools`.
 pub(crate) fn is_tool_name(name: &str) -> bool {
-    xi_tools::is_builtin(name) || name == task::NAME
+    xi_tools::is_builtin(name) || name == task::NAME || name == web_search::NAME
 }
 
 struct ActiveBackend {
@@ -1107,6 +1114,7 @@ impl Session {
                 max_tokens: backend.model.max_output,
                 reasoning: backend.model.resolve(state.config.reasoning),
                 cache_key: Some(self.id().to_string()),
+                web_search: false,
             };
             let response = self
                 .stream(
@@ -1539,6 +1547,11 @@ impl Session {
             .then(|| input.clone());
         let mut result = if name == task::NAME && tool.is_some() {
             self.run_tasks(state, input, cancel, current).await
+        } else if name == web_search::NAME && tool.is_some() {
+            xi_tools::Ran {
+                output: self.run_search(state, input, cancel).await,
+                spill: None,
+            }
         } else if let Some(tool) = tool {
             let context = state.tools_context.clone();
             let run = async {

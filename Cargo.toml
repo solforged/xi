@@ -31,6 +31,7 @@ futures = "0.3"
 globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+htmd = "0.5"
 httpdate = "1"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }

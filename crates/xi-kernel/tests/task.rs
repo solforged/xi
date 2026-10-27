@@ -121,7 +121,7 @@ impl Fixture {
                     reasoning: Vec::new(),
                     pricing: None,
                 },
-                tools: xi_kernel::toolset(&config.tools).unwrap(),
+                tools: xi_kernel::toolset(&config).unwrap(),
             }),
         )
         .unwrap();

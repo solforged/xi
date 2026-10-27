@@ -396,6 +396,7 @@ pub(crate) fn headline_arg(
             .get("tasks")
             .and_then(Value::as_array)
             .map(|tasks| counted(tasks.len(), "task", "tasks")),
+        "web_search" => field("query").map(first),
         _ => field("url").map(str::to_owned),
     }
     .unwrap_or_else(|| {

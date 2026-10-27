@@ -12,7 +12,7 @@ use xi_protocol::Decision;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::SettingLayer;
 use xi_protocol::model::{ModelRole, ModelSelector, Reasoning};
-use xi_provider::{ModelEntry, ProviderConfig, Registry, RegistryConfig};
+use xi_provider::{Auth, ModelEntry, ProviderConfig, Registry, RegistryConfig};
 
 use crate::{Error, Result};
 
@@ -229,6 +229,48 @@ impl Default for TitleConfig {
     }
 }
 
+/// Which service runs `web_search` queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackend {
+    /// The search model's hosted search when its provider has one, else Exa.
+    #[default]
+    Auto,
+    /// The search model's hosted search.
+    Model,
+    /// The Exa search API.
+    Exa,
+}
+
+/// `[web_search]`: how the opt-in `web_search` tool searches.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebSearchConfig {
+    /// The service that runs searches.
+    pub backend: SearchBackend,
+    /// The model whose provider runs hosted searches. Default `@tiny`.
+    pub model: ModelSelector,
+    /// The Exa API key. Default `{ env = "EXA_API_KEY" }`.
+    pub exa: Auth,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            backend: SearchBackend::Auto,
+            model: ModelRole::Tiny.into(),
+            exa: Auth::Env("EXA_API_KEY".into()),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSearchLayer {
+    backend: Option<SearchBackend>,
+    model: Option<String>,
+    exa: Option<Auth>,
+}
+
 /// Built-in approval policy applied before user rules.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -255,6 +297,7 @@ struct FileConfig {
     sandbox: Option<SandboxLayer>,
     compaction: Option<crate::compaction::Layer>,
     title: Option<TitleConfig>,
+    web_search: Option<WebSearchLayer>,
     #[serde(default)]
     provider: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -315,6 +358,8 @@ pub struct Config {
     pub compaction: crate::compaction::Config,
     /// Automatic session naming.
     pub title: TitleConfig,
+    /// How `web_search` searches.
+    pub web_search: WebSearchConfig,
     /// Daemon settings from the global user config file only.
     pub daemon: DaemonSettings,
     /// Ordered registry layers, resolved lazily at the first model request.
@@ -356,6 +401,7 @@ impl Config {
             sandbox: SandboxConfig::default(),
             compaction: crate::compaction::Config::default(),
             title: TitleConfig::default(),
+            web_search: WebSearchConfig::default(),
             daemon: DaemonSettings::default(),
             extensions: Vec::new(),
             registries: Vec::new(),
@@ -525,6 +571,25 @@ impl Config {
             }
             if let Some(title) = layer.title {
                 config.title = title;
+            }
+            if let Some(search) = layer.web_search {
+                if let Some(backend) = search.backend {
+                    config.web_search.backend = backend;
+                }
+                if let Some(model) = search.model {
+                    config.web_search.model = model.parse().map_err(|error| {
+                        Error::Config(format!("{}: web_search.model: {error}", path.display()))
+                    })?;
+                }
+                if let Some(exa) = search.exa {
+                    if !matches!(exa, Auth::Env(_) | Auth::File(_)) {
+                        return Err(Error::Config(format!(
+                            "{}: web_search.exa must be {{ env = NAME }} or {{ file = PATH }}",
+                            path.display()
+                        )));
+                    }
+                    config.web_search.exa = exa;
+                }
             }
             if let Some(extensions) = layer.extensions {
                 let base = path.parent().expect("config file has a parent");
