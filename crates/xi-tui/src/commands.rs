@@ -2,9 +2,11 @@ use xi_protocol::event::ModelRef;
 use xi_protocol::manifest::CommandSpec;
 use xi_protocol::model::Reasoning;
 
+use crate::approvals::Approvals;
 use crate::style::{Line, Role};
 use crate::transcript::tokens;
-use crate::{App, Error, Focus, Tree, clipboard};
+use crate::tree::Tree;
+use crate::{App, Error, clipboard};
 
 #[derive(Clone, Copy)]
 enum Builtin {
@@ -127,9 +129,9 @@ impl App {
             }
             Some(Builtin::Resume) => self.open_sessions().await,
             Some(Builtin::Approvals) => {
-                self.approvals = None;
+                self.overlays.close::<Approvals>();
                 self.refresh_inbox().await;
-                if self.approvals.is_none() {
+                if self.overlays.get::<Approvals>().is_none() {
                     self.note(vec![Line::default().dim("  no pending approvals")]);
                 }
             }
@@ -147,12 +149,11 @@ impl App {
                 if !self.idle_only("/tree") {
                     return Ok(());
                 }
-                self.tree = Some(Tree::new(
+                self.overlays.push(Box::new(Tree::new(
                     &self.launch.attached.events,
                     self.launch.attached.info.head,
-                ));
+                )));
                 self.completion = None;
-                self.focus = Focus::Tree;
             }
             Some(Builtin::Model) if rest.is_empty() => self.open_models().await,
             Some(Builtin::Model) => match rest.split_once('/') {

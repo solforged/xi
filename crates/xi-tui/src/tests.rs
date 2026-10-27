@@ -6,8 +6,12 @@ use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::SessionSummary;
 use xi_protocol::model::Reasoning;
 
-use crate::approvals::Choice;
+use crate::approvals::{Approvals, Choice};
+use crate::history::Search;
 use crate::keys::Action;
+use crate::picker::Picker;
+use crate::sessions::Sessions;
+use crate::settings::Settings;
 use serde_json::{Value, json};
 use xi_protocol::event::{Remember, StopReason, Usage};
 use xi_protocol::methods::client::{
@@ -651,7 +655,7 @@ async fn model_command_opens_the_picker_and_enter_selects_a_model() {
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 120, 24);
     app.command("/model").await.unwrap();
-    assert!(app.focus == Focus::Models);
+    assert!(app.overlays.on_top::<Picker>());
     assert_eq!(
         request(&mut requests, "session/models")["session"],
         json!(app.session_id())
@@ -669,7 +673,7 @@ async fn model_command_opens_the_picker_and_enter_selects_a_model() {
         })
     );
     assert_eq!(app.launch.attached.info.model.model, "second");
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
 }
 
 #[tokio::test]
@@ -951,7 +955,7 @@ async fn history_search_walks_older_matches_and_restores_the_draft() {
         .await
         .unwrap();
     assert_eq!(
-        app.search.as_ref().unwrap().current(&app.history),
+        app.overlays.get::<Search>().unwrap().current(&app.history),
         Some("first matching prompt")
     );
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -965,7 +969,7 @@ async fn history_search_walks_older_matches_and_restores_the_draft() {
         .await
         .unwrap();
     assert_eq!(app.editor.text(), "second matching prompt");
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
 }
 
 #[tokio::test]
@@ -1355,7 +1359,69 @@ async fn approval_option_two_remembers_the_session_scope() {
     assert_eq!(params["call"], json!(ask.call));
     assert_eq!(params["approved"], true);
     assert_eq!(params["remember"], "session");
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
+}
+
+#[tokio::test]
+async fn tab_answers_a_waiting_ask_over_another_overlay_and_records_it() {
+    let mut attached = snapshot(true);
+    attached
+        .pending_approvals
+        .push(pending(attached.info.session));
+    let (launch, mut requests) = launch(attached).await;
+    let mut app = App::new(launch, 120, 40);
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.command("/settings").await.unwrap();
+    assert!(app.overlays.on_top::<Settings>());
+    assert!(live_text(&app).contains("tab answers 1 waiting"));
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.overlays.on_top::<Approvals>());
+    assert!(live_text(&app).contains("settings › "));
+    app.commit.clear();
+    app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "approval/resolve")["remember"],
+        "session"
+    );
+    assert!(app.overlays.on_top::<Settings>());
+    let record: Vec<String> = app.commit.iter().map(Line::plain).collect();
+    assert!(
+        record
+            .iter()
+            .any(|line| line == "? allowed for this session · bash exec git push"),
+        "{record:?}"
+    );
+    assert!(!live_text(&app).contains("waiting"));
+}
+
+#[tokio::test]
+async fn esc_steps_back_one_overlay_and_ctrl_c_closes_the_stack() {
+    let (launch, _requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.editor.insert("keep draft");
+    app.command("/settings").await.unwrap();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    app.key(enter).await.unwrap();
+    assert!(app.overlays.on_top::<Picker>());
+    assert!(live_text(&app).contains("settings › models"));
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.overlays.on_top::<Settings>());
+    app.key(enter).await.unwrap();
+    app.commit.clear();
+    app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.overlays.is_empty());
+    assert!(app.commit.is_empty());
+    assert_eq!(app.editor.text(), "keep draft");
 }
 
 #[tokio::test]
@@ -1381,7 +1447,7 @@ async fn taint_approval_hides_persistent_scopes_without_renumbering_deny() {
     while let Ok((method, _)) = requests.try_recv() {
         assert_ne!(method, "approval/resolve");
     }
-    assert!(app.focus == Focus::Approval);
+    assert!(app.overlays.on_top::<Approvals>());
     app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1426,7 +1492,7 @@ async fn untrusted_approval_hides_workspace_scope_and_uses_session_details_for_e
             taint: false,
         },
     );
-    assert!(app.focus == Focus::Approval);
+    assert!(app.overlays.on_top::<Approvals>());
     assert!(live_text(&app).contains("2 Allow for this session"));
     assert!(!live_text(&app).contains("3 Always allow"));
     app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
@@ -1438,7 +1504,7 @@ async fn untrusted_approval_hides_workspace_scope_and_uses_session_details_for_e
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
     assert_eq!(app.transcript.asks().len(), 1);
 }
 
@@ -1463,7 +1529,7 @@ async fn workspace_approval_sends_workspace_scope_and_errors_keep_the_overlay() 
             .unwrap();
         let params = request(&mut requests, "approval/resolve");
         assert_eq!(params["remember"], "workspace");
-        assert_eq!(app.focus == Focus::Approval, reject);
+        assert_eq!(app.overlays.on_top::<Approvals>(), reject);
         if reject {
             assert!(
                 app.commit
@@ -1489,7 +1555,7 @@ async fn approvals_inbox_shows_and_resolves_another_sessions_ask() {
     let mut app = App::new(launch, 160, 32);
     app.command("/approvals").await.unwrap();
     request(&mut requests, "approval/list");
-    assert!(app.focus == Focus::Approval);
+    assert!(app.overlays.on_top::<Approvals>());
     let overlay = live_text(&app);
     assert!(overlay.contains(&format!("session {}", &other.info.session.to_string()[..8])));
     assert!(overlay.contains("/tmp/other-workspace"));
@@ -1502,7 +1568,7 @@ async fn approvals_inbox_shows_and_resolves_another_sessions_ask() {
     assert_eq!(params["call"], json!(ask.call));
     assert_eq!(params["remember"], "session");
     request(&mut requests, "approval/list");
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
 }
 
 #[tokio::test]
@@ -1525,8 +1591,8 @@ async fn an_answered_ask_still_listed_by_the_daemon_does_not_reopen_the_inbox() 
         .unwrap();
     request(&mut requests, "approval/resolve");
     request(&mut requests, "approval/list");
-    assert!(app.focus == Focus::Composer);
-    assert!(app.approvals.is_none());
+    assert!(app.overlays.is_empty());
+    assert!(app.overlays.get::<Approvals>().is_none());
 }
 
 #[tokio::test]
@@ -1547,8 +1613,8 @@ async fn approvals_inbox_keeps_current_asks_before_the_daemons_oldest_first_orde
     app.command("/approvals").await.unwrap();
     for expected in [own, older, newer] {
         assert_eq!(
-            app.approvals
-                .as_ref()
+            app.overlays
+                .get::<Approvals>()
                 .unwrap()
                 .current()
                 .unwrap()
@@ -1564,7 +1630,7 @@ async fn approvals_inbox_keeps_current_asks_before_the_daemons_oldest_first_orde
             json!(expected.session)
         );
     }
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
 }
 
 #[tokio::test]
@@ -1591,7 +1657,7 @@ async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live
         let (launch, mut requests) = launch_with(attached, data).await;
         let mut app = App::new(launch, 160, 32);
         app.command("/resume").await.unwrap();
-        assert!(app.focus == Focus::Sessions);
+        assert!(app.overlays.on_top::<Sessions>());
         let params = request(&mut requests, "session/list");
         assert_eq!(params["cwd"], json!(temp.path()));
         assert!(params.get("running").is_none());
@@ -1609,14 +1675,14 @@ async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live
             assert_eq!(params["session"], json!(target.info.session));
             assert!(params.get("since").is_none());
             assert!(app.running());
-            assert!(app.focus == Focus::Approval);
+            assert!(app.overlays.on_top::<Approvals>());
             assert_eq!(app.transcript.asks().len(), 1);
             assert!(live_text(&app).contains("target in flight"));
         } else {
             let params = request(&mut requests, "session/open");
             assert_eq!(params["path"], json!(target.info.path));
             assert!(!app.running());
-            assert!(app.focus == Focus::Composer);
+            assert!(app.overlays.is_empty());
         }
         assert_eq!(app.session_id(), target.info.session);
         assert_eq!(app.launch.template.cwd, target.info.cwd);
@@ -1687,7 +1753,12 @@ async fn resume_hides_children_filters_titles_and_workspaces_and_closes_on_curre
             .unwrap();
     }
     assert_eq!(
-        app.sessions.as_ref().unwrap().selected().unwrap().session,
+        app.overlays
+            .get::<Sessions>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .session,
         older.info.session
     );
     assert!(!live_text(&app).contains("Current prompt"));
@@ -1699,7 +1770,7 @@ async fn resume_hides_children_filters_titles_and_workspaces_and_closes_on_curre
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
     assert!(requests.try_recv().is_err());
 }
 
@@ -1722,11 +1793,11 @@ async fn custom_keymap_changes_dispatch_help_and_initial_thinking() {
     app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
         .await
         .unwrap();
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
     app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
         .await
         .unwrap();
-    assert!(app.focus == Focus::Search);
+    assert!(app.overlays.on_top::<Search>());
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1847,7 +1918,7 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
     launch.template.options.configs = vec!["/tmp/extra.toml".into()];
     let mut app = App::new(launch, 240, 40);
     app.command("/settings").await.unwrap();
-    assert!(app.focus == Focus::Settings);
+    assert!(app.overlays.on_top::<Settings>());
     let params = request(&mut requests, "config/settings");
     assert_eq!(params["cwd"], "/tmp/xi-tui-demo");
     assert_eq!(params["configs"], json!(["/tmp/extra.toml"]));
@@ -1919,8 +1990,8 @@ async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
     assert_eq!(params["key"], "compaction.enabled");
     assert_eq!(params["value"], false);
     let row = app
-        .settings
-        .as_ref()
+        .overlays
+        .get::<Settings>()
         .unwrap()
         .report
         .settings
@@ -1946,14 +2017,14 @@ async fn settings_saves_session_model_and_reasoning_and_returns_from_picker() {
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.focus == Focus::Models);
+    assert!(app.overlays.on_top::<Picker>());
     app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
         .await
         .unwrap();
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.focus == Focus::Settings);
+    assert!(app.overlays.on_top::<Settings>());
     assert_eq!(app.launch.attached.info.model.model, "second");
     app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
         .await
@@ -2166,9 +2237,9 @@ async fn settings_handles_missing_client_path_external_file_and_ctrl_c() {
     app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .await
         .unwrap();
-    assert!(app.focus == Focus::Composer);
+    assert!(app.overlays.is_empty());
     assert!(!app.quit);
-    assert!(app.settings.is_none());
+    assert!(app.overlays.get::<Settings>().is_none());
     assert_eq!(app.editor.text(), "keep draft");
 }
 
@@ -2187,8 +2258,8 @@ async fn settings_errors_leave_the_composer_or_show_the_rpc_message_in_the_view(
         let mut app = App::new(launch, 180, 40);
         app.command("/settings").await.unwrap();
         if reject_open {
-            assert!(app.focus == Focus::Composer);
-            assert!(app.settings.is_none());
+            assert!(app.overlays.is_empty());
+            assert!(app.overlays.get::<Settings>().is_none());
             assert!(
                 app.commit
                     .iter()
@@ -2199,7 +2270,7 @@ async fn settings_errors_leave_the_composer_or_show_the_rpc_message_in_the_view(
                 .await
                 .unwrap();
             request(&mut requests, "config/set");
-            assert!(app.focus == Focus::Settings);
+            assert!(app.overlays.on_top::<Settings>());
             assert!(live_text(&app).contains("setting rejected"));
             assert!(!live_text(&app).contains("saved · new sessions use it"));
         }

@@ -3,8 +3,11 @@
 use xi_protocol::methods::client::SessionSummary;
 use xi_protocol::{SessionId, Timestamp};
 
+use crossterm::event::KeyEvent;
+
 use crate::frame::{Body, Cursor, Frame, Hint, Tone};
 use crate::keys::{Action, Keymap};
+use crate::overlay::{Command, Ctx, ListKey, Outcome, Overlay, list_key};
 use crate::style::{Line, row};
 use crate::transcript::SPINNER;
 
@@ -215,6 +218,38 @@ impl Sessions {
             cursor,
             ..Body::default()
         }
+    }
+}
+
+impl Overlay for Sessions {
+    fn name(&self) -> &'static str {
+        "sessions"
+    }
+
+    fn frame(&self, ctx: &Ctx) -> Frame {
+        Self::frame(self, ctx.keys)
+    }
+
+    fn body(&self, inner: usize, ctx: &Ctx) -> Body {
+        Self::body(self, inner, ctx.now)
+    }
+
+    fn key(&mut self, key: KeyEvent, action: Option<Action>, _: &Ctx) -> Outcome {
+        match list_key(key, action) {
+            ListKey::Choose => {
+                if let Some(session) = self.selected() {
+                    return Outcome::Send(Box::new(Command::Resume(session.clone())));
+                }
+            }
+            ListKey::Tab => return Outcome::Send(Box::new(Command::Sessions { all: !self.all })),
+            ListKey::Close => return Outcome::Close,
+            ListKey::Up => self.up(),
+            ListKey::Down => self.down(),
+            ListKey::Backspace => self.backspace(),
+            ListKey::Type(c) => self.input(c),
+            _ => {}
+        }
+        Outcome::Stay
     }
 }
 

@@ -11,6 +11,7 @@ use xi_protocol::model::Reasoning;
 use crate::editor::Editor;
 use crate::frame::{Body, Cursor, Frame, Hint, Note, Tone};
 use crate::keys::{Action as Key, Keymap};
+use crate::overlay::{Command, Ctx, Outcome, Overlay};
 use crate::style::{self, Line, Role};
 use crate::transcript::Thinking;
 
@@ -465,6 +466,35 @@ impl Settings {
             foot: note.into_iter().map(Note::new).collect(),
             cursor,
             ..Body::default()
+        }
+    }
+}
+
+impl Overlay for Settings {
+    fn name(&self) -> &'static str {
+        "settings"
+    }
+
+    fn frame(&self, ctx: &Ctx) -> Frame {
+        Self::frame(self, ctx.keys)
+    }
+
+    fn body(&self, inner: usize, ctx: &Ctx) -> Body {
+        Self::body(
+            self,
+            inner,
+            &ctx.info.model,
+            ctx.info.reasoning,
+            ctx.thinking,
+            ctx.tui_path,
+        )
+    }
+
+    fn key(&mut self, key: KeyEvent, action: Option<Key>, ctx: &Ctx) -> Outcome {
+        match Self::key(self, key, action, &ctx.info.model, ctx.info.reasoning) {
+            Action::None => Outcome::Stay,
+            Action::Close => Outcome::Close,
+            change => Outcome::Send(Box::new(Command::Setting(change))),
         }
     }
 }

@@ -307,11 +307,11 @@ Composer keys are unique. Keys inside an overlay apply only while it has focus.
 | `enter` | Send. During a turn, steer. With a completion menu open, accept the selection. |
 | `alt+enter` | Queue a follow-up for after the turn. |
 | `shift+enter`, `ctrl+j` | New line. |
-| `esc` | Close a menu or overlay; otherwise cancel the running turn. |
-| `ctrl+c` | Close an overlay, else cancel the turn, else clear the composer, else quit. |
+| `esc` | Close a menu, or step back one overlay; otherwise cancel the running turn. |
+| `ctrl+c` | Close every open overlay, else cancel the turn, else clear the composer, else quit. |
 | `ctrl+d` | Quit when the composer is empty and no turn runs; otherwise delete forward. |
 | `up`, `down` | Move in an open menu; otherwise walk this workspace's history while the composer has one line. |
-| `tab` | Accept a completion; otherwise open pending approvals. |
+| `tab` | Accept a completion; otherwise open this session's waiting asks, from the composer or from any overlay. |
 | `ctrl+r` | Search prompt history. |
 | `ctrl+g` | Edit the prompt in the external editor. |
 | `ctrl+v` | Attach an image from the local clipboard. Backspace with empty text removes the last attachment. |
@@ -362,12 +362,14 @@ Built-in names are reserved, so an extension cannot shadow them. Model, reasonin
 
 #### Overlays
 
+Overlays form a stack, but only the top one is drawn. Its title starts with the levels under it as a breadcrumb, such as `settings › models`. `esc` steps back one level and `ctrl+c` closes them all. A frame leaves a scrollback record only when it changed something: an answer commits one line such as `? allowed for this session · bash exec cargo test`, and checkouts and model switches commit theirs. Closing a frame leaves nothing.
+
 | Overlay | Opens with | Contents and keys |
 |---|---|---|
 | Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider under headings that scroll with them: id, then context window, a reasoning mark and price per million input and output tokens at the right. `●` marks the current model. Models without credentials are dimmed with the way to add one. Typing filters on a head row that holds the cursor, `enter` selects, `esc` closes. |
 | History search | `ctrl+r` | The query on a head row, then every match, this workspace first and newest first, with the match underlined. `ctrl+r` or `down` moves to older matches, `up` to newer. |
 | Session picker | `/resume` | `session/list` for this workspace, `tab` for all workspaces with each session's workspace: first prompt, then model and age at the right. `●` marks this session, `?` one waiting on you and a spinner one that is running, newest first. Child sessions are hidden. Typing filters on prompt and workspace. `enter` attaches to a live session or opens a saved one, and attaches instead when another worker already holds the log. Idle only. |
-| Approvals | `tab`, `/approvals` | One ask at a time: its action in bold, then its tool, rule and workspace, the answers and a note on what the selected one does. `1`/`y` allows once, `2` allows for this session, `3` always allows in this workspace, `4`/`n` denies; `up`, `down` and `enter` choose too. Scopes that do not apply are hidden and their keys do nothing. The frame turns murex for an ask on a tainted branch. `tab` shows this session's asks; inside the frame it walks to the next waiting ask, and the top border counts them. `esc` leaves the ask waiting. `/approvals` shows the inbox from `approval/list`: this session's asks first, then other sessions' oldest first, each labeled with its session and workspace. |
+| Approvals | `tab`, `/approvals` | One ask at a time: its action in bold, then its tool, rule and workspace, the answers and a note on what the selected one does. `1`/`y` allows once, `2` allows for this session, `3` always allows in this workspace, `4`/`n` denies; `up`, `down` and `enter` choose too. Scopes that do not apply are hidden and their keys do nothing. The frame turns murex for an ask on a tainted branch. A new ask opens the frame only when no overlay is open and the composer is empty; otherwise it waits on the status line, and `tab` opens it over whatever is open. Inside the frame `tab` walks to the next waiting ask, and the top border counts them. `esc` leaves the ask waiting. `/approvals` shows the inbox from `approval/list`: this session's asks first, then other sessions' oldest first, each labeled with its session and workspace. |
 | Tree | `/tree` | Branch points of the session; `enter` checks out, `esc` closes. |
 | Settings | `/settings` | See below. |
 

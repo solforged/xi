@@ -2,16 +2,14 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use xi_client::client::ClientNotification;
-use xi_protocol::Timestamp;
 use xi_protocol::methods::client::EventParams;
 use xi_protocol::model::Reasoning;
 
-use crate::frame;
 use crate::screen::Screen;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
 use crate::transcript::{SPINNER, blocks_text, tokens};
-use crate::{App, Focus, lineage};
+use crate::{App, lineage};
 
 /// The footer's form of a level.
 fn short_reasoning(reasoning: Reasoning) -> &'static str {
@@ -218,7 +216,7 @@ impl App {
                     .short(Line::default().murex("◆")),
             );
         }
-        let asks = self.transcript.asks().len();
+        let asks = self.waiting();
         if asks > 0 {
             segs.push(
                 Segment::new(
@@ -278,7 +276,7 @@ impl App {
                 cols,
             ));
         }
-        let border = if self.focus != Focus::Composer {
+        let border = if !self.overlays.is_empty() {
             Role::Dim
         } else if self.transcript.tainted {
             Role::Murex
@@ -296,56 +294,13 @@ impl App {
         // and the turn's own rows; streamed rows above it scroll off first.
         let reserved = composer.len() + 1 + attachment_rows + lines.len() - transcript_rows;
         let overlay_rows = self.rows.saturating_sub(1 + reserved);
-        let mut overlay_cursor = None;
-        let inner = frame::inner(cols);
-        let framed = match self.focus {
-            Focus::Approval => self.approvals.as_ref().map(|approvals| {
-                (
-                    approvals.frame(&self.keymap),
-                    approvals.body(inner, self.session_id()),
-                )
-            }),
-            Focus::Tree => self
-                .tree
-                .as_ref()
-                .map(|tree| (tree.frame(&self.keymap), tree.body(inner, Timestamp::now()))),
-            Focus::Models => self.picker.as_ref().map(|picker| {
-                let back = self.settings.is_some().then_some("settings");
-                (picker.frame(&self.keymap, back), picker.body(inner))
-            }),
-            Focus::Sessions => self.sessions.as_ref().map(|sessions| {
-                (
-                    sessions.frame(&self.keymap),
-                    sessions.body(inner, Timestamp::now()),
-                )
-            }),
-            Focus::Search => self.search.as_ref().map(|search| {
-                (
-                    search.frame(&self.history, &self.keymap),
-                    search.body(&self.history, inner),
-                )
-            }),
-            Focus::Settings => self.settings.as_ref().map(|settings| {
-                let info = &self.launch.attached.info;
-                (
-                    settings.frame(&self.keymap),
-                    settings.body(
-                        inner,
-                        &info.model,
-                        info.reasoning,
-                        self.transcript.thinking_display(),
-                        self.launch.tui_config.as_deref(),
-                    ),
-                )
-            }),
-            Focus::Composer => None,
-        };
-        if let Some((framed, body)) = framed {
-            let (rows, cursor) = frame::draw(&framed, body, cols, overlay_rows.max(4));
-            overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
-            lines.extend(rows);
-        }
-        if self.focus == Focus::Composer
+        let mut ctx = crate::overlays::ctx!(self);
+        let (rows, cursor) =
+            self.overlays
+                .draw(&mut ctx, self.waiting(), cols, overlay_rows.max(4));
+        let overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
+        lines.extend(rows);
+        if self.overlays.is_empty()
             && let Some(menu) = &self.completion
         {
             lines.extend(menu.render(cols, overlay_rows.min(8)));
@@ -363,7 +318,7 @@ impl App {
         lines.extend(composer);
         lines.push(self.footer(cols));
         let cursor =
-            overlay_cursor.or_else(|| (self.focus == Focus::Composer).then_some((top + row, col)));
+            overlay_cursor.or_else(|| self.overlays.is_empty().then_some((top + row, col)));
         (lines, cursor)
     }
 

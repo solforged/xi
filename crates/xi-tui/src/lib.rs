@@ -22,6 +22,7 @@ mod git;
 pub mod history;
 mod input;
 pub mod keys;
+mod overlay;
 mod overlays;
 pub mod picker;
 pub mod screen;
@@ -55,15 +56,12 @@ use crate::commands::builtin_commands;
 use crate::complete::{FileIndex, Menu};
 use crate::config::TuiConfig;
 use crate::editor::Editor;
-use crate::history::{History, Search};
+use crate::history::History;
 use crate::keys::Keymap;
-use crate::picker::Picker;
+use crate::overlay::Overlays;
 use crate::screen::Screen;
-use crate::sessions::Sessions;
-use crate::settings::Settings;
 use crate::style::{Line, Role};
 use crate::transcript::{Transcript, duration, tokens};
-use crate::tree::Tree;
 
 /// A client error.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -109,17 +107,6 @@ impl Drop for Raw {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Composer,
-    Approval,
-    Tree,
-    Models,
-    Search,
-    Sessions,
-    Settings,
-}
-
 type Reply = oneshot::Receiver<Result<PromptResult, ClientError>>;
 
 enum ExternalRequest {
@@ -134,14 +121,9 @@ struct App {
     editor: Editor,
     /// Images attached to the current composer draft, not prompt history.
     images: Vec<Block>,
-    focus: Focus,
-    /// The session tree overlay, while it is open.
-    tree: Option<Tree>,
-    picker: Option<Picker>,
-    search: Option<Search>,
-    sessions: Option<Sessions>,
-    approvals: Option<Approvals>,
-    settings: Option<Settings>,
+    /// Open overlays; only the top one draws and gets keys. Empty while
+    /// the composer has them.
+    overlays: Overlays,
     approval_workspaces: HashMap<SessionId, PathBuf>,
     /// Other sessions' asks this client answered. The daemon drops an ask
     /// from `approval/list` only when its resolution event arrives, which
@@ -260,7 +242,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
             Some(reply) = app.pending.next(), if !app.pending.is_empty() => app.replied(reply),
             event = keys.next() => match event {
                 Some(Ok(TermEvent::Key(key))) if key.kind != KeyEventKind::Release => app.key(key).await?,
-                Some(Ok(TermEvent::Paste(text))) if app.focus == Focus::Composer => {
+                Some(Ok(TermEvent::Paste(text))) if app.overlays.is_empty() => {
                     app.editor.insert(&text);
                     app.update_completion();
                 }
@@ -318,13 +300,7 @@ impl App {
             transcript,
             editor,
             images: Vec::new(),
-            focus: Focus::Composer,
-            tree: None,
-            picker: None,
-            search: None,
-            sessions: None,
-            approvals: None,
-            settings: None,
+            overlays: Overlays::default(),
             approval_workspaces: HashMap::new(),
             answered: HashSet::new(),
             inbox_refresh: false,
@@ -415,17 +391,10 @@ impl App {
         self.update_completion();
     }
 
+    /// Closes every overlay and returns the keys to the composer.
     fn close_overlay(&mut self) {
-        if let Some(search) = self.search.take() {
-            self.editor.set_text(search.draft());
-        }
-        self.tree = None;
-        self.picker = None;
-        self.sessions = None;
-        self.approvals = None;
-        self.settings = None;
+        self.overlays.clear();
         self.inbox_refresh = false;
-        self.focus = Focus::Composer;
         self.completion = None;
     }
 
@@ -490,7 +459,7 @@ impl App {
             if let ClientNotification::ApprovalPending(pending) = notification {
                 let cwd = self.approval_workspaces.get(&pending.session).cloned();
                 let current = self.session_id();
-                if let Some(approvals) = self.approvals.as_mut()
+                if let Some(approvals) = self.overlays.get_mut::<Approvals>()
                     && approvals.inbox
                 {
                     approvals.upsert(
@@ -569,18 +538,20 @@ impl App {
             }
             _ => {}
         }
+        // A new ask takes the keys only when nothing else has them;
+        // otherwise it waits on the status line for `tab`.
         let now = self.transcript.asks().len();
         if now > asks
             && self.editor.is_empty()
             && self.images.is_empty()
-            && self.focus == Focus::Composer
+            && self.overlays.is_empty()
         {
             self.open_own_approvals();
         }
-        if self.focus == Focus::Approval {
+        if self.overlays.get::<Approvals>().is_some() {
             let entries = self.own_approvals();
             let session = self.session_id();
-            if let Some(approvals) = self.approvals.as_mut() {
+            if let Some(approvals) = self.overlays.get_mut::<Approvals>() {
                 approvals.replace_current(entries, session);
             }
             self.close_empty_approvals();
@@ -617,20 +588,13 @@ impl App {
     fn finish_turn(&mut self, outcome: Option<PromptResult>) {
         self.launch.attached.running = false;
         self.transcript.end_turn();
-        if self.focus == Focus::Approval
-            && !self
-                .approvals
-                .as_ref()
-                .is_some_and(|approvals| approvals.inbox)
-        {
-            self.close_overlay();
-        }
-        if self.focus == Focus::Approval {
-            let session = self.session_id();
-            if let Some(approvals) = self.approvals.as_mut() {
-                approvals.replace_current(Vec::new(), session);
+        if let Some(approvals) = self.overlays.get_mut::<Approvals>() {
+            if approvals.inbox {
+                approvals.replace_current(Vec::new(), self.launch.attached.info.session);
+                self.close_empty_approvals();
+            } else {
+                self.overlays.close::<Approvals>();
             }
-            self.close_empty_approvals();
         }
         let elapsed = self.started.take().map_or(0, |s| {
             u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)

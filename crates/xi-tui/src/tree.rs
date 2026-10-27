@@ -10,8 +10,11 @@ use std::collections::HashMap;
 
 use xi_protocol::{Block, Event, EventId, EventKind, Timestamp};
 
+use crossterm::event::{KeyCode, KeyEvent};
+
 use crate::frame::{Body, Frame, Hint, Note, Tone};
 use crate::keys::{Action, Keymap};
+use crate::overlay::{Command, Ctx, Outcome, Overlay};
 use crate::style::{Line, Role, row};
 use crate::transcript::tokens;
 
@@ -366,6 +369,40 @@ impl Tree {
             foot,
             ..Body::default()
         }
+    }
+}
+
+impl Overlay for Tree {
+    fn name(&self) -> &'static str {
+        "tree"
+    }
+
+    fn frame(&self, ctx: &Ctx) -> Frame {
+        Self::frame(self, ctx.keys)
+    }
+
+    fn body(&self, inner: usize, ctx: &Ctx) -> Body {
+        Self::body(self, inner, ctx.now)
+    }
+
+    fn key(&mut self, key: KeyEvent, action: Option<Action>, ctx: &Ctx) -> Outcome {
+        let page = isize::try_from(ctx.rows / 2).unwrap_or(1).max(1);
+        match (action, key.code) {
+            (Some(Action::Up), _) | (_, KeyCode::Char('k')) => self.step(-1),
+            (Some(Action::Down), _) | (_, KeyCode::Char('j')) => self.step(1),
+            (Some(Action::Send), _) => {
+                if let Some(node) = self.current() {
+                    return Outcome::Send(Box::new(Command::Checkout(node.clone())));
+                }
+            }
+            (Some(Action::Escape), _) | (_, KeyCode::Char('q')) => return Outcome::Close,
+            (_, KeyCode::PageUp) => self.step(-page),
+            (_, KeyCode::PageDown) => self.step(page),
+            (_, KeyCode::Home) => self.jump(false),
+            (_, KeyCode::End) => self.jump(true),
+            _ => {}
+        }
+        Outcome::Stay
     }
 }
 
