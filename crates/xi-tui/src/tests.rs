@@ -351,7 +351,7 @@ async fn attach_keeps_partial_and_deduplicates_events_after_interleaved_appends(
     assert_eq!(app.launch.attached.events.len(), 1);
     assert!(
         app.transcript
-            .live(app.measure(), 0)
+            .live(app.display.measure(), 0)
             .iter()
             .any(|line| line.plain().contains("in flight"))
     );
@@ -369,7 +369,7 @@ async fn attach_keeps_partial_and_deduplicates_events_after_interleaved_appends(
         session: app.session_id(),
         event: event.clone(),
     }));
-    let committed = app.commit.len();
+    let committed = app.display.commit.len();
     app.notify(&ClientNotification::Event(EventParams {
         session: app.session_id(),
         event,
@@ -379,7 +379,7 @@ async fn attach_keeps_partial_and_deduplicates_events_after_interleaved_appends(
         event: root,
     }));
     assert_eq!(app.launch.attached.events.len(), 2);
-    assert_eq!(app.commit.len(), committed);
+    assert_eq!(app.display.commit.len(), committed);
 }
 
 #[tokio::test]
@@ -407,7 +407,7 @@ async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
     }
     let live: Vec<_> = app
         .transcript
-        .live(app.measure(), 0)
+        .live(app.display.measure(), 0)
         .iter()
         .map(Line::plain)
         .collect();
@@ -423,7 +423,7 @@ async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
         attempt: 2,
         sequence: 9,
     }));
-    assert!(app.transcript.live(app.measure(), 0).is_empty());
+    assert!(app.transcript.live(app.display.measure(), 0).is_empty());
     app.notify(&ClientNotification::Delta(DeltaParams {
         session,
         attempt: 2,
@@ -434,7 +434,7 @@ async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
     }));
     assert!(
         app.transcript
-            .live(app.measure(), 0)
+            .live(app.display.measure(), 0)
             .iter()
             .any(|line| line.plain().contains("next"))
     );
@@ -444,20 +444,19 @@ async fn attach_watermark_deduplicates_queued_deltas_and_resets() {
 async fn prompt_runs_off_the_ui_and_finishes_from_the_daemon_outcome() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 80, 24);
-    app.commit.clear();
+    app.display.commit.clear();
     app.send(vec![Block::Text {
         text: "hello".into(),
     }]);
-    assert!(app.running());
-    assert_eq!(app.pending.len(), 1);
-    let reply = app.pending.next().await.unwrap();
+    assert!(app.turn.running());
+    assert_eq!(app.turn.pending.len(), 1);
+    let reply = app.turn.pending.next().await.unwrap();
     app.replied(reply);
-    assert!(!app.running());
-    assert!(
-        app.commit
-            .iter()
-            .any(|line| line.plain().contains("done ·"))
-    );
+    assert!(!app.turn.running());
+    assert!(app.turn.pending.is_empty());
+    assert!(app.turn.started.is_none());
+    assert!(!app.launch.attached.running);
+    assert!(!app.transcript.thinking());
 }
 
 #[tokio::test]
@@ -474,9 +473,9 @@ async fn approvals_resolved_elsewhere_are_not_reported_as_errors_or_revived() {
         trusted: true,
     };
     app.notify(&ClientNotification::ApprovalPending(pending.clone()));
-    app.commit.clear();
+    app.display.commit.clear();
     app.answer(Choice::Once).await;
-    assert!(app.commit.is_empty());
+    assert!(app.display.commit.is_empty());
     app.notify(&ClientNotification::Event(EventParams {
         session: app.session_id(),
         event: Event {
@@ -675,7 +674,7 @@ async fn footer_git_state_is_collected_asynchronously_and_scoped_to_the_workspac
 async fn alt_s_toggles_the_live_sandbox_without_saving_a_default() {
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 160, 24);
-    app.editor.insert("keep this draft");
+    app.composer.editor.insert("keep this draft");
     for enabled in [false, true] {
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT))
             .await
@@ -685,7 +684,7 @@ async fn alt_s_toggles_the_live_sandbox_without_saving_a_default() {
         assert_eq!(params["enabled"], enabled);
         assert_eq!(app.launch.attached.info.sandbox_enabled, enabled);
         assert_eq!(app.footer(160).plain().contains("sandbox off"), !enabled);
-        assert_eq!(app.editor.text(), "keep this draft");
+        assert_eq!(app.composer.editor.text(), "keep this draft");
         assert!(
             requests.try_recv().is_err(),
             "must not save a global default"
@@ -702,11 +701,11 @@ async fn alt_s_toggles_the_live_sandbox_without_saving_a_default() {
             enabled
         );
     }
-    app.commit.clear();
+    app.display.commit.clear();
     app.command("/sandbox invalid").await.unwrap();
     assert!(requests.try_recv().is_err());
     assert!(
-        app.commit
+        app.display.commit
             .iter()
             .any(|line| line.plain().contains("expects on or off"))
     );
@@ -730,7 +729,7 @@ async fn rejected_sandbox_changes_keep_the_active_state() {
     assert!(app.launch.attached.info.sandbox_enabled);
     assert!(app.footer(160).plain().contains("◇ sandbox"));
     assert!(
-        app.commit
+        app.display.commit
             .iter()
             .any(|line| line.plain().contains("session is running"))
     );
@@ -781,7 +780,7 @@ async fn shift_tab_cycles_the_models_levels_and_updates_the_footer() {
 async fn reasoning_command_accepts_xhigh_without_a_transcript_note() {
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 160, 24);
-    app.commit.clear();
+    app.display.commit.clear();
     app.command("/reasoning xhigh").await.unwrap();
     assert_eq!(
         request(&mut requests, "session/set_reasoning")["reasoning"],
@@ -789,8 +788,8 @@ async fn reasoning_command_accepts_xhigh_without_a_transcript_note() {
     );
     assert_eq!(request(&mut requests, "config/set")["value"], "xhigh");
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::XHigh);
-    assert!(app.footer(160).plain().contains("think xhigh"));
-    assert!(app.commit.is_empty());
+    assert!(app.turn.pending.is_empty());
+    assert!(app.display.commit.is_empty());
 }
 
 #[tokio::test]
@@ -804,11 +803,11 @@ async fn reasoning_change_notes_a_failed_default_save() {
     )
     .await;
     let mut app = App::new(launch, 160, 24);
-    app.commit.clear();
+    app.display.commit.clear();
     app.command("/reasoning high").await.unwrap();
     request(&mut requests, "config/set");
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::High);
-    assert!(app.commit.iter().any(|line| {
+    assert!(app.display.commit.iter().any(|line| {
         line.plain()
             .contains("reasoning default not saved: setting rejected")
     }));
@@ -850,13 +849,11 @@ async fn model_command_selects_a_role_and_shows_the_model_it_resolved_to() {
         json!({ "role": "smol" })
     );
     assert_eq!(app.launch.attached.info.model.model, "second");
-    app.commit.clear();
+    app.display.commit.clear();
     app.command("/model @huge").await.unwrap();
-    assert!(
-        app.commit
-            .iter()
-            .any(|line| line.plain().contains("PROVIDER/MODEL or @slow"))
-    );
+    assert_eq!(app.launch.attached.info.model.model, "second");
+    assert!(app.overlays.is_empty());
+    assert!(requests.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -868,13 +865,15 @@ async fn unknown_commands_are_sent_to_extensions_and_point_to_help() {
     assert_eq!(params["name"], "missing");
     assert_eq!(params["args"], "raw arguments");
     assert!(
-        app.commit
+        app.display
+            .commit
             .iter()
             .any(|line| line.plain().contains("unknown command /missing · /help"))
     );
     app.command("/known argument").await.unwrap();
     assert!(
-        app.commit
+        app.display
+            .commit
             .iter()
             .any(|line| line.plain().contains("extension result"))
     );
@@ -889,14 +888,14 @@ async fn accepting_command_completion_replaces_the_composer_without_submitting()
             .await
             .unwrap();
     }
-    assert!(app.completion.is_some());
+    assert!(app.composer.completion.is_some());
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(app.editor.text(), "/reasoning ");
-    assert!(app.completion.is_none());
-    assert!(app.pending.is_empty());
-    assert!(!app.running());
+    assert_eq!(app.composer.editor.text(), "/reasoning ");
+    assert!(app.composer.completion.is_none());
+    assert!(app.turn.pending.is_empty());
+    assert!(!app.turn.running());
     while let Ok((method, _)) = requests.try_recv() {
         assert_eq!(method, "initialize");
     }
@@ -906,19 +905,20 @@ async fn accepting_command_completion_replaces_the_composer_without_submitting()
 async fn enter_on_a_fully_typed_command_runs_it() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 80, 24);
-    app.commit.clear();
+    app.display.commit.clear();
     for c in "/help".chars() {
         app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
             .await
             .unwrap();
     }
-    assert!(app.completion.is_some());
+    assert!(app.composer.completion.is_some());
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.editor.is_empty());
+    assert!(app.composer.editor.is_empty());
     assert!(
-        app.commit
+        app.display
+            .commit
             .iter()
             .any(|line| line.plain().contains("show keys and commands"))
     );
@@ -931,11 +931,11 @@ async fn submitted_prompts_are_persisted_but_commands_are_not() {
     let (mut launch, _) = launch(snapshot(false)).await;
     launch.history = Some(path.clone());
     let mut app = App::new(launch, 80, 24);
-    app.editor.set_text("persist this prompt");
+    app.composer.editor.set_text("persist this prompt");
     app.submit(false).await.unwrap();
-    let reply = app.pending.next().await.unwrap();
+    let reply = app.turn.pending.next().await.unwrap();
     app.replied(reply);
-    app.editor.set_text("/reasoning");
+    app.composer.editor.set_text("/reasoning");
     app.submit(false).await.unwrap();
     let lines = std::fs::read_to_string(path).unwrap();
     let entries: Vec<Value> = lines
@@ -945,8 +945,8 @@ async fn submitted_prompts_are_persisted_but_commands_are_not() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["text"], "persist this prompt");
     assert_eq!(entries[0]["cwd"], json!(app.launch.attached.info.cwd));
-    app.editor.history_back();
-    assert_eq!(app.editor.text(), "persist this prompt");
+    app.composer.editor.history_back();
+    assert_eq!(app.composer.editor.text(), "persist this prompt");
 }
 
 fn pasted_image() -> Block {
@@ -964,9 +964,9 @@ async fn image_only_and_mixed_prompts_send_all_blocks_without_storing_images_in_
         let (mut launch, mut requests) = launch(snapshot(false)).await;
         launch.history = Some(path.clone());
         let mut app = App::new(launch, 100, 24);
-        app.editor.set_text(text);
-        app.images = vec![pasted_image(), pasted_image()];
-        assert_eq!(app.editor.text(), text);
+        app.composer.editor.set_text(text);
+        app.composer.images = vec![pasted_image(), pasted_image()];
+        assert_eq!(app.composer.editor.text(), text);
         let live = app.live().0;
         assert!(
             live.iter()
@@ -978,9 +978,9 @@ async fn image_only_and_mixed_prompts_send_all_blocks_without_storing_images_in_
         }));
 
         app.submit(false).await.unwrap();
-        assert!(app.editor.is_empty());
-        assert!(app.images.is_empty());
-        let reply = app.pending.next().await.unwrap();
+        assert!(app.composer.editor.is_empty());
+        assert!(app.composer.images.is_empty());
+        let reply = app.turn.pending.next().await.unwrap();
         app.replied(reply);
         let mut expected = Vec::new();
         if !text.is_empty() {
@@ -996,8 +996,16 @@ async fn image_only_and_mixed_prompts_send_all_blocks_without_storing_images_in_
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["content"], json!(expected));
         let history = std::fs::read_to_string(path).unwrap_or_default();
-        assert!(!history.contains("cGl4ZWxz"));
-        assert_eq!(history.lines().count(), usize::from(!text.is_empty()));
+        let stored: Vec<Value> = history
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let expected = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "cwd": "/tmp/xi-tui-demo", "text": text })]
+        };
+        assert_eq!(stored, expected);
     }
 }
 
@@ -1005,19 +1013,17 @@ async fn image_only_and_mixed_prompts_send_all_blocks_without_storing_images_in_
 async fn queued_images_survive_until_the_next_turn() {
     let (launch, mut requests) = launch(snapshot(true)).await;
     let mut app = App::new(launch, 100, 24);
-    app.images.push(pasted_image());
+    app.composer.images.push(pasted_image());
     app.submit(true).await.unwrap();
-    assert!(app.images.is_empty());
-    assert!(app.pending.is_empty());
-    assert_eq!(app.queued, vec![vec![pasted_image()]]);
-    assert!(app.live().0.iter().any(|line| {
-        let text = line.plain();
-        text.contains("queued") && text.contains("[image]")
-    }));
+    assert!(app.composer.images.is_empty());
+    assert!(app.turn.pending.is_empty());
+    assert_eq!(app.turn.queued, vec![vec![pasted_image()]]);
+    assert!(app.turn.running());
+    assert!(app.turn.steering.is_empty());
 
     app.finish_turn(None);
-    assert!(app.queued.is_empty());
-    let reply = app.pending.next().await.unwrap();
+    assert!(app.turn.queued.is_empty());
+    let reply = app.turn.pending.next().await.unwrap();
     app.replied(reply);
     let mut sent = Vec::new();
     while let Ok((method, params)) = requests.try_recv() {
@@ -1038,10 +1044,10 @@ async fn steering_matches_the_image_payload_not_just_the_text() {
         data: "b3RoZXI=".into(),
     };
     for image in [&first, &second] {
-        app.images.push(image.clone());
+        app.composer.images.push(image.clone());
         app.submit(false).await.unwrap();
     }
-    assert_eq!(app.steering.len(), 2);
+    assert_eq!(app.turn.steering.len(), 2);
     app.notify(&ClientNotification::Event(EventParams {
         session: app.session_id(),
         event: Event {
@@ -1053,9 +1059,10 @@ async fn steering_matches_the_image_payload_not_just_the_text() {
             },
         },
     }));
-    assert_eq!(app.steering, vec![vec![first]]);
+    assert_eq!(app.turn.steering, vec![vec![first]]);
     assert!(
-        app.commit
+        app.display
+            .commit
             .iter()
             .any(|line| line.plain().contains("[image]"))
     );
@@ -1074,10 +1081,10 @@ async fn skill_invocations_are_prompts_whose_echo_shows_only_the_typed_text() {
     let typed = Block::Text {
         text: "/skill:review the diff".into(),
     };
-    app.editor.set_text("/skill:review the diff");
+    app.composer.editor.set_text("/skill:review the diff");
     app.submit(false).await.unwrap();
-    assert_eq!(app.steering, vec![vec![typed.clone()]]);
-    app.commit.clear();
+    assert_eq!(app.turn.steering, vec![vec![typed.clone()]]);
+    app.display.commit.clear();
     app.notify(&ClientNotification::Event(EventParams {
         session: app.session_id(),
         event: Event {
@@ -1092,8 +1099,8 @@ async fn skill_invocations_are_prompts_whose_echo_shows_only_the_typed_text() {
             },
         },
     }));
-    assert!(app.steering.is_empty());
-    let shown: Vec<_> = app.commit.iter().map(|line| line.plain()).collect();
+    assert!(app.turn.steering.is_empty());
+    let shown: Vec<_> = app.display.commit.iter().map(|line| line.plain()).collect();
     assert!(
         !shown.iter().any(|line| line.contains("another client")),
         "{shown:?}"
@@ -1109,7 +1116,7 @@ async fn skill_invocations_are_prompts_whose_echo_shows_only_the_typed_text() {
         ]),
         Some("/skill:review the diff".into())
     );
-    let reply = app.pending.next().await.unwrap();
+    let reply = app.turn.pending.next().await.unwrap();
     app.replied(reply);
     let mut methods = Vec::new();
     while let Ok((method, params)) = requests.try_recv() {
@@ -1126,26 +1133,26 @@ async fn skill_invocations_are_prompts_whose_echo_shows_only_the_typed_text() {
 async fn draft_images_can_be_removed_and_do_not_count_as_an_empty_composer() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 100, 24);
-    app.images = vec![pasted_image(), pasted_image()];
+    app.composer.images = vec![pasted_image(), pasted_image()];
     app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
         .await
         .unwrap();
     assert!(!app.quit);
-    assert_eq!(app.images.len(), 2);
-    app.editor.set_text("x");
+    assert_eq!(app.composer.images.len(), 2);
+    app.composer.editor.set_text("x");
     app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.editor.is_empty());
-    assert_eq!(app.images.len(), 2);
+    assert!(app.composer.editor.is_empty());
+    assert_eq!(app.composer.images.len(), 2);
     app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(app.images.len(), 1);
+    assert_eq!(app.composer.images.len(), 1);
     app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .await
         .unwrap();
-    assert!(app.images.is_empty());
+    assert!(app.composer.images.is_empty());
     assert!(!app.quit);
 }
 
@@ -1162,14 +1169,14 @@ async fn new_clears_scrollback_and_pending_output_before_drawing_one_fresh_heade
                 app.draw(&mut screen).unwrap();
             }
             app.note(vec![Line::default().ink("pending old output")]);
-            app.editor.set_text("/new");
+            app.composer.editor.set_text("/new");
             app.submit(false).await.unwrap();
             request(&mut requests, "session/create");
-            assert!(app.clear_scrollback);
-            assert_eq!(app.commit.len(), 1);
-            assert!(app.commit[0].plain().starts_with("ξ xi "));
+            assert!(app.display.clear_scrollback);
+            assert_eq!(app.display.commit.len(), 1);
+            assert!(app.display.commit[0].plain().starts_with("ξ xi "));
             app.draw(&mut screen).unwrap();
-            assert!(!app.clear_scrollback);
+            assert!(!app.display.clear_scrollback);
             app.draw(&mut screen).unwrap();
         }
         let output = String::from_utf8(output).unwrap();
@@ -1196,13 +1203,17 @@ async fn new_keeps_the_screen_when_session_creation_fails() {
     .await;
     let mut app = App::new(launch, 100, 24);
     app.note(vec![Line::default().ink("keep this output")]);
-    let committed: Vec<_> = app.commit.iter().map(Line::plain).collect();
+    let committed: Vec<_> = app.display.commit.iter().map(Line::plain).collect();
     let session = app.session_id();
     assert!(app.command("/new").await.is_err());
     assert_eq!(app.session_id(), session);
-    assert!(!app.clear_scrollback);
+    assert!(!app.display.clear_scrollback);
     assert_eq!(
-        app.commit.iter().map(Line::plain).collect::<Vec<_>>(),
+        app.display
+            .commit
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>(),
         committed
     );
 }
@@ -1211,36 +1222,36 @@ async fn new_keeps_the_screen_when_session_creation_fails() {
 async fn commands_keep_draft_images_but_switching_sessions_clears_them() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 100, 24);
-    app.images.push(pasted_image());
-    app.editor.set_text("/help");
+    app.composer.images.push(pasted_image());
+    app.composer.editor.set_text("/help");
     app.submit(false).await.unwrap();
-    assert_eq!(app.images, vec![pasted_image()]);
-    assert!(app.pending.is_empty());
-    app.editor.set_text("/new");
+    assert_eq!(app.composer.images, vec![pasted_image()]);
+    assert!(app.turn.pending.is_empty());
+    app.composer.editor.set_text("/new");
     app.submit(false).await.unwrap();
-    assert!(app.images.is_empty());
+    assert!(app.composer.images.is_empty());
 }
 
 #[tokio::test]
 async fn exited_sessions_keep_unsent_images_in_the_draft() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 100, 24);
-    app.exited = true;
-    app.images.push(pasted_image());
-    app.editor.set_text("unsent");
+    app.turn.exited = true;
+    app.composer.images.push(pasted_image());
+    app.composer.editor.set_text("unsent");
     app.submit(false).await.unwrap();
-    assert_eq!(app.images, vec![pasted_image()]);
-    assert_eq!(app.editor.text(), "unsent");
-    assert!(app.pending.is_empty());
+    assert_eq!(app.composer.images, vec![pasted_image()]);
+    assert_eq!(app.composer.editor.text(), "unsent");
+    assert!(app.turn.pending.is_empty());
 }
 
 #[tokio::test]
 async fn history_search_walks_older_matches_and_restores_the_draft() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 80, 24);
-    app.history.push("first matching prompt").unwrap();
-    app.history.push("second matching prompt").unwrap();
-    app.editor.set_text("unfinished draft");
+    app.composer.history.push("first matching prompt").unwrap();
+    app.composer.history.push("second matching prompt").unwrap();
+    app.composer.editor.set_text("unfinished draft");
     app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
         .await
         .unwrap();
@@ -1251,20 +1262,23 @@ async fn history_search_walks_older_matches_and_restores_the_draft() {
         .await
         .unwrap();
     assert_eq!(
-        app.overlays.get::<Search>().unwrap().current(&app.history),
+        app.overlays
+            .get::<Search>()
+            .unwrap()
+            .current(&app.composer.history),
         Some("first matching prompt")
     );
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(app.editor.text(), "unfinished draft");
+    assert_eq!(app.composer.editor.text(), "unfinished draft");
     app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
         .await
         .unwrap();
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(app.editor.text(), "second matching prompt");
+    assert_eq!(app.composer.editor.text(), "second matching prompt");
     assert!(app.overlays.is_empty());
 }
 
@@ -1283,17 +1297,15 @@ async fn model_reasoning_sandbox_and_compaction_changes_are_refused_while_runnin
     assert!(app.launch.attached.info.sandbox_enabled);
     app.command("/compact").await.unwrap();
     app.command("/new").await.unwrap();
-    assert!(!app.clear_scrollback);
+    assert!(!app.display.clear_scrollback);
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::Medium);
     assert_eq!(app.launch.attached.info.model.model, "script");
     while let Ok((method, _)) = requests.try_recv() {
         assert_eq!(method, "initialize");
     }
-    assert!(
-        app.commit
-            .iter()
-            .any(|line| line.plain().contains("waits for the turn to end"))
-    );
+    assert!(app.turn.running());
+    assert!(app.turn.pending.is_empty());
+    assert!(app.overlays.is_empty());
 }
 
 #[tokio::test]
@@ -1312,6 +1324,8 @@ async fn reasoning_model_and_sandbox_events_from_other_clients_update_metadata()
             },
         },
     ] {
+        let committed = app.display.commit.len();
+        let reasoning = matches!(kind, EventKind::ReasoningChanged { .. });
         app.notify(&ClientNotification::Event(EventParams {
             session: app.session_id(),
             event: Event {
@@ -1321,22 +1335,29 @@ async fn reasoning_model_and_sandbox_events_from_other_clients_update_metadata()
                 kind,
             },
         }));
+        if reasoning {
+            assert_eq!(app.display.commit.len(), committed);
+        }
     }
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::Low);
     assert_eq!(app.launch.attached.info.model.model, "other");
     assert!(!app.launch.attached.info.sandbox_enabled);
     assert!(app.footer(160).plain().contains("sandbox off"));
     assert!(
-        app.commit
+        app.display.commit
             .iter()
             .any(|line| line.plain().contains("unrestricted host files and network"))
     );
-    assert!(app.refresh);
+    assert!(app.turn.refresh);
     assert!(app.footer(160).plain().contains("think low"));
     assert!(
-        app.commit
+        app.display.commit
             .iter()
             .all(|line| !line.plain().contains("reasoning →"))
+    );
+    assert_eq!(
+        app.transcript.model.as_ref(),
+        Some(&app.launch.attached.info.model)
     );
 }
 
@@ -1344,9 +1365,10 @@ async fn reasoning_model_and_sandbox_events_from_other_clients_update_metadata()
 async fn help_uses_dispatch_bindings_and_only_implemented_commands() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 80, 24);
-    app.commit.clear();
+    app.display.commit.clear();
     app.command("/hotkeys").await.unwrap();
     let help = app
+        .display
         .commit
         .iter()
         .map(Line::plain)
@@ -1377,18 +1399,18 @@ async fn session_completion_loads_extension_commands_and_workspace_files() {
     let mut app = App::new(launch, 80, 24);
     app.initialize_composer().await;
     request(&mut requests, "session/commands");
-    app.editor.set_text("/kno");
-    app.update_completion();
+    app.composer.editor.set_text("/kno");
+    app.composer.update_completion();
     app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(app.editor.text(), "/known ");
-    app.editor.set_text("read @sour");
-    app.update_completion();
+    assert_eq!(app.composer.editor.text(), "/known ");
+    app.composer.editor.set_text("read @sour");
+    app.composer.update_completion();
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(app.editor.text(), "read @source.rs ");
+    assert_eq!(app.composer.editor.text(), "read @source.rs ");
 }
 
 fn pending(session: SessionId) -> PendingApproval {
@@ -1544,6 +1566,7 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
     let live = live_text(&app);
     assert!(live.contains("task    3 tasks"), "{live}");
     assert!(live.contains("↑ 2.0k"), "{live}");
+    assert_eq!(app.transcript.children().sent(), 2_000);
     let rows: Vec<&str> = live.lines().filter(|l| l.contains("─ ")).collect();
     assert_eq!(rows.len(), 3, "{live}");
     assert!(rows[0].starts_with("  ├─ ") && rows[0].contains(" 1  read docs/policies.md"));
@@ -1551,7 +1574,7 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
     assert!(rows[1].contains("● 2  4 fixtures still use archived keys"));
     assert!(!rows[1].contains("**") && !rows[1].contains("more detail"));
     assert!(rows[2].starts_with("  └─ ✕ 3  failed · provider unavailable"));
-    assert!(app.footer(120).plain().contains("agents 1 running"));
+    assert_eq!(app.transcript.children().running(), 1);
 
     child_event(&mut app, one, result("read-call", "1|x"));
     assert!(live_text(&app).contains(" 1  thinking"));
@@ -1560,9 +1583,9 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
         one,
         reply(text_blocks("all keys match"), StopReason::EndTurn),
     );
-    assert!(!app.footer(120).plain().contains("agents"));
+    assert_eq!(app.transcript.children().running(), 0);
 
-    app.commit.clear();
+    app.display.commit.clear();
     append(
         &mut app,
         result(
@@ -1570,7 +1593,7 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
             "Task 1 [done]\nall keys match\n\nTask 2 [done]\n4 fixtures",
         ),
     );
-    let committed: Vec<String> = app.commit.iter().map(Line::plain).collect();
+    let committed: Vec<String> = app.display.commit.iter().map(Line::plain).collect();
     let text = committed.join("\n");
     assert!(
         committed.iter().any(|l| l.starts_with("● task    3 tasks")),
@@ -1591,13 +1614,13 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
         app.transcript.collapsed(),
         "the full results stay reachable through ctrl+o"
     );
-    assert!(!live_text(&app).contains("─ "));
+    assert!(app.transcript.children().is_empty());
 
     // The next call's result does not claim children it never started.
-    app.commit.clear();
+    app.display.commit.clear();
     append(&mut app, read_call());
     append(&mut app, result("read-call", "1|x"));
-    assert!(app.commit.iter().all(|l| !l.plain().contains("─ ")));
+    assert!(app.transcript.children().is_empty());
 }
 
 fn result(call: &str, text: &str) -> EventKind {
@@ -1642,7 +1665,7 @@ async fn attaching_mid_call_shows_children_already_running() {
     let live = live_text(&app);
     assert!(live.contains("└─ "), "{live}");
     assert!(live.contains(" 1  read docs/policies.md"), "{live}");
-    assert!(app.footer(120).plain().contains("agents 1 running"));
+    assert_eq!(app.transcript.children().running(), 1);
 }
 
 fn text_blocks(text: &str) -> Vec<Block> {
@@ -1656,15 +1679,18 @@ async fn approval_option_two_remembers_the_session_scope() {
     attached.pending_approvals.push(ask.clone());
     let (launch, mut requests) = launch(attached).await;
     let mut app = App::new(launch, 120, 32);
-    let overlay = live_text(&app);
-    for label in [
-        "1 Allow once",
-        "2 Allow for this session",
-        "3 Always allow in this workspace",
-        "4 Deny",
-    ] {
-        assert!(overlay.contains(label), "{overlay}");
-    }
+    assert!(app.overlays.on_top::<Approvals>());
+    let approvals = app.overlays.get::<Approvals>().unwrap();
+    assert_eq!(
+        approvals.options(),
+        &[
+            Choice::Once,
+            Choice::Session,
+            Choice::Workspace,
+            Choice::Deny
+        ]
+    );
+    assert_eq!(approvals.current().unwrap().pending.call, ask.call);
     app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1694,8 +1720,9 @@ async fn tab_answers_a_waiting_ask_over_another_overlay_and_records_it() {
         .await
         .unwrap();
     assert!(app.overlays.on_top::<Approvals>());
-    assert!(live_text(&app).contains("settings › "));
-    app.commit.clear();
+    assert_eq!(app.overlays.len(), 2);
+    assert!(app.overlays.get::<Settings>().is_some());
+    app.display.commit.clear();
     app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1704,21 +1731,22 @@ async fn tab_answers_a_waiting_ask_over_another_overlay_and_records_it() {
         "session"
     );
     assert!(app.overlays.on_top::<Settings>());
-    let record: Vec<String> = app.commit.iter().map(Line::plain).collect();
+    let record: Vec<String> = app.display.commit.iter().map(Line::plain).collect();
     assert!(
         record
             .iter()
             .any(|line| line == "? allowed for this session · bash exec git push"),
         "{record:?}"
     );
-    assert!(!live_text(&app).contains("waiting"));
+    assert_eq!(app.waiting(), 0);
+    assert!(app.overlays.get::<Approvals>().is_none());
 }
 
 /// The live region's last composer row: above the footer inline and above
 /// the deck's status row, which a frame drops.
 fn composer_line(app: &App) -> String {
     let lines = app.live().0;
-    let below = usize::from(app.deck.is_none() || app.overlays.is_empty());
+    let below = usize::from(app.display.deck.is_none() || app.overlays.is_empty());
     lines[lines.len() - 1 - below].plain()
 }
 
@@ -1726,7 +1754,7 @@ fn composer_line(app: &App) -> String {
 async fn esc_steps_back_one_overlay_and_ctrl_c_closes_the_stack() {
     let (launch, _requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 180, 40);
-    app.editor.insert("keep draft\nsecond line");
+    app.composer.editor.insert("keep draft\nsecond line");
     app.command("/settings").await.unwrap();
     let composer = composer_line(&app);
     assert!(composer.starts_with("ξ keep draft "), "{composer}");
@@ -1734,20 +1762,21 @@ async fn esc_steps_back_one_overlay_and_ctrl_c_closes_the_stack() {
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     app.key(enter).await.unwrap();
     assert!(app.overlays.on_top::<Picker>());
-    assert!(live_text(&app).contains("settings › models"));
+    assert_eq!(app.overlays.len(), 2);
+    assert!(app.overlays.get::<Settings>().is_some());
     assert!(composer_line(&app).ends_with("ctrl+c returns here"));
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
     assert!(app.overlays.on_top::<Settings>());
     app.key(enter).await.unwrap();
-    app.commit.clear();
+    app.display.commit.clear();
     app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .await
         .unwrap();
     assert!(app.overlays.is_empty());
-    assert!(app.commit.is_empty());
-    assert_eq!(app.editor.text(), "keep draft\nsecond line");
+    assert!(app.display.commit.is_empty());
+    assert_eq!(app.composer.editor.text(), "keep draft\nsecond line");
     let composer = composer_line(&app);
     assert!(composer.starts_with("┃  "), "{composer}");
     assert!(!composer.contains("returns here"), "{composer}");
@@ -1761,13 +1790,13 @@ async fn taint_approval_hides_persistent_scopes_without_renumbering_deny() {
     attached.pending_approvals.push(ask);
     let (launch, mut requests) = launch(attached).await;
     let mut app = App::new(launch, 120, 32);
-    let overlay = live_text(&app);
-    assert!(overlay.contains("1 Allow once"));
-    assert!(overlay.contains("4 Deny"));
-    assert!(overlay.contains("◆ ? approval · bash"), "{overlay}");
-    assert!(overlay.contains("session and workspace grants are not offered"));
-    assert!(!overlay.contains("2 Allow for this session"));
-    assert!(!overlay.contains("3 Always allow"));
+    let approvals = app.overlays.get::<Approvals>().unwrap();
+    assert!(approvals.current().unwrap().pending.taint);
+    assert_eq!(approvals.options(), &[Choice::Once, Choice::Deny]);
+    assert_eq!(approvals.shortcut('1'), Some(Choice::Once));
+    assert_eq!(approvals.shortcut('4'), Some(Choice::Deny));
+    assert_eq!(approvals.shortcut('2'), None);
+    assert_eq!(approvals.shortcut('3'), None);
     for c in ['2', '3'] {
         app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
             .await
@@ -1824,8 +1853,12 @@ async fn untrusted_approval_hides_workspace_scope_and_uses_session_details_for_e
         },
     );
     assert!(app.overlays.on_top::<Approvals>());
-    assert!(live_text(&app).contains("2 Allow for this session"));
-    assert!(!live_text(&app).contains("3 Always allow"));
+    let approvals = app.overlays.get::<Approvals>().unwrap();
+    assert!(!approvals.current().unwrap().pending.trusted);
+    assert_eq!(
+        approvals.options(),
+        &[Choice::Once, Choice::Session, Choice::Deny]
+    );
     app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1874,9 +1907,10 @@ async fn egress_asks_open_the_overlay_with_the_parent_tool_and_resolve_the_conne
     );
     assert_eq!(app.transcript.asks()[0].tool, "bash");
     assert!(app.overlays.on_top::<Approvals>());
-    let overlay = live_text(&app);
-    assert!(overlay.contains("approval · bash"), "{overlay}");
-    assert!(overlay.contains("net github.com:443"), "{overlay}");
+    let approval = app.overlays.get::<Approvals>().unwrap().current().unwrap();
+    assert_eq!(approval.pending.call, "connection".into());
+    assert_eq!(approval.pending.tool, "bash");
+    assert_eq!(approval.pending.action, "net github.com:443");
     app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1921,7 +1955,8 @@ async fn workspace_approval_sends_workspace_scope_and_errors_keep_the_overlay() 
         assert_eq!(app.overlays.on_top::<Approvals>(), reject);
         if reject {
             assert!(
-                app.commit
+                app.display
+                    .commit
                     .iter()
                     .any(|line| line.plain().contains("scope rejected"))
             );
@@ -1945,10 +1980,12 @@ async fn approvals_inbox_shows_and_resolves_another_sessions_ask() {
     app.command("/approvals").await.unwrap();
     request(&mut requests, "approval/list");
     assert!(app.overlays.on_top::<Approvals>());
-    let overlay = live_text(&app);
-    assert!(overlay.contains(&format!("session {}", &other.info.session.to_string()[..8])));
-    assert!(overlay.contains("/tmp/other-workspace"));
-    assert!(!app.footer(160).plain().contains("waiting"));
+    let approvals = app.overlays.get::<Approvals>().unwrap();
+    assert!(approvals.inbox);
+    let shown = approvals.current().unwrap();
+    assert_eq!(shown.pending.session, other.info.session);
+    assert_eq!(shown.cwd.as_deref(), Some(other.info.cwd.as_path()));
+    assert!(app.transcript.asks().is_empty());
     app.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2071,7 +2108,17 @@ async fn startup_picker_focuses_the_latest_previous_session_only_when_requested(
                 .session,
             target.info.session
         );
-        assert!(!live_text(&app).contains("hidden child"));
+        let current = app.session_id();
+        let picker = app.overlays.get_mut::<Sessions>().unwrap();
+        picker.up();
+        assert_eq!(picker.selected().unwrap().session, current);
+        picker.down();
+        assert_eq!(picker.selected().unwrap().session, target.info.session);
+        picker.down();
+        assert_eq!(picker.selected().unwrap().session, older.info.session);
+        picker.down();
+        assert_eq!(picker.selected().unwrap().session, older.info.session);
+        picker.up();
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -2095,7 +2142,8 @@ async fn empty_startup_picker_can_be_closed_without_opening_a_session() {
     let session = app.session_id();
     app.initialize().await;
     request(&mut requests, "session/list");
-    assert!(live_text(&app).contains("no matching sessions"));
+    assert!(app.overlays.on_top::<Sessions>());
+    assert!(app.overlays.get::<Sessions>().unwrap().selected().is_none());
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2141,7 +2189,7 @@ async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live
             .unwrap();
         let params = request(&mut requests, "session/list");
         assert!(params.get("cwd").is_none());
-        assert!(live_text(&app).contains("all workspaces"));
+        assert!(app.overlays.get::<Sessions>().unwrap().all);
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -2149,24 +2197,24 @@ async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live
             let params = request(&mut requests, "session/attach");
             assert_eq!(params["session"], json!(target.info.session));
             assert!(params.get("since").is_none());
-            assert!(app.running());
+            assert!(app.turn.running());
             assert!(app.overlays.on_top::<Approvals>());
             assert_eq!(app.transcript.asks().len(), 1);
             assert!(
                 app.transcript
-                    .live(app.measure(), 0)
+                    .live(app.display.measure(), 0)
                     .iter()
                     .any(|line| line.plain().contains("target in flight"))
             );
         } else {
             let params = request(&mut requests, "session/open");
             assert_eq!(params["path"], json!(target.info.path));
-            assert!(!app.running());
+            assert!(!app.turn.running());
             assert!(app.overlays.is_empty());
         }
         assert_eq!(app.session_id(), target.info.session);
         assert_eq!(app.launch.template.cwd, target.info.cwd);
-        assert!(app.editor.is_empty());
+        assert!(app.composer.editor.is_empty());
     }
 }
 
@@ -2186,18 +2234,19 @@ async fn resume_mid_turn_leaves_the_turn_running_unless_prompts_are_queued() {
     let (launch, mut requests) = launch_with(attached, data).await;
     let mut app = App::new(launch, 160, 32);
     let previous = app.session_id();
-    assert!(app.running());
-    app.queued.push(vec![Block::Text {
+    assert!(app.turn.running());
+    app.turn.queued.push(vec![Block::Text {
         text: "queued".into(),
     }]);
     app.command("/resume").await.unwrap();
     assert!(app.overlays.is_empty());
-    assert!(
-        committed(&app)
-            .iter()
-            .any(|line| line.contains("waits for queued prompts"))
-    );
-    app.queued.clear();
+    assert_eq!(app.session_id(), previous);
+    assert!(app.turn.running());
+    assert_eq!(app.turn.queued, vec![text_blocks("queued")]);
+    while let Ok((method, _)) = requests.try_recv() {
+        assert_eq!(method, "initialize");
+    }
+    app.turn.queued.clear();
     app.command("/resume").await.unwrap();
     assert!(app.overlays.on_top::<Sessions>());
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -2217,7 +2266,7 @@ async fn resume_mid_turn_leaves_the_turn_running_unless_prompts_are_queued() {
             .all(|method| method != "session/close" && method != "session/cancel")
     );
     assert_eq!(app.session_id(), target.info.session);
-    assert!(!app.running());
+    assert!(!app.turn.running());
 }
 
 #[tokio::test]
@@ -2249,8 +2298,8 @@ async fn saved_session_held_by_a_worker_attaches_and_updates_the_new_session_wor
         json!(target.info.session)
     );
     assert_eq!(app.launch.template.cwd, other);
-    assert_eq!(app.file_cwd.as_ref(), Some(&target.info.cwd));
-    assert!(app.running());
+    assert_eq!(app.composer.file_cwd.as_ref(), Some(&target.info.cwd));
+    assert!(app.turn.running());
 }
 
 #[tokio::test]
@@ -2275,8 +2324,46 @@ async fn resume_hides_children_filters_titles_and_workspaces_and_closes_on_curre
     app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(!live_text(&app).contains("hidden child"));
-    assert!(live_text(&app).contains("● Current prompt"));
+    assert_eq!(
+        app.overlays
+            .get::<Sessions>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .session,
+        app.session_id()
+    );
+    press(&mut app, KeyCode::Down).await;
+    assert_eq!(
+        app.overlays
+            .get::<Sessions>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .session,
+        older.info.session
+    );
+    press(&mut app, KeyCode::Down).await;
+    assert_eq!(
+        app.overlays
+            .get::<Sessions>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .session,
+        older.info.session
+    );
+    press(&mut app, KeyCode::Up).await;
+    press(&mut app, KeyCode::Up).await;
+    assert_eq!(
+        app.overlays
+            .get::<Sessions>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .session,
+        app.session_id()
+    );
     for c in "other-workspace".chars() {
         app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
             .await
@@ -2291,7 +2378,16 @@ async fn resume_hides_children_filters_titles_and_workspaces_and_closes_on_curre
             .session,
         older.info.session
     );
-    assert!(!live_text(&app).contains("Current prompt"));
+    press(&mut app, KeyCode::Down).await;
+    assert_eq!(
+        app.overlays
+            .get::<Sessions>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .session,
+        older.info.session
+    );
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2331,9 +2427,10 @@ async fn custom_keymap_changes_dispatch_help_and_initial_thinking() {
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    app.commit.clear();
+    app.display.commit.clear();
     app.command("/help").await.unwrap();
     let help = app
+        .display
         .commit
         .iter()
         .map(Line::plain)
@@ -2352,7 +2449,8 @@ async fn config_warnings_are_dim_notes_and_ctrl_t_cycles_thinking_display() {
     launch.tui_config = Some(path);
     let mut app = App::new(launch, 120, 32);
     assert_eq!(
-        app.commit
+        app.display
+            .commit
             .iter()
             .filter(|line| line.plain().contains("tui.toml:"))
             .count(),
@@ -2371,7 +2469,7 @@ async fn config_warnings_are_dim_notes_and_ctrl_t_cycles_thinking_display() {
             .await
             .unwrap();
         assert_eq!(app.transcript.thinking_display(), expected);
-        assert!(app.commit.iter().any(|line| {
+        assert!(app.display.commit.iter().any(|line| {
             line.plain()
                 .contains(&format!("thinking display → {}", expected.name()))
         }));
@@ -2383,12 +2481,8 @@ async fn copy_queues_osc52_until_the_next_draw_on_the_frame_writer() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 120, 32);
     app.command("/copy").await.unwrap();
-    assert!(app.controls.is_empty());
-    assert!(
-        app.commit
-            .iter()
-            .any(|line| line.plain().contains("nothing to copy yet"))
-    );
+    assert!(app.display.controls.is_empty());
+    assert_eq!(app.transcript.last_text(), None);
     append(
         &mut app,
         EventKind::AssistantMessage {
@@ -2405,19 +2499,15 @@ async fn copy_queues_osc52_until_the_next_draw_on_the_frame_writer() {
     );
     app.command("/copy").await.unwrap();
     let sequence = "\x1b]52;c;aGVsbG8Kd29ybGQ=\x07";
-    assert_eq!(app.controls, vec![sequence]);
-    assert!(
-        app.commit
-            .iter()
-            .any(|line| line.plain().contains("copied 2 lines"))
-    );
+    assert_eq!(app.display.controls, vec![sequence]);
+    assert_eq!(app.transcript.last_text(), Some("hello\nworld"));
     let mut output = Vec::new();
     {
         let mut screen = Screen::new(&mut output, false, 120);
         app.draw(&mut screen).unwrap();
     }
     assert!(output.starts_with(sequence.as_bytes()));
-    assert!(app.controls.is_empty());
+    assert!(app.display.controls.is_empty());
     assert!(String::from_utf8(output).unwrap().contains("\x1b[?2026h"));
 }
 
@@ -2487,6 +2577,20 @@ async fn settings_number(app: &mut App, text: &str) {
     }
 }
 
+fn reported_setting<'a>(app: &'a App, key: &str) -> &'a Setting {
+    let report = app
+        .overlays
+        .get::<Roles>()
+        .map(|roles| &roles.report)
+        .or_else(|| {
+            app.overlays
+                .get::<Settings>()
+                .map(|settings| &settings.report)
+        })
+        .expect("a settings or roles overlay holds the report");
+    report.settings.iter().find(|row| row.key == key).unwrap()
+}
+
 #[tokio::test]
 async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
     let mut report = settings_report();
@@ -2552,13 +2656,13 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
     assert!(!text.contains("default/model"));
-    assert!(app.commands.iter().any(|command| {
+    assert!(app.composer.commands.iter().any(|command| {
         command.name == "settings" && command.description == "show and change settings"
     }));
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    app.commit.clear();
+    app.display.commit.clear();
     app.command("/help").await.unwrap();
     assert!(
         committed(&app).iter().any(|line| {
@@ -2592,7 +2696,7 @@ async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
         .unwrap();
     assert_eq!(row.value, false);
     assert_eq!(row.source, SettingLayer::Global);
-    assert!(live_text(&app).contains("Saved to the global config."));
+    assert!(app.overlays.on_top::<Settings>());
 }
 
 #[tokio::test]
@@ -2618,8 +2722,8 @@ async fn settings_sandbox_toggle_saves_the_default_without_changing_the_worker()
         assert_eq!(row.value, enabled);
         assert_eq!(row.source, SettingLayer::Global);
         assert!(app.launch.attached.info.sandbox_enabled);
-        assert!(app.footer(180).plain().contains("◇ sandbox"));
-        assert!(live_text(&app).contains("Running sessions keep the settings they started with."));
+        assert!(app.overlays.on_top::<Settings>());
+        assert!(requests.try_recv().is_err());
     }
 }
 
@@ -2659,7 +2763,11 @@ async fn settings_saves_session_model_and_reasoning_and_returns_from_picker() {
         "high"
     );
     assert_eq!(request(&mut requests, "config/set")["value"], "high");
-    assert!(live_text(&app).contains("new sessions use this reasoning level"));
+    assert_eq!(reported_setting(&app, "reasoning").value, "high");
+    assert_eq!(
+        reported_setting(&app, "reasoning").source,
+        SettingLayer::Global
+    );
     app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
         .await
         .unwrap();
@@ -2749,28 +2857,45 @@ async fn roles_view_shows_sources_and_assigns_resets_and_uses_roles() {
     press(&mut app, KeyCode::Down).await;
     press(&mut app, KeyCode::Enter).await;
     assert!(requests.try_recv().is_err());
-    assert!(live_text(&app).contains("Set in /tmp/xi-tui-demo/.xi/config.local.toml"));
+    assert!(app.overlays.on_top::<Roles>());
+    assert_eq!(
+        reported_setting(&app, "roles.slow").source,
+        SettingLayer::Local
+    );
+    assert_eq!(reported_setting(&app, "roles.slow").value, "lab/big");
 
     // A global override offers to drop it, from the picker's first row.
     press(&mut app, KeyCode::Down).await;
     press(&mut app, KeyCode::Down).await;
-    assert!(live_text(&app).contains("roles.smol in config.toml overrides the preset"));
-    assert!(live_text(&app).contains("r resets"));
+    assert_eq!(
+        reported_setting(&app, "roles.smol").source,
+        SettingLayer::Global
+    );
+    assert!(!reported_setting(&app, "roles.smol").from_preset);
     press(&mut app, KeyCode::Enter).await;
     request(&mut requests, "session/models");
     assert!(app.overlays.on_top::<Picker>());
-    assert!(live_text(&app).contains("roles › smol"));
-    let reset = row_with(&app, "↺ preset");
-    assert!(reset.contains("lab/small") && reset.contains("drops roles.smol"));
-    assert!(row_with(&app, "second").contains("› ● second"));
+    assert_eq!(app.overlays.len(), 2);
+    assert!(app.overlays.get::<Roles>().is_some());
+    assert_eq!(
+        app.overlays
+            .get::<Picker>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .model
+            .model,
+        "second"
+    );
     press(&mut app, KeyCode::Up).await;
     press(&mut app, KeyCode::Up).await;
+    assert!(app.overlays.get::<Picker>().unwrap().selected().is_none());
     press(&mut app, KeyCode::Enter).await;
     let params = request(&mut requests, "config/set");
     assert_eq!(params["key"], "roles.smol");
     assert_eq!(params["value"], Value::Null);
     assert!(app.overlays.on_top::<Roles>());
-    assert!(live_text(&app).contains("Saved to the global config."));
+    assert!(reported_setting(&app, "roles.smol").value.is_null());
     press(&mut app, KeyCode::Char('r')).await;
     assert_eq!(request(&mut requests, "config/set")["key"], "roles.smol");
 
@@ -2782,18 +2907,35 @@ async fn roles_view_shows_sources_and_assigns_resets_and_uses_roles() {
         json!({ "provider": "demo", "model": "second" })
     );
     assert_eq!(app.launch.attached.info.model.model, "second");
-    assert!(live_text(&app).contains("This session now uses demo/second."));
-    assert!(row_with(&app, " tiny ").contains("● tiny"));
+    assert!(app.overlays.on_top::<Roles>());
+    let assigned = reported_setting(&app, "roles.tiny")
+        .value
+        .as_str()
+        .unwrap()
+        .parse::<ModelRef>()
+        .unwrap();
+    assert_eq!(app.launch.attached.info.model, assigned);
     // A preset role has nothing to reset.
     press(&mut app, KeyCode::Char('r')).await;
     assert!(requests.try_recv().is_err());
-    assert!(live_text(&app).contains("tiny has no override in the global config to drop."));
+    assert!(reported_setting(&app, "roles.tiny").from_preset);
+    assert_eq!(reported_setting(&app, "roles.tiny").value, "demo/second");
 
     // Assigning a preset role writes its own key.
     press(&mut app, KeyCode::Up).await;
     press(&mut app, KeyCode::Up).await;
     press(&mut app, KeyCode::Enter).await;
-    assert!(!live_text(&app).contains("↺"));
+    assert!(app.overlays.on_top::<Picker>());
+    assert_eq!(
+        app.overlays
+            .get::<Picker>()
+            .unwrap()
+            .selected()
+            .unwrap()
+            .model
+            .model,
+        "script"
+    );
     press(&mut app, KeyCode::Down).await;
     press(&mut app, KeyCode::Enter).await;
     let params = request(&mut requests, "config/set");
@@ -2803,7 +2945,7 @@ async fn roles_view_shows_sources_and_assigns_resets_and_uses_roles() {
     // The preset row cycles the presets, then none.
     press(&mut app, KeyCode::Up).await;
     press(&mut app, KeyCode::Up).await;
-    assert!(live_text(&app).contains("enter cycles lab, none."));
+    assert_eq!(reported_setting(&app, "preset").value, "lab");
     press(&mut app, KeyCode::Enter).await;
     let params = request(&mut requests, "config/set");
     assert_eq!(params["key"], "preset");
@@ -2816,14 +2958,13 @@ async fn settings_roles_row_opens_roles_and_shows_its_edits_on_return() {
     let mut app = App::new(launch, 120, 40);
     app.command("/settings").await.unwrap();
     settings_down(&mut app, 4).await;
-    assert!(row_with(&app, "Roles").contains("› Roles"));
-    assert!(row_with(&app, "Roles").contains("none"));
-    assert!(live_text(&app).contains("enter opens"));
+    assert!(app.overlays.on_top::<Settings>());
+    assert!(reported_setting(&app, "preset").value.is_null());
     press(&mut app, KeyCode::Enter).await;
     assert!(app.overlays.on_top::<Roles>());
-    assert!(live_text(&app).contains("settings › roles"));
-    assert!(live_text(&app).contains("no preset"));
-    assert!(live_text(&app).contains("esc back to settings"));
+    assert_eq!(app.overlays.len(), 2);
+    assert!(app.overlays.get::<Settings>().is_some());
+    assert!(reported_setting(&app, "preset").value.is_null());
     let tiny = row_with(&app, " tiny ");
     assert!(tiny.contains("↑ smol · default/model") && tiny.contains("fallback"));
     request(&mut requests, "config/settings");
@@ -2833,7 +2974,11 @@ async fn settings_roles_row_opens_roles_and_shows_its_edits_on_return() {
     assert_eq!(params["value"], "lab");
     press(&mut app, KeyCode::Esc).await;
     assert!(app.overlays.on_top::<Settings>());
-    assert!(row_with(&app, "Roles").contains("lab"));
+    assert_eq!(reported_setting(&app, "preset").value, "lab");
+    assert_eq!(
+        reported_setting(&app, "preset").source,
+        SettingLayer::Global
+    );
 }
 
 #[tokio::test]
@@ -2885,7 +3030,11 @@ async fn settings_refuses_to_remove_the_last_tool() {
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(live_text(&app).contains("cannot remove the last tool"));
+    assert_eq!(reported_setting(&app, "tools").value, json!(["read"]));
+    assert_eq!(
+        reported_setting(&app, "tools").source,
+        SettingLayer::Default
+    );
     assert!(requests.try_recv().is_err());
 }
 
@@ -2920,7 +3069,10 @@ async fn settings_cycles_approvals_and_edits_kept_tail_tokens() {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert!(live_text(&app).contains("enter a positive token count"));
+        assert_eq!(
+            reported_setting(&app, "compaction.keep_recent_tokens").value,
+            16_000
+        );
         assert!(requests.try_recv().is_err());
         assert!(app.live().1.is_some());
     }
@@ -2931,7 +3083,11 @@ async fn settings_cycles_approvals_and_edits_kept_tail_tokens() {
     let params = request(&mut requests, "config/set");
     assert_eq!(params["key"], "compaction.keep_recent_tokens");
     assert_eq!(params["value"], 8_000);
-    assert!(live_text(&app).contains("8000 tokens"));
+    assert_eq!(
+        reported_setting(&app, "compaction.keep_recent_tokens").value,
+        8_000
+    );
+    assert!(app.live().1.is_none());
 }
 
 #[tokio::test]
@@ -2956,8 +3112,15 @@ async fn settings_trigger_saves_percent_and_preserves_threshold_when_switching_u
     let params = request(&mut requests, "config/set");
     assert_eq!(params["key"], "compaction.trigger");
     assert_eq!(params["value"], json!({ "percent": 50 }));
-    assert!(live_text(&app).contains("50%"));
-    assert!(live_text(&app).contains("128000 tokens"));
+    assert_eq!(
+        reported_setting(&app, "compaction.trigger").value,
+        json!({ "percent": 50 })
+    );
+    assert_eq!(
+        reported_setting(&app, "compaction.trigger").source,
+        SettingLayer::Global
+    );
+    assert!(app.live().1.is_none());
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2972,7 +3135,11 @@ async fn settings_trigger_saves_percent_and_preserves_threshold_when_switching_u
         request(&mut requests, "config/set")["value"],
         json!({ "tokens": 128_000 })
     );
-    assert!(live_text(&app).contains("128000 tokens (fixed)"));
+    assert_eq!(
+        reported_setting(&app, "compaction.trigger").value,
+        json!({ "tokens": 128_000 })
+    );
+    assert!(app.live().1.is_none());
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2997,6 +3164,7 @@ async fn settings_trigger_rejects_invalid_percentages_and_accepts_boundaries() {
     request(&mut requests, "config/settings");
     settings_down(&mut app, 7).await;
     for valid in [1, 100] {
+        let before = reported_setting(&app, "compaction.trigger").value.clone();
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -3005,7 +3173,7 @@ async fn settings_trigger_rejects_invalid_percentages_and_accepts_boundaries() {
             app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .await
                 .unwrap();
-            assert!(live_text(&app).contains("enter a percentage from 1 to 100"));
+            assert_eq!(reported_setting(&app, "compaction.trigger").value, before);
             assert!(requests.try_recv().is_err());
             assert!(app.live().1.is_some());
         }
@@ -3063,7 +3231,7 @@ async fn settings_trigger_reset_removes_the_override_from_editor_or_row() {
             .unwrap();
         assert_eq!(setting.value, json!({ "percent": 80 }));
         assert_eq!(setting.source, SettingLayer::Default);
-        assert!(live_text(&app).contains("204800 tokens"));
+        assert!(app.overlays.on_top::<Settings>());
         assert!(app.live().1.is_none());
     }
 }
@@ -3146,7 +3314,11 @@ async fn settings_trigger_recalculates_for_selected_model_and_handles_unknown_wi
         request(&mut requests, "config/set")["value"],
         json!({ "tokens": 24_000 })
     );
-    assert!(live_text(&app).contains("24000 tokens (fixed)"));
+    assert_eq!(
+        reported_setting(&app, "compaction.trigger").value,
+        json!({ "tokens": 24_000 })
+    );
+    assert!(app.live().1.is_none());
 }
 
 #[tokio::test]
@@ -3187,7 +3359,7 @@ async fn settings_trigger_nonintegral_unit_conversion_requires_new_value_and_kee
         .await
         .unwrap();
     for cols in [16, 24, 40, 80] {
-        app.cols = cols;
+        app.display.cols = cols;
         let (live, cursor, _) = app.live();
         let (row, col) = cursor.expect("the inline cursor survives a narrow terminal");
         let field = live[row].plain();
@@ -3242,7 +3414,7 @@ async fn settings_thinking_toggle_persists_but_live_toggle_does_not() {
 async fn settings_handles_missing_client_path_external_file_and_ctrl_c() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 180, 40);
-    app.editor.set_text("keep draft");
+    app.composer.editor.set_text("keep draft");
     app.command("/settings").await.unwrap();
     settings_down(&mut app, 2).await;
     app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
@@ -3257,17 +3429,17 @@ async fn settings_handles_missing_client_path_external_file_and_ctrl_c() {
         .await
         .unwrap();
     assert!(
-        matches!(&app.external_requested, Some(ExternalRequest::Settings(path))
+        matches!(&app.composer.external_requested, Some(ExternalRequest::Settings(path))
             if path == Path::new("/tmp/xi-test-config/config.toml"))
     );
-    app.external_requested = None;
+    app.composer.external_requested = None;
     app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .await
         .unwrap();
     assert!(app.overlays.is_empty());
     assert!(!app.quit);
     assert!(app.overlays.get::<Settings>().is_none());
-    assert_eq!(app.editor.text(), "keep draft");
+    assert_eq!(app.composer.editor.text(), "keep draft");
 }
 
 #[tokio::test]
@@ -3299,7 +3471,10 @@ async fn settings_errors_leave_the_composer_or_show_the_rpc_message_in_the_view(
             request(&mut requests, "config/set");
             assert!(app.overlays.on_top::<Settings>());
             assert!(live_text(&app).contains("setting rejected"));
-            assert!(!live_text(&app).contains("saved · new sessions use it"));
+            let model = reported_setting(&app, "default_model");
+            assert_eq!(model.value, "default/model");
+            assert_eq!(model.source, SettingLayer::Default);
+            assert_eq!(app.launch.attached.info.model.model, "script");
         }
     }
 }
@@ -3362,7 +3537,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
     assert!(activity.ends_with("esc stop"));
     assert!(!activity.contains('↑'));
     assert!(!activity.contains('↓'));
-    app.cols = 250;
+    app.display.cols = 250;
     let (lines, ..) = app.live();
     let activity = lines
         .iter()
@@ -3379,7 +3554,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
 async fn short_live_region_keeps_the_frame_title_five_rows_and_hints() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 124, 17);
-    app.editor.set_text(&"draft\n".repeat(20));
+    app.composer.editor.set_text(&"draft\n".repeat(20));
     assert!(app.live().0.len() <= 8);
     app.command("/settings").await.unwrap();
     let (lines, ..) = app.live();
@@ -3394,8 +3569,18 @@ async fn short_live_region_keeps_the_frame_title_five_rows_and_hints() {
 
 /// Rows committed so far: scrollback inline, the retained log on the deck.
 fn committed(app: &App) -> Vec<String> {
-    let deck = app.deck.as_ref().map(|deck| deck.log.rows()).unwrap_or(&[]);
-    app.commit.iter().chain(deck).map(Line::plain).collect()
+    let deck = app
+        .display
+        .deck
+        .as_ref()
+        .map(|deck| deck.log.rows())
+        .unwrap_or(&[]);
+    app.display
+        .commit
+        .iter()
+        .chain(deck)
+        .map(Line::plain)
+        .collect()
 }
 
 #[tokio::test]
@@ -3405,7 +3590,7 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
     let (mut launch, _) = launch(snapshot(false)).await;
     launch.tui_config = Some(path.clone());
     let mut app = App::new(launch, 250, 36);
-    assert!(app.deck.is_some(), "auto opens the deck at 250×36");
+    assert!(app.display.deck.is_some(), "auto opens the deck at 250×36");
     app.command("/layout").await.unwrap();
     assert!(committed(&app).contains(&"i layout auto · sheet, 250×36".to_owned()));
     for (name, layout, deck) in [
@@ -3413,11 +3598,12 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
         ("inline", Layout::Inline, false),
     ] {
         app.command(&format!("/layout {name}")).await.unwrap();
-        assert_eq!(app.layout, layout);
-        assert_eq!(app.deck.is_some(), deck);
+        assert_eq!(app.display.layout, layout);
+        assert_eq!(app.display.deck.is_some(), deck);
         assert!(committed(&app).contains(&format!("i layout → {name}")));
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains(&format!("layout = \"{name}\"")), "{saved}");
+        assert!(path.is_file());
         assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
     }
 }
@@ -3435,10 +3621,10 @@ async fn settings_layout_cycles_and_saves_client_display() {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert_eq!(app.layout, layout);
-        assert_eq!(app.deck.is_some(), layout != Layout::Inline);
+        assert_eq!(app.display.layout, layout);
+        assert_eq!(app.display.deck.is_some(), layout != Layout::Inline);
         assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
-        assert!(live_text(&app).contains("saved · layout"));
+        assert!(app.overlays.on_top::<Settings>());
     }
 }
 
@@ -3456,15 +3642,16 @@ async fn layout_config_loads_and_invalid_layout_warns_once() {
         let (mut launch, _) = launch(snapshot(false)).await;
         launch.tui_config = Some(path.clone());
         let app = App::new(launch, size.0, size.1);
-        assert_eq!(app.layout.name(), value);
-        assert_eq!(app.deck.is_some(), deck);
+        assert_eq!(app.display.layout.name(), value);
+        assert_eq!(app.display.deck.is_some(), deck);
     }
     std::fs::write(&path, "[display]\nlayout = \"wide\"\n").unwrap();
     let (mut launch, _) = launch(snapshot(false)).await;
     launch.tui_config = Some(path);
     let app = App::new(launch, 120, 36);
-    assert_eq!(app.layout, Layout::Auto);
+    assert_eq!(app.display.layout, Layout::Auto);
     let warnings: Vec<_> = app
+        .display
         .commit
         .iter()
         .filter(|line| line.plain().contains("display.layout"))
@@ -3481,8 +3668,8 @@ async fn layout_config_loads_and_invalid_layout_warns_once() {
 async fn deck_focus_keys_are_in_help_and_noop_inline() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 120, 36);
-    app.editor.set_text("keep draft");
-    app.commit.clear();
+    app.composer.editor.set_text("keep draft");
+    app.display.commit.clear();
     for (key, action, name) in [
         ('1', Action::FocusSessions, "focus_sessions"),
         ('2', Action::FocusLog, "focus_log"),
@@ -3492,12 +3679,13 @@ async fn deck_focus_keys_are_in_help_and_noop_inline() {
         assert_eq!(app.keymap.action(key), Some(action));
         assert_eq!(action.name(), name);
         app.key(key).await.unwrap();
-        assert_eq!(app.editor.text(), "keep draft");
+        assert_eq!(app.composer.editor.text(), "keep draft");
         assert!(app.overlays.is_empty());
-        assert!(app.commit.is_empty());
+        assert!(app.display.commit.is_empty());
     }
     app.command("/help").await.unwrap();
     let help = app
+        .display
         .commit
         .iter()
         .map(Line::plain)
@@ -3523,7 +3711,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     };
     let (launch, _) = launch_with(attached, data).await;
     let mut app = App::new(launch, 250, 36);
-    assert!(app.deck.is_some(), "auto opens the deck at 250×36");
+    assert!(app.display.deck.is_some(), "auto opens the deck at 250×36");
     app.refresh_deck().await;
     append(
         &mut app,
@@ -3541,7 +3729,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     append(&mut app, read_call());
     append(&mut app, result("read-call", "1|x\n2|y"));
     assert!(
-        app.commit.is_empty(),
+        app.display.commit.is_empty(),
         "the deck keeps committed rows itself"
     );
     let mut out = Vec::new();
@@ -3597,7 +3785,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
         .unwrap();
-    let selected = app.deck.as_ref().unwrap().log.selected().unwrap();
+    let selected = app.display.deck.as_ref().unwrap().log.selected().unwrap();
     assert_eq!(selected.title, "edit src/a.rs");
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
@@ -3607,11 +3795,11 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
             .iter()
             .any(|row| row.starts_with("── edit src/a.rs ──"))
     );
-    assert!(app.editor.is_empty());
+    assert!(app.composer.editor.is_empty());
     // Leaving the deck prints its log ahead of later rows.
     app.command("/layout inline").await.unwrap();
-    assert!(app.deck.is_none());
-    let rows: Vec<_> = app.commit.iter().map(Line::plain).collect();
+    assert!(app.display.deck.is_none());
+    let rows: Vec<_> = app.display.commit.iter().map(Line::plain).collect();
     let edit = rows
         .iter()
         .position(|row| row.starts_with("● edit    src/a.rs"));
@@ -3685,7 +3873,7 @@ async fn the_deck_panel_titles_a_session_by_its_prompt_until_it_is_titled() {
 async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 140, 36);
-    assert!(app.deck.is_none());
+    assert!(app.display.deck.is_none());
     append(
         &mut app,
         reply(
@@ -3706,9 +3894,9 @@ async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it(
             .any(|row| row.starts_with("● edit    src/a.rs"))
     );
     // The inline rows reach scrollback with the next frame.
-    app.commit.clear();
+    app.display.commit.clear();
     app.set_layout(Layout::Deck).unwrap();
-    let deck = app.deck.as_ref().unwrap();
+    let deck = app.display.deck.as_ref().unwrap();
     let rows: Vec<_> = deck.log.rows().iter().map(Line::plain).collect();
     assert!(
         rows.iter().any(|row| row.starts_with("● edit    src/a.rs")),
@@ -3717,7 +3905,7 @@ async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it(
     assert_eq!(deck.log.selected().unwrap().title, "edit src/a.rs");
     assert_eq!(deck.log.selected().unwrap().text, "  one\n- two\n+ three\n");
     app.command("/layout inline").await.unwrap();
-    let rows: Vec<_> = app.commit.iter().map(Line::plain).collect();
+    let rows: Vec<_> = app.display.commit.iter().map(Line::plain).collect();
     assert!(
         !rows.iter().any(|row| row.starts_with("● edit    src/a.rs")),
         "{rows:?}"

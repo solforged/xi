@@ -4,6 +4,7 @@ use xi_protocol::model::Reasoning;
 use crate::approvals::Approvals;
 use crate::callout::Kind;
 use crate::layout::Layout;
+use crate::overlay::Command;
 use crate::style::{Line, Role};
 use crate::transcript::{notice_rows, tokens};
 use crate::tree::Tree;
@@ -114,8 +115,8 @@ impl App {
     /// Changes and saves the client's layout choice, entering or leaving
     /// the deck as it says.
     pub(crate) fn set_layout(&mut self, layout: Layout) -> std::io::Result<()> {
-        self.layout = layout;
-        if layout.deck_at(self.cols, self.rows) {
+        self.display.layout = layout;
+        if layout.deck_at(self.display.cols, self.display.rows) {
             self.enter_deck();
         } else {
             self.leave_deck();
@@ -185,7 +186,7 @@ impl App {
             Some(Builtin::Copy) => {
                 if let Some(text) = self.transcript.last_text() {
                     let lines = text.lines().count();
-                    self.controls.push(clipboard::osc52(text));
+                    self.display.controls.push(clipboard::osc52(text));
                     self.notice(Kind::Done, format!("copied {lines} lines"));
                 } else {
                     self.notice(Kind::Info, "nothing to copy yet");
@@ -199,7 +200,7 @@ impl App {
                     &self.launch.attached.events,
                     self.launch.attached.info.head,
                 )));
-                self.completion = None;
+                self.composer.completion = None;
             }
             Some(Builtin::Model) if rest.is_empty() => self.open_models().await,
             Some(Builtin::Model) => match rest.parse() {
@@ -234,22 +235,29 @@ impl App {
                     self.notice(Kind::Warn, format!("{error}; use {names}"));
                 }
             },
-            Some(Builtin::Sandbox) => match rest {
-                "" => self.toggle_sandbox().await,
-                "on" => self.set_sandbox(true).await,
-                "off" => self.set_sandbox(false).await,
-                _ => self.notice(Kind::Warn, "/sandbox expects on or off"),
-            },
+            Some(Builtin::Sandbox) => {
+                let command = match rest {
+                    "" => Command::ToggleSandbox,
+                    "on" => Command::Sandbox(true),
+                    "off" => Command::Sandbox(false),
+                    _ => {
+                        self.notice(Kind::Warn, "/sandbox expects on or off");
+                        return Ok(());
+                    }
+                };
+                // Submit reaches this handler through execute; box the return edge.
+                Box::pin(self.execute(command)).await?;
+            }
             Some(Builtin::Layout) if rest.is_empty() => {
                 self.notice(
                     Kind::Info,
                     Line::default()
-                        .ink(format!("layout {}", self.layout.name()))
+                        .ink(format!("layout {}", self.display.layout.name()))
                         .dim(format!(
                             " · {}, {}×{}",
-                            self.measure().tier.name(),
-                            self.cols,
-                            self.rows
+                            self.display.measure().tier.name(),
+                            self.display.cols,
+                            self.display.rows
                         )),
                 );
             }
@@ -295,7 +303,7 @@ impl App {
                 {
                     Ok(Some(result)) => {
                         if let Some(message) = result.message {
-                            let m = self.measure();
+                            let m = self.display.measure();
                             let rows = message
                                 .lines()
                                 .enumerate()

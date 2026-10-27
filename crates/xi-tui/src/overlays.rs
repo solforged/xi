@@ -1,4 +1,3 @@
-use crossterm::event::KeyEvent;
 use futures::stream::FuturesUnordered;
 use xi_client::client::{ClientError, ClientNotification};
 use xi_protocol::SessionId;
@@ -12,9 +11,8 @@ use xi_protocol::rpc::RpcError;
 use crate::approvals::{Approval, Approvals, Choice};
 use crate::callout::Kind;
 use crate::editor::Editor;
-use crate::history::History;
-use crate::keys::Action;
-use crate::overlay::{Command, Outcome};
+use crate::history::{History, Search};
+use crate::overlay::Command;
 use crate::picker::Picker;
 use crate::roles::{self, Roles};
 use crate::sessions::Sessions;
@@ -30,13 +28,13 @@ macro_rules! ctx {
     ($app:ident) => {
         $crate::overlay::Ctx {
             keys: &$app.keymap,
-            history: &$app.history,
+            history: &$app.composer.history,
             info: &$app.launch.attached.info,
             thinking: $app.transcript.thinking_display(),
-            layout: $app.layout,
+            layout: $app.display.layout,
             tui_path: $app.launch.tui_config.as_deref(),
             now: ::xi_protocol::Timestamp::now(),
-            rows: $app.rows,
+            rows: $app.display.rows,
             parent: None,
         }
     };
@@ -49,31 +47,49 @@ impl App {
         self.transcript
             .asks()
             .iter()
-            .filter(|ask| !self.resolved.contains(&ask.call))
+            .filter(|ask| !self.turn.resolved.contains(&ask.call))
             .count()
     }
 
-    /// Hands a key to the top overlay and carries out what it asks for.
-    /// `tab` from any other overlay opens this session's waiting asks on
-    /// top, and `esc` there returns to it.
-    pub(crate) async fn overlay_key(&mut self, key: KeyEvent, action: Option<Action>) {
-        if action == Some(Action::Complete)
-            && !self.overlays.on_top::<Approvals>()
-            && self.waiting() > 0
-        {
-            self.open_own_approvals();
-            return;
-        }
-        let mut ctx = ctx!(self);
-        match self.overlays.key(key, action, &mut ctx) {
-            Outcome::Stay => {}
-            Outcome::Close => self.overlays.pop(),
-            Outcome::Send(command) => self.run(*command).await,
-        }
-    }
-
-    async fn run(&mut self, command: Command) {
+    /// Carries out work requested by the component with the keys.
+    pub(crate) async fn execute(&mut self, command: Command) -> Result<(), Error> {
         match command {
+            Command::Close => self.overlays.pop(),
+            Command::Dismiss => self.close_overlay(),
+            Command::Submit { queue } => self.submit(queue).await?,
+            Command::Cancel => self.cancel().await,
+            Command::Quit => self.quit = true,
+            Command::OwnApprovals => self.open_own_approvals(),
+            Command::SearchHistory => {
+                self.overlays.push(Box::new(Search::default()));
+                self.composer.completion = None;
+            }
+            Command::External => {
+                self.composer.external_requested = Some(ExternalRequest::Composer);
+            }
+            Command::PasteImage => self.paste_image().await,
+            Command::Models => self.open_models().await,
+            Command::Reasoning => self.cycle_reasoning().await,
+            Command::Sandbox(enabled) => self.set_sandbox(enabled).await,
+            Command::ToggleSandbox => self.toggle_sandbox().await,
+            Command::Expand => {
+                let m = self.display.measure();
+                let lines = self.transcript.expand(m).unwrap_or_else(|| {
+                    let why = if self.transcript.collapsed() {
+                        "that was the oldest cut-short result · ctrl+o starts again from the newest"
+                    } else {
+                        "nothing cut short yet · results longer than three lines show whole here"
+                    };
+                    self.transcript.notice(Kind::Info, why, m)
+                });
+                self.commit_lines(lines);
+            }
+            Command::Thinking => {
+                let thinking = self.transcript.thinking_display().next();
+                self.transcript.set_thinking(thinking);
+                self.notice(Kind::Info, format!("thinking display → {}", thinking.name()));
+            }
+            Command::Note(lines) => self.note(lines),
             Command::Answer(choice) => self.answer(choice).await,
             Command::Checkout(node) => self.checkout(node).await,
             Command::SetModel(entry) => self.choose_model(entry).await,
@@ -104,10 +120,11 @@ impl App {
             Command::Role(action) => self.role(action).await,
             Command::UsePrompt(prompt) => {
                 self.overlays.pop();
-                self.editor.set_text(&prompt);
-                self.update_completion();
+                self.composer.editor.set_text(&prompt);
+                self.composer.update_completion();
             }
         }
+        Ok(())
     }
 
     async fn setting(&mut self, action: settings::Action) {
@@ -136,7 +153,7 @@ impl App {
                 }
             }
             settings::Action::Layout => {
-                let layout = match self.layout {
+                let layout = match self.display.layout {
                     crate::layout::Layout::Inline => crate::layout::Layout::Deck,
                     crate::layout::Layout::Deck => crate::layout::Layout::Auto,
                     crate::layout::Layout::Auto => crate::layout::Layout::Inline,
@@ -159,7 +176,7 @@ impl App {
             },
             settings::Action::EditFile => {
                 if let Some(settings) = self.overlays.get::<Settings>() {
-                    self.external_requested = Some(ExternalRequest::Settings(
+                    self.composer.external_requested = Some(ExternalRequest::Settings(
                         settings.report.files.global.clone(),
                     ));
                 }
@@ -193,7 +210,7 @@ impl App {
             }
             roles::Action::EditFile => {
                 if let Some(roles) = self.overlays.get::<Roles>() {
-                    self.external_requested =
+                    self.composer.external_requested =
                         Some(ExternalRequest::Settings(roles.report.files.global.clone()));
                 }
             }
@@ -258,7 +275,7 @@ impl App {
         self.transcript
             .asks()
             .iter()
-            .filter(|ask| !self.resolved.contains(&ask.call))
+            .filter(|ask| !self.turn.resolved.contains(&ask.call))
             .map(|ask| Approval {
                 pending: PendingApproval {
                     session: info.session,
@@ -284,7 +301,7 @@ impl App {
             Some(approvals) => approvals.replace_current(entries, session),
             None => self.overlays.push(Box::new(Approvals::new(entries, false))),
         }
-        self.completion = None;
+        self.composer.completion = None;
     }
 
     pub(crate) fn close_empty_approvals(&mut self) {
@@ -298,7 +315,7 @@ impl App {
     }
 
     pub(crate) async fn refresh_inbox(&mut self) {
-        self.inbox_refresh = false;
+        self.approvals.inbox_refresh = false;
         let pending = match self.launch.client.approvals().await {
             Ok(pending) => pending,
             Err(error) => {
@@ -308,11 +325,15 @@ impl App {
         };
         let current = self.session_id();
         if pending.iter().any(|ask| {
-            ask.session != current && !self.approval_workspaces.contains_key(&ask.session)
+            ask.session != current
+                && !self
+                    .approvals
+                    .approval_workspaces
+                    .contains_key(&ask.session)
         }) {
             match self.launch.client.list(ListParams::default()).await {
                 Ok(sessions) => {
-                    self.approval_workspaces = sessions
+                    self.approvals.approval_workspaces = sessions
                         .into_iter()
                         .map(|session| (session.session, session.cwd))
                         .collect();
@@ -326,10 +347,17 @@ impl App {
                 .into_iter()
                 .filter(|ask| {
                     ask.session != current
-                        && !self.answered.contains(&(ask.session, ask.call.clone()))
+                        && !self
+                            .approvals
+                            .answered
+                            .contains(&(ask.session, ask.call.clone()))
                 })
                 .map(|pending| {
-                    let cwd = self.approval_workspaces.get(&pending.session).cloned();
+                    let cwd = self
+                        .approvals
+                        .approval_workspaces
+                        .get(&pending.session)
+                        .cloned();
                     Approval { pending, cwd }
                 }),
         );
@@ -337,14 +365,14 @@ impl App {
             Some(approvals) => approvals.replace(entries),
             None => self.overlays.push(Box::new(Approvals::new(entries, true))),
         }
-        self.completion = None;
+        self.composer.completion = None;
         self.close_empty_approvals();
     }
 
     /// Whether the TUI may leave this session. A running turn keeps running
     /// in its worker, but queued prompts live only here and would be lost.
     fn can_leave(&mut self) -> bool {
-        if self.queued.is_empty() {
+        if self.turn.queued.is_empty() {
             return true;
         }
         self.notice(Kind::Warn, "/resume waits for queued prompts to send");
@@ -367,7 +395,7 @@ impl App {
             Ok(sessions) => {
                 self.overlays
                     .push(Box::new(Sessions::new(sessions, self.session_id())));
-                self.completion = None;
+                self.composer.completion = None;
             }
             Err(error) => self.notice(Kind::Error, error.to_string()),
         }
@@ -383,36 +411,38 @@ impl App {
         let changed_workspace = attached.info.cwd != self.launch.attached.info.cwd;
         self.launch.template.cwd = attached.info.cwd.clone();
         self.launch.attached = attached;
-        self.exited = false;
-        self.refresh = false;
-        self.failed = false;
-        self.started = None;
-        self.pending = FuturesUnordered::new();
+        self.turn.exited = false;
+        self.turn.refresh = false;
+        self.turn.failed = false;
+        self.turn.started = None;
+        self.turn.pending = FuturesUnordered::new();
         self.transcript = Transcript::default();
         self.transcript.set_thinking(thinking);
         self.close_overlay();
-        self.inbox_refresh = false;
-        self.steering.clear();
-        self.queued.clear();
-        self.editor = Editor::default();
-        self.images.clear();
+        self.approvals.inbox_refresh = false;
+        self.turn.steering.clear();
+        self.turn.queued.clear();
+        self.composer.editor = Editor::default();
+        self.composer.images.clear();
         let error = if changed_workspace {
             let (history, error) =
                 History::load(self.launch.history.clone(), &self.launch.attached.info.cwd);
-            self.history = history;
+            self.composer.history = history;
             error
         } else {
             None
         };
-        self.editor.set_history(self.history.workspace());
-        if self.deck.is_some() {
+        self.composer
+            .editor
+            .set_history(self.composer.history.workspace());
+        if self.display.deck.is_some() {
             // The deck's log shows the attached session alone.
             self.reset_deck_log();
         } else if clear_scrollback {
-            self.commit.clear();
-            self.clear_scrollback = true;
+            self.display.commit.clear();
+            self.display.clear_scrollback = true;
         } else {
-            self.note(vec![style::rule(self.cols)]);
+            self.note(vec![style::rule(self.display.cols)]);
         }
         self.attach();
         if let Some(error) = error {
@@ -448,7 +478,8 @@ impl App {
                 data: Some(data),
                 ..
             }) if data.get("session").is_some() => {
-                let held: SessionId = serde_json::from_value(data["session"].clone())?;
+                let held: SessionId =
+                    serde_json::from_value(data["session"].clone()).map_err(ClientError::from)?;
                 self.launch.client.attach(held, None).await?
             }
             Err(error) => return Err(error.into()),
@@ -524,7 +555,7 @@ impl App {
                     .find(|entry| entry.model == models.current)
                     .map(|entry| entry.info.clone());
                 self.overlays.push(Box::new(Picker::new(models)));
-                self.completion = None;
+                self.composer.completion = None;
             }
             Err(error) => self.notice(Kind::Error, error.to_string()),
         }
@@ -540,7 +571,7 @@ impl App {
             Ok(model) => {
                 self.launch.attached.info.model = model;
                 self.launch.attached.info.model_info = None;
-                self.refresh = true;
+                self.turn.refresh = true;
                 true
             }
             Err(error) => {
@@ -652,9 +683,10 @@ impl App {
             }
         };
         if pending.session == self.session_id() {
-            self.resolved.insert(pending.call.clone());
+            self.turn.resolved.insert(pending.call.clone());
         } else {
-            self.answered
+            self.approvals
+                .answered
                 .insert((pending.session, pending.call.clone()));
         }
         if answered {
@@ -669,7 +701,7 @@ impl App {
                     .span(role, false, choice.record())
                     .dim(" · ")
                     .ink(format!("{} {}", pending.tool, pending.action))
-                    .truncate(self.cols),
+                    .truncate(self.display.cols),
             ]);
         }
         let mut inbox = false;
@@ -705,7 +737,7 @@ impl App {
                 session: self.session_id(),
                 event,
             });
-            transcript.apply(&n, self.measure());
+            transcript.apply(&n, self.display.measure());
         }
         transcript.end_turn();
         // Replayed rows are not committed, so nothing may inspect them.
@@ -716,19 +748,19 @@ impl App {
         self.refresh_details().await;
         let what = match &node.prompt {
             Some(prompt) => {
-                if self.editor.is_empty() {
-                    self.editor.insert(prompt);
+                if self.composer.editor.is_empty() {
+                    self.composer.editor.insert(prompt);
                 }
                 "before this prompt · edit it or send it as is to start a new branch"
             }
             None => "your next prompt continues from here",
         };
-        self.update_completion();
+        self.composer.update_completion();
         let mut line = Line::default().ink("checked out · ").dim(what);
         if self.transcript.tainted {
             line = line.dim(" · ").murex("◆ tainted");
         }
-        let rows = notice_rows(Line::default().brass("↳"), line, self.measure());
+        let rows = notice_rows(Line::default().brass("↳"), line, self.display.measure());
         self.note(rows);
     }
 }

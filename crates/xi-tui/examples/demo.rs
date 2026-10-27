@@ -235,10 +235,26 @@ impl Tool for Fake {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum DemoError {
+    #[error("the demo needs a terminal")]
+    TerminalRequired,
+    #[error("the default model is not in the registry")]
+    MissingModel,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Config(#[from] xi_kernel::Error),
+    #[error(transparent)]
+    Client(#[from] xi_client::client::ClientError),
+    #[error(transparent)]
+    Tui(#[from] xi_tui::Error),
+}
+
 #[tokio::main]
-async fn main() -> Result<(), xi_tui::Error> {
+async fn main() -> Result<(), DemoError> {
     if !xi_tui::available() {
-        return Err("the demo needs a terminal".into());
+        return Err(DemoError::TerminalRequired);
     }
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
@@ -257,7 +273,7 @@ async fn main() -> Result<(), xi_tui::Error> {
         .registry()
         .model(&config.model)
         .cloned()
-        .ok_or("the default model is not in the registry")?;
+        .ok_or(DemoError::MissingModel)?;
     let spawner = xi_daemon::InProcessSpawner {
         paths: paths.clone(),
         backend: Some(Arc::new(move || {
@@ -329,5 +345,6 @@ async fn main() -> Result<(), xi_tui::Error> {
         history: None,
         tui_config: None,
     })
-    .await
+    .await?;
+    Ok(())
 }
