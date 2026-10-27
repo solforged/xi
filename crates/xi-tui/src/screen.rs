@@ -130,14 +130,19 @@ impl<W: Write> Screen<W> {
             if i > 0 {
                 buf.push_str("\r\n");
             }
-            if line.width() > self.cols {
-                line.clone()
-                    .truncate(self.cols)
-                    .write_ansi(&mut buf, self.color);
+            let width = if line.width() > self.cols {
+                let line = line.clone().truncate(self.cols);
+                line.write_ansi(&mut buf, self.color);
+                line.width()
             } else {
                 line.write_ansi(&mut buf, self.color);
+                line.width()
+            };
+            // A full row leaves the cursor waiting to wrap on the last
+            // cell, where erasing to the end of the line would blank it.
+            if width < self.cols {
+                buf.push_str("\x1b[K");
             }
-            buf.push_str("\x1b[K");
         }
         if let Some((row, col)) = cursor {
             buf.push_str(&format!("\x1b[{};{}H\x1b[?25h", row + 1, col + 1));
@@ -293,10 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn deck_without_a_cursor_stays_hidden_and_never_adds_a_trailing_newline() {
+    fn deck_full_rows_skip_the_erase_that_would_blank_their_last_cell() {
         let mut s = Screen::new(Vec::new(), false, 4);
         s.draw_deck(&[Line::default().ink("full")], None).unwrap();
-        assert_eq!(text(&s), "\x1b[?2026h\x1b[?25l\x1b[Hfull\x1b[K\x1b[?2026l");
+        assert_eq!(text(&s), "\x1b[?2026h\x1b[?25l\x1b[Hfull\x1b[?2026l");
         s.draw_deck(&[], None).unwrap();
         assert!(text(&s).ends_with("\x1b[?2026h\x1b[?25l\x1b[H\x1b[?2026l"));
     }
