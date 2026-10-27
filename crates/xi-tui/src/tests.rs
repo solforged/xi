@@ -4,12 +4,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use xi_protocol::Timestamp;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::SessionSummary;
-use xi_protocol::model::Reasoning;
+use xi_protocol::model::{ModelRole, Reasoning};
 
 use crate::approvals::{Approvals, Choice};
 use crate::history::Search;
 use crate::keys::Action;
 use crate::picker::Picker;
+use crate::roles::Roles;
 use crate::sessions::Sessions;
 use crate::settings::Settings;
 use serde_json::{Value, json};
@@ -87,6 +88,10 @@ fn settings_report() -> SettingsReport {
         ("compaction.trigger", json!({ "percent": 80 })),
         ("compaction.keep_recent_tokens", json!(16_000)),
         ("sandbox.enabled", json!(true)),
+        ("preset", Value::Null),
+        ("roles.slow", json!("default/model")),
+        ("roles.smol", json!("default/model")),
+        ("roles.tiny", json!("default/model")),
         ("extensions", json!(["/tmp/extensions"])),
         ("sandbox.readable", json!(["/tmp/notes"])),
         ("sandbox.writable", json!(["/tmp/output"])),
@@ -100,7 +105,8 @@ fn settings_report() -> SettingsReport {
         key: key.into(),
         value,
         source: SettingLayer::Default,
-        editable: index < 8,
+        editable: index < 12,
+        from_preset: false,
         held_back: None,
     })
     .collect();
@@ -114,6 +120,19 @@ fn settings_report() -> SettingsReport {
         trusted: true,
         settings,
         warnings: Vec::new(),
+        presets: [(
+            "lab".to_owned(),
+            [
+                (ModelRole::Slow, "lab/big"),
+                (ModelRole::Default, "demo/script"),
+                (ModelRole::Smol, "lab/small"),
+                (ModelRole::Tiny, "demo/second"),
+            ]
+            .into_iter()
+            .map(|(role, model)| (role, model.parse().unwrap()))
+            .collect(),
+        )]
+        .into(),
     }
 }
 
@@ -2412,7 +2431,7 @@ async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 5).await;
+    settings_down(&mut app, 6).await;
     app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2440,7 +2459,7 @@ async fn settings_sandbox_toggle_saves_the_default_without_changing_the_worker()
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 8).await;
+    settings_down(&mut app, 9).await;
     for (key, enabled) in [(KeyCode::Char(' '), false), (KeyCode::Enter, true)] {
         app.key(KeyEvent::new(key, KeyModifiers::NONE))
             .await
@@ -2508,6 +2527,173 @@ async fn settings_saves_session_model_and_reasoning_and_returns_from_picker() {
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::High);
 }
 
+async fn press(app: &mut App, code: KeyCode) {
+    app.key(KeyEvent::new(code, KeyModifiers::NONE))
+        .await
+        .unwrap();
+}
+
+/// The `lab` preset from the global file, with `smol` overridden there and
+/// `slow` overridden in the workspace's local file.
+fn roles_report() -> SettingsReport {
+    let mut report = settings_report();
+    for (key, value, source, from_preset) in [
+        ("preset", json!("lab"), SettingLayer::Global, false),
+        (
+            "default_model",
+            json!("demo/script"),
+            SettingLayer::Global,
+            true,
+        ),
+        ("roles.slow", json!("lab/big"), SettingLayer::Local, false),
+        (
+            "roles.smol",
+            json!("demo/second"),
+            SettingLayer::Global,
+            false,
+        ),
+        (
+            "roles.tiny",
+            json!("demo/second"),
+            SettingLayer::Global,
+            true,
+        ),
+    ] {
+        let row = report
+            .settings
+            .iter_mut()
+            .find(|row| row.key == key)
+            .unwrap();
+        row.value = value;
+        row.source = source;
+        row.from_preset = from_preset;
+    }
+    report
+}
+
+fn row_with(app: &App, needle: &str) -> String {
+    live_text(app)
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no row with {needle:?}: {}", live_text(app)))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn roles_view_shows_sources_and_assigns_resets_and_uses_roles() {
+    let data = FakeData {
+        settings: Some(roles_report()),
+        ..FakeData::default()
+    };
+    let (launch, mut requests) = launch_with(snapshot(false), data).await;
+    let mut app = App::new(launch, 120, 40);
+    app.command("/roles").await.unwrap();
+    assert!(app.overlays.on_top::<Roles>());
+    request(&mut requests, "config/settings");
+    assert!(live_text(&app).contains("lab preset · 2 overrides"));
+    let source = |row: String| row.trim_end_matches('│').trim_end().to_owned();
+    let preset = source(row_with(&app, "Preset"));
+    assert!(preset.contains("Preset          lab") && preset.ends_with("global"));
+    let default = source(row_with(&app, " default "));
+    assert!(
+        default.contains("● default         demo/script"),
+        "{default}"
+    );
+    assert!(default.ends_with("preset"), "{default}");
+    assert!(source(row_with(&app, "lab/big")).ends_with("local"));
+    assert!(source(row_with(&app, " smol ")).ends_with("global"));
+
+    // A role a later file sets stays put and names that file.
+    press(&mut app, KeyCode::Down).await;
+    press(&mut app, KeyCode::Enter).await;
+    assert!(requests.try_recv().is_err());
+    assert!(live_text(&app).contains("Set in /tmp/xi-tui-demo/.xi/config.local.toml"));
+
+    // A global override offers to drop it, from the picker's first row.
+    press(&mut app, KeyCode::Down).await;
+    press(&mut app, KeyCode::Down).await;
+    assert!(live_text(&app).contains("roles.smol in config.toml overrides the preset"));
+    assert!(live_text(&app).contains("r resets"));
+    press(&mut app, KeyCode::Enter).await;
+    request(&mut requests, "session/models");
+    assert!(app.overlays.on_top::<Picker>());
+    assert!(live_text(&app).contains("roles › smol"));
+    let reset = row_with(&app, "↺ preset");
+    assert!(reset.contains("lab/small") && reset.contains("drops roles.smol"));
+    assert!(row_with(&app, "second").contains("› ● second"));
+    press(&mut app, KeyCode::Up).await;
+    press(&mut app, KeyCode::Up).await;
+    press(&mut app, KeyCode::Enter).await;
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "roles.smol");
+    assert_eq!(params["value"], Value::Null);
+    assert!(app.overlays.on_top::<Roles>());
+    assert!(live_text(&app).contains("Saved to the global config."));
+    press(&mut app, KeyCode::Char('r')).await;
+    assert_eq!(request(&mut requests, "config/set")["key"], "roles.smol");
+
+    // `u` switches the session to the role's concrete model.
+    press(&mut app, KeyCode::Down).await;
+    press(&mut app, KeyCode::Char('u')).await;
+    assert_eq!(
+        request(&mut requests, "session/set_model")["model"],
+        json!({ "provider": "demo", "model": "second" })
+    );
+    assert_eq!(app.launch.attached.info.model.model, "second");
+    assert!(live_text(&app).contains("This session now uses demo/second."));
+    assert!(row_with(&app, " tiny ").contains("● tiny"));
+    // A preset role has nothing to reset.
+    press(&mut app, KeyCode::Char('r')).await;
+    assert!(requests.try_recv().is_err());
+    assert!(live_text(&app).contains("tiny has no override in the global config to drop."));
+
+    // Assigning a preset role writes its own key.
+    press(&mut app, KeyCode::Up).await;
+    press(&mut app, KeyCode::Up).await;
+    press(&mut app, KeyCode::Enter).await;
+    assert!(!live_text(&app).contains("↺"));
+    press(&mut app, KeyCode::Down).await;
+    press(&mut app, KeyCode::Enter).await;
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "default_model");
+    assert_eq!(params["value"], "demo/second");
+
+    // The preset row cycles the presets, then none.
+    press(&mut app, KeyCode::Up).await;
+    press(&mut app, KeyCode::Up).await;
+    assert!(live_text(&app).contains("enter cycles lab, none."));
+    press(&mut app, KeyCode::Enter).await;
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "preset");
+    assert_eq!(params["value"], Value::Null);
+}
+
+#[tokio::test]
+async fn settings_roles_row_opens_roles_and_shows_its_edits_on_return() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 120, 40);
+    app.command("/settings").await.unwrap();
+    settings_down(&mut app, 4).await;
+    assert!(row_with(&app, "Roles").contains("› Roles"));
+    assert!(row_with(&app, "Roles").contains("none"));
+    assert!(live_text(&app).contains("enter opens"));
+    press(&mut app, KeyCode::Enter).await;
+    assert!(app.overlays.on_top::<Roles>());
+    assert!(live_text(&app).contains("settings › roles"));
+    assert!(live_text(&app).contains("no preset"));
+    assert!(live_text(&app).contains("esc back to settings"));
+    let tiny = row_with(&app, " tiny ");
+    assert!(tiny.contains("↑ smol · default/model") && tiny.contains("fallback"));
+    request(&mut requests, "config/settings");
+    press(&mut app, KeyCode::Enter).await;
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "preset");
+    assert_eq!(params["value"], "lab");
+    press(&mut app, KeyCode::Esc).await;
+    assert!(app.overlays.on_top::<Settings>());
+    assert!(row_with(&app, "Roles").contains("lab"));
+}
+
 #[tokio::test]
 async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_order() {
     let mut report = settings_report();
@@ -2522,7 +2708,7 @@ async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_orde
     .await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
-    settings_down(&mut app, 10).await;
+    settings_down(&mut app, 11).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2553,7 +2739,7 @@ async fn settings_refuses_to_remove_the_last_tool() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 10).await;
+    settings_down(&mut app, 11).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2566,7 +2752,7 @@ async fn settings_cycles_approvals_and_edits_kept_tail_tokens() {
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
-    settings_down(&mut app, 4).await;
+    settings_down(&mut app, 5).await;
     for approval in ["reads", "auto", "ask"] {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
@@ -2612,7 +2798,7 @@ async fn settings_trigger_saves_percent_and_preserves_threshold_when_switching_u
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 6).await;
+    settings_down(&mut app, 7).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2667,7 +2853,7 @@ async fn settings_trigger_rejects_invalid_percentages_and_accepts_boundaries() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 6).await;
+    settings_down(&mut app, 7).await;
     for valid in [1, 100] {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
@@ -2698,7 +2884,7 @@ async fn settings_trigger_reset_removes_the_override_from_editor_or_row() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 6).await;
+    settings_down(&mut app, 7).await;
     for reset_in_editor in [true, false] {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
@@ -2798,7 +2984,7 @@ async fn settings_trigger_recalculates_for_selected_model_and_handles_unknown_wi
         .find(|setting| setting.key == "compaction.trigger")
         .unwrap();
     assert_eq!(setting.value, json!({ "percent": 50 }));
-    settings_down(&mut app, 6).await;
+    settings_down(&mut app, 7).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2842,7 +3028,7 @@ async fn settings_trigger_nonintegral_unit_conversion_requires_new_value_and_kee
     let mut app = App::new(launch, 80, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 6).await;
+    settings_down(&mut app, 7).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();

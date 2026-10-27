@@ -1,7 +1,9 @@
-//! A filterable model registry, grouped by provider.
+//! A filterable model registry, grouped by provider. It switches the
+//! session's model, or assigns one to a role from the roles view.
 
 use std::collections::BTreeMap;
 
+use serde_json::Value;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{ModelEntry, ModelsResult};
 use xi_protocol::model::ModelRole;
@@ -11,7 +13,14 @@ use crossterm::event::KeyEvent;
 use crate::frame::{Body, Cursor, Frame, Hint, Tone};
 use crate::keys::{Action, Keymap};
 use crate::overlay::{Command, Ctx, ListKey, Outcome, Overlay, list_key};
+use crate::roles::{self, Reset};
 use crate::style::{Line, Role, row};
+
+/// The role a picker assigns, and what dropping its override reveals.
+struct Assign {
+    role: ModelRole,
+    reset: Option<Reset>,
+}
 
 /// The model-selection overlay.
 pub struct Picker {
@@ -20,7 +29,9 @@ pub struct Picker {
     current: ModelRef,
     query: String,
     matches: Vec<usize>,
+    /// A position among the reset row, when shown, then the matches.
     selected: usize,
+    assign: Option<Assign>,
 }
 
 impl Picker {
@@ -43,7 +54,40 @@ impl Picker {
             query: String::new(),
             matches,
             selected,
+            assign: None,
         }
+    }
+
+    /// Opens the registry to assign `role`, with its model selected and
+    /// marked. `roles` tags rows with the configured roles, which may
+    /// differ from the ones the session started with. `reset`, when
+    /// given, is a first row that drops the role's override.
+    pub(crate) fn assign(
+        mut result: ModelsResult,
+        role: ModelRole,
+        current: Option<ModelRef>,
+        roles: BTreeMap<ModelRole, ModelRef>,
+        reset: Option<Reset>,
+    ) -> Self {
+        if let Some(current) = current {
+            result.current = current;
+        }
+        result.roles = roles;
+        let mut picker = Self::new(result);
+        picker.selected += usize::from(reset.is_some());
+        picker.assign = Some(Assign { role, reset });
+        picker
+    }
+
+    /// 1 while the reset row shows: in assign mode, with an empty filter.
+    fn offset(&self) -> usize {
+        usize::from(
+            self.query.is_empty()
+                && self
+                    .assign
+                    .as_ref()
+                    .is_some_and(|assign| assign.reset.is_some()),
+        )
     }
 
     /// The roles that resolve to `model`, as `@smol @tiny`.
@@ -69,7 +113,7 @@ impl Picker {
                     .then_some(index)
             })
             .collect();
-        self.selected = 0;
+        self.selected = self.offset();
     }
 
     /// Adds a character to the filter.
@@ -91,14 +135,17 @@ impl Picker {
 
     /// Selects the next matching model.
     pub fn down(&mut self) {
-        self.selected = (self.selected + 1).min(self.matches.len().saturating_sub(1));
+        self.selected =
+            (self.selected + 1).min((self.offset() + self.matches.len()).saturating_sub(1));
     }
 
-    /// The selected model, including its credential availability.
+    /// The selected model, including its credential availability; `None`
+    /// on the reset row.
     #[must_use]
     pub fn selected(&self) -> Option<&ModelEntry> {
-        self.matches
-            .get(self.selected)
+        self.selected
+            .checked_sub(self.offset())
+            .and_then(|position| self.matches.get(position))
             .map(|index| &self.models[*index])
     }
 
@@ -111,9 +158,12 @@ impl Picker {
         } else {
             format!("{} of {}", self.matches.len(), self.models.len())
         };
-        let mut hints: Vec<Hint> = Hint::key(keys, Action::Send, "selects", 0)
-            .into_iter()
-            .collect();
+        let verb = if self.assign.is_some() {
+            "assigns"
+        } else {
+            "selects"
+        };
+        let mut hints: Vec<Hint> = Hint::key(keys, Action::Send, verb, 0).into_iter().collect();
         hints.push(Hint::new("type to filter", 2).short("type"));
         hints.extend(match back {
             Some(back) => keys.key(Action::Escape).map(|key| {
@@ -121,9 +171,13 @@ impl Picker {
             }),
             None => Hint::key(keys, Action::Escape, "closes", 0),
         });
+        let title = self
+            .assign
+            .as_ref()
+            .map_or("models", |assign| assign.role.name());
         Frame {
             tone: Tone::Focus,
-            title: Line::default().ink("models"),
+            title: Line::default().ink(title),
             info: Some(Line::default().dim(info)),
             hints,
         }
@@ -148,6 +202,29 @@ impl Picker {
         }
         let mut list = Vec::new();
         let mut selected = 0;
+        let offset = self.offset();
+        if let Some(assign) = self.assign.as_ref().filter(|_| offset > 0)
+            && let Some(reset) = &assign.reset
+        {
+            let here = self.selected == 0;
+            let left = Line::default()
+                .span(
+                    if here { Role::Brass } else { Role::Ink },
+                    false,
+                    format!(
+                        "{}↺ {:<16}{}",
+                        if here { "› " } else { "  " },
+                        reset.label,
+                        reset.value
+                    ),
+                )
+                .truncate(inner);
+            list.push(row(
+                left,
+                Line::default().dim(format!("drops {}", roles::key(assign.role))),
+                inner,
+            ));
+        }
         let mut provider = None;
         for (position, index) in self.matches.iter().enumerate() {
             let entry = &self.models[*index];
@@ -155,7 +232,7 @@ impl Picker {
                 provider = Some(entry.model.provider.as_str());
                 list.push(Line::default().strong(Role::Ink, &entry.model.provider));
             }
-            let here = position == self.selected;
+            let here = position + offset == self.selected;
             if here {
                 selected = list.len();
             }
@@ -222,6 +299,19 @@ impl Overlay for Picker {
     fn key(&mut self, key: KeyEvent, action: Option<Action>, _: &Ctx) -> Outcome {
         match list_key(key, action) {
             ListKey::Choose => {
+                if let Some(assign) = &self.assign {
+                    let value = match self.selected() {
+                        Some(entry) => {
+                            Value::String(format!("{}/{}", entry.model.provider, entry.model.model))
+                        }
+                        None if self.selected < self.offset() => Value::Null,
+                        None => return Outcome::Stay,
+                    };
+                    return Outcome::Send(Box::new(Command::Role(roles::Action::Set {
+                        key: roles::key(assign.role),
+                        value,
+                    })));
+                }
                 if let Some(entry) = self.selected() {
                     return Outcome::Send(Box::new(Command::SetModel(entry.clone())));
                 }

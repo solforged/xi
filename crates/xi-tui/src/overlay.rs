@@ -18,6 +18,7 @@ use crate::frame::{self, Body, Frame, Hint};
 use crate::history::History;
 use crate::keys::{Action, Keymap};
 use crate::layout::Layout;
+use crate::roles;
 use crate::settings;
 use crate::style::Line;
 use crate::transcript::Thinking;
@@ -63,6 +64,8 @@ pub(crate) enum Command {
     Sessions { all: bool },
     /// A change from the settings view.
     Setting(settings::Action),
+    /// A change from the roles view.
+    Role(roles::Action),
     /// Put a prompt from history in the composer.
     UsePrompt(String),
 }

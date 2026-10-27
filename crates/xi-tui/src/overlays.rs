@@ -6,7 +6,7 @@ use xi_protocol::methods::client::{
     AttachResult, EventParams, ListParams, ModelEntry, OpenParams, PendingApproval, SessionSummary,
     SetSettingParams, SettingsParams, SettingsReport,
 };
-use xi_protocol::model::{ModelSelector, Reasoning};
+use xi_protocol::model::{ModelRole, ModelSelector, Reasoning};
 use xi_protocol::rpc::RpcError;
 
 use crate::approvals::{Approval, Approvals, Choice};
@@ -15,6 +15,7 @@ use crate::history::History;
 use crate::keys::Action;
 use crate::overlay::{Command, Outcome};
 use crate::picker::Picker;
+use crate::roles::{self, Roles};
 use crate::sessions::Sessions;
 use crate::settings::{self, Settings};
 use crate::style::{Line, Role};
@@ -99,6 +100,7 @@ impl App {
                 }
             }
             Command::Setting(action) => self.setting(action).await,
+            Command::Role(action) => self.role(action).await,
             Command::UsePrompt(prompt) => {
                 self.overlays.pop();
                 self.editor.set_text(&prompt);
@@ -111,6 +113,12 @@ impl App {
         match action {
             settings::Action::None | settings::Action::Close => {}
             settings::Action::Models => self.open_models().await,
+            settings::Action::Roles => {
+                if let Some(settings) = self.overlays.get::<Settings>() {
+                    let roles = Roles::new(settings.report.clone());
+                    self.overlays.push(Box::new(roles));
+                }
+            }
             settings::Action::Reasoning => self.cycle_reasoning().await,
             settings::Action::Thinking => {
                 let thinking = self.transcript.thinking_display().next();
@@ -155,6 +163,74 @@ impl App {
                     ));
                 }
             }
+        }
+    }
+
+    async fn role(&mut self, action: roles::Action) {
+        match action {
+            roles::Action::Set { key, value } => {
+                let saved = self.save_setting(key, value).await;
+                self.overlays.close::<Picker>();
+                match saved {
+                    Ok(report) => {
+                        if let Some(settings) = self.overlays.get_mut::<Settings>() {
+                            settings.replace(report.clone());
+                        }
+                        if let Some(roles) = self.overlays.get_mut::<Roles>() {
+                            roles.saved(report);
+                        }
+                    }
+                    Err(error) => self.roles_note(error.to_string()),
+                }
+            }
+            roles::Action::Pick(role) => self.pick_role(role).await,
+            roles::Action::Use(model) => {
+                let name = format!("{}/{}", model.provider, model.model);
+                if self.set_model(model.into()).await {
+                    self.roles_note(format!("This session now uses {name}."));
+                }
+            }
+            roles::Action::EditFile => {
+                if let Some(roles) = self.overlays.get::<Roles>() {
+                    self.external_requested =
+                        Some(ExternalRequest::Settings(roles.report.files.global.clone()));
+                }
+            }
+        }
+    }
+
+    fn roles_note(&mut self, note: impl Into<String>) {
+        if let Some(roles) = self.overlays.get_mut::<Roles>() {
+            roles.note(note);
+        }
+    }
+
+    /// Opens the roles view on its own, like `/settings`.
+    pub(crate) async fn open_roles(&mut self) {
+        let report = self.launch.client.settings(self.settings_params()).await;
+        self.close_overlay();
+        match report {
+            Ok(report) => self.overlays.push(Box::new(Roles::new(report))),
+            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+        }
+    }
+
+    /// Opens the model picker over the roles view to assign `role`.
+    async fn pick_role(&mut self, role: ModelRole) {
+        let Some((current, roles, reset)) = self
+            .overlays
+            .get::<Roles>()
+            .map(|view| view.assignment(role))
+        else {
+            return;
+        };
+        match self.launch.client.models(self.session_id()).await {
+            Ok(models) => {
+                self.overlays.push(Box::new(Picker::assign(
+                    models, role, current, roles, reset,
+                )));
+            }
+            Err(error) => self.roles_note(error.to_string()),
         }
     }
 
