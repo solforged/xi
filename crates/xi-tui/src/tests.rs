@@ -13,6 +13,7 @@ use crate::picker::Picker;
 use crate::roles::Roles;
 use crate::sessions::Sessions;
 use crate::settings::Settings;
+use crate::style::Role;
 use serde_json::{Value, json};
 use xi_protocol::event::{Remember, StopReason, TitleSource, Usage};
 use xi_protocol::methods::client::{
@@ -3404,7 +3405,7 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
     let mut app = App::new(launch, 250, 36);
     assert!(app.deck.is_some(), "auto opens the deck at 250×36");
     app.command("/layout").await.unwrap();
-    assert!(committed(&app).contains(&"  layout · auto (sheet, 250×36)".to_owned()));
+    assert!(committed(&app).contains(&"i layout auto · sheet, 250×36".to_owned()));
     for (name, layout, deck) in [
         ("deck", Layout::Deck, true),
         ("inline", Layout::Inline, false),
@@ -3412,7 +3413,7 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
         app.command(&format!("/layout {name}")).await.unwrap();
         assert_eq!(app.layout, layout);
         assert_eq!(app.deck.is_some(), deck);
-        assert!(committed(&app).contains(&format!("  layout → {name}")));
+        assert!(committed(&app).contains(&format!("i layout → {name}")));
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains(&format!("layout = \"{name}\"")), "{saved}");
         assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
@@ -3469,9 +3470,9 @@ async fn layout_config_loads_and_invalid_layout_warns_once() {
     assert_eq!(warnings.len(), 1);
     assert_eq!(
         warnings[0].plain(),
-        "  tui.toml: display.layout must be inline, deck or auto"
+        "! tui.toml: display.layout must be inline, deck or auto"
     );
-    assert!(warnings[0].0.iter().all(|span| span.role == Role::Dim));
+    assert_eq!(warnings[0].0[0].role, Role::Brass);
 }
 
 #[tokio::test]
@@ -3614,7 +3615,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     let edit = rows
         .iter()
         .position(|row| row.starts_with("● edit src/a.rs"));
-    let note = rows.iter().position(|row| row == "  layout → inline");
+    let note = rows.iter().position(|row| row == "i layout → inline");
     assert!(
         edit.is_some_and(|edit| note.is_some_and(|note| edit < note)),
         "{rows:?}"
@@ -3721,5 +3722,5 @@ async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it(
         !rows.iter().any(|row| row.starts_with("● edit src/a.rs")),
         "{rows:?}"
     );
-    assert!(rows.contains(&"  layout → inline".to_owned()), "{rows:?}");
+    assert!(rows.contains(&"i layout → inline".to_owned()), "{rows:?}");
 }

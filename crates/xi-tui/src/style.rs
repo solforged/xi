@@ -17,9 +17,10 @@ pub type Rgb = [u8; 3];
 pub enum Role {
     /// What you read. The terminal's default foreground.
     Ink,
-    /// Apparatus: metadata, connectors, hints. ANSI bright black.
+    /// Apparatus: metadata, connectors, hints, and the model's reasoning.
+    /// ANSI bright black.
     Dim,
-    /// You and now, and anything waiting on you. ANSI yellow.
+    /// You and now, anything waiting on you, and warnings. ANSI yellow.
     Brass,
     /// Done, passed, added. ANSI green.
     Verdigris,
@@ -57,6 +58,8 @@ pub struct Span {
     /// Underlined, for marks that must not change the text's role, such as
     /// a search match on a selected row.
     pub underline: bool,
+    /// Set in italics, for the model's reasoning.
+    pub italic: bool,
     /// Set on the raised surface, where the deck draws one.
     pub raised: bool,
 }
@@ -64,6 +67,18 @@ pub struct Span {
 /// One terminal row of spans.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Line(pub Vec<Span>);
+
+impl From<&str> for Line {
+    fn from(text: &str) -> Self {
+        Self::default().ink(text)
+    }
+}
+
+impl From<String> for Line {
+    fn from(text: String) -> Self {
+        Self::default().ink(text)
+    }
+}
 
 /// Replaces tabs and drops escape sequences and control characters, so the
 /// width is what prints. A carriage return followed by more text keeps only
@@ -141,6 +156,7 @@ impl Line {
                 role,
                 bold,
                 underline: false,
+                italic: false,
                 raised: false,
             });
         }
@@ -165,6 +181,7 @@ impl Line {
                 role,
                 bold: false,
                 underline: true,
+                italic: false,
                 raised: false,
             });
         }
@@ -175,6 +192,15 @@ impl Line {
     #[must_use]
     pub fn extend(mut self, other: Self) -> Self {
         self.0.extend(other.0);
+        self
+    }
+
+    /// Sets every span in italics.
+    #[must_use]
+    pub fn italic(mut self) -> Self {
+        for span in &mut self.0 {
+            span.italic = true;
+        }
         self
     }
 
@@ -262,6 +288,7 @@ impl Line {
             let codes = [
                 (color && span.bold).then_some("1"),
                 (color && span.underline).then_some("4"),
+                (color && span.italic).then_some("3"),
                 span.role.sgr().filter(|_| color),
             ];
             if bg.is_none() && codes.iter().all(Option::is_none) {
@@ -364,6 +391,58 @@ pub fn wrap(text: &str, cols: usize) -> Vec<String> {
             }
         }
         rows.push(row);
+    }
+    rows
+}
+
+/// Word-wraps a styled line like [`wrap`]; each character keeps its span's
+/// style.
+#[must_use]
+pub fn wrap_line(line: &Line, cols: usize) -> Vec<Line> {
+    let styled: Vec<(char, &Span)> = line
+        .0
+        .iter()
+        .flat_map(|span| span.text.chars().map(move |c| (c, span)))
+        .collect();
+    // A row is the line's characters in order, less the spaces wrapping
+    // dropped, so each row character finds its span by skipping ahead.
+    let mut at = 0;
+    let mut rows = Vec::new();
+    for row in wrap(&line.plain(), cols) {
+        let mut out: Vec<Span> = Vec::new();
+        for c in row.chars() {
+            while at < styled.len() && styled[at].0 != c {
+                at += 1;
+            }
+            let Some(&(_, span)) = styled.get(at).or(styled.last()) else {
+                continue;
+            };
+            at += 1;
+            match out.last_mut() {
+                Some(last)
+                    if (
+                        last.role,
+                        last.bold,
+                        last.underline,
+                        last.italic,
+                        last.raised,
+                    ) == (
+                        span.role,
+                        span.bold,
+                        span.underline,
+                        span.italic,
+                        span.raised,
+                    ) =>
+                {
+                    last.text.push(c);
+                }
+                _ => out.push(Span {
+                    text: c.to_string(),
+                    ..*span
+                }),
+            }
+        }
+        rows.push(Line(out));
     }
     rows
 }
@@ -487,35 +566,13 @@ pub fn prose(text: &str, cols: usize, role: Role) -> Vec<Line> {
     let mut fenced = false;
     for raw in clean_lines(text) {
         let fence = raw.trim_start().starts_with("```");
-        let (text, set) = if fenced || fence {
-            let n = raw.chars().count();
-            (raw, vec![Mark::Plain; n])
+        let line = if fenced || fence {
+            Line::default().span(role, false, &raw)
         } else {
-            marks(&raw)
+            inline(&raw, role)
         };
         fenced ^= fence;
-        let chars: Vec<char> = text.chars().collect();
-        // A row is the line's characters in order, less the spaces wrapping
-        // dropped, so each row character finds its mark by skipping ahead.
-        let mut at = 0;
-        for row in wrap(&text, cols) {
-            let mut line = Line::default();
-            let mut run = String::new();
-            let mut current = Mark::Plain;
-            for c in row.chars() {
-                while at < chars.len() && chars[at] != c {
-                    at += 1;
-                }
-                let mark = set.get(at).copied().unwrap_or(Mark::Plain);
-                at += 1;
-                if mark != current {
-                    line = marked(line, current, role, &std::mem::take(&mut run));
-                    current = mark;
-                }
-                run.push(c);
-            }
-            lines.push(marked(line, current, role, &run));
-        }
+        lines.extend(wrap_line(&line, cols));
     }
     lines
 }
@@ -673,6 +730,7 @@ mod tests {
                 role: Role::Dim,
                 bold: true,
                 underline: false,
+                italic: false,
                 raised: false,
             }]
         );

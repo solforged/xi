@@ -12,6 +12,7 @@ use xi_protocol::{Block, Event, EventId, EventKind, Timestamp};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::callout;
 use crate::frame::{Body, Frame, Hint, Note, Tone};
 use crate::keys::{Action, Keymap};
 use crate::overlay::{Command, Ctx, Outcome, Overlay};
@@ -361,11 +362,14 @@ impl Tree {
                 "This branch read untrusted content, so egress on it asks.",
             ));
         }
-        foot.push(Note::new(if node.prompt.is_some() {
-            "enter puts this prompt back in the composer; sending it starts a new branch."
-        } else {
-            "enter checks out this point; your next prompt continues from it."
-        }));
+        foot.push(Note::new(
+            callout::Kind::Info,
+            if node.prompt.is_some() {
+                "enter puts this prompt back in the composer; sending it starts a new branch."
+            } else {
+                "enter checks out this point; your next prompt continues from it."
+            },
+        ));
         Body {
             list: (0..self.nodes.len())
                 .map(|i| self.row(i, now, inner))

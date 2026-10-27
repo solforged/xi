@@ -59,7 +59,7 @@ fn script() -> Script {
             ],
         ),
         t(
-            "",
+            "The registry looks policies up by `archive` now. The old key `archived` must have survived the rename in one place, which would explain why the filter never runs.\n\nRenaming the key should be enough. I'll check the other policies use singular keys too, then run the whole suite so nothing else depends on the plural form.",
             "archive.py still registers under the old key `archived`, but the registry now looks policies up by `archive`, so the **filter never runs**. Renaming the key.",
             vec![("edit", json!({"path": "policies/archive.py"}))],
         ),
@@ -89,7 +89,7 @@ fn script() -> Script {
         ),
         t(
             "",
-            "Fixed. All 11 policies now register singular keys and the suite passes.",
+            "Fixed. All 11 policies now register singular keys and the suite passes.\n\n> The registry looks policies up by the singular key.\n\n> [!WARNING] Saved exports\n> Exports written before this fix still lack archived rows. Re-run `ledger export` to rebuild them.",
             vec![],
         ),
     ])))

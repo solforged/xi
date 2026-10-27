@@ -10,6 +10,7 @@
 //! The client attaches to a daemon session over the typed JSON-RPC connection.
 
 pub mod approvals;
+pub mod callout;
 pub mod children;
 pub mod clipboard;
 mod commands;
@@ -59,6 +60,7 @@ use xi_protocol::rpc::RpcError;
 use xi_protocol::{Block, Event, EventId, SessionId, ToolCallId};
 
 use crate::approvals::{Approval, Approvals};
+use crate::callout::Kind;
 use crate::commands::builtin_commands;
 use crate::complete::{FileIndex, Menu};
 use crate::config::TuiConfig;
@@ -69,7 +71,7 @@ use crate::layout::{Layout, Measure};
 use crate::overlay::Overlays;
 use crate::panes::Deck;
 use crate::screen::{Screen, Settle};
-use crate::style::{Line, Role};
+use crate::style::Line;
 use crate::transcript::{Transcript, duration, tokens};
 
 /// A client error.
@@ -259,15 +261,13 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
             if settings_file {
                 app.refresh_settings().await;
                 if let Err(error) = edited {
-                    app.settings_note(format!("external editor: {error}"));
+                    app.settings_note(Kind::Error, format!("external editor: {error}"));
                 }
             } else {
                 match edited {
                     Ok(Some(text)) => app.editor.set_text(&text),
                     Ok(None) => {}
-                    Err(error) => app.note(vec![
-                        Line::default().dim(format!("  external editor: {error}")),
-                    ]),
+                    Err(error) => app.notice(Kind::Error, format!("external editor: {error}")),
                 }
                 app.update_completion();
             }
@@ -319,7 +319,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
                     }
                 }
                 None => {
-                    app.note(vec![Line::default().dim("  daemon connection closed")]);
+                    app.notice(Kind::Error, "daemon connection closed");
                     break;
                 }
             },
@@ -474,12 +474,10 @@ impl App {
         };
         app.attach();
         for warning in warnings {
-            app.note(vec![Line::default().dim(format!("  tui.toml: {warning}"))]);
+            app.notice(Kind::Warn, format!("tui.toml: {warning}"));
         }
         if let Some(error) = history_error {
-            app.note(vec![
-                Line::default().dim(format!("  prompt history: {error}")),
-            ]);
+            app.notice(Kind::Warn, format!("prompt history: {error}"));
         }
         app
     }
@@ -504,9 +502,7 @@ impl App {
                     }
                 }
             }
-            Err(error) => self.note(vec![
-                Line::default().dim(format!("  command completion: {error}")),
-            ]),
+            Err(error) => self.notice(Kind::Error, format!("command completion: {error}")),
         }
         let cwd = &self.launch.attached.info.cwd;
         if self.file_cwd.as_ref() != Some(cwd) {
@@ -516,9 +512,7 @@ impl App {
                     self.files = Some(files);
                     self.file_cwd = Some(self.launch.attached.info.cwd.clone());
                 }
-                Err(error) => self.note(vec![
-                    Line::default().dim(format!("  file completion: {error}")),
-                ]),
+                Err(error) => self.notice(Kind::Error, format!("file completion: {error}")),
             }
         }
         self.update_completion();
@@ -557,9 +551,12 @@ impl App {
         if !self.running() {
             return true;
         }
-        self.note(vec![Line::default().dim(format!(
-            "  {action} waits for the turn to end · esc stops it"
-        ))]);
+        self.notice(
+            Kind::Warn,
+            Line::default()
+                .ink(format!("{action} waits for the turn to end"))
+                .dim(" · esc stops it"),
+        );
         false
     }
 
@@ -599,7 +596,7 @@ impl App {
                     self.finish_turn(None);
                 }
             }
-            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+            Err(error) => self.notice(Kind::Error, error.to_string()),
         }
     }
 
@@ -741,10 +738,7 @@ impl App {
                 Some(outcome)
             }
             Ok(Err(error)) => {
-                let lines = self
-                    .transcript
-                    .note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
-                self.commit_lines(lines);
+                self.notice(Kind::Error, error.to_string());
                 self.failed = true;
                 None
             }
@@ -772,11 +766,11 @@ impl App {
             u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)
         });
         let failed = std::mem::take(&mut self.failed);
-        let (word, role) = match &outcome {
-            Some(o) if o.cancelled => ("stopped", Role::Brass),
-            Some(o) if o.failed => ("failed", Role::Sanguine),
-            None if failed => ("failed", Role::Sanguine),
-            _ => ("done", Role::Dim),
+        let (word, kind) = match &outcome {
+            Some(o) if o.cancelled => ("stopped", Kind::Warn),
+            Some(o) if o.failed => ("failed", Kind::Error),
+            None if failed => ("failed", Kind::Error),
+            _ => ("done", Kind::Done),
         };
         let turn = self.transcript.turn;
         let mut parts = vec![duration(elapsed)];
@@ -797,12 +791,12 @@ impl App {
                 parts.push(format!("${cost:.2}"));
             }
         }
-        let line = Line::default()
-            .ink("  ")
-            .span(role, false, word)
-            .dim(format!(" · {}", parts.join(" · ")));
-        let lines = self.transcript.note(vec![line]);
-        self.commit_lines(lines);
+        self.notice(
+            kind,
+            Line::default()
+                .ink(word)
+                .dim(format!(" · {}", parts.join(" · "))),
+        );
         self.steering.clear();
         if !self.exited && !self.queued.is_empty() {
             let next = self.queued.remove(0);
@@ -812,9 +806,12 @@ impl App {
 
     fn send(&mut self, content: Vec<Block>) {
         if self.exited {
-            self.note(vec![
-                Line::default().dim("  session exited · /new starts another"),
-            ]);
+            self.notice(
+                Kind::Warn,
+                Line::default()
+                    .ink("session exited")
+                    .dim(" · /new starts another"),
+            );
             return;
         }
         if self.started.is_none() {
@@ -863,9 +860,15 @@ impl App {
         self.commit_lines(lines);
     }
 
+    /// Commits a marked notice, such as a setting change or an error.
+    fn notice(&mut self, kind: Kind, text: impl Into<Line>) {
+        let lines = self.transcript.notice(kind, text, self.measure());
+        self.commit_lines(lines);
+    }
+
     async fn cancel(&mut self) {
         if let Err(error) = self.launch.client.cancel(self.session_id()).await {
-            self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+            self.notice(Kind::Error, error.to_string());
         }
     }
 
@@ -916,7 +919,7 @@ impl App {
                 self.images.push(image);
                 self.completion = None;
             }
-            Err(error) => self.note(vec![Line::default().dim(format!("  paste image: {error}"))]),
+            Err(error) => self.notice(Kind::Warn, format!("paste image: {error}")),
         }
     }
 
@@ -935,18 +938,19 @@ impl App {
             return Ok(());
         }
         if self.exited {
-            self.note(vec![
-                Line::default().dim("  session exited · /new starts another"),
-            ]);
+            self.notice(
+                Kind::Warn,
+                Line::default()
+                    .ink("session exited")
+                    .dim(" · /new starts another"),
+            );
             self.editor.set_text(&text);
             self.update_completion();
             return Ok(());
         }
         if !text.is_empty() {
             if let Err(error) = self.history.push(&text) {
-                self.note(vec![
-                    Line::default().dim(format!("  prompt history: {error}")),
-                ]);
+                self.notice(Kind::Warn, format!("prompt history: {error}"));
             }
             self.editor.set_history(self.history.workspace());
         }

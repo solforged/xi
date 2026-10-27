@@ -2,9 +2,10 @@ use xi_protocol::manifest::CommandSpec;
 use xi_protocol::model::Reasoning;
 
 use crate::approvals::Approvals;
+use crate::callout::Kind;
 use crate::layout::Layout;
 use crate::style::{Line, Role};
-use crate::transcript::tokens;
+use crate::transcript::{notice_rows, tokens};
 use crate::tree::Tree;
 use crate::{App, Error, clipboard};
 
@@ -176,7 +177,7 @@ impl App {
                 self.overlays.close::<Approvals>();
                 self.refresh_inbox().await;
                 if self.overlays.get::<Approvals>().is_none() {
-                    self.note(vec![Line::default().dim("  no pending approvals")]);
+                    self.notice(Kind::Info, "no pending approvals");
                 }
             }
             Some(Builtin::Settings) => self.open_settings().await,
@@ -185,9 +186,9 @@ impl App {
                 if let Some(text) = self.transcript.last_text() {
                     let lines = text.lines().count();
                     self.controls.push(clipboard::osc52(text));
-                    self.note(vec![Line::default().dim(format!("  copied {lines} lines"))]);
+                    self.notice(Kind::Done, format!("copied {lines} lines"));
                 } else {
-                    self.note(vec![Line::default().dim("  nothing to copy yet")]);
+                    self.notice(Kind::Info, "nothing to copy yet");
                 }
             }
             Some(Builtin::Tree) => {
@@ -205,25 +206,23 @@ impl App {
                 Ok(model) => {
                     self.set_model(model).await;
                 }
-                Err(_) => self
-                    .note(vec![Line::default().dim(
-                        "  /model expects PROVIDER/MODEL or @slow, @default, @smol, @tiny",
-                    )]),
+                Err(_) => self.notice(
+                    Kind::Warn,
+                    "/model expects PROVIDER/MODEL or @slow, @default, @smol, @tiny",
+                ),
             },
             Some(Builtin::Reasoning) if rest.is_empty() => {
                 let info = &self.launch.attached.info;
                 let line = match &info.model_info {
                     Some(model) if model.reasoning.is_empty() => {
-                        format!("  {} does not reason", model.id)
+                        Line::default().ink(format!("{} does not reason", model.id))
                     }
-                    Some(model) => format!(
-                        "  reasoning {} · /reasoning {}",
-                        model.resolve(info.reasoning),
-                        reasoning_levels(model, "|")
-                    ),
-                    None => format!("  reasoning {}", info.reasoning),
+                    Some(model) => Line::default()
+                        .ink(format!("reasoning {}", model.resolve(info.reasoning)))
+                        .dim(format!(" · /reasoning {}", reasoning_levels(model, "|"))),
+                    None => Line::default().ink(format!("reasoning {}", info.reasoning)),
                 };
-                self.note(vec![Line::default().dim(line)]);
+                self.notice(Kind::Info, line);
             }
             Some(Builtin::Reasoning) => match rest.parse::<Reasoning>() {
                 Ok(reasoning) => self.set_reasoning(reasoning).await,
@@ -232,61 +231,59 @@ impl App {
                         Some(model) if !model.reasoning.is_empty() => reasoning_levels(model, ", "),
                         _ => Reasoning::ALL.map(Reasoning::name).join(", "),
                     };
-                    self.note(vec![Line::default().dim(format!("  {error}; use {names}"))]);
+                    self.notice(Kind::Warn, format!("{error}; use {names}"));
                 }
             },
             Some(Builtin::Sandbox) => match rest {
                 "" => self.toggle_sandbox().await,
                 "on" => self.set_sandbox(true).await,
                 "off" => self.set_sandbox(false).await,
-                _ => self.note(vec![Line::default().dim("  /sandbox expects on or off")]),
+                _ => self.notice(Kind::Warn, "/sandbox expects on or off"),
             },
             Some(Builtin::Layout) if rest.is_empty() => {
-                self.note(vec![Line::default().dim(format!(
-                    "  layout · {} ({}, {}×{})",
-                    self.layout.name(),
-                    self.measure().tier.name(),
-                    self.cols,
-                    self.rows
-                ))]);
+                self.notice(
+                    Kind::Info,
+                    Line::default()
+                        .ink(format!("layout {}", self.layout.name()))
+                        .dim(format!(
+                            " · {}, {}×{}",
+                            self.measure().tier.name(),
+                            self.cols,
+                            self.rows
+                        )),
+                );
             }
             Some(Builtin::Layout) => match Layout::parse(rest) {
                 Some(layout) => {
                     let saved = self.set_layout(layout);
-                    self.note(vec![
-                        Line::default().dim(format!("  layout → {}", layout.name())),
-                    ]);
+                    self.notice(Kind::Info, format!("layout → {}", layout.name()));
                     if let Err(error) = saved {
-                        self.note(vec![
-                            Line::default().dim(format!("  layout not saved: {error}")),
-                        ]);
+                        self.notice(Kind::Error, format!("layout not saved: {error}"));
                     }
                 }
-                None => self.note(vec![
-                    Line::default().dim("  /layout expects inline, deck or auto"),
-                ]),
+                None => self.notice(Kind::Warn, "/layout expects inline, deck or auto"),
             },
             Some(Builtin::Compact) => {
                 if !self.idle_only("/compact") {
                     return Ok(());
                 }
                 match self.launch.client.compact(self.session_id()).await {
-                    Ok(result) => self.note(vec![Line::default().dim(format!(
-                        "  compacted · {} tokens before",
-                        tokens(result.tokens_before)
-                    ))]),
-                    Err(error) => {
-                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
-                    }
+                    Ok(result) => self.notice(
+                        Kind::Done,
+                        Line::default()
+                            .ink("compacted")
+                            .dim(format!(" · {} tokens before", tokens(result.tokens_before))),
+                    ),
+                    Err(error) => self.notice(Kind::Error, error.to_string()),
                 }
             }
             Some(Builtin::Rename) if rest.is_empty() => {
-                self.note(vec![Line::default().dim("  /rename expects a title")]);
+                self.notice(Kind::Warn, "/rename expects a title");
             }
             Some(Builtin::Rename) => {
                 // The `session_titled` event commits the scrollback line.
                 if let Err(error) = self.launch.client.rename(self.session_id(), rest).await {
-                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                    self.notice(Kind::Error, error.to_string());
                 }
             }
             None => {
@@ -298,20 +295,29 @@ impl App {
                 {
                     Ok(Some(result)) => {
                         if let Some(message) = result.message {
-                            self.note(
-                                message
-                                    .lines()
-                                    .map(|line| Line::default().dim(format!("  {line}")))
-                                    .collect(),
-                            );
+                            let m = self.measure();
+                            let rows = message
+                                .lines()
+                                .enumerate()
+                                .flat_map(|(i, line)| {
+                                    let mark = if i == 0 {
+                                        Kind::Info.mark()
+                                    } else {
+                                        Line::default().ink(" ")
+                                    };
+                                    notice_rows(mark, line.into(), m)
+                                })
+                                .collect();
+                            self.note(rows);
                         }
                     }
-                    Ok(None) => self.note(vec![
-                        Line::default().dim(format!("  unknown command /{name} · /help")),
-                    ]),
-                    Err(error) => {
-                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
-                    }
+                    Ok(None) => self.notice(
+                        Kind::Warn,
+                        Line::default()
+                            .ink(format!("unknown command /{name}"))
+                            .dim(" · /help"),
+                    ),
+                    Err(error) => self.notice(Kind::Error, error.to_string()),
                 }
             }
         }

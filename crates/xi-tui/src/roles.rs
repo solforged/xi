@@ -10,6 +10,7 @@ use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{Setting, SettingLayer, SettingsReport};
 use xi_protocol::model::ModelRole;
 
+use crate::callout::Kind;
 use crate::frame::{Body, Frame, Hint, Note, Tone};
 use crate::keys::{Action as Key, Keymap};
 use crate::overlay::{Command, Ctx, Outcome, Overlay};
@@ -72,7 +73,7 @@ pub struct Roles {
     pub report: SettingsReport,
     /// 0 is the preset row, then one row per role in [`ModelRole::ALL`].
     selected: usize,
-    note: Option<String>,
+    note: Option<(Kind, String)>,
 }
 
 impl Roles {
@@ -89,14 +90,15 @@ impl Roles {
     /// Completes a successful global edit.
     pub fn saved(&mut self, report: SettingsReport) {
         self.report = report;
-        self.note = Some(
-            "Saved to the global config. New sessions use it; u switches this one now.".into(),
+        self.note(
+            Kind::Done,
+            "Saved to the global config. New sessions use it; u switches this one now.",
         );
     }
 
     /// Shows a result or error under the list.
-    pub fn note(&mut self, note: impl Into<String>) {
-        self.note = Some(note.into());
+    pub fn note(&mut self, kind: Kind, note: impl Into<String>) {
+        self.note = Some((kind, note.into()));
     }
 
     fn setting(&self, key: &str) -> Option<&Setting> {
@@ -270,10 +272,13 @@ impl Roles {
                         value: Value::Null,
                     });
                 }
-                self.note = Some(format!(
-                    "{} has no override in the global config to drop.",
-                    role.name()
-                ));
+                self.note(
+                    Kind::Warn,
+                    format!(
+                        "{} has no override in the global config to drop.",
+                        role.name()
+                    ),
+                );
                 None
             }
             KeyCode::Char('u') => {
@@ -281,7 +286,7 @@ impl Roles {
                 match self.value(self::key(role)).parse() {
                     Ok(model) => Some(Action::Use(model)),
                     Err(_) => {
-                        self.note = Some(format!("{} has no model to use.", role.name()));
+                        self.note(Kind::Warn, format!("{} has no model to use.", role.name()));
                         None
                     }
                 }
@@ -293,7 +298,7 @@ impl Roles {
     fn enter(&mut self) -> Option<Action> {
         let Some(role) = self.role() else {
             if let Some(blocked) = self.blocked("preset") {
-                self.note = Some(blocked);
+                self.note(Kind::Warn, blocked);
                 return None;
             }
             let names: Vec<&String> = self.report.presets.keys().collect();
@@ -310,7 +315,7 @@ impl Roles {
             });
         };
         if let Some(blocked) = self.blocked(key(role)) {
-            self.note = Some(blocked);
+            self.note(Kind::Warn, blocked);
             return None;
         }
         Some(Action::Pick(role))
@@ -411,11 +416,14 @@ impl Roles {
         } else {
             self.selected + 2
         };
-        let note = self.note.clone().unwrap_or_else(|| self.explain());
+        let (kind, note) = self
+            .note
+            .clone()
+            .unwrap_or_else(|| (Kind::Info, self.explain()));
         Body {
             list,
             selected: Some(selected),
-            foot: vec![Note::new(note)],
+            foot: vec![Note::new(kind, note)],
             ..Body::default()
         }
     }

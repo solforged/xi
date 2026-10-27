@@ -8,6 +8,7 @@ use xi_protocol::{SessionId, ToolCallId};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::callout::Kind;
 use crate::frame::{Body, Frame, Hint, Note, Tone};
 use crate::keys::{Action, Keymap};
 use crate::overlay::{Command, Ctx, Outcome, Overlay};
@@ -370,7 +371,7 @@ impl Approvals {
                 "This branch read untrusted content, so session and workspace grants are not offered.",
             ));
         } else if let Some(choice) = self.selected() {
-            foot.push(Note::new(choice.consequence()));
+            foot.push(Note::new(Kind::Info, choice.consequence()));
         }
         Body {
             head: vec![Line::default().strong(Role::Ink, &ask.action)],
