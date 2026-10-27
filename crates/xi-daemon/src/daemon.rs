@@ -1375,6 +1375,9 @@ fn list_sessions(
                     continue;
                 }
                 let metadata = log_metadata(&path);
+                if metadata.unprompted {
+                    continue;
+                }
                 let Some(event) = metadata.root else {
                     continue;
                 };
@@ -1423,21 +1426,28 @@ struct LogMetadata {
     root: Option<Event>,
     updated: Option<Timestamp>,
     title: Option<String>,
+    /// The whole log was read and holds no user message, so the session
+    /// was opened and left without ever starting.
+    unprompted: bool,
 }
+
+const METADATA_SCAN: u64 = 64 * 1024;
 
 fn log_metadata(path: &Path) -> LogMetadata {
     let mut metadata = LogMetadata::default();
     let Ok(file) = std::fs::File::open(path) else {
         return metadata;
     };
-    metadata.updated = file
-        .metadata()
-        .ok()
+    let stat = file.metadata().ok();
+    let whole = stat
+        .as_ref()
+        .is_some_and(|stat| stat.len() <= METADATA_SCAN);
+    metadata.updated = stat
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
         .map(Timestamp);
-    let mut reader = BufReader::new(file.take(64 * 1024));
+    let mut reader = BufReader::new(file.take(METADATA_SCAN));
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() || !line.ends_with('\n') {
         return metadata;
@@ -1451,8 +1461,13 @@ fn log_metadata(path: &Path) -> LogMetadata {
     metadata.root = Some(root);
     loop {
         line.clear();
-        if reader.read_line(&mut line).is_err() || !line.ends_with('\n') {
-            break;
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                metadata.unprompted = whole;
+                break;
+            }
+            Ok(_) if line.ends_with('\n') => {}
+            _ => break,
         }
         let Ok(event) = serde_json::from_str::<Event>(&line) else {
             break;
@@ -1721,6 +1736,53 @@ mod tests {
         assert!(missing.root.is_none());
         assert!(missing.updated.is_none());
         assert!(missing.title.is_none());
+        assert!(!missing.unprompted);
+        std::fs::write(
+            &path,
+            format!("{first}{}\n", serde_json::to_string(&padding).unwrap()),
+        )
+        .unwrap();
+        assert!(!log_metadata(&path).unprompted);
+        std::fs::write(&path, &first).unwrap();
+        assert!(log_metadata(&path).unprompted);
+        std::fs::write(&path, format!("{first}{last}")).unwrap();
+        assert!(!log_metadata(&path).unprompted);
+    }
+
+    fn saved(path: &Path, session: SessionId, prompted: bool) {
+        let root = root(session);
+        let mut text = format!("{}\n", serde_json::to_string(&root).unwrap());
+        if prompted {
+            let prompt = Event {
+                id: EventId::generate(),
+                parent: Some(root.id),
+                at: Timestamp(12),
+                kind: EventKind::UserMessage {
+                    content: vec![Block::Text { text: "hi".into() }],
+                },
+            };
+            text.push_str(&format!("{}\n", serde_json::to_string(&prompt).unwrap()));
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn saved_sessions_without_a_prompt_are_not_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let prompted = SessionId::generate();
+        let empty = SessionId::generate();
+        saved(&workspace.join("prompted.jsonl"), prompted, true);
+        saved(&workspace.join("empty.jsonl"), empty, false);
+        let listed = list_sessions(directory.path(), Vec::new(), ListParams::default()).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|summary| summary.session)
+                .collect::<Vec<_>>(),
+            [prompted]
+        );
     }
 
     #[test]
@@ -1732,11 +1794,7 @@ mod tests {
         sessions.sort();
         for (index, session) in sessions.iter().rev().enumerate() {
             let path = workspace.join(format!("{index}.jsonl"));
-            std::fs::write(
-                &path,
-                format!("{}\n", serde_json::to_string(&root(*session)).unwrap()),
-            )
-            .unwrap();
+            saved(&path, *session, true);
             std::fs::File::open(&path)
                 .unwrap()
                 .set_modified(UNIX_EPOCH + Duration::from_secs(100))

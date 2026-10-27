@@ -960,6 +960,7 @@ async fn worker_exit_notifies_attached_clients_and_running_list_watchers() {
         .unwrap()
         .info
         .session;
+    prompt(&first, session).await;
     request::<SessionList>(
         &watcher,
         &ListParams {
