@@ -335,8 +335,25 @@ impl Session {
         params: Value,
         cancel: &CancellationToken,
     ) -> BoxFuture<'static, Result<Value>> {
+        let child = serde_json::from_value(params)
+            .map(|params| self.run_child(state, params, cancel))
+            .map_err(Error::from);
+        Box::pin(async move {
+            let (result, _) = child?.await?;
+            Ok(serde_json::to_value(result)?)
+        })
+    }
+
+    /// Prepares a linked child from the parent's state now, and returns a
+    /// future that runs its prompt to the end of its turn. The future also
+    /// says whether the child's context ended tainted.
+    pub(crate) fn run_child(
+        &self,
+        state: &State,
+        params: AgentRunParams,
+        cancel: &CancellationToken,
+    ) -> BoxFuture<'static, Result<(AgentRunResult, bool)>> {
         let prepared = (|| -> Result<_> {
-            let params: AgentRunParams = serde_json::from_value(params)?;
             let mut config = state.config.clone();
             config.extensions.clear();
             let parent = state.backend.as_ref().expect("connected backend");
@@ -403,6 +420,10 @@ impl Session {
             .map_err(|_| Error::Config("child turn stopped".into()))?
             .map_err(Error::Config)?;
             let info = child.info().await;
+            let tainted = {
+                let state = child.0.state.lock().await;
+                state.log.is_tainted(state.head) == Some(true)
+            };
             let mut usage = Usage::default();
             for event in &info.events {
                 let tokens = match event.kind {
@@ -417,13 +438,14 @@ impl Session {
                 usage.cache_read += tokens.cache_read;
                 usage.cache_write += tokens.cache_write;
             }
-            Ok(serde_json::to_value(AgentRunResult {
+            let result = AgentRunResult {
                 session: child.id(),
                 path: info.path,
                 text: outcome.text,
                 failed: outcome.failed || outcome.cancelled,
                 usage,
-            })?)
+            };
+            Ok((result, tainted))
         })
     }
 

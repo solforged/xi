@@ -181,7 +181,7 @@ fn validate_value(key: &str, value: &Value) -> Result<Option<toml_edit::Value>> 
             for value in values {
                 let name = value
                     .as_str()
-                    .filter(|name| xi_tools::is_builtin(name))
+                    .filter(|name| crate::is_tool_name(name))
                     .ok_or_else(invalid)?;
                 array.push(name);
             }

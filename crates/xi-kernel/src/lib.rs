@@ -17,6 +17,7 @@ mod egress;
 mod extension_session;
 pub mod extensions;
 pub mod settings;
+mod task;
 pub mod worker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -189,13 +190,33 @@ impl Backend {
             ))
         })?;
         let provider = registry.connect(&config.model)?;
-        let tools = xi_tools::toolset(&config.tools).map_err(Error::Config)?;
+        let tools = toolset(&config.tools)?;
         Ok(Self {
             provider,
             model,
             tools,
         })
     }
+}
+
+/// Tools in `names` order: built-ins from `xi-tools`, plus the kernel's own
+/// opt-in `task`, which runs only inside a [`Session`].
+///
+/// # Errors
+/// Returns `Config` for an unknown tool name.
+pub fn toolset(names: &[impl AsRef<str>]) -> Result<Vec<Arc<dyn Tool>>> {
+    let names: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
+    let builtins: Vec<_> = names.iter().filter(|&&name| name != task::NAME).collect();
+    let mut tools = xi_tools::toolset(&builtins).map_err(Error::Config)?;
+    if let Some(at) = names.iter().position(|&name| name == task::NAME) {
+        tools.insert(at, Arc::new(task::Task));
+    }
+    Ok(tools)
+}
+
+/// Whether `name` may appear in `tools`.
+pub(crate) fn is_tool_name(name: &str) -> bool {
+    xi_tools::is_builtin(name) || name == task::NAME
 }
 
 struct ActiveBackend {
@@ -1155,6 +1176,43 @@ impl Session {
         unreachable!("last attempt returns")
     }
 
+    /// Runs a `task` call's children concurrently while serving egress asks,
+    /// and joins their answers in task order.
+    async fn run_tasks(
+        &self,
+        state: &mut State,
+        input: serde_json::Value,
+        cancel: &CancellationToken,
+        current: extension_session::Current<'_>,
+    ) -> xi_tools::Ran {
+        let output = match task::parse(input) {
+            Err(error) => error_output(error),
+            Ok(children) => {
+                let runs: Vec<_> = children
+                    .into_iter()
+                    .map(|child| {
+                        let params = xi_protocol::methods::extension::AgentRunParams {
+                            session: self.id(),
+                            prompt: child.prompt,
+                            tools: child.tools,
+                            model: child.model,
+                        };
+                        self.run_child(state, params, cancel)
+                    })
+                    .collect();
+                let all = async { Ok(futures::future::join_all(runs).await) };
+                match self.service(state, all, cancel, Some(current)).await {
+                    Ok(results) => task::output(results),
+                    Err(error) => error_output(error.to_string()),
+                }
+            }
+        };
+        xi_tools::Ran {
+            output,
+            spill: None,
+        }
+    }
+
     async fn invoke(
         &self,
         state: &mut State,
@@ -1427,7 +1485,9 @@ impl Session {
         let post_input = extensions
             .has_hook(xi_protocol::manifest::HookPoint::PostTool)
             .then(|| input.clone());
-        let mut result = if let Some(tool) = tool {
+        let mut result = if name == task::NAME && tool.is_some() {
+            self.run_tasks(state, input, cancel, current).await
+        } else if let Some(tool) = tool {
             let context = state.tools_context.clone();
             let run = async {
                 Ok(tokio::select! {

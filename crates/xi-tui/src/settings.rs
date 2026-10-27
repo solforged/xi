@@ -44,6 +44,7 @@ const ROWS: &[Row] = &[
     Row::Tool("bash"),
     Row::Tool("search"),
     Row::Tool("hashline"),
+    Row::Tool("task"),
     Row::ReadOnly("Sandbox readable", "sandbox.readable"),
     Row::ReadOnly("Sandbox writable", "sandbox.writable"),
     Row::ReadOnly("Sandbox env", "sandbox.env"),

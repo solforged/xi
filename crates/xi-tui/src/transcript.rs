@@ -391,7 +391,7 @@ pub(crate) fn headline_arg(
             Some(".") | None => p.to_owned(),
             Some(path) => format!("{p} in {path}"),
         }),
-        // The subagents package's tool; its children show in their own rows.
+        // The built-in `task` tool; its children show in their own rows.
         "task" => input
             .get("tasks")
             .and_then(Value::as_array)
