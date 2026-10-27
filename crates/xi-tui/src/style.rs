@@ -80,7 +80,7 @@ pub struct Span {
 
 /// One terminal row of spans.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Line(pub Vec<Span>);
+pub struct Line(pub Vec<Span>, pub(crate) Option<crate::images::ImageRow>);
 
 impl From<&str> for Line {
     fn from(text: &str) -> Self {
@@ -216,6 +216,10 @@ impl Line {
     /// Appends another line's spans.
     #[must_use]
     pub fn extend(mut self, other: Self) -> Self {
+        if let Some(mut image) = other.1 {
+            image.col += self.width();
+            self.1 = Some(image);
+        }
         self.0.extend(other.0);
         self
     }
@@ -290,7 +294,8 @@ impl Line {
                 break;
             }
         }
-        let mut line = Self(out);
+        let image = self.1.filter(|row| row.col + row.preview.cols <= budget);
+        let mut line = Self(out, image);
         if cols > 0 {
             let (role, raised) = line
                 .0
@@ -498,7 +503,7 @@ pub fn wrap_line(line: &Line, cols: usize) -> Vec<Line> {
                 }),
             }
         }
-        rows.push(Line(out));
+        rows.push(Line(out, None));
     }
     rows
 }

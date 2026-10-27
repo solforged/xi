@@ -23,6 +23,7 @@ pub mod frame;
 mod git;
 pub mod history;
 pub mod icons;
+mod images;
 mod input;
 pub mod keys;
 pub mod layout;
