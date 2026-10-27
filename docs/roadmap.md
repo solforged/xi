@@ -29,7 +29,7 @@ Rows 1 to 5 are done; their results are below.
 | 2 | Edit format | `xi-tools` | Done. Exact replacement is the default `edit`; hash anchors are the opt-in `hashline`. |
 | 3 | Compaction | kernel | Done. Overflow recovery always on; automatic compaction stays opt-in. |
 | 4 | Extension host and TypeScript SDK | kernel, `sdk/typescript` | Done. Gate for rows 5 to 9. |
-| 5 | Subagents | `extensions/subagents` | Done as an optional package. Not used unprompted by Qwen 3.8. |
+| 5 | Subagents | Opt-in built-in `task` tool | Done; moved from the `extensions/subagents` package into the kernel, still off by default. Not used unprompted by Qwen 3.8. |
 | 6 | LSP diagnostics after edits | package | Calls and time to green on the Rust and TypeScript tasks. |
 | 7 | Todo or plan tool | package | Pass rate on multi-step tasks (`invoice-rounding`, `revision-store`), prompt size. |
 | 8 | `fetch` and web search, with taint wired in | package | Tasks that need docs; taint must turn later egress into `ask`. The egress proxy and `net` capability it needs exist. |
@@ -169,4 +169,4 @@ Hash-anchored edits (now `hashline`) against exact replacement (now the default 
 - With the `task` tool available, Qwen never called it in three trials. The `xi-subagents` differences are trial noise.
 - When the prompt asked for delegation, Qwen split the packages across children. Two of three trials passed against none for the baseline, at five times the model calls and four times the uncached input. Two baseline trials ended when a single response used the whole 16,384-token output budget reasoning about all five packages; the third hit the 900-second timeout. Each child only holds one package.
 - The same `xi` baseline passed 2/3 on the single-slot 256k server (see the suite baseline). The two servers differ in per-slot context and GGUF build, and three trials are few, so the delegation gain is suggestive, not settled.
-- Decision: subagents stay an optional package. The mechanism helps when used, so the next step is the tool description or a prompt hint, measured on the same task.
+- Decision: subagents stay optional. They later moved from a package to an opt-in built-in tool, which keeps the same ablation through `--tools`. The mechanism helps when used, so the next step is the tool description or a prompt hint, measured on the same task.
