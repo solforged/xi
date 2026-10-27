@@ -155,6 +155,7 @@ impl Fixture {
                 max_turns: 4,
                 approval: ApprovalMode::Headless(false),
                 leaser: None,
+                auto_title: false,
             },
             Some(Backend {
                 provider: fake.clone(),

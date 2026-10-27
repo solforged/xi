@@ -102,6 +102,11 @@ pub mod client {
         SessionSetReasoning, "session/set_reasoning", SetReasoningParams => ()
     );
     request!(
+        /// Client → daemon: set a session's title. It applies at the next
+        /// model boundary of a running turn, or at once when idle.
+        SessionRename, "session/rename", RenameParams => ()
+    );
+    request!(
         /// Client → daemon: list the session's available model metadata.
         SessionModels, "session/models", SessionRef => ModelsResult
     );
@@ -302,6 +307,10 @@ pub mod client {
         /// How unresolved asks are handled.
         #[serde(default)]
         pub approval: ApprovalPolicy,
+        /// Name the session with the `tiny` model when `[title] auto` allows.
+        /// Interactive clients set it; scripted runs leave it off.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub auto_title: bool,
     }
 
     /// Approval behaviour for a session invocation.
@@ -456,7 +465,8 @@ pub mod client {
         /// Log modification time in milliseconds since the epoch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub updated: Option<Timestamp>,
-        /// First non-blank line of the first user message.
+        /// The latest `session_titled` title, else the first non-blank line
+        /// of the first user message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub title: Option<String>,
     }
@@ -477,6 +487,15 @@ pub mod client {
         pub session: SessionId,
         /// Reasoning depth to select.
         pub reasoning: Reasoning,
+    }
+
+    /// Parameters for [`SessionRename`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RenameParams {
+        /// Session to rename.
+        pub session: SessionId,
+        /// One line of at most 80 characters, after trimming.
+        pub title: String,
     }
 
     /// Session model selection and registry metadata.

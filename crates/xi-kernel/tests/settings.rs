@@ -437,6 +437,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("compaction.trigger", SettingLayer::Project),
         ("compaction.keep_recent_tokens", SettingLayer::Local),
         ("sandbox.enabled", SettingLayer::Default),
+        ("title.auto", SettingLayer::Default),
         ("extensions", SettingLayer::Local),
         ("sandbox.readable", SettingLayer::Global),
         (
@@ -458,7 +459,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
     for (index, (row, (key, source))) in trusted.settings.iter().zip(expected).enumerate() {
         assert_eq!(row.key, key);
         assert_eq!(row.source, source, "{key}");
-        assert_eq!(row.editable, index < 8, "{key}");
+        assert_eq!(row.editable, index < 9, "{key}");
         assert_eq!(row.held_back, None, "{key}");
     }
     assert_eq!(setting(&trusted, "approvals").value, json!("auto"));

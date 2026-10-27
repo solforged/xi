@@ -1322,6 +1322,20 @@ async fn session_list_enriches_live_and_saved_sessions_and_orders_by_mtime() {
     assert_eq!(listed[1].started, Some(first.events[0].at));
     assert_eq!(listed[0].title, Some(format!("{}…", "界".repeat(80))));
     assert_eq!(listed[1].title.as_deref(), Some("first prompt"));
+    request::<SessionRename>(
+        &peer,
+        &RenameParams {
+            session: second.info.session,
+            title: " Renamed by hand ".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let listed = request::<SessionList>(&peer, &ListParams::default())
+        .await
+        .unwrap();
+    assert_eq!(listed[0].session, second.info.session);
+    assert_eq!(listed[0].title.as_deref(), Some("Renamed by hand"));
     for session in [first.info.session, second.info.session] {
         request::<SessionClose>(&peer, &SessionRef { session })
             .await

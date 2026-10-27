@@ -456,6 +456,13 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                 }
                 continue;
             }
+            if let Some(title) = line.strip_prefix("/rename ") {
+                match client.rename(session, title).await {
+                    Ok(()) => eprintln!("Renamed."),
+                    Err(error) => eprintln!("xi: {error}"),
+                }
+                continue;
+            }
             if let Some(level) = line.strip_prefix("/reasoning ") {
                 match level.trim().parse::<Reasoning>() {
                     Ok(reasoning) => {
@@ -478,7 +485,7 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                         }
                     }
                     Ok(None) => eprintln!(
-                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /model PROVIDER/MODEL, /reasoning [LEVEL]"
+                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /rename TITLE, /model PROVIDER/MODEL, /reasoning [LEVEL]"
                     ),
                     Err(error) => eprintln!("xi: {error}"),
                 }

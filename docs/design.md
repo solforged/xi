@@ -134,7 +134,7 @@ Client → daemon requests:
 | `session/open` | `{path, options}` → attach result | Spawn a worker for an existing log. If a live worker holds the same canonical path, fail with -32005 and return its session id so the client can attach instead. |
 | `session/attach` | `{session, since?}` → `{info, events, partial, running, pending_approvals, stream_sequence, children}` | Subscribe the connection to the session's notifications. `since` is the last event id the client already has; `events` contains the events after it on disk, or the whole log without `since`. `partial` contains in-flight assistant blocks not yet persisted. `children` holds the `agent/run` children started since the session's last tool result, each `{session, events}` from its root, in start order. |
 | `session/detach` | `{session}` → null | Unsubscribe; the turn keeps running. |
-| `session/list` | `{cwd?, running?}` → `[{session, path, cwd, model, head, running, pending_approvals, parent_session, started?, updated?, title?}]` | List live sessions and sessions found in the session directories, newest `updated` first. `started` is the root event's time, `updated` the log file's modification time, and `title` the first line of the first user prompt, cut to 80 characters. Each log is read from the root line up to its first user prompt, at most 64 KiB; a log that cannot be read leaves these fields absent. `running` is the worker's own turn state, so a steering prompt left queued after a cancel does not count. |
+| `session/list` | `{cwd?, running?}` → `[{session, path, cwd, model, head, running, pending_approvals, parent_session, started?, updated?, title?}]` | List live sessions and sessions found in the session directories, newest `updated` first. `started` is the root event's time, `updated` the log file's modification time, and `title` the latest [session title](#session-titles), else the first line of the first user prompt, cut to 80 characters. The daemon reads each log once and afterwards only the complete lines appended since; a changed root line or a shorter file is read again from the start. A log that cannot be read leaves these fields absent, and a whole log without a user prompt is not listed. `running` is the worker's own turn state, so a steering prompt left queued after a cancel does not count. |
 | `session/close` | `{session}` → null | Stop the worker; fail while a turn runs. Steering prompts left queued after a cancel are rejected with an error. |
 | `session/prompt` | `{session, content}` → `{head, failed, cancelled, text}` | Route to the worker; run a turn and return its outcome when it ends. `text` is the final assistant response text. |
 | `session/cancel` | `{session}` → null | Route to the worker; stop the running turn. |
@@ -142,6 +142,7 @@ Client → daemon requests:
 | `session/compact` | `{session}` → `{head, tokens_before}` | Route to the worker; summarize older context at an idle prompt. |
 | `session/set_model` | `{session, model}` → `ModelRef` | Idle only. `model` is a `ModelRef` or `{role}`. Resolve a role, record `model_changed` with the concrete model when it changes, and return it. |
 | `session/set_reasoning` | `{session, reasoning}` → null | Idle only; record `reasoning_changed` when the level changes. A model that reasons must list the level, or the request fails with the levels it accepts. Reopening a log restores the last level on the head's lineage. Models without reasoning keep the setting and ignore it. |
+| `session/rename` | `{session, title}` → null | Record a user [title](#session-titles), one line of 1 to 80 characters after trimming. Applies at once when idle, otherwise at the running turn's next model boundary. |
 | `session/models` | `{session}` → `{current, reasoning, roles, models: [{model, info, available}]}` | Route to the worker; list the session's model registry with `ModelInfo`. `roles` maps each [model role](#model-roles) to its model after fallbacks. `available` is false when the provider's credential is missing. No credential value is ever returned. |
 | `session/commands` | `{session}` → `[{name, description}]` | Route to the worker; list the session's extension slash commands for completion. |
 | `session/command` | `{session, name, args}` → command result or null | Route an extension slash command to the worker. The result is the extension protocol's `CommandResult`; null means an unknown command. |
@@ -163,6 +164,7 @@ Client → daemon requests:
 | `extensions` | Path array, empty | Extra extension directories (`--extension`). |
 | `max_turns` | Optional integer, absent means 200 | Turn limit (`--max-turns`). |
 | `approval` | `ApprovalPolicy`: `client` (default), `allow`, or `deny` | `client` waits for a client approval; `allow` and `deny` resolve asks headlessly. |
+| `auto_title` | Boolean, false | Name the session with the `tiny` model when `[title] auto` allows; see [Session titles](#session-titles). The TUI and line mode set it. |
 
 The attach result is `{info, events, partial, running, pending_approvals, stream_sequence, children}` for create, open and attach. `info` is `SessionDetails`: `{session, path, head, cwd, trusted, model, reasoning, sandbox_enabled, model_info?, parent_session?}`. `sandbox_enabled` reports the worker's active tool sandbox setting and defaults to `true` when absent on older peers. Saved sessions without a live worker have no `head` in `session/list`. The daemon guarantees at-least-once event delivery between an attach result and subsequent `event/appended` notifications, so clients deduplicate events by id. Stream notifications can also arrive twice, because the daemon subscribes a connection before asking the worker for its snapshot; `stream_sequence` is the last stream sequence included in `partial`, and clients drop `stream/delta` and `stream/reset` notifications at or below it. A sequence of 0 means unsequenced and is always applied. The prompt result's `failed`, `cancelled` and `text` fields come from the kernel's `TurnOutcome` and default on deserialization to false, false and an empty string.
 
@@ -190,7 +192,7 @@ On the daemon ↔ worker link, the first request must be `worker/start`. Its res
 | `model/lease` | Worker → daemon request | `{endpoint}` → null | Wait for permission to make a model request. |
 | `model/release` | Worker → daemon notification | `{endpoint}` | Release a granted lease. |
 
-After startup, the daemon forwards `session/attach`, `session/close`, `session/prompt`, `session/cancel`, `session/checkout`, `session/compact`, `session/set_model`, `session/set_reasoning`, `session/models`, `session/commands`, `session/command` and `approval/resolve` unchanged. A worker's attach response is a snapshot, not a subscription; the daemon owns client subscriptions. Workers send `event/appended`, `stream/delta` and `stream/reset` notifications to the daemon. Before each model request a worker requests a lease for the endpoint and waits for a grant. It releases the lease when the response ends, fails or is cancelled. Leases are FIFO per endpoint; retries of the same request keep the lease, and worker exit releases its leases implicitly.
+After startup, the daemon forwards `session/attach`, `session/close`, `session/prompt`, `session/cancel`, `session/checkout`, `session/compact`, `session/set_model`, `session/set_reasoning`, `session/rename`, `session/models`, `session/commands`, `session/command` and `approval/resolve` unchanged. A worker's attach response is a snapshot, not a subscription; the daemon owns client subscriptions. Workers send `event/appended`, `stream/delta` and `stream/reset` notifications to the daemon. Before each model request a worker requests a lease for the endpoint and waits for a grant. It releases the lease when the response ends, fails or is cancelled. Leases are FIFO per endpoint; retries of the same request keep the lease, and worker exit releases its leases implicitly.
 
 Errors use the JSON-RPC server range; `data` carries structured detail:
 
@@ -321,6 +323,19 @@ The same provider and model summarize the older prefix, including any previous s
 
 The summary is the first user-side content after the unchanged system prompt. The log supplies retained events before descendants, so reopening or branching rebuilds the same context. An extension `compact` hook can supply the summary instead, which skips the model call and records `usage: None`.
 
+### Session titles
+
+A session's title is the latest `session_titled` event in its log, in file order and whatever the branch; without one, it is the first line of the first prompt. `/rename TITLE` in the TUI and line mode, or `session/rename`, records a user title. Automatic titles never replace a user title, and none run after one.
+
+Clients that list sessions for a person set `auto_title` in `SessionOptions`: the TUI and line mode do, while `xi -p`, the benchmark and child sessions do not. With `[title] auto = true`, the default, the `tiny` [model role](#model-roles) names those sessions in two passes. Each pass is one unstreamed request without tools, using the short `crates/xi-kernel/src/title.md` prompt at the model's lowest reasoning level:
+
+1. When a turn first runs with a prompt of at least four words or 20 characters, a request with that prompt runs beside the turn. Shorter prompts, such as "hi", wait for a later one.
+2. When that prompt's first completed turn ends, a request sends the prompt, the current title and the turn's final reply, and records only a changed title. A cancelled or failed turn leaves the pass to the next one. A tainted head skips it, so fetched content never names a session. A first-pass request still unanswered by then is cancelled.
+
+The first pass is skipped when `tiny` shares the session model's endpoint and that endpoint has a `[[daemon.limit]]`, so a title request never queues the turn's own; the second pass then names the session alone. When `tiny` is the session's model, the session's connection serves the requests. Otherwise `tiny`'s provider needs credentials, and the prompt and reply go to that provider. Any failure leaves the title as it was. Titles apply at the next model boundary, or at once when the session is idle.
+
+Each event records `by`: `first_prompt`, `first_turn` or `user`. Automatic titles also record the model and the request's usage. Reopening a log that holds any title runs no further pass. The TUI commits `renamed · TITLE` for user titles and shows automatic ones only where it lists sessions.
+
 ### Terminal client
 
 `xi-tui` is the daily interface: a daemon client that commits finished output to the terminal's native scrollback and redraws only a live region below it. The live region holds the streaming turn, any open overlay, the composer and a one-line footer. Everything about a session goes through the protocol. The client owns only local state: prompt history, key bindings and display preferences. Edits to the user's global config file go through `config/set`.
@@ -397,6 +412,7 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 | `/reasoning [LEVEL]` | Set reasoning and save it as the global default; without an argument, show it and the levels the model accepts. |
 | `/layout [inline\|deck\|auto]` | Change and save the client layout; without an argument, show the choice, tier and pane size. |
 | `/compact` | Summarize older context now. |
+| `/rename TITLE` | Set the session's title; see [Session titles](#session-titles). Line mode has it too. |
 | `/approvals` | Open the approvals inbox for all sessions. |
 | `/settings` | Open the settings view. |
 | `/copy` | Copy the last response through OSC 52, which also works over SSH. |
@@ -441,6 +457,7 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 | One row per built-in tool, including `hashline` | Global default | Toggles the tool in `tools`, keeping the order and any other names; the last tool cannot be removed. |
 | Automatic compaction, trigger, kept tail | Global default | Toggles `enabled`, or edits an explicitly unit-tagged threshold or token-count tail. The trigger shows `%` and its effective token count for the selected model, or `tokens (fixed)`. In the trigger editor, `u` switches percent/token units without silently reinterpreting the number; if an exact conversion is unavailable, enter a new value before saving. `r` on the trigger row or in its editor removes the global override, revealing inherited settings or the default 80%. Empty fields are invalid. |
 | Tool sandbox | Global default | Toggles `sandbox.enabled`; off gives tool commands unrestricted host filesystem and network access. |
+| Session titles | Global default | Toggles `title.auto`, automatic naming with the `tiny` model. |
 | Sandbox roots and environment, extensions, trust, daemon idle timeout | Read only | `e` opens the file. |
 
 Global defaults go through `config/set`, which edits the global `config.toml` with a format-preserving TOML writer, so comments and ordering survive. `tui.toml` is edited the same way by the client. A running worker keeps the config it started with; new sessions read the change. Provider sections, `[[model]]` and `[[rule]]` stay file-only.

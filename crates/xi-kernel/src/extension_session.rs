@@ -400,6 +400,7 @@ impl Session {
                     max_turns: self.0.options.max_turns,
                     approval: ApprovalMode::Headless(false),
                     leaser: self.0.options.leaser.clone(),
+                    auto_title: false,
                 },
                 Some(backend),
                 Some(self.id()),

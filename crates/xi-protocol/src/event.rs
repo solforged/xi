@@ -154,6 +154,20 @@ pub enum EventKind {
         /// The new reasoning depth.
         reasoning: Reasoning,
     },
+    /// The session's display title. The latest in file order names the
+    /// session on every branch. Context building ignores it.
+    SessionTitled {
+        /// One line, at most 80 characters.
+        title: String,
+        /// Who wrote it.
+        by: TitleSource,
+        /// Model that generated an automatic title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelRef>,
+        /// Token use of the request that generated an automatic title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+    },
     /// State persisted by an extension. The kernel does not interpret it.
     Custom {
         /// The extension that wrote the event.
@@ -203,6 +217,18 @@ pub struct Usage {
     /// Input tokens written to the prompt cache.
     #[serde(default)]
     pub cache_write: u64,
+}
+
+/// Who wrote a [`EventKind::SessionTitled`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    /// The `tiny` model, from the session's first eligible prompt.
+    FirstPrompt,
+    /// The `tiny` model, once that prompt's first completed turn ended.
+    FirstTurn,
+    /// A person, through `session/rename`. Automatic titles never replace it.
+    User,
 }
 
 /// A policy outcome. Variants are ordered by strictness, so `max` picks the

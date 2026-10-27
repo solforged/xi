@@ -335,6 +335,7 @@ impl Session {
                     backend.provider.as_ref(),
                     &request,
                     &state.config,
+                    &state.config.model,
                     cancel,
                     false,
                 )

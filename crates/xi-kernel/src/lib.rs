@@ -18,6 +18,7 @@ mod extension_session;
 pub mod extensions;
 pub mod settings;
 mod task;
+pub mod title;
 pub mod worker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -158,6 +159,8 @@ pub struct TurnOptions {
     pub approval: ApprovalMode,
     /// Optional daemon scheduler for model requests.
     pub leaser: Option<Arc<dyn Leaser>>,
+    /// Name the session with the `tiny` model when `[title] auto` allows.
+    pub auto_title: bool,
 }
 
 impl Default for TurnOptions {
@@ -166,6 +169,7 @@ impl Default for TurnOptions {
             max_turns: 200,
             approval: ApprovalMode::Client,
             leaser: None,
+            auto_title: false,
         }
     }
 }
@@ -284,6 +288,8 @@ struct Control {
     cancel: CancellationToken,
     queue: VecDeque<Queued>,
     approvals: HashMap<ToolCallId, PendingAsk>,
+    /// Titles that arrived while a turn held the log.
+    titles: Vec<title::Update>,
 }
 struct State {
     log: SessionLog,
@@ -296,6 +302,7 @@ struct State {
     extensions: Option<extensions::Extensions>,
     grants: HashSet<(String, String)>,
     egress: EgressState,
+    titles: title::Titles,
 }
 /// The session's egress proxy for tool processes. Extensions have their own
 /// listeners.
@@ -495,6 +502,7 @@ impl Session {
             cancel: CancellationToken::new(),
         };
         let backend = backend.map(Into::into);
+        let titles = title::Titles::from_events(log.events());
         let session = Self(Arc::new(Inner {
             id,
             state: tokio::sync::Mutex::new(State {
@@ -512,6 +520,7 @@ impl Session {
                     tx: egress_tx,
                     rx: Some(egress_rx),
                 },
+                titles,
             }),
             control: Mutex::new(Control::default()),
             commands: Mutex::new(Vec::new()),
@@ -820,10 +829,10 @@ impl Session {
             let result = self.run(&mut state, &cancel, &mut replies).await;
             // A prompt arriving during turn-end hooks starts a new turn.
             // Cancellation retains steering until a later submission.
-            let again = {
+            let (again, titles) = {
                 let mut control = self.0.control.lock().expect("control lock");
                 if control.generation != generation {
-                    false
+                    (false, Vec::new())
                 } else {
                     control.approvals.clear();
                     let again = result.is_ok()
@@ -831,10 +840,18 @@ impl Session {
                         && !self.0.stop.is_cancelled()
                         && !control.queue.is_empty();
                     control.running = again;
-                    again
+                    (again, std::mem::take(&mut control.titles))
                 }
             };
-            let result = result.map_err(|error| error.to_string());
+            let mut result = result.map_err(|error| error.to_string());
+            // Titles that arrived after the turn's last boundary.
+            for update in titles {
+                if let Err(error) = self.apply_title(&mut state, update)
+                    && result.is_ok()
+                {
+                    result = Err(error.to_string());
+                }
+            }
             for reply in replies {
                 let _ = reply.send(result.clone());
             }
@@ -895,6 +912,7 @@ impl Session {
                 break;
             }
             self.drain(state, replies)?;
+            self.apply_titles(state)?;
             if requests >= self.0.options.max_turns {
                 self.append(
                     state,
@@ -911,6 +929,7 @@ impl Session {
             if state.backend.is_none() {
                 state.backend = Some(Backend::connect(&state.config)?.into());
             }
+            self.start_titles(state);
 
             requests += 1;
             let response = self.model_response(state, cancel).await;
@@ -1025,6 +1044,8 @@ impl Session {
             )?;
             outcome.failed = true;
         }
+        self.apply_titles(state)?;
+        self.finish_titles(state, &outcome);
         outcome.head = state.head;
         Ok(outcome)
     }
@@ -1061,6 +1082,7 @@ impl Session {
                     backend.provider.as_ref(),
                     &request,
                     &state.config,
+                    &state.config.model,
                     cancel,
                     true,
                 )
@@ -1089,6 +1111,7 @@ impl Session {
         provider: &dyn Provider,
         request: &Request,
         config: &Config,
+        model: &ModelRef,
         cancel: &CancellationToken,
         publish: bool,
     ) -> Result<Response> {
@@ -1100,10 +1123,8 @@ impl Session {
         let _lease = if let Some(leaser) = &self.0.options.leaser {
             let registry = config.registry();
             let endpoint = &registry
-                .provider(&config.model.provider)
-                .ok_or_else(|| {
-                    Error::Config(format!("unknown provider {}", config.model.provider))
-                })?
+                .provider(&model.provider)
+                .ok_or_else(|| Error::Config(format!("unknown provider {}", model.provider)))?
                 .base_url;
             Some(tokio::select! {
                 biased;
