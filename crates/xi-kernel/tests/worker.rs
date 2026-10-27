@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
-use xi_rpc::{Incoming, Peer, PeerError};
 use xi_kernel::Backend;
 use xi_kernel::config::Paths;
 use xi_kernel::worker::{WorkerSetup, run};
@@ -27,6 +26,7 @@ use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestMethod, RpcError};
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput};
 use xi_provider::{BoxFuture, Error, ErrorKind, Provider, Request, Response};
+use xi_rpc::{Incoming, Peer, PeerError};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 const ENDPOINT: &str = "http://worker.test/v1";
