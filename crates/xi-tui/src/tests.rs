@@ -1542,7 +1542,7 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
     );
 
     let live = live_text(&app);
-    assert!(live.contains("task 3 tasks"), "{live}");
+    assert!(live.contains("task    3 tasks"), "{live}");
     assert!(live.contains("↑ 2.0k"), "{live}");
     let rows: Vec<&str> = live.lines().filter(|l| l.contains("─ ")).collect();
     assert_eq!(rows.len(), 3, "{live}");
@@ -1573,7 +1573,7 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
     let committed: Vec<String> = app.commit.iter().map(Line::plain).collect();
     let text = committed.join("\n");
     assert!(
-        committed.iter().any(|l| l.starts_with("● task 3 tasks")),
+        committed.iter().any(|l| l.starts_with("● task    3 tasks")),
         "{text}"
     );
     assert!(text.contains("» from child 1 · "), "{text}");
@@ -3550,16 +3550,14 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     // foot the workspace and the rules it runs under.
     for expected in [
         "Route sandboxed bash",
-        "Context",
-        "Changes",
+        "context",
+        "changes",
         "+1 −1",
-        "Sessions",
-        "1 more",
-        "● edit src/a.rs",
-        "● read docs/policies.md",
+        "alt+1 sessions",
+        "● edit    src/a.rs",
+        "● read    docs/policies.md",
         "/tmp/xi-tui-demo",
         "\u{f45e} approvals ask · \u{f49c} sandboxed · \u{f4a1} trusted",
-        "ξ xi",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
@@ -3614,7 +3612,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     let rows: Vec<_> = app.commit.iter().map(Line::plain).collect();
     let edit = rows
         .iter()
-        .position(|row| row.starts_with("● edit src/a.rs"));
+        .position(|row| row.starts_with("● edit    src/a.rs"));
     let note = rows.iter().position(|row| row == "i layout → inline");
     assert!(
         edit.is_some_and(|edit| note.is_some_and(|note| edit < note)),
@@ -3703,7 +3701,7 @@ async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it(
     assert!(
         committed(&app)
             .iter()
-            .any(|row| row.starts_with("● edit src/a.rs"))
+            .any(|row| row.starts_with("● edit    src/a.rs"))
     );
     // The inline rows reach scrollback with the next frame.
     app.commit.clear();
@@ -3711,7 +3709,7 @@ async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it(
     let deck = app.deck.as_ref().unwrap();
     let rows: Vec<_> = deck.log.rows().iter().map(Line::plain).collect();
     assert!(
-        rows.iter().any(|row| row.starts_with("● edit src/a.rs")),
+        rows.iter().any(|row| row.starts_with("● edit    src/a.rs")),
         "{rows:?}"
     );
     assert_eq!(deck.log.selected().unwrap().title, "edit src/a.rs");
@@ -3719,7 +3717,7 @@ async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it(
     app.command("/layout inline").await.unwrap();
     let rows: Vec<_> = app.commit.iter().map(Line::plain).collect();
     assert!(
-        !rows.iter().any(|row| row.starts_with("● edit src/a.rs")),
+        !rows.iter().any(|row| row.starts_with("● edit    src/a.rs")),
         "{rows:?}"
     );
     assert!(rows.contains(&"i layout → inline".to_owned()), "{rows:?}");

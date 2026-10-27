@@ -13,6 +13,7 @@ use xi_protocol::event::StopReason;
 use xi_protocol::{Block, Event, EventKind, SessionId, Timestamp, ToolCallId};
 
 use crate::callout::markdown;
+use crate::deck::AgentRow;
 use crate::layout::Measure;
 use crate::style::{Line, Role, inline, lr};
 use crate::transcript::{
@@ -308,6 +309,51 @@ impl Children {
             rows.push(Line::default().dim("  └─ ").dim(more).truncate(cols));
         }
         rows
+    }
+
+    /// Each child as the deck's panel lists it.
+    #[must_use]
+    pub fn agents(&self, frame: usize) -> Vec<AgentRow> {
+        let now = Timestamp::now();
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                let mark = match &child.state {
+                    State::Running => Line::default().brass(SPINNER[frame % SPINNER.len()]),
+                    State::Done(_) => Line::default().verdigris("●"),
+                    State::Failed(_) => Line::default().sanguine("✕"),
+                };
+                let doing = match &child.state {
+                    State::Running => match child.open.first() {
+                        Some((_, tool, arg)) if arg.is_empty() => Line::default().muted(tool),
+                        Some((_, tool, arg)) => Line::default().muted(tool).dim(" ").dim(arg),
+                        None => Line::default().dim("thinking"),
+                    },
+                    State::Done(text) => inline(
+                        text.lines()
+                            .find(|line| !line.trim().is_empty())
+                            .unwrap_or("done")
+                            .trim(),
+                        Role::Dim,
+                    ),
+                    State::Failed(message) => {
+                        Line::default().sanguine(message.lines().next().unwrap_or("failed"))
+                    }
+                };
+                let elapsed = child.ended.unwrap_or(now).0.saturating_sub(child.started.0);
+                AgentRow {
+                    mark,
+                    title: child
+                        .label
+                        .clone()
+                        .filter(|label| !label.is_empty())
+                        .unwrap_or_else(|| format!("agent {}", index + 1)),
+                    doing,
+                    detail: duration(elapsed),
+                }
+            })
+            .collect()
     }
 
     /// Open-sided slips and complete answers for the call's finished children.

@@ -305,25 +305,14 @@ impl App {
         screen.draw_deck(&rows, cursor)
     }
 
-    /// The session's meta row: when it started, its head and event count.
+    /// The session's meta row: when it started.
     fn log_meta(&self) -> String {
         let info = &self.launch.attached.info;
-        let started = self
-            .deck
+        self.deck
             .as_ref()
             .and_then(|deck| deck.sessions.iter().find(|e| e.session == info.session))
-            .and_then(|entry| entry.started);
-        let mut parts = Vec::new();
-        if let Some(started) = started {
-            parts.push(clock(started));
-        }
-        let head = info.head.to_string();
-        parts.push(head[..head.len().min(8)].to_owned());
-        parts.push(match self.launch.attached.events.len() {
-            1 => "1 event".to_owned(),
-            events => format!("{events} events"),
-        });
-        parts.join(" · ")
+            .and_then(|entry| entry.started)
+            .map_or_else(String::new, |started| format!("started {}", clock(started)))
     }
 
     /// The deck's header segments `names` asks for, joined by ` · `.
@@ -616,6 +605,7 @@ impl App {
             scrolled: deck.inspector,
             asks,
             changed,
+            agents: self.transcript.children().agents(self.frame),
             sessions,
             context,
             place: self.place(),
