@@ -83,27 +83,63 @@ pub struct Fitted {
     pub dropped: Vec<&'static str>,
 }
 
-struct Slot {
-    segment: Segment,
-    short: bool,
+/// How a fitted item is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Form {
+    Full,
+    Short,
+    Dropped,
 }
 
-impl Slot {
-    fn value(&self) -> &Line {
-        match (&self.segment.short, self.short) {
-            (Some(short), true) => short,
-            _ => &self.segment.value,
+/// Shortens and then drops items until `fits` accepts their forms. `items`
+/// holds each item's priority and whether it has a short form. The item
+/// with the highest priority number changes first, the earlier one on a tie.
+/// Priority 0 never drops, and shortens only once every optional item is
+/// gone. Returns each item's form and the dropped indices in drop order.
+/// The status line and frame hints share this order.
+pub(crate) fn shrink(
+    items: &[(u8, bool)],
+    fits: impl Fn(&[Form]) -> bool,
+) -> (Vec<Form>, Vec<usize>) {
+    let mut forms = vec![Form::Full; items.len()];
+    let mut dropped = Vec::new();
+    while !fits(&forms) {
+        let optional = (0..items.len())
+            .filter(|&i| forms[i] != Form::Dropped && items[i].0 > 0)
+            .max_by_key(|&i| (items[i].0, std::cmp::Reverse(i)));
+        if let Some(i) = optional {
+            if items[i].1 && forms[i] == Form::Full {
+                forms[i] = Form::Short;
+            } else {
+                forms[i] = Form::Dropped;
+                dropped.push(i);
+            }
+            continue;
+        }
+        // Safety labels keep their full wording until only safety remains.
+        match (0..items.len()).find(|&i| forms[i] == Form::Full && items[i].1) {
+            Some(i) => forms[i] = Form::Short,
+            None => break,
         }
     }
+    (forms, dropped)
 }
 
-fn join(slots: &[Slot], side: Side, sep: &str) -> Line {
+fn join(segments: &[Segment], forms: &[Form], side: Side, sep: &str) -> Line {
     let mut line = Line::default();
-    for (i, slot) in slots.iter().filter(|s| s.segment.side == side).enumerate() {
+    let shown = segments
+        .iter()
+        .zip(forms)
+        .filter(|(s, form)| s.side == side && **form != Form::Dropped);
+    for (i, (segment, form)) in shown.enumerate() {
         if i > 0 {
             line = line.dim(sep);
         }
-        line = line.extend(slot.value().clone());
+        let value = match (&segment.short, form) {
+            (Some(short), Form::Short) => short,
+            _ => &segment.value,
+        };
+        line = line.extend(value.clone());
     }
     line
 }
@@ -112,53 +148,24 @@ fn join(slots: &[Slot], side: Side, sep: &str) -> Line {
 /// fit, it is visibly truncated rather than replaced with an empty row.
 #[must_use]
 pub fn fit(segments: Vec<Segment>, cols: usize) -> Fitted {
-    let mut slots: Vec<Slot> = segments
-        .into_iter()
-        .map(|segment| Slot {
-            segment,
-            short: false,
-        })
+    let items: Vec<_> = segments
+        .iter()
+        .map(|s| (priority(s.name), s.short.is_some()))
         .collect();
-    let mut dropped = Vec::new();
-    let width = |slots: &[Slot]| {
-        let left = join(slots, Side::Left, "  ").width();
-        let right = join(slots, Side::Right, " · ").width();
+    let width = |forms: &[Form]| {
+        let left = join(&segments, forms, Side::Left, "  ").width();
+        let right = join(&segments, forms, Side::Right, " · ").width();
         2 + left + right + if left > 0 && right > 0 { 2 } else { 0 }
     };
-    while width(&slots) > cols {
-        let rank = |(i, s): &(usize, &Slot)| (priority(s.segment.name), std::cmp::Reverse(*i));
-        let optional = slots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| priority(s.segment.name) > 0)
-            .max_by_key(rank)
-            .map(|(i, _)| i);
-        if let Some(i) = optional {
-            if slots[i].segment.short.is_some() && !slots[i].short {
-                slots[i].short = true;
-            } else {
-                dropped.push(slots.remove(i).segment.name);
-            }
-            continue;
-        }
-        // Safety labels keep their full wording until only safety remains.
-        if let Some(slot) = slots
-            .iter_mut()
-            .find(|s| s.segment.short.is_some() && !s.short)
-        {
-            slot.short = true;
-        } else {
-            break;
-        }
-    }
+    let (forms, dropped) = shrink(&items, |forms| width(forms) <= cols);
     let inner = cols.saturating_sub(2);
-    let left = join(&slots, Side::Left, "  ");
-    let right = join(&slots, Side::Right, " · ");
+    let left = join(&segments, &forms, Side::Left, "  ");
+    let right = join(&segments, &forms, Side::Right, " · ");
     let gap = inner.saturating_sub(left.width() + right.width());
     let row = left.ink(" ".repeat(gap)).extend(right).truncate(inner);
     Fitted {
         line: Line::default().ink(" ").extend(row).ink(" ").truncate(cols),
-        dropped,
+        dropped: dropped.into_iter().map(|i| segments[i].name).collect(),
     }
 }
 
