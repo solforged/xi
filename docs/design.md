@@ -334,7 +334,7 @@ Clients that list sessions for a person set `auto_title` in `SessionOptions`: th
 
 The first pass is skipped when `tiny` shares the session model's endpoint and that endpoint has a `[[daemon.limit]]`, so a title request never queues the turn's own; the second pass then names the session alone. When `tiny` is the session's model, the session's connection serves the requests. Otherwise `tiny`'s provider needs credentials, and the prompt and reply go to that provider. Any failure leaves the title as it was. Titles apply at the next model boundary, or at once when the session is idle.
 
-Each event records `by`: `first_prompt`, `first_turn` or `user`. Automatic titles also record the model and the request's usage. Reopening a log that holds any title runs no further pass. The TUI commits `renamed · TITLE` for user titles and shows automatic ones only where it lists sessions.
+Each event records `by`: `first_prompt`, `first_turn` or `user`. Automatic titles also record the model and the request's usage. Reopening a log that holds any title runs no further pass. The TUI adds no transcript line for titles; they show in the terminal title, the session lists and the deck, and user titles also as a `/tree` note.
 
 The TUI also sets the terminal's window and tab title with OSC 0: `ξ: TITLE` from the log's latest title, or `ξ` before the session has one. It follows live titles and session switches, saves the terminal's previous title with the xterm title stack on start and restores it on exit. Terminals without that stack keep the last `ξ` title. Inside tmux, the outer terminal shows it only with `set-titles on`.
 
