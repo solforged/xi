@@ -169,6 +169,13 @@ impl Sessions {
                 ..Body::default()
             };
         }
+        // Ages pad to one width, so the models before them line up too.
+        let ages: Vec<String> = self
+            .matches
+            .iter()
+            .map(|index| age(self.sessions[*index].updated, now))
+            .collect();
+        let age_width = ages.iter().map(String::len).max().unwrap_or(0);
         let list = self
             .matches
             .iter()
@@ -213,9 +220,8 @@ impl Sessions {
                     right = right.dim(format!("{} · ", crate::view::home(&entry.cwd)));
                 }
                 right = right.dim(format!(
-                    "{} · {}",
-                    entry.model.model,
-                    age(entry.updated, now)
+                    "{} · {:>age_width$}",
+                    entry.model.model, ages[position]
                 ));
                 row(left, right, inner)
             })

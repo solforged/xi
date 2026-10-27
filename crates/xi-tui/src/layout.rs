@@ -23,10 +23,10 @@ pub const PROSE: usize = 88;
 pub const SHORT_BELOW: usize = 20;
 /// The narrowest side panel the deck shows beside the log.
 pub const PANEL_MIN: usize = 36;
-/// The widest side panel beside the log. It stays against the right edge;
-/// columns past it go to the log, so resizing a wide terminal does not
-/// stretch the panel.
-pub const PANEL_MAX: usize = 64;
+/// The widest side panel beside the log, OpenCode's sidebar width. It stays
+/// against the right edge; columns past it go to the log, so resizing a
+/// wide terminal does not stretch the panel.
+pub const PANEL_MAX: usize = 42;
 /// The size from which `layout = "auto"` chooses the deck at start: the
 /// sheet with its gutter and margin, a separator and the narrowest panel.
 pub const DECK_FROM: (usize, usize) = (SHEET + 3 + PANEL_MIN, 30);
@@ -127,11 +127,15 @@ pub struct Measure {
     /// Rows of the pane drawn into.
     pub rows: usize,
     /// Columns output rows span and outcomes align to: the sheet's 120 on
-    /// the sheet, else `cols`.
+    /// the sheet, else `cols`; every column of the deck's log.
     pub out: usize,
-    /// Columns prose, thinking and prompts wrap at, before their two-cell
-    /// indent: 88 on the sheet, else `out - 2`.
+    /// Columns prose and thinking wrap at, before their two-cell indent:
+    /// 88 on the sheet, else `out - 2`.
     pub prose: usize,
+    /// Columns prompts wrap at, after their bar and indent: the prose
+    /// measure inline; on the deck, the composer's, so a prompt wraps
+    /// where it was typed.
+    pub prompt: usize,
 }
 
 impl Measure {
@@ -154,6 +158,18 @@ impl Measure {
             rows,
             out,
             prose,
+            prompt: prose.min(out.saturating_sub(3)).max(1),
+        }
+    }
+
+    /// The measure of the deck's log column: output, frames and the
+    /// composer span all of it, and prose keeps its reading measure.
+    #[must_use]
+    pub fn column(cols: usize, rows: usize) -> Self {
+        Self {
+            out: cols,
+            prompt: cols.saturating_sub(3).max(1),
+            ..Self::new(cols, rows)
         }
     }
 

@@ -146,8 +146,12 @@ pub struct Panel<'a> {
     pub context: ContextGauge,
     /// The workspace and branch, on the shared baseline under the log.
     pub place: Line,
-    /// Approvals, sandbox, trust, taint and running agents, on the shared
-    /// baseline under the panel.
+    /// The turn's spinner, time and tokens while one runs, else empty; the
+    /// top row of the panel's foot.
+    pub activity: Line,
+    /// The model and reasoning level, under the activity.
+    pub model: Line,
+    /// Approvals, sandbox, trust, taint and running agents, at the panel's foot.
     pub facts: Line,
     /// Which glyphs mark sessions, asks and tools.
     pub icons: Icons,
@@ -219,7 +223,7 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
         return folded(scene, cols, rows);
     };
     // Both panes end above one unraised baseline: the workspace under the
-    // log, the session's rules and the sessions key under the panel.
+    // log and the sessions key under the panel.
     let body = rows - 1;
     // A blank row above the log, when there is room, matches the panel's.
     let top = usize::from(body >= 8);
@@ -245,17 +249,8 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
         scene.panel.place.clone(),
         columns.log.saturating_sub(5),
     ));
-    // The rules outrank the hint: when both don't fit, the key keeps only
-    // its name before any rule is cut.
-    let inner = panel.saturating_sub(2 * PANEL_PAD);
-    let facts = &scene.panel.facts;
-    let keys = if facts.width() + "  alt+1 sessions".len() <= inner {
-        Line::default().muted("alt+1").dim(" sessions")
-    } else {
-        Line::default().muted("alt+1")
-    };
-    let foot = lr(facts.clone(), keys, inner);
-    let side = Line::default().ink(" ".repeat(PANEL_PAD)).extend(foot);
+    let keys = Line::default().muted("alt+1").dim(" sessions");
+    let side = Line::default().ink(" ".repeat(PANEL_PAD)).extend(keys);
     out.push(pad(pad(place, columns.log).ink(" ").extend(side), cols));
     (out, cursor.map(|(row, col)| (top + row, col + 1)))
 }
@@ -276,7 +271,11 @@ fn folded(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option<(us
     let inner = cols.saturating_sub(2);
     let gutter = |line: Line| Line::default().ink(" ").extend(line).truncate(cols);
     if matches!(scene.focus, Focus::Sessions | Focus::Inspector) {
-        out.extend(panel_rows(scene, inner, height).into_iter().map(gutter));
+        out.extend(
+            panel_rows(scene, inner, height, false)
+                .into_iter()
+                .map(gutter),
+        );
         return (out, None);
     }
     let title = lr(
@@ -374,7 +373,7 @@ fn panel_column(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     let inner = width.saturating_sub(2 * PANEL_PAD);
     let margin = " ".repeat(PANEL_PAD);
     let blank = Line::default().ink(&margin).raise().fill(width);
-    let body = panel_rows(scene, inner, height - 2 * edge);
+    let body = panel_rows(scene, inner, height - 2 * edge, true);
     let mut out = Vec::with_capacity(height);
     out.extend(std::iter::repeat_n(blank.clone(), edge));
     out.extend(body.into_iter().map(|line| {
@@ -389,29 +388,59 @@ fn panel_column(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
 }
 
 /// Exactly `height` panel rows: the focused view, then its keys while a
-/// pane has them.
-fn panel_rows(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
+/// pane has them. Beside the log, the panel's foot stays at the bottom
+/// under every view.
+fn panel_rows(scene: &Scene<'_>, width: usize, height: usize, beside: bool) -> Vec<Line> {
     let icons = scene.panel.icons;
-    let keys = match scene.focus {
+    let keys: &[&str] = match scene.focus {
         Focus::Composer => {
             return overview(scene, width, height)
                 .into_iter()
                 .map(|line| line.truncate(width))
                 .collect();
         }
-        Focus::Log => "↑↓ select · enter prints · pgup pgdn · esc back",
-        Focus::Inspector => "↑↓ scroll · alt+2 log · esc back",
-        Focus::Sessions => "↑↓ move · enter resumes · esc back",
+        Focus::Log => &["↑↓ select", "enter prints", "pgup pgdn", "esc back"],
+        Focus::Inspector => &["↑↓ scroll", "alt+2 log", "esc back"],
+        Focus::Sessions => &["↑↓ move", "enter resumes", "esc back"],
     };
-    let Some(body) = height.checked_sub(1) else {
-        return Vec::new();
+    let keys = hint_rows(keys, width);
+    let foot = if beside {
+        foot(&scene.panel, width.min(LIVE_MAX))
+    } else {
+        Vec::new()
     };
+    let gap = usize::from(!foot.is_empty());
+    let body = height.saturating_sub(keys.len() + gap + foot.len());
     let mut lines = match scene.focus {
         Focus::Sessions => sessions_view(&scene.panel.sessions, icons, width, body),
         _ => inspector_view(&scene.panel, width, body),
     };
-    lines.push(Line::default().dim(keys));
+    lines.extend(keys);
+    if gap > 0 {
+        lines.push(Line::default());
+    }
+    lines.extend(foot);
+    lines.drain(..lines.len().saturating_sub(height));
     lines.into_iter().map(|line| line.truncate(width)).collect()
+}
+
+/// Key hints joined by ` · `, wrapping between hints so a narrow panel
+/// keeps every one.
+fn hint_rows(hints: &[&str], width: usize) -> Vec<Line> {
+    use unicode_width::UnicodeWidthStr;
+    let mut rows: Vec<String> = Vec::new();
+    for hint in hints {
+        match rows.last_mut() {
+            Some(row) if row.width() + 3 + hint.width() <= width => {
+                row.push_str(" · ");
+                row.push_str(hint);
+            }
+            _ => rows.push((*hint).to_owned()),
+        }
+    }
+    rows.into_iter()
+        .map(|row| Line::default().dim(row))
+        .collect()
 }
 
 fn mark(mark: Mark, icons: Icons) -> Line {
@@ -474,8 +503,9 @@ fn elide_left(line: Line, cols: usize) -> Line {
 }
 
 /// The session at a glance while the composer has the keys: its title, what
-/// waits on you, its context, what changed and its running agents. Rows
-/// past `height` are cut, ending in `…`.
+/// waits on you, its context, what changed and its running agents, with
+/// the turn's activity, the model and the rules it runs under against the
+/// bottom.
 fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     let panel = &scene.panel;
     let icons = panel.icons;
@@ -572,15 +602,55 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
             top.push(Line::default().dim(format!("… {} more", panel.agents.len() - AGENT_ROWS)));
         }
     }
-    if top.len() > height {
-        top.truncate(height.saturating_sub(1));
-        if height > 0 {
+    let foot = foot(panel, w);
+    // The foot keeps its rows; the sections above it are cut first, with
+    // a gap between the two.
+    let foot = &foot[foot.len().saturating_sub(height)..];
+    let room = height.saturating_sub(foot.len() + 1);
+    if top.len() > room {
+        top.truncate(room.saturating_sub(1));
+        if room > 0 {
             top.push(Line::default().dim("…"));
         }
     }
     let mut lines = top;
-    lines.resize(height, Line::default());
+    lines.resize(height - foot.len(), Line::default());
+    lines.extend_from_slice(foot);
     lines
+}
+
+/// The panel's foot: the turn's activity while one runs, the model, then
+/// the rules, which wrap between items so unusual ones stay whole.
+fn foot(panel: &Panel<'_>, width: usize) -> Vec<Line> {
+    [panel.activity.clone(), panel.model.clone()]
+        .into_iter()
+        .chain(wrap_items(&panel.facts, width))
+        .map(|line| line.truncate(width))
+        .filter(|line| !line.plain().trim().is_empty())
+        .collect()
+}
+
+/// `line` broken into rows at its ` · ` separators, each as wide as fits
+/// `width`.
+fn wrap_items(line: &Line, width: usize) -> Vec<Line> {
+    let mut items = vec![Line::default()];
+    for span in &line.0 {
+        if span.text == " · " {
+            items.push(Line::default());
+        } else if let Some(item) = items.last_mut() {
+            item.0.push(span.clone());
+        }
+    }
+    let mut rows: Vec<Line> = Vec::new();
+    for item in items.into_iter().filter(|item| !item.0.is_empty()) {
+        match rows.last_mut() {
+            Some(row) if row.width() + 3 + item.width() <= width => {
+                *row = std::mem::take(row).dim(" · ").extend(item);
+            }
+            _ => rows.push(item),
+        }
+    }
+    rows
 }
 
 /// A changed path's file, or the path itself, with its added and removed
@@ -724,11 +794,14 @@ fn inspector_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
         lines.truncate(height);
         return lines;
     };
-    let mut lines = vec![lr(
-        Line::default().strong(Role::Ink, headline(inspect, panel.icons)),
-        Line::default().dim(&inspect.meta),
-        width,
-    )];
+    let head = Line::default().strong(Role::Ink, headline(inspect, panel.icons));
+    let meta = Line::default().dim(&inspect.meta);
+    // A headline too long to share its row puts the meta under it.
+    let mut lines = if meta.0.is_empty() || head.width() + 2 + meta.width() <= width {
+        vec![lr(head, meta, width)]
+    } else {
+        vec![head.truncate(width), meta]
+    };
     if !inspect.note.is_empty() {
         lines.push(Line::default().dim(&inspect.note));
     }
@@ -753,9 +826,6 @@ fn sessions_view(pane: &SessionsPane, icons: Icons, width: usize, height: usize)
     let mut at = None;
     let mut push = |lines: &mut Vec<Line>, index: usize, session: &SessionRow| {
         let selected = index == pane.selected;
-        if selected {
-            at = Some(lines.len());
-        }
         let lead = if selected {
             Line::default().brass("› ")
         } else {
@@ -766,11 +836,18 @@ fn sessions_view(pane: &SessionsPane, icons: Icons, width: usize, height: usize)
         } else {
             Line::default().ink(format!(" {}", session.title))
         };
-        lines.push(lr(
-            lead.extend(mark(session.mark, icons)).extend(title),
-            Line::default().dim(&session.detail),
-            width,
-        ));
+        let left = lead.extend(mark(session.mark, icons)).extend(title);
+        let detail = Line::default().dim(&session.detail);
+        if left.width() + 2 + detail.width() <= width {
+            lines.push(lr(left, detail, width));
+        } else {
+            // A title too long to share its row puts the detail under it.
+            lines.push(left.truncate(width));
+            lines.push(Line::default().ink("    ").extend(detail).truncate(width));
+        }
+        if selected {
+            at = Some(lines.len() - 1);
+        }
     };
     for (index, session) in pane.here.iter().enumerate() {
         push(&mut lines, index, session);
@@ -963,6 +1040,8 @@ mod tests {
                         .ink("xi")
                         .dim("  ")
                         .ink("main*"),
+                    activity: Line::default(),
+                    model: Line::default().dim("chatgpt/").ink("gpt-6").dim(" · high"),
                     facts: Line::default().dim("ask · sandboxed · trusted"),
                     icons: Icons::Unicode,
                 },
@@ -1004,10 +1083,10 @@ mod tests {
         // Between the minimum and the maximum the panel still takes the room
         // and the log stays on the sheet.
         assert_eq!(
-            columns(176),
+            columns(163),
             Columns {
                 log: 122,
-                panel: Some(53)
+                panel: Some(40)
             }
         );
         assert_eq!(
@@ -1084,15 +1163,14 @@ mod tests {
             assert_eq!(cursor, Some((35, 8)));
             let side = side(&plain(&lines), cols);
             assert_eq!(side[0].trim_end(), "");
-            assert_eq!(
-                side[1].trim_end(),
-                "Route sandboxed bash through the egress proxy"
-            );
-            assert_eq!(side[2].trim_end(), "started 14:02");
+            // The title splits evenly over two rows in the narrow panel.
+            assert_eq!(side[1].trim_end(), "Route sandboxed bash");
+            assert_eq!(side[2].trim_end(), "through the egress proxy");
+            assert_eq!(side[3].trim_end(), "started 14:02");
             assert!(
-                side[4].starts_with("waiting · 1") && side[4].trim_end().ends_with("tab answers")
+                side[5].starts_with("waiting · 1") && side[5].trim_end().ends_with("tab answers")
             );
-            assert!(side[5].starts_with("? bash exec  cargo update -p tokio"));
+            assert!(side[6].starts_with("? bash exec  cargo update -p tokio"));
             let at = |name: &str| side.iter().position(|line| line.starts_with(name)).unwrap();
             let context = at("context");
             // The gauge ends where the flush-right "tab answers" does.
@@ -1101,7 +1179,7 @@ mod tests {
                 gauge.starts_with('━') && gauge.ends_with("━ 10%"),
                 "{gauge}"
             );
-            assert_eq!(gauge.chars().count(), side[4].trim_end().chars().count());
+            assert_eq!(gauge.chars().count(), side[5].trim_end().chars().count());
             assert_eq!(side[context + 2].trim_end(), "29.8k of 272.0k · 94% cached");
             let changes = at("changes");
             assert!(side[changes].trim_end().ends_with("+43 −28"));
@@ -1123,10 +1201,12 @@ mod tests {
             assert!(!side.iter().any(|line| line.contains("Port footer")));
             // The newest tool row stays in the log and the inspector.
             assert!(!side.iter().any(|line| line.contains("edit ×5")));
-            // The rules and the sessions key share the log's baseline.
+            // The model and the rules close the panel; the sessions key
+            // shares the log's baseline.
+            assert_eq!(side[36].trim_end(), "chatgpt/gpt-6 · high");
+            assert_eq!(side[37].trim_end(), "ask · sandboxed · trusted");
             assert_eq!(side[38].trim_end(), "");
-            assert!(side[39].starts_with("ask · sandboxed · trusted"));
-            assert!(side[39].trim_end().ends_with("alt+1 sessions"));
+            assert_eq!(side[39].trim_end(), "alt+1 sessions");
             assert!(lines[39].plain().starts_with("    ~/src/xi  main*"));
             assert!(lines[39].0.iter().all(|span| !span.raised));
             assert_eq!(side.iter().filter(|l| l.contains("trusted")).count(), 1);
@@ -1139,6 +1219,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut scene = fixture.scene();
         let (lines, _) = render(&scene, 176, 40);
+        let log = columns(176).log;
         for line in &lines[..lines.len() - 1] {
             let (mut col, mut raised) = (0, Vec::new());
             for span in &line.0 {
@@ -1146,8 +1227,8 @@ mod tests {
                 col += span.text.chars().count();
             }
             assert_eq!(col, 176);
-            assert!(raised[123..].iter().all(|r| *r), "{}", line.plain());
-            assert!(!raised[0] && !raised[122]);
+            assert!(raised[log + 1..].iter().all(|r| *r), "{}", line.plain());
+            assert!(!raised[0] && !raised[log]);
         }
         let text = plain(&lines);
         let prompt = text
@@ -1165,15 +1246,15 @@ mod tests {
                 >= 120
         );
         assert!(!lines[prompt + 2].0.iter().take(3).any(|s| s.raised));
-        assert_eq!(text[0].chars().nth(122), Some(' '));
+        assert_eq!(text[0].chars().nth(log), Some(' '));
         scene.surfaces = false;
         let text = plain(&render(&scene, 176, 40).0);
         assert!(
             text[..text.len() - 1]
                 .iter()
-                .all(|line| line.chars().nth(122) == Some('│'))
+                .all(|line| line.chars().nth(log) == Some('│'))
         );
-        assert_eq!(text.last().unwrap().chars().nth(122), Some(' '));
+        assert_eq!(text.last().unwrap().chars().nth(log), Some(' '));
     }
 
     #[test]
@@ -1198,14 +1279,30 @@ mod tests {
     }
 
     #[test]
-    fn short_panels_cut_the_sections_and_mark_the_cut() {
+    fn short_panels_keep_the_foot_and_cut_the_sections_above_it() {
         let fixture = Fixture::new();
         let scene = fixture.scene();
         let text = plain(&overview(&scene, 60, 12));
         assert_eq!(text.len(), 12);
-        assert_eq!(text[0], "Route sandboxed bash through the egress proxy");
-        assert_eq!(text[11], "…");
-        assert_eq!(plain(&overview(&scene, 60, 1)), ["…"]);
+        assert_eq!(text[8], "…");
+        assert_eq!(text[9], "");
+        assert_eq!(text[10], "chatgpt/gpt-6 · high");
+        assert_eq!(text[11], "ask · sandboxed · trusted");
+        let mut running = fixture.scene();
+        running.panel.activity = Line::default().brass("⠋").dim(" working · 4s");
+        let text = plain(&overview(&running, 60, 12));
+        assert_eq!(
+            text[9..],
+            [
+                "⠋ working · 4s",
+                "chatgpt/gpt-6 · high",
+                "ask · sandboxed · trusted"
+            ]
+        );
+        assert_eq!(
+            plain(&overview(&scene, 60, 1)),
+            ["ask · sandboxed · trusted"]
+        );
         assert!(overview(&scene, 60, 0).is_empty());
     }
 
@@ -1320,7 +1417,9 @@ mod tests {
         );
         scene.focus = Focus::Log;
         let text = plain(&render(&scene, 176, 36).0);
-        assert!(text[33].trim_end().ends_with("esc back"));
+        // The keys wrap above the panel's foot, which stays at the bottom.
+        assert!(text[30].trim_end().ends_with("esc back"));
+        assert!(text[33].trim_end().ends_with("ask · sandboxed · trusted"));
     }
 
     #[test]
@@ -1405,24 +1504,27 @@ mod tests {
         let rows = inspector_view(&scene.panel, 40, 20);
         let text = plain(&rows);
         assert_eq!(rows.len(), 20);
-        assert!(text[0].starts_with("edit ×5 crates/xi-tools"));
-        assert!(text[0].ends_with("+22 −16"));
-        assert_eq!(text[1], "net diff · 5 edits");
-        assert_eq!(text[3].trim_end(), "+ added 0");
-        assert!(text[6].starts_with("xxx"), "wrapped: {text:?}");
+        // Too long to share a row, the headline puts its meta under it.
+        assert_eq!(text[0], "edit ×5 crates/xi-tools/src/bash.rs");
+        assert_eq!(text[1], "+22 −16");
+        assert_eq!(text[2], "net diff · 5 edits");
+        assert_eq!(text[4].trim_end(), "+ added 0");
+        assert!(text[7].starts_with("xxx"), "wrapped: {text:?}");
         assert!(text[19].starts_with("… ") && text[19].ends_with(" more lines"));
-        assert!(rows[6].0.iter().all(|span| span.role == Role::Verdigris));
+        assert!(rows[7].0.iter().all(|span| span.role == Role::Verdigris));
         scene.panel.scrolled = 4;
         let scrolled = plain(&inspector_view(&scene.panel, 40, 20));
-        assert_eq!(scrolled[..3], text[..3]);
-        assert_eq!(scrolled[3], text[7]);
+        assert_eq!(scrolled[..4], text[..4]);
+        assert_eq!(scrolled[4], text[8]);
         scene.panel.scrolled = 10_000;
         let end = plain(&inspector_view(&scene.panel, 40, 20));
-        assert_eq!(end[3].trim_end(), "+ added 39");
-        assert_eq!(end[4], "");
+        assert_eq!(end[4].trim_end(), "+ added 39");
+        assert_eq!(end[5], "");
+        let wide = plain(&inspector_view(&scene.panel, 60, 20));
+        assert!(wide[0].starts_with("edit ×5") && wide[0].ends_with("+22 −16"));
         fixture.inspect.text.clear();
         let scene = fixture.scene();
-        assert_eq!(plain(&inspector_view(&scene.panel, 40, 6))[3], "no output");
+        assert_eq!(plain(&inspector_view(&scene.panel, 40, 6))[4], "no output");
         // The inspector's scroll bound measures the panel's own width.
         let wide = Fixture::new();
         assert_eq!(inspector_rows(&wide.inspect, 176), 3);
@@ -1452,7 +1554,8 @@ mod tests {
         scene.focus = Focus::Log;
         let text = plain(&render(&scene, 200, 30).0);
         assert!(text[1].contains("   edit ×5 crates/xi-tools/src/bash.rs"));
-        assert!(text[27].trim_end().ends_with("esc back"));
+        assert!(text[24].trim_end().ends_with("esc back"));
+        assert!(text[27].trim_end().ends_with("ask · sandboxed · trusted"));
         scene.focus = Focus::Sessions;
         scene.panel.sessions.selected = 4;
         let (lines, cursor) = render(&scene, 200, 30);
@@ -1499,12 +1602,12 @@ mod tests {
         let text = plain(&sessions_view(&pane, Icons::Unicode, 50, 10));
         assert!(text[3].starts_with("› ┤ Port footer"));
         assert!(text[3].ends_with("sonnet-5.5 · 2m"));
-        // A title too long for the row is cut so its age stays readable.
+        // A title too long to share its row puts the detail under it.
         pane.here[1].title = "a title far too long to fit beside its age ".repeat(3);
         let text = plain(&sessions_view(&pane, Icons::Unicode, 50, 10));
         assert!(text[3].starts_with("› ┤ a title far") && text[3].contains('…'));
-        assert!(text[3].ends_with("sonnet-5.5 · 2m"));
         assert_eq!(text[3].chars().count(), 50);
+        assert!(text[4].starts_with("    ") && text[4].ends_with("sonnet-5.5 · 2m"));
     }
 
     #[test]

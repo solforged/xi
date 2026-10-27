@@ -1043,20 +1043,15 @@ async fn deck_composer_groups_attachments_and_leaves_room_after_completion() {
         let (row, col) = cursor.unwrap();
         assert_eq!(text[row], "┃  second line");
         assert_eq!(col, 3 + "second line".len());
-        let model = lines
+        // The panel's foot carries the model; the block's keys row stays
+        // empty while no turn runs.
+        let foot: Vec<_> = text[text.len() - 3..]
             .iter()
-            .find(|line| {
-                line.plain()
-                    .starts_with(&format!("┃  {}/", app.launch.attached.info.model.provider))
-            })
-            .unwrap();
-        assert!(model.0.iter().any(|span| {
-            span.text == format!("{}/", app.launch.attached.info.model.provider)
-                && span.role == Role::Dim
-        }));
-        assert!(model.0.iter().any(|span| {
-            span.text == app.launch.attached.info.model.model && span.role == Role::Ink
-        }));
+            .map(|row| row.trim_end())
+            .collect();
+        assert_eq!(foot, ["┃", "┃", "┃"]);
+        let model = &app.launch.attached.info.model.model;
+        assert!(!text.iter().any(|row| row.contains(model.as_str())));
     }
 }
 
@@ -3556,23 +3551,50 @@ async fn slit_composer_is_a_rule_and_bare_prompt() {
 }
 
 #[tokio::test]
-async fn sheet_chrome_stays_on_the_output_measure() {
-    let (launch, _) = launch(snapshot(true)).await;
-    let app = App::new(launch, 250, 36);
+async fn deck_dock_spans_the_log_column_and_the_panel_foot_carries_the_turn() {
+    let (wide, _) = launch(snapshot(true)).await;
+    let mut app = App::new(wide, 250, 36);
     let (lines, ..) = app.live();
-    let activity = lines
+    // The log's rows sit behind a gutter cell and a cell of margin.
+    let width = deck::columns(250).log - 2;
+    assert!(width > 120);
+    assert!(lines.iter().all(|line| line.width() <= width));
+    let text: Vec<_> = lines.iter().map(Line::plain).collect();
+    assert_eq!(
+        text[text.len() - 2],
+        "┃  enter steers  alt+enter queues  esc stops"
+    );
+    let model = app.launch.attached.info.model.model.clone();
+    assert!(
+        !text
+            .iter()
+            .any(|row| row.contains("working") || row.contains(&model))
+    );
+    let mut out = Vec::new();
+    app.draw(&mut Screen::new(&mut out, false, 250)).unwrap();
+    let drawn = String::from_utf8(out).unwrap();
+    let at = |needle: &str| {
+        drawn
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {drawn}"))
+    };
+    assert!(at("working  ") < at(&format!("/{model}")));
+    assert!(at(&format!("/{model}")) < at("approvals ask"));
+
+    // Without the panel, the model shares the keys row with the activity.
+    let (launch, _) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 140, 36);
+    app.enter_deck();
+    let (lines, ..) = app.live();
+    let row = lines
         .iter()
-        .find(|line| line.plain().contains("working"))
+        .map(Line::plain)
+        .find(|row| row.contains("working  "))
         .unwrap();
-    assert_eq!(activity.width(), 120);
-    assert_eq!(lines.last().unwrap().plain(), "┃");
-    for line in lines.iter().filter(|line| {
-        let text = line.plain();
-        text.starts_with('╭') || text.starts_with('│') || text.starts_with('╰')
-    }) {
-        assert_eq!(line.width(), 120);
-    }
-    assert!(lines.iter().all(|line| line.width() <= 120));
+    assert!(row.starts_with(&format!(
+        "┃  {}/{model}",
+        app.launch.attached.info.model.provider
+    )));
 }
 
 #[tokio::test]
@@ -3928,10 +3950,9 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     let mut screen = Screen::new(&mut out, false, 250);
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
-    assert!(
-        text.contains("approvals ask · sandbox off · untrusted"),
-        "{text}"
-    );
+    // Unusual rules wrap between items in the narrow panel.
+    assert!(text.contains("approvals ask · sandbox off  "), "{text}");
+    assert!(text.contains("│  untrusted  "), "{text}");
     // alt+1 lists every session; idle ones stay out of the live view.
     let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
     app.key(alt('1')).await.unwrap();

@@ -1451,7 +1451,7 @@ impl Transcript {
                 let text = blocks_text(xi_protocol::skill::typed(content));
                 // A brass bar down the prompt's left, a blank row above and
                 // below it, all on the raised surface where the deck has one.
-                let rows = wrap(&text, m.prose.min(cols.saturating_sub(3)).max(1));
+                let rows = wrap(&text, m.prompt);
                 let bar = || Line::default().brass("┃").raise();
                 let lines = std::iter::once(bar())
                     .chain(
