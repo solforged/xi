@@ -125,11 +125,18 @@ impl Block {
     }
 }
 
-/// Prose like [`prose`], with `>` quotes behind a dim bar and GitHub or
-/// Obsidian callouts such as `> [!WARNING] Title` under a marked headline.
-/// Quotes nest; lines inside a fenced code block stay literal.
+/// Prose like [`prose`], with `>` quotes and GitHub or Obsidian callouts
+/// such as `> [!WARNING] Title` set as notes behind a `▍` bar. A note
+/// outside another sits on the raised surface `cols` wide, its bar running
+/// through a blank row above and below. Quotes nest; lines inside a fenced
+/// code block stay literal.
 #[must_use]
 pub fn markdown(text: &str, cols: usize, role: Role) -> Vec<Line> {
+    blocks(text, cols, role, true)
+}
+
+/// [`markdown`], with its quotes raised and padded when they are `outer`.
+fn blocks(text: &str, cols: usize, role: Role, outer: bool) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut plain: Vec<&str> = Vec::new();
     let mut quoted: Vec<&str> = Vec::new();
@@ -145,7 +152,7 @@ pub fn markdown(text: &str, cols: usize, role: Role) -> Vec<Line> {
             quoted.push(inner);
         } else {
             if !quoted.is_empty() {
-                lines.extend(quote(&quoted, cols, role));
+                lines.extend(note(&quoted, cols, role, outer));
                 quoted.clear();
             }
             fenced ^= raw.trim_start().starts_with("```");
@@ -156,7 +163,7 @@ pub fn markdown(text: &str, cols: usize, role: Role) -> Vec<Line> {
         lines.extend(prose(&plain.join("\n"), cols, role));
     }
     if !quoted.is_empty() {
-        lines.extend(quote(&quoted, cols, role));
+        lines.extend(note(&quoted, cols, role, outer));
     }
     lines
 }
@@ -167,46 +174,114 @@ fn unquote(line: &str) -> Option<&str> {
     Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
-/// The kind and title of a callout's first line, such as
-/// `[!NOTE]` or `[!tip]- Custom title`.
-fn callout(first: &str) -> Option<(Kind, String)> {
+/// A note's label, such as `warning`, its pigment, and a title when it
+/// names one.
+struct Label {
+    name: String,
+    bar: Role,
+    title: Option<String>,
+}
+
+impl Label {
+    fn new(name: &str, title: &str) -> Self {
+        let bar = match Kind::of_callout(name) {
+            Kind::Info => Role::Rubric,
+            kind => kind.role(),
+        };
+        Self {
+            name: name.to_ascii_lowercase(),
+            bar,
+            title: (!title.is_empty()).then(|| title.to_owned()),
+        }
+    }
+}
+
+/// The label of a callout's first line, such as `[!NOTE]` or
+/// `[!tip]- Custom title`.
+fn callout(first: &str) -> Option<Label> {
     let (name, after) = first.trim().strip_prefix("[!")?.split_once(']')?;
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }
-    let title = after.trim_start_matches(['+', '-']).trim();
-    let title = if title.is_empty() {
-        let mut chars = name.chars();
-        chars.next().map_or_else(String::new, |first| {
-            first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
-        })
-    } else {
-        title.to_owned()
-    };
-    Some((Kind::of_callout(name), title))
+    Some(Label::new(
+        name,
+        after.trim_start_matches(['+', '-']).trim(),
+    ))
 }
 
-fn quote(inner: &[&str], cols: usize, role: Role) -> Vec<Line> {
-    let (head, bar, body) = match inner.first().and_then(|first| callout(first)) {
-        Some((kind, title)) => (
-            kind.mark().ink(" ").strong(Role::Ink, title),
-            kind.role(),
-            &inner[1..],
-        ),
-        None => (Line::default(), Role::Dim, inner),
+/// The label of a first line that opens with a bold callout name, such as
+/// `**Note:** text`, and the text after it.
+fn lead(first: &str) -> Option<(Label, &str)> {
+    let (word, after) = first.trim_start().strip_prefix("**")?.split_once("**")?;
+    let word = word.trim_end_matches(':');
+    let known = matches!(
+        word.to_ascii_lowercase().as_str(),
+        "note" | "tip" | "important" | "warning" | "caution" | "danger"
+    );
+    known.then(|| {
+        let after = after.strip_prefix(':').unwrap_or(after).trim_start();
+        (Label::new(word, ""), after)
+    })
+}
+
+/// A run of quoted lines as a note: a bar down its left in the label's
+/// pigment, rubric for a plain quote or a note, and the label beside its
+/// first row with every further row hanging under the text. A title is the
+/// first row, in bold.
+fn note(inner: &[&str], cols: usize, role: Role, outer: bool) -> Vec<Line> {
+    let mut body: Vec<&str> = inner.to_vec();
+    let label = match body.first().and_then(|first| callout(first)) {
+        Some(label) => {
+            body.remove(0);
+            Some(label)
+        }
+        None => match body.first().and_then(|first| lead(first)) {
+            Some((label, after)) => {
+                body[0] = after;
+                Some(label)
+            }
+            None => None,
+        },
     };
-    let rows = if body.is_empty() {
-        Vec::new()
-    } else {
-        markdown(&body.join("\n"), Block::inner(cols), role)
-    };
-    Block {
-        head,
-        meta: Line::default(),
-        bar,
-        rows,
+    let bar = label.as_ref().map_or(Role::Rubric, |label| label.bar);
+    let lead = label.as_ref().map_or_else(Line::default, |label| {
+        Line::default().span(bar, false, format!("{}  ", label.name))
+    });
+    let width = Block::inner(cols).saturating_sub(lead.width()).max(1);
+    let mut rows = Vec::new();
+    if let Some(title) = label.as_ref().and_then(|label| label.title.as_deref()) {
+        rows.extend(
+            crate::style::wrap(title, width)
+                .into_iter()
+                .map(|row| Line::default().strong(Role::Ink, row)),
+        );
     }
-    .lines(cols)
+    let text = body.join("\n");
+    if !text.trim().is_empty() {
+        rows.extend(blocks(text.trim_matches('\n'), width, role, false));
+    }
+    if rows.is_empty() {
+        rows.push(Line::default());
+    }
+    let mark = || Line::default().span(bar, false, "▍ ");
+    let indent = Line::default().ink(" ".repeat(lead.width()));
+    let mut lines: Vec<Line> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let lead = if i == 0 { lead.clone() } else { indent.clone() };
+            mark().extend(lead).extend(row).truncate(cols)
+        })
+        .collect();
+    if outer {
+        lines.insert(0, mark());
+        lines.push(mark());
+        lines = lines
+            .into_iter()
+            .map(|line| line.raise().fill(cols))
+            .collect();
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -217,59 +292,93 @@ mod tests {
         lines.iter().map(Line::plain).collect()
     }
 
+    /// The rows without the surface's trailing fill.
+    fn trimmed(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.plain().trim_end().to_owned())
+            .collect()
+    }
+
     #[test]
-    fn callouts_take_a_marked_headline_and_a_bar_in_their_kind() {
+    fn callouts_set_their_label_beside_the_text_on_a_bar_in_their_kind() {
         let rows = markdown(
             "Before.\n> [!WARNING] Drops data\n> Run it on a **copy** first.\n\nAfter.",
             24,
             Role::Ink,
         );
         assert_eq!(
-            plain(&rows),
+            trimmed(&rows),
             [
                 "Before.",
-                "! Drops data",
-                "│ Run it on a copy",
-                "│ first.",
+                "▍",
+                "▍ warning  Drops data",
+                "▍          Run it on a",
+                "▍          copy first.",
+                "▍",
                 "",
                 "After."
             ]
         );
-        assert_eq!(rows[1].0[0].role, Role::Brass);
-        assert!(rows[1].0.iter().any(|s| s.text == "Drops data" && s.bold));
-        assert_eq!(rows[2].0[0].role, Role::Brass);
-        assert!(rows[2].0.iter().any(|s| s.text == "copy" && s.bold));
-        // A name alone becomes the title; a fold marker is dropped.
+        // The note and a bar row either side sit on the surface, filled to
+        // the width; the prose around it does not.
+        assert!(
+            rows[1..6]
+                .iter()
+                .all(|row| { row.width() == 24 && row.0.iter().all(|span| span.raised) })
+        );
+        assert!(!rows[0].0[0].raised && rows[6].0.is_empty());
+        assert!(rows[1..6].iter().all(|row| row.0[0].role == Role::Brass));
+        assert!(
+            rows[2]
+                .0
+                .iter()
+                .any(|s| s.text == "warning  " && s.role == Role::Brass)
+        );
+        assert!(rows[2].0.iter().any(|s| s.text == "Drops data" && s.bold));
+        assert!(rows[4].0.iter().any(|s| s.text == "copy" && s.bold));
+        // A name alone leaves the label; a fold marker is dropped.
         assert_eq!(
-            plain(&markdown("> [!tip]-\n> Use ctrl+o.", 40, Role::Ink)),
-            ["i Tip", "│ Use ctrl+o."]
+            trimmed(&markdown("> [!tip]-\n> Use ctrl+o.", 40, Role::Ink)),
+            ["▍", "▍ tip  Use ctrl+o.", "▍"]
         );
         assert_eq!(
-            plain(&markdown("> [!CAUTION]", 40, Role::Ink)),
-            ["! Caution"]
+            trimmed(&markdown("> [!CAUTION]", 40, Role::Ink)),
+            ["▍", "▍ caution", "▍"]
         );
+        // A bold name opening a quote is a label too, and a note is rubric.
+        let rows = markdown("> **Note:** keep it short", 40, Role::Ink);
+        assert_eq!(
+            plain(&rows[1..2]),
+            [format!("{:<40}", "▍ note  keep it short")]
+        );
+        assert_eq!(rows[1].0[0].role, Role::Rubric);
     }
 
     #[test]
-    fn quotes_nest_behind_dim_bars_and_fences_stay_literal() {
+    fn quotes_nest_behind_rubric_bars_and_fences_stay_literal() {
         let rows = markdown(
             "```\n> literal\n```\n> outer\n>\n> > inner\n> [!NOTE] not first",
             40,
             Role::Ink,
         );
         assert_eq!(
-            plain(&rows),
+            trimmed(&rows),
             [
                 "```",
                 "> literal",
                 "```",
-                "│ outer",
-                "│",
-                "│ │ inner",
-                "│ [!NOTE] not first"
+                "▍",
+                "▍ outer",
+                "▍",
+                "▍ ▍ inner",
+                "▍ [!NOTE] not first",
+                "▍"
             ]
         );
-        assert!(rows[3..].iter().all(|row| row.0[0].role == Role::Dim));
+        assert!(rows[3..].iter().all(|row| row.0[0].role == Role::Rubric));
+        // Only the outer quote takes the bar rows around it.
+        assert!(rows[6].0[1].role == Role::Rubric && rows[6].0[1].text == "▍ ");
     }
 
     #[test]

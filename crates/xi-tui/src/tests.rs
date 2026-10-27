@@ -1748,7 +1748,9 @@ async fn esc_steps_back_one_overlay_and_ctrl_c_closes_the_stack() {
     assert!(app.overlays.is_empty());
     assert!(app.commit.is_empty());
     assert_eq!(app.editor.text(), "keep draft\nsecond line");
-    assert_eq!(composer_line(&app), "┃");
+    let composer = composer_line(&app);
+    assert!(composer.starts_with("┃  "), "{composer}");
+    assert!(!composer.contains("returns here"), "{composer}");
 }
 
 #[tokio::test]
@@ -3334,8 +3336,8 @@ async fn sheet_chrome_stays_on_the_output_measure() {
         .iter()
         .find(|line| line.plain().contains("working"))
         .unwrap();
-    assert!(activity.width() <= 120);
-    assert_eq!(lines.last().unwrap().width(), 120);
+    assert_eq!(activity.width(), 120);
+    assert_eq!(lines.last().unwrap().plain(), "┃");
     for line in lines.iter().filter(|line| {
         let text = line.plain();
         text.starts_with('╭') || text.starts_with('│') || text.starts_with('╰')
