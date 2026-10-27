@@ -249,12 +249,14 @@ impl App {
     }
 
     /// The live region, its cursor, and how many of its last rows the deck
-    /// keeps against the bottom: frames and the composer, whose model row
-    /// carries the turn's activity.
+    /// keeps against the bottom: frames and the composer, whose last row
+    /// carries the turn's keys.
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>, usize) {
         let m = self.display.measure();
         let cols = m.out;
         let deck = self.display.deck.is_some();
+        // A side panel carries the model and the turn's activity at its foot.
+        let paneled = deck && crate::deck::columns(self.display.cols).panel.is_some();
         // Frames keep their room by shrinking streamed rows and the composer.
         // Short panes omit the collapsed composer so title and hints survive.
         let framed = !self.overlays.is_empty();
@@ -266,10 +268,10 @@ impl App {
             self.transcript.live(m, self.display.frame)
         };
         let transcript_rows = lines.len();
-        // The deck shows the turn's activity under its composer, which a
-        // frame collapses.
+        // The folded deck shows the turn's activity under its composer,
+        // which a frame collapses; the side panel shows it at its foot.
         let activity = self.turn.running().then(|| self.activity(m));
-        if let Some(activity) = activity.clone().filter(|_| !deck || framed) {
+        if let Some(activity) = activity.clone().filter(|_| !deck || (framed && !paneled)) {
             if !lines.is_empty() && !framed {
                 lines.push(Line::default());
             }
@@ -310,6 +312,13 @@ impl App {
             let noun = if count == 1 { "image" } else { "images" };
             Line::default().dim(format!("{count} {noun} attached"))
         });
+        let shape = if deck {
+            Shape::Bar
+        } else if m.tier == Tier::Slit {
+            Shape::Rule
+        } else {
+            Shape::Box
+        };
         let (composer, (row, col)) = if framed && m.short {
             (Vec::new(), (0, 0))
         } else if framed {
@@ -334,7 +343,7 @@ impl App {
         } else if deck {
             let form = Form {
                 rows: m.composer_rows(),
-                shape: Shape::Bar,
+                shape,
             };
             let (mut block, mut cursor) = self.composer.editor.render(cols, border, "", form);
             let bar = || Line::default().span(border, false, "┃");
@@ -349,32 +358,39 @@ impl App {
                 );
                 cursor.0 += 1;
             }
-            // The model shares its row with the turn's activity and keys,
-            // each group set apart by a wider gap and its keys by tone.
+            // The side panel's foot carries the model and the turn's
+            // activity, so the block keeps a row for the turn's keys.
+            // Without the panel, the model shares that row with them, each
+            // group set apart by a wider gap and its keys by tone.
             let room = cols.saturating_sub(3);
-            let model = self.model_line();
-            let mut right = activity.clone().unwrap_or_default();
             let keys = key_hints(&[
                 ("enter", "steers"),
                 ("alt+enter", "queues"),
                 ("esc", "stops"),
             ]);
-            if self.turn.running() && model.width() + right.width() + keys.width() + 7 <= room {
-                right = right.ink("   ").extend(keys);
-            }
-            // A blank row parts the draft from the model, as above it.
+            let keys = if paneled {
+                if self.turn.running() {
+                    keys.truncate(room)
+                } else {
+                    Line::default()
+                }
+            } else {
+                let model = self.model_line();
+                let mut right = activity.clone().unwrap_or_default();
+                if self.turn.running() && model.width() + right.width() + keys.width() + 7 <= room {
+                    right = right.ink("   ").extend(keys);
+                }
+                lr(model, right, room)
+            };
+            // A blank row parts the draft from that row, as above it.
             block.push(bar().raise());
-            block.push(bar().ink("  ").extend(lr(model, right, room)).raise());
+            block.push(bar().ink("  ").extend(keys).raise());
             block.push(bar().raise());
             (block, cursor)
         } else {
             let form = Form {
                 rows: m.composer_rows(),
-                shape: if m.tier == Tier::Slit {
-                    Shape::Rule
-                } else {
-                    Shape::Box
-                },
+                shape,
             };
             self.composer.editor.render(cols, border, hint, form)
         };
@@ -402,8 +418,14 @@ impl App {
             lines.push(Line::default());
         }
         if !framed && let Some(menu) = &self.composer.completion {
+            // Entry labels start in the composer's text column.
             let menu_rows = overlay_rows.min(8).min(frame_rows);
-            lines.extend(menu.render(cols, menu_rows));
+            let indent = shape.lead().saturating_sub(2);
+            lines.extend(
+                menu.render(cols.saturating_sub(indent), menu_rows)
+                    .into_iter()
+                    .map(|row| Line::default().ink(" ".repeat(indent)).extend(row)),
+            );
         }
         if attachment_rows > 0
             && let Some(attachment) = attachment
@@ -431,7 +453,7 @@ impl App {
 
     /// The turn's spinner, what it does and for how long, and its tokens
     /// when the measure has room.
-    fn activity(&self, m: crate::layout::Measure) -> Line {
+    pub(crate) fn activity(&self, m: crate::layout::Measure) -> Line {
         let elapsed = self.turn.started.map_or(0, |s| s.elapsed().as_secs());
         let turn = self.transcript.turn;
         let what = if self.transcript.thinking() {
@@ -452,8 +474,9 @@ impl App {
         line
     }
 
-    /// The model and its reasoning level, under the deck's composer.
-    fn model_line(&self) -> Line {
+    /// The model and its reasoning level, at the deck panel's foot or under
+    /// the folded deck's composer.
+    pub(crate) fn model_line(&self) -> Line {
         let info = &self.launch.attached.info;
         let model = Line::default()
             .dim(format!("{}/", info.model.provider))

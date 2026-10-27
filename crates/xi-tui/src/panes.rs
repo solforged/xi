@@ -529,6 +529,12 @@ impl App {
             sessions,
             context,
             place: self.place(),
+            activity: if self.turn.running() {
+                self.activity(self.display.measure())
+            } else {
+                Line::default()
+            },
+            model: self.model_line(),
             facts: self.bar(&FACTS),
             icons,
         };
@@ -665,7 +671,7 @@ impl Display {
         let columns = deck::columns(self.cols);
         // A gutter cell and a cell of margin beside the log's rows; the
         // folded deck's header, title and the gap under it take three rows.
-        Measure::new(
+        Measure::column(
             columns.log.saturating_sub(2),
             self.rows.saturating_sub(3).max(4),
         )

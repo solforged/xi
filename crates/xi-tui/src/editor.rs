@@ -25,6 +25,18 @@ pub enum Shape {
     Bar,
 }
 
+impl Shape {
+    /// The column the composer's text starts at.
+    #[must_use]
+    pub fn lead(self) -> usize {
+        match self {
+            Self::Box => 4,
+            Self::Rule => 2,
+            Self::Bar => 3,
+        }
+    }
+}
+
 /// Text being composed, with a cursor and history.
 #[derive(Default)]
 pub struct Editor {
@@ -313,11 +325,7 @@ impl Editor {
         if form.shape == Shape::Box {
             lines.push(b(&format!("╰{}╯", "─".repeat(cols.saturating_sub(2)))));
         }
-        let lead = match form.shape {
-            Shape::Box => 4,
-            Shape::Rule => 2,
-            Shape::Bar => 3,
-        };
+        let lead = form.shape.lead();
         (lines, (1 + crow - top, lead + ccol))
     }
 }
