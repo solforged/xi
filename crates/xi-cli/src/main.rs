@@ -192,10 +192,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     tokio::io::stdin(),
                     tokio::io::stdout(),
                     paths,
-                    Arc::new(ProcessSpawner {
-                        exe: executable()?,
-                        log: None,
-                    }),
+                    Arc::new(ProcessSpawner::open(executable()?, None)?),
                 )
                 .await;
             }
@@ -242,13 +239,8 @@ async fn run(cli: Cli) -> Result<u8> {
             None => WorkerStartParams::Create(template.clone()),
         };
         xi_kernel::worker::validate_config(&paths, &start)?;
-        let (reader, writer) = xi_daemon::private(
-            paths,
-            Arc::new(ProcessSpawner {
-                exe: executable()?,
-                log: None,
-            }),
-        );
+        let (reader, writer) =
+            xi_daemon::private(paths, Arc::new(ProcessSpawner::open(executable()?, None)?));
         let (client, mut notifications) = Client::over(reader, writer, "xi").await?;
         let mut renderer = Renderer::new(if cli.json {
             Render::Json

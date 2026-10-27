@@ -25,10 +25,10 @@ pub async fn run_user_daemon(paths: Paths) -> Result<(), DaemonError> {
     let initial_exe = executable_stamp(&exe)?;
     let daemon = Daemon::new(DaemonOptions {
         settings,
-        spawner: Arc::new(ProcessSpawner {
-            exe: exe.clone(),
-            log: Some(paths.state.join("daemon.log")),
-        }),
+        spawner: Arc::new(ProcessSpawner::open(
+            exe.clone(),
+            Some(paths.state.join("daemon.log")),
+        )?),
         paths,
         private: false,
     });
