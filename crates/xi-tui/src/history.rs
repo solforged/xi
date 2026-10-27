@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::{Body, Cursor, Frame, Hint, Tone};
 use crate::keys::{Action, Keymap};
-use crate::style::{Line, Role, lr};
+use crate::style::{Line, Role, row};
 
 const MAX_ENTRIES: usize = 5_000;
 
@@ -269,7 +269,7 @@ impl Search {
                 } else {
                     Line::default().dim("other workspace")
                 };
-                lr(left, right, inner)
+                row(left, right, inner)
             })
             .collect();
         Body {

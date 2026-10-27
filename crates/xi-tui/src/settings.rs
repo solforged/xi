@@ -1,6 +1,5 @@
 //! Effective settings, their sources and the settings editor overlay.
 
-use std::borrow::Cow;
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,7 +9,9 @@ use xi_protocol::methods::client::{Setting, SettingLayer, SettingsReport};
 use xi_protocol::model::Reasoning;
 
 use crate::editor::Editor;
-use crate::style::{Line, Role};
+use crate::frame::{Body, Cursor, Frame, Hint, Note, Tone};
+use crate::keys::{Action as Key, Keymap};
+use crate::style::{self, Line, Role};
 use crate::transcript::Thinking;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,15 +33,15 @@ const ROWS: &[Row] = &[
     Row::Reasoning,
     Row::Thinking,
     Row::Approvals,
+    Row::Compaction,
+    Row::Trigger,
+    Row::Tail,
     Row::Tool("read"),
     Row::Tool("edit"),
     Row::Tool("write"),
     Row::Tool("bash"),
     Row::Tool("search"),
     Row::Tool("hashline"),
-    Row::Compaction,
-    Row::Trigger,
-    Row::Tail,
     Row::ReadOnly("Sandbox readable", "sandbox.readable"),
     Row::ReadOnly("Sandbox writable", "sandbox.writable"),
     Row::ReadOnly("Sandbox env", "sandbox.env"),
@@ -49,6 +50,20 @@ const ROWS: &[Row] = &[
     Row::Trust,
     Row::ReadOnly("Daemon idle exit", "daemon.idle_exit"),
 ];
+
+/// The heading a section starts with, by the index of its first row.
+fn heading(index: usize) -> Option<&'static str> {
+    match ROWS[index] {
+        Row::Model => Some("this session"),
+        Row::Thinking => Some("defaults"),
+        Row::Tool("read") => Some("tools"),
+        Row::ReadOnly(_, "sandbox.readable") => Some("read only"),
+        _ => None,
+    }
+}
+
+/// Label width, so values line up.
+const LABEL: usize = 22;
 
 /// A settings action that needs the connection or terminal owner.
 pub(crate) enum Action {
@@ -114,7 +129,9 @@ impl Settings {
     /// Completes a successful global edit.
     pub fn saved(&mut self, report: SettingsReport) {
         self.replace(report);
-        self.note("saved · new sessions use it");
+        self.note(
+            "Saved to the global config. Running sessions keep the settings they started with.",
+        );
     }
 
     fn setting(&self, key: &str) -> Option<&Setting> {
@@ -139,19 +156,24 @@ impl Settings {
     }
 
     /// Handles navigation and prepares a change for the application owner.
-    pub(crate) fn key(&mut self, key: KeyEvent, model: &ModelRef, reasoning: Reasoning) -> Action {
-        if key.code == KeyCode::Esc {
-            return Action::Close;
-        }
+    /// `action` is the key's keymap action, so rebound keys work here too.
+    pub(crate) fn key(
+        &mut self,
+        key: KeyEvent,
+        action: Option<Key>,
+        model: &ModelRef,
+        reasoning: Reasoning,
+    ) -> Action {
         let plain = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        if plain && key.code == KeyCode::Char('e') {
-            return Action::EditFile;
-        }
         if let Some(input) = self.input.as_mut() {
-            match key.code {
-                KeyCode::Enter => {
+            match (action, key.code) {
+                (_, KeyCode::Char(c)) if plain && c.is_ascii_digit() => {
+                    input.editor.insert(&c.to_string());
+                }
+                (Some(Key::Escape), _) => self.input = None,
+                (Some(Key::Send), _) => {
                     let text = input.editor.text();
                     let value = if text.is_empty() && input.key == "compaction.trigger_tokens" {
                         Value::Null
@@ -171,18 +193,21 @@ impl Settings {
                         value,
                     };
                 }
-                KeyCode::Backspace => input.editor.backspace(),
-                KeyCode::Delete => input.editor.delete(),
-                KeyCode::Left => input.editor.left(),
-                KeyCode::Right => input.editor.right(),
-                KeyCode::Home => input.editor.home(),
-                KeyCode::End => input.editor.end(),
-                KeyCode::Char(c) if plain && c.is_ascii_digit() => {
-                    input.editor.insert(&c.to_string())
-                }
+                (Some(Key::Backspace), _) => input.editor.backspace(),
+                (Some(Key::Delete | Key::DeleteOrQuit), _) => input.editor.delete(),
+                (Some(Key::Left), _) => input.editor.left(),
+                (Some(Key::Right), _) => input.editor.right(),
+                (Some(Key::Home), _) => input.editor.home(),
+                (Some(Key::End), _) => input.editor.end(),
                 _ => {}
             }
             return Action::None;
+        }
+        if action == Some(Key::Escape) {
+            return Action::Close;
+        }
+        if plain && key.code == KeyCode::Char('e') {
+            return Action::EditFile;
         }
         let row = ROWS[self.selected];
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
@@ -198,12 +223,13 @@ impl Settings {
                 _ => Action::None,
             };
         }
-        match key.code {
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(ROWS.len() - 1),
-            KeyCode::Enter | KeyCode::Char(' ') if plain => {
+        let enter = action == Some(Key::Send);
+        match action {
+            Some(Key::Up) => self.selected = self.selected.saturating_sub(1),
+            Some(Key::Down) => self.selected = (self.selected + 1).min(ROWS.len() - 1),
+            _ if enter || (plain && key.code == KeyCode::Char(' ')) => {
                 return match row {
-                    Row::Model if key.code == KeyCode::Enter => Action::Models,
+                    Row::Model if enter => Action::Models,
                     Row::Reasoning => Action::Reasoning,
                     Row::Thinking => Action::Thinking,
                     Row::Approvals => Action::Set {
@@ -242,11 +268,11 @@ impl Settings {
                             !self.value("compaction.enabled").as_bool().unwrap_or(false),
                         ),
                     },
-                    Row::Trigger if key.code == KeyCode::Enter => {
+                    Row::Trigger if enter => {
                         self.start_number("compaction.trigger_tokens");
                         Action::None
                     }
-                    Row::Tail if key.code == KeyCode::Enter => {
+                    Row::Tail if enter => {
                         self.start_number("compaction.keep_recent_tokens");
                         Action::None
                     }
@@ -352,93 +378,94 @@ impl Settings {
         source
     }
 
-    /// Renders the visible rows and the cursor of an inline token field.
+    /// The border, the global config path and the keys. `ctrl+s` shows
+    /// only on rows it saves.
     #[must_use]
-    pub fn render(
+    pub fn frame(&self, keys: &Keymap) -> Frame {
+        let mut hints = Vec::new();
+        if self.input.is_some() {
+            hints.extend(Hint::key(keys, Key::Send, "saves", 0));
+            hints.extend(Hint::key(keys, Key::Escape, "cancels", 0));
+        } else {
+            hints.extend(Hint::key(keys, Key::Send, "changes", 0));
+            if matches!(ROWS[self.selected], Row::Model | Row::Reasoning) {
+                hints.push(Hint::new("ctrl+s saves default", 2).short("ctrl+s"));
+            }
+            hints.push(Hint::new("e edits file", 3));
+            hints.extend(Hint::key(keys, Key::Escape, "closes", 0));
+        }
+        Frame {
+            tone: Tone::Focus,
+            title: Line::default().ink("settings"),
+            info: (!self.report.files.global.as_os_str().is_empty())
+                .then(|| Line::default().dim(crate::view::home(&self.report.files.global))),
+            hints,
+        }
+    }
+
+    /// Rows under section headings, `inner` wide, with sources at the
+    /// right where they truncate before labels and values. An inline
+    /// number field holds the cursor.
+    #[must_use]
+    pub fn body(
         &self,
-        cols: usize,
-        rows: usize,
+        inner: usize,
         model: &ModelRef,
         reasoning: Reasoning,
         thinking: Thinking,
         tui_path: Option<&Path>,
-    ) -> (Vec<Line>, Option<(usize, usize)>) {
-        if rows == 0 {
-            return (Vec::new(), None);
-        }
-        let mut header = Line::default().brass("settings").dim(format!(
-            " · saved to {} · enter changes · ctrl+s saves default · e edits file · esc closes",
-            crate::view::home(&self.report.files.global)
-        ));
-        if header.width() > cols {
-            header = Line::default()
-                .brass("settings")
-                .dim(" · enter changes · ctrl+s saves · e file · esc closes");
-        }
-        if header.width() > cols {
-            header = Line::default()
-                .brass("settings")
-                .dim(" · enter · e file · esc closes");
-        }
-        let mut lines = vec![header.truncate(cols)];
-        let note = self.note.as_deref().map(Cow::Borrowed).or_else(|| {
-            (!self.report.warnings.is_empty()).then(|| Cow::Owned(self.report.warnings.join(" · ")))
-        });
-        if let Some(note) = note.filter(|_| lines.len() < rows) {
-            lines.push(Line::default().dim(format!("  {note}")).truncate(cols));
-        }
-        let capacity = rows.saturating_sub(lines.len());
-        let start = self
-            .selected
-            .saturating_sub(capacity.saturating_sub(1) / 2)
-            .min(ROWS.len().saturating_sub(capacity));
+    ) -> Body {
+        let mut list = Vec::new();
+        let mut selected = 0;
         let mut cursor = None;
-        let visible: Vec<_> = ROWS
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(capacity)
-            .map(|(index, row)| (index, self.row(*row, model, reasoning, thinking, tui_path)))
-            .collect();
-        // Sources line up in one column unless a long value pushes them out.
-        let column = visible
-            .iter()
-            .map(|(_, (_, value, _))| unicode_width::UnicodeWidthStr::width(value.as_str()))
-            .filter(|width| *width <= 30)
-            .max()
-            .unwrap_or(0);
-        for (index, (label, value, source)) in visible {
-            let selected = index == self.selected;
-            let role = if selected { Role::Brass } else { Role::Ink };
+        for (index, row) in ROWS.iter().enumerate() {
+            if let Some(heading) = heading(index) {
+                list.push(Line::default().strong(Role::Ink, heading));
+            }
+            let (label, value, source) = self.row(*row, model, reasoning, thinking, tui_path);
+            let here = index == self.selected;
+            let role = if here { Role::Brass } else { Role::Ink };
             let prefix = Line::default().span(
                 role,
                 false,
-                format!("{} {label:<22}  ", if selected { "›" } else { " " }),
+                format!("{} {label:<LABEL$}  ", if here { "›" } else { " " }),
             );
-            let line = if selected && let Some(input) = &self.input {
-                let prefix = prefix.truncate(cols.saturating_sub(5));
-                let available = cols.saturating_sub(prefix.width() + 2).max(1);
+            if here {
+                selected = list.len();
+            }
+            let line = if here && let Some(input) = &self.input {
+                let text = input.editor.text();
+                let available = inner.saturating_sub(prefix.width() + 2).max(1);
                 let from = input.editor.cursor().saturating_sub(available - 1);
-                let to = (from + available).min(input.editor.text().len());
-                cursor = Some((
-                    lines.len(),
-                    (prefix.width() + 1 + input.editor.cursor() - from).min(cols.saturating_sub(1)),
+                let to = (from + available).min(text.len());
+                cursor = Some(Cursor::List(
+                    list.len(),
+                    prefix.width() + 1 + input.editor.cursor() - from,
                 ));
                 prefix
                     .brass("[")
-                    .ink(&input.editor.text()[from..to])
+                    .ink(&text[from..to])
                     .brass("]")
                     .dim(" · enter saves")
             } else {
-                let pad =
-                    column.saturating_sub(unicode_width::UnicodeWidthStr::width(value.as_str()));
-                prefix
-                    .span(role, false, value)
-                    .dim(format!("{}  {source}", " ".repeat(pad)))
+                style::row(
+                    prefix.span(role, false, value),
+                    Line::default().dim(source),
+                    inner,
+                )
             };
-            lines.push(line.truncate(cols));
+            list.push(line);
         }
-        (lines, cursor)
+        let note = self.note.clone().or_else(|| {
+            (!self.report.warnings.is_empty()).then(|| self.report.warnings.join(" · "))
+        });
+        Body {
+            list,
+            selected: Some(selected),
+            foot: note.into_iter().map(Note::new).collect(),
+            cursor,
+            ..Body::default()
+        }
     }
 }
 

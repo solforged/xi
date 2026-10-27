@@ -5,7 +5,7 @@ use xi_protocol::{SessionId, Timestamp};
 
 use crate::frame::{Body, Cursor, Frame, Hint, Tone};
 use crate::keys::{Action, Keymap};
-use crate::style::{Line, lr};
+use crate::style::{Line, row};
 use crate::transcript::SPINNER;
 
 /// A filterable list of top-level sessions, newest activity first.
@@ -205,7 +205,7 @@ impl Sessions {
                     entry.model.model,
                     age(entry.updated, now)
                 ));
-                lr(left, right, inner)
+                row(left, right, inner)
             })
             .collect();
         Body {

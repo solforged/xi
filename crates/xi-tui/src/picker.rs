@@ -5,7 +5,7 @@ use xi_protocol::methods::client::{ModelEntry, ModelsResult};
 
 use crate::frame::{Body, Cursor, Frame, Hint, Tone};
 use crate::keys::{Action, Keymap};
-use crate::style::{Line, Role, lr};
+use crate::style::{Line, Role, row};
 
 /// The model-selection overlay.
 pub struct Picker {
@@ -172,7 +172,7 @@ impl Picker {
             } else if let Some(pricing) = entry.info.pricing {
                 meta.push(format!("${}/${}", pricing.input, pricing.output));
             }
-            list.push(lr(left, Line::default().dim(meta.join(" · ")), inner));
+            list.push(row(left, Line::default().dim(meta.join(" · ")), inner));
         }
         Body {
             head,

@@ -1854,7 +1854,11 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
     let text = live_text(&app);
     for expected in [
         "settings",
-        "saved to /tmp/xi-test-config/config.toml",
+        "/tmp/xi-test-config/config.toml",
+        "this session",
+        "defaults",
+        "tools",
+        "read only",
         "Model",
         "demo/script",
         "Reasoning",
@@ -1906,7 +1910,7 @@ async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 10).await;
+    settings_down(&mut app, 4).await;
     app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1925,7 +1929,7 @@ async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
         .unwrap();
     assert_eq!(row.value, false);
     assert_eq!(row.source, SettingLayer::Global);
-    assert!(live_text(&app).contains("saved · new sessions use it"));
+    assert!(live_text(&app).contains("Saved to the global config."));
 }
 
 #[tokio::test]
@@ -1986,7 +1990,7 @@ async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_orde
     .await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
-    settings_down(&mut app, 4).await;
+    settings_down(&mut app, 7).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2017,7 +2021,7 @@ async fn settings_refuses_to_remove_the_last_tool() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 4).await;
+    settings_down(&mut app, 7).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2039,11 +2043,18 @@ async fn settings_cycles_approvals_and_edits_nullable_and_positive_token_counts(
         assert_eq!(params["key"], "approvals");
         assert_eq!(params["value"], approval);
     }
-    settings_down(&mut app, 8).await;
+    settings_down(&mut app, 2).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.live().1.is_some());
+    let (live, cursor) = app.live();
+    let (row, col) = cursor.expect("the number field holds the cursor");
+    let field = live[row].plain();
+    assert!(
+        field.contains("Compaction trigger") && field.contains("[]"),
+        "{field}"
+    );
+    assert_eq!(field.chars().nth(col - 1), Some('['), "{field}");
     for c in "24000".chars() {
         app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
             .await

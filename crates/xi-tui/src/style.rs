@@ -258,6 +258,24 @@ pub fn lr(left: Line, right: Line, cols: usize) -> Line {
     left.truncate(cols)
 }
 
+/// A list row: `left`, then `right` flush to column `cols`. Unlike [`lr`],
+/// the right side is metadata, so it is cut first and drops once fewer
+/// than six cells are left for it; only then is `left` cut.
+#[must_use]
+pub fn row(left: Line, right: Line, cols: usize) -> Line {
+    let (lw, rw) = (left.width(), right.width());
+    if lw + 1 + rw <= cols {
+        return left.ink(" ".repeat(cols - lw - rw)).extend(right);
+    }
+    let room = cols.saturating_sub(lw + 2);
+    if room >= 6 {
+        let right = right.truncate(room);
+        let gap = cols - lw - right.width();
+        return left.ink(" ".repeat(gap)).extend(right);
+    }
+    left.truncate(cols)
+}
+
 /// A line of `─` in dim, `cols` wide.
 #[must_use]
 pub fn rule(cols: usize) -> Line {
@@ -478,6 +496,33 @@ mod tests {
         let colored = "\x1b[1;31merror\x1b[0m: \x1b]8;;https://x\x07link\x1b]8;;\x1b\\ done";
         assert_eq!(Line::default().ink(colored).plain(), "error: link done");
         assert_eq!(Line::default().ink("10%\r55%\r100%").plain(), "100%");
+    }
+
+    #[test]
+    fn list_rows_cut_their_metadata_before_their_own_text() {
+        let row = |cols| {
+            super::row(
+                Line::default().ink("› Compaction trigger    80% of window"),
+                Line::default().dim("--config extra.toml"),
+                cols,
+            )
+            .plain()
+        };
+        assert_eq!(
+            row(60),
+            "› Compaction trigger    80% of window    --config extra.toml"
+        );
+        assert_eq!(
+            row(50),
+            "› Compaction trigger    80% of window  --config e…"
+        );
+        assert_eq!(row(45), "› Compaction trigger    80% of window  --con…");
+        assert_eq!(
+            row(44),
+            "› Compaction trigger    80% of window",
+            "drops under six cells"
+        );
+        assert_eq!(row(20), "› Compaction trigge…");
     }
 
     #[test]
