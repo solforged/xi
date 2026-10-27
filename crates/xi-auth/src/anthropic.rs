@@ -13,10 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use xi_protocol::BoxFuture;
 
+use crate::network;
 use crate::oauth;
-use crate::transport::network;
 use crate::{Error, ErrorKind};
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -141,12 +140,14 @@ fn authorization_url(challenge: &str, state: &str) -> String {
 }
 
 /// Adds only the bearer credential. The Messages adapter owns wire fingerprinting.
-pub(crate) struct Signer {
+pub struct Credentials {
     file: PathBuf,
 }
 
-impl Signer {
-    pub(crate) fn new(file: PathBuf) -> Self {
+impl Credentials {
+    /// Uses the tokens stored at `file`.
+    #[must_use]
+    pub fn new(file: PathBuf) -> Self {
         Self { file }
     }
 
@@ -177,28 +178,34 @@ impl Signer {
     }
 }
 
-impl crate::transport::Signer for Signer {
-    fn sign<'a>(
-        &'a self,
-        client: &'a reqwest::Client,
-        headers: &'a mut HeaderMap,
-    ) -> BoxFuture<'a, Result<(), Error>> {
-        Box::pin(async move {
-            let tokens = self.tokens(client, TOKEN_URL).await?;
-            let mut bearer = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
-                .map_err(|_| malformed())?;
-            bearer.set_sensitive(true);
-            headers.insert(AUTHORIZATION, bearer);
-            Ok(())
-        })
+impl Credentials {
+    /// Adds the bearer header, refreshing tokens near expiry first.
+    ///
+    /// # Errors
+    /// Returns an error when reading, refreshing or decoding credentials fails.
+    pub async fn sign(
+        &self,
+        client: &reqwest::Client,
+        headers: &mut HeaderMap,
+    ) -> Result<(), Error> {
+        let tokens = self.tokens(client, TOKEN_URL).await?;
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
+            .map_err(|_| malformed())?;
+        bearer.set_sensitive(true);
+        headers.insert(AUTHORIZATION, bearer);
+        Ok(())
     }
 
-    fn rejected<'a>(
-        &'a self,
-        client: &'a reqwest::Client,
-        headers: &'a HeaderMap,
-    ) -> BoxFuture<'a, Result<bool, Error>> {
-        Box::pin(self.retry(client, headers, TOKEN_URL))
+    /// Refreshes a rejected bearer token, unless another process already has.
+    ///
+    /// # Errors
+    /// Returns an error when reading, refreshing or saving credentials fails.
+    pub async fn rejected(
+        &self,
+        client: &reqwest::Client,
+        headers: &HeaderMap,
+    ) -> Result<bool, Error> {
+        self.retry(client, headers, TOKEN_URL).await
     }
 }
 
@@ -480,7 +487,6 @@ async fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::Signer as _;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -729,7 +735,7 @@ mod tests {
         let mut old = tokens();
         old.expires_at = 1;
         let file = stored(dir.path(), &old);
-        let signer = Signer::new(file);
+        let signer = Credentials::new(file);
         let client = oauth::client().unwrap();
         let url = format!("{}/token", server.uri());
         assert_eq!(
@@ -754,7 +760,7 @@ mod tests {
     async fn rejection_refreshes_even_when_stored_expiry_is_not_close() {
         let server = refresh_server().await;
         let dir = tempfile::tempdir().unwrap();
-        let signer = Signer::new(stored(dir.path(), &tokens()));
+        let signer = Credentials::new(stored(dir.path(), &tokens()));
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,

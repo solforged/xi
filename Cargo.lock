@@ -3213,6 +3213,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
+name = "xi-auth"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "xi-bench"
 version = "0.0.0"
 dependencies = [
@@ -3235,6 +3250,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "xi-auth",
  "xi-client",
  "xi-daemon",
  "xi-kernel",
@@ -3283,6 +3299,7 @@ dependencies = [
  "futures",
  "globset",
  "nix",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -3293,6 +3310,8 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "wiremock",
+ "xi-auth",
  "xi-policy",
  "xi-protocol",
  "xi-provider",
@@ -3339,6 +3358,7 @@ dependencies = [
  "tokio",
  "toml",
  "wiremock",
+ "xi-auth",
  "xi-protocol",
  "xxhash-rust",
 ]

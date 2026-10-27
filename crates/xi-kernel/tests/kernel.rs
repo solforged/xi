@@ -445,7 +445,7 @@ fn context_recovers_legacy_tool_metadata_and_groups_results_after_compaction() {
                 call("a", "fake", json!({})),
                 call("b", "fake", json!({})),
                 Block::Opaque {
-                    provider: "anthropic".into(),
+                    provider: xi_protocol::ProviderTag::Anthropic,
                     value: json!({
                         "type":"tool_use", "id":"c", "name":"fake", "input":{},
                         "caller":{"type":"direct"},

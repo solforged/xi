@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
-use xi_protocol::OutputBlock;
+use xi_protocol::{OutputBlock, ProviderTag, Signature};
 
 use crate::sse::Events;
 use crate::transport::{api_error, decode};
@@ -157,13 +157,11 @@ fn block(block: &Block) -> Result<Option<Value>, Error> {
         Block::Image { media_type, data } => image(media_type, data),
         Block::Thinking {
             text,
-            signature: Some(signature),
+            signature: Some(Signature::Anthropic(signature)),
         } => json!({"type": "thinking", "thinking": text, "signature": signature}),
-        Block::Thinking {
-            signature: None, ..
-        } => {
-            // Cancelled streams and other providers can leave unsigned thinking
-            // in history. Keep it in the log, but Anthropic cannot replay it.
+        Block::Thinking { .. } => {
+            // Unsigned and foreign thinking stays in the log, but Anthropic
+            // cannot replay it.
             return Ok(None);
         }
         Block::RedactedThinking { data } => json!({"type": "redacted_thinking", "data": data}),
@@ -185,9 +183,10 @@ fn block(block: &Block) -> Result<Option<Value>, Error> {
             value["input"] = input.clone();
             value
         }
-        Block::Opaque { provider, value } if provider == "anthropic" && value.is_object() => {
-            value.clone()
-        }
+        Block::Opaque {
+            provider: ProviderTag::Anthropic,
+            value,
+        } if value.is_object() => value.clone(),
         Block::Opaque { .. } => {
             return Err(Error::new(
                 ErrorKind::InvalidRequest,
@@ -452,7 +451,7 @@ fn decode_block(mut value: Value) -> Result<Block, Error> {
             .any(|key| !fields.contains(&key.as_str()))
     {
         return Ok(Block::Opaque {
-            provider: "anthropic".into(),
+            provider: ProviderTag::Anthropic,
             value,
         });
     }
@@ -462,7 +461,7 @@ fn decode_block(mut value: Value) -> Result<Block, Error> {
         }),
         "thinking" => Ok(Block::Thinking {
             text: take_string(&mut value, "thinking")?,
-            signature: Some(take_string(&mut value, "signature")?),
+            signature: Some(Signature::Anthropic(take_string(&mut value, "signature")?)),
         }),
         "redacted_thinking" => Ok(Block::RedactedThinking {
             data: take_string(&mut value, "data")?,
@@ -524,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_thinking_is_omitted_without_losing_replayable_blocks() {
+    fn unsigned_and_foreign_thinking_are_omitted_without_losing_replayable_blocks() {
         let request = request(vec![
             Message::User(vec![Block::Text {
                 text: "Hello".into(),
@@ -535,8 +534,15 @@ mod tests {
                     signature: None,
                 },
                 Block::Thinking {
+                    text: "Responses reasoning".into(),
+                    signature: Some(Signature::Responses {
+                        id: "rs_1".into(),
+                        encrypted_content: "sealed".into(),
+                    }),
+                },
+                Block::Thinking {
                     text: "Signed reasoning".into(),
-                    signature: Some("original-signature".into()),
+                    signature: Some(Signature::Anthropic("original-signature".into())),
                 },
                 Block::RedactedThinking {
                     data: "encrypted".into(),

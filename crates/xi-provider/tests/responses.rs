@@ -10,7 +10,7 @@ use wiremock::MockServer;
 use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::Reasoning;
-use xi_protocol::{Block, OutputBlock, ToolOutput};
+use xi_protocol::{Block, OutputBlock, ProviderTag, Signature, ToolOutput};
 use xi_provider::{Api, Auth, ErrorKind, Message, Registry, RegistryConfig, ToolResult};
 
 fn sse(values: Vec<Value>) -> String {
@@ -123,7 +123,10 @@ async fn reasoning_text_tools_and_usage_round_trip_statelessly() {
             cache_write: 0
         }
     );
-    let signature = json!({"encrypted_content":"sealed-1","id":"rs_1"}).to_string();
+    let signature = Signature::Responses {
+        id: "rs_1".into(),
+        encrypted_content: "sealed-1".into(),
+    };
     assert_eq!(
         response.content,
         vec![
@@ -216,7 +219,7 @@ async fn other_providers_reasoning_is_left_out_of_the_replay() {
     request.messages.push(Message::Assistant(vec![
         Block::Thinking {
             text: "Anthropic reasoning".into(),
-            signature: Some("EqQBCkYIBxgCKkA".into()),
+            signature: Some(Signature::Anthropic("EqQBCkYIBxgCKkA".into())),
         },
         Block::Thinking {
             text: "Chat Completions reasoning".into(),
@@ -226,7 +229,7 @@ async fn other_providers_reasoning_is_left_out_of_the_replay() {
             data: "encrypted".into(),
         },
         Block::Opaque {
-            provider: "anthropic".into(),
+            provider: ProviderTag::Anthropic,
             value: json!({"type":"server_tool_use"}),
         },
         Block::Text {
@@ -309,7 +312,7 @@ async fn grok_account_requests_use_responses_and_token_routing() {
     let server = MockServer::start().await;
     mock(&server, Api::OpenaiResponses, transcript()).await;
     let credentials = tempfile::tempdir().unwrap();
-    let file = xi_provider::grok_file(credentials.path());
+    let file = xi_auth::grok_file(credentials.path());
     std::fs::write(
         &file,
         json!({
@@ -368,7 +371,7 @@ async fn chatgpt_requests_are_signed_and_model_compat_overrides_the_provider() {
     mock(&server, Api::OpenaiResponses, sse(vec![completed(1, 0, 1)])).await;
     let credentials = tempfile::tempdir().unwrap();
     let access = jwt(json!({"exp": 4_102_444_800_u64}));
-    let file = xi_provider::chatgpt_file(credentials.path());
+    let file = xi_auth::chatgpt_file(credentials.path());
     std::fs::write(
         &file,
         json!({"access_token":access,"refresh_token":"r","id_token":"e30.e30.sig","account_id":"acct-1"})

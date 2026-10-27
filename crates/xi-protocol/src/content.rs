@@ -11,6 +11,60 @@ use serde_json::Value;
 
 use crate::ids::ToolCallId;
 
+/// The wire API that owns an uninterpreted content block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderTag {
+    /// Anthropic Messages.
+    Anthropic,
+    /// OpenAI Responses.
+    Openai,
+}
+
+/// Provider-owned reasoning data needed to replay a thinking block.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Signature {
+    /// An Anthropic thinking signature, stored as a plain string.
+    Anthropic(String),
+    /// Encrypted OpenAI Responses reasoning, stored as an object.
+    Responses {
+        /// The reasoning item's identifier.
+        id: String,
+        /// The encrypted reasoning payload.
+        encrypted_content: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Responses {
+            id: String,
+            encrypted_content: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Text(String),
+            Responses(Responses),
+        }
+
+        let sealed = match Stored::deserialize(deserializer)? {
+            Stored::Responses(sealed) => sealed,
+            Stored::Text(text) => match serde_json::from_str::<Responses>(&text) {
+                Ok(sealed) => sealed,
+                Err(_) => return Ok(Self::Anthropic(text)),
+            },
+        };
+        Ok(Self::Responses {
+            id: sealed.id,
+            encrypted_content: sealed.encrypted_content,
+        })
+    }
+}
+
 /// One block of a user or assistant message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -33,7 +87,7 @@ pub enum Block {
         text: String,
         /// Provider signature that must be sent back unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
+        signature: Option<Signature>,
     },
     /// Reasoning the provider returned only in encrypted form.
     RedactedThinking {
@@ -56,7 +110,7 @@ pub enum Block {
     /// A provider-specific block xi does not interpret, kept for round-tripping.
     Opaque {
         /// Provider that produced the block.
-        provider: String,
+        provider: ProviderTag,
         /// The block exactly as received.
         value: Value,
     },
@@ -73,7 +127,7 @@ where
         let Block::Opaque { provider, value } = block else {
             continue;
         };
-        if provider != "anthropic" || value["type"] != "tool_use" {
+        if *provider != ProviderTag::Anthropic || value["type"] != "tool_use" {
             continue;
         }
         let fields = value
@@ -145,6 +199,62 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn thinking_signatures_read_plain_legacy_and_object_forms() {
+        let sealed = json!({"id":"rs_1", "encrypted_content":"sealed"});
+        let responses = Signature::Responses {
+            id: "rs_1".into(),
+            encrypted_content: "sealed".into(),
+        };
+        for (input, expected, stored) in [
+            (
+                json!("signed"),
+                Signature::Anthropic("signed".into()),
+                json!("signed"),
+            ),
+            (json!(sealed.to_string()), responses.clone(), sealed.clone()),
+            (sealed.clone(), responses, sealed),
+        ] {
+            let block: Block = serde_json::from_value(json!({
+                "type":"thinking", "text":"reasoning", "signature":input,
+            }))
+            .unwrap();
+            assert_eq!(
+                block,
+                Block::Thinking {
+                    text: "reasoning".into(),
+                    signature: Some(expected),
+                }
+            );
+            assert_eq!(serde_json::to_value(block).unwrap()["signature"], stored);
+        }
+    }
+
+    #[test]
+    fn opaque_provider_tags_keep_the_wire_names_and_reject_unknown_tags() {
+        for (tag, name) in [
+            (ProviderTag::Anthropic, "anthropic"),
+            (ProviderTag::Openai, "openai"),
+        ] {
+            let value = json!({"type":"opaque", "provider":name, "value":{}});
+            let block: Block = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                block,
+                Block::Opaque {
+                    provider: tag,
+                    value: json!({})
+                }
+            );
+            assert_eq!(serde_json::to_value(block).unwrap(), value);
+        }
+        assert!(
+            serde_json::from_value::<Block>(
+                json!({"type":"opaque", "provider":"other", "value":{}})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn tool_metadata_round_trips_and_old_calls_default_to_empty() {
         let plain = json!({"type":"tool_use", "id":"call", "name":"read", "input":{}});
         let mut block: Block = serde_json::from_value(plain.clone()).unwrap();
@@ -161,7 +271,7 @@ mod tests {
     #[test]
     fn only_legacy_anthropic_assistant_tool_calls_are_upgraded() {
         let legacy = Block::Opaque {
-            provider: "anthropic".into(),
+            provider: ProviderTag::Anthropic,
             value: json!({
                 "type":"tool_use", "id":"call", "name":"read", "input":{"path":"a"},
                 "caller":{"type":"direct"}, "future_field":[1, 2],
@@ -169,11 +279,11 @@ mod tests {
         };
         let untouched = vec![
             Block::Opaque {
-                provider: "other".into(),
+                provider: ProviderTag::Openai,
                 value: json!({"type":"tool_use", "id":"other", "name":"read", "input":{}}),
             },
             Block::Opaque {
-                provider: "anthropic".into(),
+                provider: ProviderTag::Anthropic,
                 value: json!({"type":"server_tool_use", "id":"server", "name":"web_search", "input":{}}),
             },
         ];

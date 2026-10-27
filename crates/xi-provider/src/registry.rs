@@ -141,7 +141,9 @@ fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn
             )
         })?;
         return match service {
-            LoginService::Chatgpt => Ok(Box::new(chatgpt::Signer::new(chatgpt_file(credentials)))),
+            LoginService::Chatgpt => Ok(Box::new(crate::auth::LoginSigner::Chatgpt(
+                xi_auth::ChatgptCredentials::new(xi_auth::chatgpt_file(credentials)),
+            ))),
             LoginService::Grok => {
                 if !matches!(config.api, Api::OpenaiChat | Api::OpenaiResponses) {
                     return Err(Error::new(
@@ -149,7 +151,9 @@ fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn
                         "Grok login requires an OpenAI-compatible API",
                     ));
                 }
-                Ok(Box::new(grok::Signer::new(grok_file(credentials))))
+                Ok(Box::new(crate::auth::LoginSigner::Grok(
+                    xi_auth::GrokCredentials::new(xi_auth::grok_file(credentials)),
+                )))
             }
             LoginService::Anthropic => {
                 if config.api != Api::AnthropicMessages {
@@ -158,13 +162,13 @@ fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn
                         "Anthropic login requires the Anthropic Messages API",
                     ));
                 }
-                Ok(Box::new(anthropic_login::Signer::new(anthropic_file(
-                    credentials,
-                ))))
+                Ok(Box::new(crate::auth::LoginSigner::Anthropic(
+                    xi_auth::AnthropicCredentials::new(xi_auth::anthropic_file(credentials)),
+                )))
             }
         };
     }
-    let Some(credential) = resolve_auth(&config.auth)? else {
+    let Some(credential) = config.auth.resolve()? else {
         return Ok(Box::new(Key(None)));
     };
     let (name, value) = match config.api {
@@ -181,46 +185,53 @@ fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn
     Ok(Box::new(Key(Some((HeaderName::from_static(name), value)))))
 }
 
-pub(crate) fn resolve_auth(auth: &Auth) -> Result<Option<String>, Error> {
-    let raw = match auth {
-        Auth::None | Auth::Login(_) => return Ok(None),
-        Auth::Env(name) => std::env::var(name).map_err(|_| {
-            Error::new(
-                ErrorKind::Auth,
-                format!("Credential environment variable {name} is missing or not Unicode"),
-            )
-        })?,
-        Auth::File(path) => {
-            let mut file = std::fs::File::open(path)
-                .map_err(|_| Error::new(ErrorKind::Auth, "Cannot open credential file"))?;
-            let metadata = file
-                .metadata()
-                .map_err(|_| Error::new(ErrorKind::Auth, "Cannot inspect credential file"))?;
-            if !metadata.is_file() {
-                return Err(Error::new(
+impl Auth {
+    /// Reads an API key from its configured environment variable or private file.
+    /// Login services and absent credentials return `None`.
+    ///
+    /// # Errors
+    /// Returns `Auth` for missing, empty, unreadable or insecure credentials.
+    pub fn resolve(&self) -> Result<Option<String>, Error> {
+        let raw = match self {
+            Auth::None | Auth::Login(_) => return Ok(None),
+            Auth::Env(name) => std::env::var(name).map_err(|_| {
+                Error::new(
                     ErrorKind::Auth,
-                    "Credential path is not a regular file",
-                ));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o7177 != 0 {
+                    format!("Credential environment variable {name} is missing or not Unicode"),
+                )
+            })?,
+            Auth::File(path) => {
+                let mut file = std::fs::File::open(path)
+                    .map_err(|_| Error::new(ErrorKind::Auth, "Cannot open credential file"))?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|_| Error::new(ErrorKind::Auth, "Cannot inspect credential file"))?;
+                if !metadata.is_file() {
                     return Err(Error::new(
                         ErrorKind::Auth,
-                        "Credential file must have mode 0600 or stricter",
+                        "Credential path is not a regular file",
                     ));
                 }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o7177 != 0 {
+                        return Err(Error::new(
+                            ErrorKind::Auth,
+                            "Credential file must have mode 0600 or stricter",
+                        ));
+                    }
+                }
+                let mut raw = String::new();
+                file.read_to_string(&mut raw)
+                    .map_err(|_| Error::new(ErrorKind::Auth, "Cannot read credential file"))?;
+                raw
             }
-            let mut raw = String::new();
-            file.read_to_string(&mut raw)
-                .map_err(|_| Error::new(ErrorKind::Auth, "Cannot read credential file"))?;
-            raw
+        };
+        let credential = raw.trim();
+        if credential.is_empty() {
+            return Err(Error::new(ErrorKind::Auth, "Credential is empty"));
         }
-    };
-    let credential = raw.trim();
-    if credential.is_empty() {
-        return Err(Error::new(ErrorKind::Auth, "Credential is empty"));
+        Ok(Some(credential.to_owned()))
     }
-    Ok(Some(credential.to_owned()))
 }

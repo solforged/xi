@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use wiremock::MockServer;
 use xi_protocol::model::Reasoning;
 use xi_protocol::{
-    Block, OutputBlock, ToolOutput,
+    Block, OutputBlock, ProviderTag, Signature, ToolOutput,
     event::{StopReason, Usage},
     methods::client::Delta,
 };
@@ -90,7 +90,7 @@ async fn signed_thinking_unknown_blocks_tools_usage_and_request_round_trip() {
         response.content[0],
         Block::Thinking {
             text: "Inspect the files.".into(),
-            signature: Some("sig-abc".into())
+            signature: Some(Signature::Anthropic("sig-abc".into()))
         }
     );
     assert_eq!(
@@ -104,12 +104,12 @@ async fn signed_thinking_unknown_blocks_tools_usage_and_request_round_trip() {
     assert_eq!(
         response.content[2],
         Block::Opaque {
-            provider: "anthropic".into(),
+            provider: ProviderTag::Anthropic,
             value: server_call.clone()
         }
     );
     assert!(
-        matches!(&response.content[3], Block::Opaque { provider, value } if provider == "anthropic" && value["content"][0]["encrypted_content"] == "opaque")
+        matches!(&response.content[3], Block::Opaque { provider: ProviderTag::Anthropic, value } if value["content"][0]["encrypted_content"] == "opaque")
     );
     assert_eq!(
         response.content[4],
