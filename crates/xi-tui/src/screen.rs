@@ -61,6 +61,8 @@ pub struct Screen<W: Write> {
     widths: Vec<usize>,
     /// Row and column of the cursor within the live region.
     cursor: (usize, usize),
+    /// Erases the display and scrollback at the start of the next frame.
+    clear: bool,
 }
 
 impl<W: Write> Screen<W> {
@@ -72,6 +74,7 @@ impl<W: Write> Screen<W> {
             cols: cols.max(1),
             widths: Vec::new(),
             cursor: (0, 0),
+            clear: false,
         }
     }
 
@@ -79,6 +82,11 @@ impl<W: Write> Screen<W> {
     /// screen, so a row drawn wider than `cols` now takes several.
     pub fn resize(&mut self, cols: usize) {
         self.cols = cols.max(1);
+    }
+
+    /// Clears the display and native scrollback in the next synchronized frame.
+    pub fn clear(&mut self) {
+        self.clear = true;
     }
 
     /// Writes a terminal control sequence before the next frame flushes it.
@@ -167,7 +175,11 @@ impl<W: Write> Screen<W> {
         rows: usize,
     ) -> io::Result<()> {
         let mut buf = String::from("\x1b[?2026h\x1b[?25l");
-        self.rewind(&mut buf);
+        if std::mem::take(&mut self.clear) {
+            buf.push_str("\x1b[H\x1b[2J\x1b[3J");
+        } else {
+            self.rewind(&mut buf);
+        }
         for line in committed {
             line.write_ansi(&mut buf, self.color);
             buf.push_str("\r\n");
@@ -310,6 +322,35 @@ mod tests {
         );
         s.finish().unwrap();
         assert!(text(&s).ends_with("\r\x1b[J\x1b[?25h"));
+    }
+
+    #[test]
+    fn clear_erases_scrollback_and_redraws_from_home_without_a_stale_rewind() {
+        let mut s = Screen::new(Vec::new(), false, 10);
+        let l = |t: &str| Line::default().ink(t);
+        s.draw(
+            &[l("old output")],
+            &[l("working"), l("ξ draft"), l("footer")],
+            Some((1, 7)),
+            24,
+        )
+        .unwrap();
+        s.resize(80);
+        s.clear();
+        s.draw(&[l("fresh")], &[l("ξ "), l("footer")], Some((0, 2)), 24)
+            .unwrap();
+        s.draw(&[], &[l("ξ "), l("footer")], Some((0, 2)), 24)
+            .unwrap();
+        let out = text(&s);
+        let frames: Vec<_> = out.split("\x1b[?2026h").skip(1).collect();
+        assert_eq!(
+            frames[1],
+            "\x1b[?25l\x1b[H\x1b[2J\x1b[3Jfresh\r\nξ \r\nfooter\x1b[1A\r\x1b[2C\x1b[?25h\x1b[?2026l"
+        );
+        assert_eq!(
+            frames[2],
+            "\x1b[?25l\r\x1b[Jξ \r\nfooter\x1b[1A\r\x1b[2C\x1b[?25h\x1b[?2026l"
+        );
     }
 
     #[test]

@@ -29,7 +29,11 @@ const COMMANDS: &[(&str, &str, Builtin)] = &[
     ("hotkeys", "show keys and commands", Builtin::Help),
     ("quit", "leave; a running turn keeps running", Builtin::Quit),
     ("exit", "leave; a running turn keeps running", Builtin::Quit),
-    ("new", "start a session in this workspace", Builtin::New),
+    (
+        "new",
+        "clear scrollback and start a session in this workspace",
+        Builtin::New,
+    ),
     (
         "resume",
         "pick a session to attach or open",
@@ -146,7 +150,7 @@ impl App {
                     .client
                     .create(self.launch.template.clone())
                     .await?;
-                self.switch_session(attached).await?;
+                self.switch_session(attached, true).await?;
             }
             Some(Builtin::Resume) => self.open_sessions().await,
             Some(Builtin::Approvals) => {

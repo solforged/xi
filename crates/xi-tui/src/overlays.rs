@@ -300,7 +300,11 @@ impl App {
         }
     }
 
-    pub(crate) async fn switch_session(&mut self, attached: AttachResult) -> Result<(), Error> {
+    pub(crate) async fn switch_session(
+        &mut self,
+        attached: AttachResult,
+        clear_scrollback: bool,
+    ) -> Result<(), Error> {
         self.release().await?;
         let thinking = self.transcript.thinking_display();
         let changed_workspace = attached.info.cwd != self.launch.attached.info.cwd;
@@ -328,7 +332,12 @@ impl App {
             None
         };
         self.editor.set_history(self.history.workspace());
-        self.note(vec![style::rule(self.cols)]);
+        if clear_scrollback {
+            self.commit.clear();
+            self.clear_scrollback = true;
+        } else {
+            self.note(vec![style::rule(self.cols)]);
+        }
         self.attach();
         if let Some(error) = error {
             self.note(vec![
@@ -370,7 +379,7 @@ impl App {
             }
             Err(error) => return Err(error.into()),
         };
-        self.switch_session(attached).await
+        self.switch_session(attached, false).await
     }
 
     pub(crate) fn settings_params(&self) -> SettingsParams {
