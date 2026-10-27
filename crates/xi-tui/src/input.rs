@@ -98,7 +98,7 @@ impl App {
                 return Ok(());
             }
             Some(Action::Expand) => {
-                let lines = self.transcript.expand(self.cols).unwrap_or_else(|| {
+                let lines = self.transcript.expand(self.measure()).unwrap_or_else(|| {
                     let why = if self.transcript.collapsed() {
                         "  that was the oldest cut-short result · ctrl+o starts again from the newest"
                     } else {

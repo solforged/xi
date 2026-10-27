@@ -16,6 +16,7 @@ use xi_protocol::model::Pricing;
 use xi_protocol::{Block, EventKind, OutputBlock, SessionId, Timestamp, ToolCallId, ToolOutput};
 
 use crate::children::Children;
+use crate::layout::Measure;
 use crate::style::{Line, Role, inline, lr, prose, wrap};
 
 /// Terminal spinner frames, one every 125 ms.
@@ -823,7 +824,8 @@ impl Transcript {
 
     /// Applies a live notification, distinguishing our own prompt echoes
     /// from messages sent by another client. Snapshot replay uses `apply`.
-    pub fn apply_live(&mut self, notification: &ClientNotification, cols: usize) -> Vec<Line> {
+    pub fn apply_live(&mut self, notification: &ClientNotification, m: Measure) -> Vec<Line> {
+        let cols = m.out;
         if let ClientNotification::Event(params) = notification
             && let EventKind::UserMessage { content } = &params.event.kind
         {
@@ -845,11 +847,12 @@ impl Transcript {
                 return self.note(lines);
             }
         }
-        self.apply(notification, cols)
+        self.apply(notification, m)
     }
 
     /// Applies a notification and returns the lines it commits.
-    pub fn apply(&mut self, notification: &ClientNotification, cols: usize) -> Vec<Line> {
+    pub fn apply(&mut self, notification: &ClientNotification, m: Measure) -> Vec<Line> {
+        let cols = m.out;
         match notification {
             ClientNotification::Reset(_) => {
                 self.stream.clear();
@@ -869,9 +872,7 @@ impl Transcript {
                 }
                 Vec::new()
             }
-            ClientNotification::Event(params) => {
-                self.event(&params.event.kind, params.event.at, cols)
-            }
+            ClientNotification::Event(params) => self.event(&params.event.kind, params.event.at, m),
             ClientNotification::ApprovalPending(pending) => {
                 let ask = Ask {
                     call: pending.call.clone(),
@@ -929,7 +930,8 @@ impl Transcript {
         }
     }
 
-    fn event(&mut self, kind: &EventKind, at: Timestamp, cols: usize) -> Vec<Line> {
+    fn event(&mut self, kind: &EventKind, at: Timestamp, m: Measure) -> Vec<Line> {
+        let cols = m.out;
         let mut out = Vec::new();
         match kind {
             EventKind::SessionStarted { model, cwd, .. } => {
@@ -1228,7 +1230,8 @@ impl Transcript {
     /// The whole result of the newest collapsed call not yet expanded, as
     /// lines to commit. Each call steps one result further back; past the
     /// oldest it returns `None` and starts again from the newest.
-    pub fn expand(&mut self, cols: usize) -> Option<Vec<Line>> {
+    pub fn expand(&mut self, m: Measure) -> Option<Vec<Line>> {
+        let cols = m.out;
         let Some(at) = self.details.len().checked_sub(self.expanded + 1) else {
             self.expanded = 0;
             return None;
@@ -1290,19 +1293,20 @@ impl Transcript {
 
     /// Calls still in flight, then the newest streamed rows.
     #[must_use]
-    pub fn live(&self, cols: usize, frame: usize) -> Vec<Line> {
-        self.live_rows(cols, frame, false)
+    pub fn live(&self, m: Measure, frame: usize) -> Vec<Line> {
+        self.live_rows(m, frame, false)
     }
 
     /// [`Self::live`] while a frame holds the keys: streamed text shrinks
     /// to one `┤ streaming · 34 lines` row and thinking to its first line,
     /// so the frame keeps its room. Calls, asks and children stay.
     #[must_use]
-    pub fn live_under_frame(&self, cols: usize, frame: usize) -> Vec<Line> {
-        self.live_rows(cols, frame, true)
+    pub fn live_under_frame(&self, m: Measure, frame: usize) -> Vec<Line> {
+        self.live_rows(m, frame, true)
     }
 
-    fn live_rows(&self, cols: usize, frame: usize, collapse: bool) -> Vec<Line> {
+    fn live_rows(&self, m: Measure, frame: usize, collapse: bool) -> Vec<Line> {
+        let cols = m.out;
         let mut lines = Vec::new();
         if !self.stream.trim().is_empty() {
             let rows = prose(self.stream.trim(), cols.saturating_sub(2), Role::Ink);
@@ -1475,6 +1479,12 @@ mod tests {
 
     use super::*;
 
+    /// A `cols`-wide measure of a tall pane: the tier `cols` picks, never
+    /// short.
+    fn m(cols: usize) -> Measure {
+        Measure::new(cols, 36)
+    }
+
     fn ev(kind: EventKind, at: u64) -> ClientNotification {
         ClientNotification::Event(EventParams {
             session: SessionId::generate(),
@@ -1566,20 +1576,23 @@ mod tests {
                     ]),
                     0,
                 ),
-                100,
+                m(100),
             );
             assert!(
-                t.apply(&ev(egress("net1", Some("a"), None, Decision::Ask), 1), 100)
-                    .is_empty()
+                t.apply(
+                    &ev(egress("net1", Some("a"), None, Decision::Ask), 1),
+                    m(100)
+                )
+                .is_empty()
             );
             t.apply(
                 &ev(egress("net2", Some("a"), None, Decision::Allow), 2),
-                100,
+                m(100),
             );
             assert_eq!(t.asks().len(), 1);
             assert_eq!(t.asks()[0].call, "net1".into());
             assert_eq!(t.asks()[0].tool, "bash");
-            let live = plain(&t.live(100, 0));
+            let live = plain(&t.live(m(100), 0));
             assert!(live[0].starts_with("┤ bash curl github.com"));
             assert_eq!(live[1], "  ⇄ net github.com:443 · asked");
             assert_eq!(live[2], "  ⇄ net github.com:443 · allowed by user#2");
@@ -1593,24 +1606,24 @@ mod tests {
                     },
                     3,
                 ),
-                100,
+                m(100),
             );
             assert!(t.asks().is_empty());
             let status = if approved { "allowed" } else { "denied" };
             assert_eq!(
-                plain(&t.live(100, 0))[1],
+                plain(&t.live(m(100), 0))[1],
                 format!("  ⇄ net github.com:443 · {status}")
             );
             assert!(
-                t.apply(&ev(result("b", "1|file", false), 4), 100)
+                t.apply(&ev(result("b", "1|file", false), 4), m(100))
                     .is_empty()
             );
-            let rows = plain(&t.apply(&ev(result("a", "", false), 5), 100));
+            let rows = plain(&t.apply(&ev(result("a", "", false), 5), m(100)));
             assert!(rows[0].starts_with("● bash curl github.com"), "{rows:?}");
             assert_eq!(rows[1], format!("  ⇄ net github.com:443 · {status}"));
             assert_eq!(rows[2], "  ⇄ net github.com:443 · allowed by user#2");
             assert!(rows[3].starts_with("● read file"), "{rows:?}");
-            assert!(t.live(100, 0).is_empty());
+            assert!(t.live(m(100), 0).is_empty());
         }
     }
 
@@ -1622,20 +1635,20 @@ mod tests {
             *rule = None;
         }
         assert_eq!(
-            plain(&t.apply(&ev(event, 0), 100)),
+            plain(&t.apply(&ev(event, 0), m(100))),
             ["⇄ fetch · net github.com:443 · allowed"]
         );
         assert_eq!(
-            plain(&t.apply(&ev(egress("net2", None, None, Decision::Ask), 1), 100)),
+            plain(&t.apply(&ev(egress("net2", None, None, Decision::Ask), 1), m(100))),
             ["⇄ net github.com:443 · asked"]
         );
         t.apply(
             &ev(egress("net3", None, Some("fetch"), Decision::Ask), 2),
-            100,
+            m(100),
         );
         assert_eq!(t.asks().len(), 2);
         assert_eq!(t.asks()[1].tool, "fetch");
-        assert!(t.live(100, 0).is_empty());
+        assert!(t.live(m(100), 0).is_empty());
     }
 
     fn plain(lines: &[Line]) -> Vec<String> {
@@ -1652,10 +1665,10 @@ mod tests {
                 },
                 0,
             ),
-            80,
+            m(80),
         );
         assert!(rows.is_empty());
-        assert!(t.live(80, 0).is_empty());
+        assert!(t.live(m(80), 0).is_empty());
     }
 
     #[test]
@@ -1668,25 +1681,28 @@ mod tests {
             use_("a", "bash", json!({"command": "pytest -x\necho"})),
             use_("b", "read", json!({"path": "policies/archive.py"})),
         ]);
-        let prose = t.apply(&ev(msg, 0), 60);
+        let prose = t.apply(&ev(msg, 0), m(60));
         assert_eq!(plain(&prose), ["", "  I'll run the tests first.", ""]);
-        t.apply(&ev(decide("a", Decision::Allow, Some("user#1")), 1000), 60);
-        t.apply(&ev(decide("b", Decision::Allow, None), 1000), 60);
+        t.apply(
+            &ev(decide("a", Decision::Allow, Some("user#1")), 1000),
+            m(60),
+        );
+        t.apply(&ev(decide("b", Decision::Allow, None), 1000), m(60));
         assert!(
             t.apply(
                 &ev(
                     result("b", "1|x\n2|y\n[More lines. Continue with read.]", false),
                     1100
                 ),
-                60
+                m(60)
             )
             .is_empty()
         );
-        let live = plain(&t.live(60, 0));
+        let live = plain(&t.live(m(60), 0));
         assert!(live[0].starts_with("┤ bash pytest -x"), "{live:?}");
         let rows = t.apply(
             &ev(result("a", "FAILED test_x\nassert\nmore\nmore", true), 2800),
-            60,
+            m(60),
         );
         let rows = plain(&rows);
         assert!(rows[0].starts_with("✕ bash pytest -x"), "{rows:?}");
@@ -1695,7 +1711,7 @@ mod tests {
         assert_eq!(rows[4], "    … 1 more line · ctrl+o");
         assert!(rows[5].starts_with("● read policies/archive.py"));
         assert!(rows[5].ends_with("2 lines · 0.1s"));
-        assert!(t.live(60, 0).is_empty());
+        assert!(t.live(m(60), 0).is_empty());
         assert_eq!(t.context, 15_280);
     }
 
@@ -1711,16 +1727,16 @@ mod tests {
                 json!({"path": "src", "offset": 40, "limit": 10}),
             ),
         ]);
-        t.apply(&ev(calls, 0), 60);
+        t.apply(&ev(calls, 0), m(60));
         let mut rows = t.apply(
             &ev(result("a", "/w\nfind: ..: denied\n[exit 1]", true), 0),
-            60,
+            m(60),
         );
         rows.extend(t.apply(
             &ev(result("b", "Cannot read gone\nNo such file", true), 0),
-            60,
+            m(60),
         ));
-        rows.extend(t.apply(&ev(result("c", "lib.rs\nmod/", false), 0), 60));
+        rows.extend(t.apply(&ev(result("c", "lib.rs\nmod/", false), 0), m(60)));
         let red = |line: &Line| line.0.iter().any(|s| s.role == Role::Sanguine);
         let reds: Vec<bool> = rows.iter().map(red).collect();
         assert_eq!(plain(&rows[1..3]), ["  └ /w", "    find: ..: denied"]);
@@ -1739,7 +1755,7 @@ mod tests {
                 assistant(vec![use_("a", "bash", json!({"command": "curl x"}))]),
                 0,
             ),
-            60,
+            m(60),
         );
         t.apply(
             &ev(
@@ -1749,13 +1765,13 @@ mod tests {
                 },
                 0,
             ),
-            60,
+            m(60),
         );
-        t.apply(&ev(decide("a", Decision::Ask, Some("user#2")), 0), 60);
+        t.apply(&ev(decide("a", Decision::Ask, Some("user#2")), 0), m(60));
         assert_eq!(t.asks().len(), 1);
         assert!(!t.asks()[0].taint);
         assert_eq!(t.asks()[0].trusted, None);
-        assert!(plain(&t.live(60, 0))[0].ends_with("waiting on you"));
+        assert!(plain(&t.live(m(60), 0))[0].ends_with("waiting on you"));
         t.apply(
             &ev(
                 EventKind::ApprovalResolved {
@@ -1766,10 +1782,13 @@ mod tests {
                 },
                 0,
             ),
-            60,
+            m(60),
         );
         assert!(t.asks().is_empty());
-        let rows = plain(&t.apply(&ev(result("a", "denied by policy (user#2)", true), 0), 60));
+        let rows = plain(&t.apply(
+            &ev(result("a", "denied by policy (user#2)", true), 0),
+            m(60),
+        ));
         assert!(
             rows[0].ends_with("denied by you · user#2 · 0.0s"),
             "{rows:?}"
@@ -1784,11 +1803,11 @@ mod tests {
                 assistant(vec![use_("a", "edit", json!({"path": "deleted.py"}))]),
                 0,
             ),
-            60,
+            m(60),
         );
         let rows = t.apply(
             &ev(result("a", "Stale anchors. No changes written.", true), 0),
-            60,
+            m(60),
         );
         assert!(rows[0].plain().starts_with("↺ edit deleted.py"));
     }
@@ -1796,7 +1815,7 @@ mod tests {
     #[test]
     fn ctrl_o_expands_cut_results_newest_first_then_starts_over() {
         let mut t = Transcript::default();
-        assert!(t.expand(60).is_none());
+        assert!(t.expand(m(60)).is_none());
         t.apply(
             &ev(
                 assistant(vec![
@@ -1806,23 +1825,26 @@ mod tests {
                 ]),
                 0,
             ),
-            60,
+            m(60),
         );
-        t.apply(&ev(result("a", "1\n2\n3\n\n4", false), 0), 60);
-        t.apply(&ev(result("b", "short", false), 0), 60);
+        t.apply(&ev(result("a", "1\n2\n3\n\n4", false), 0), m(60));
+        t.apply(&ev(result("b", "short", false), 0), m(60));
         t.apply(
             &ev(result("c", "\x1b[31mFAIL\x1b[0m\na\nb\nc", true), 0),
-            60,
+            m(60),
         );
         assert!(t.collapsed());
-        let newest = plain(&t.expand(60).unwrap());
+        let newest = plain(&t.expand(m(60)).unwrap());
         assert_eq!(newest[1], "── bash · make test ──");
         assert_eq!(newest[2..], ["FAIL", "a", "b", "c", "── end · 4 lines ──"]);
-        let older = plain(&t.expand(60).unwrap());
+        let older = plain(&t.expand(m(60)).unwrap());
         assert_eq!(older[1], "── bash · make ──");
         assert_eq!(older[2..], ["1", "2", "3", "", "4", "── end · 5 lines ──"]);
-        assert!(t.expand(60).is_none());
-        assert_eq!(plain(&t.expand(60).unwrap())[1], "── bash · make test ──");
+        assert!(t.expand(m(60)).is_none());
+        assert_eq!(
+            plain(&t.expand(m(60)).unwrap())[1],
+            "── bash · make test ──"
+        );
     }
 
     #[test]
@@ -1885,7 +1907,7 @@ mod tests {
                 },
                 0,
             ),
-            60,
+            m(60),
         ));
         assert!(
             rows[1].starts_with("─── ≡ compacted 30.7k tokens before ─"),
@@ -1900,7 +1922,7 @@ mod tests {
                 "  … 6 more lines of summary · ctrl+o",
             ]
         );
-        let full = plain(&t.expand(60).unwrap());
+        let full = plain(&t.expand(m(60)).unwrap());
         // The divider already ended in a blank row, so no gap comes first.
         assert_eq!(full[0], "── ≡ compacted · summary ──");
         assert_eq!(full[1], "## User goal and constraints");
@@ -1944,7 +1966,7 @@ mod tests {
                     ]),
                     0,
                 ),
-                60,
+                m(60),
             );
             let text = plain(&rows);
             let answer = text.iter().position(|line| line == "  answer").unwrap();
@@ -1991,7 +2013,7 @@ mod tests {
                 }]),
                 0,
             ),
-            16,
+            m(16),
         );
         assert!(rows.iter().all(|line| line.width() <= 16));
         assert!(rows.len() > 3);
@@ -2004,7 +2026,7 @@ mod tests {
                 }]),
                 0,
             ),
-            24,
+            m(24),
         );
         assert!(rows.iter().all(|line| line.width() <= 24));
         assert!(plain(&rows).iter().any(|line| line.ends_with(" · ctrl+t")));
@@ -2018,7 +2040,7 @@ mod tests {
                     }]),
                     0,
                 ),
-                60,
+                m(60),
             );
             assert_eq!(
                 plain(&rows)
@@ -2048,15 +2070,15 @@ mod tests {
             &delta(Delta::Thinking {
                 text: "one\ntwo\nthree\n".into(),
             }),
-            60,
+            m(60),
         );
-        assert!(t.live(60, 0).len() > 1);
-        assert_eq!(plain(&t.live_under_frame(60, 0)), ["  ∴ three"]);
+        assert!(t.live(m(60), 0).len() > 1);
+        assert_eq!(plain(&t.live_under_frame(m(60), 0)), ["  ∴ three"]);
         let text: String = (1..=12).map(|n| format!("line {n}\n\n")).collect();
-        t.apply(&delta(Delta::Text { text }), 60);
-        assert_eq!(t.live(60, 0).len(), STREAM_ROWS + 1);
+        t.apply(&delta(Delta::Text { text }), m(60));
+        assert_eq!(t.live(m(60), 0).len(), STREAM_ROWS + 1);
         assert_eq!(
-            plain(&t.live_under_frame(60, 0)),
+            plain(&t.live_under_frame(m(60), 0)),
             ["┤ streaming · 23 lines"]
         );
     }
@@ -2075,13 +2097,13 @@ mod tests {
                     sequence: 0,
                     delta: Delta::Thinking { text: text.into() },
                 }),
-                60,
+                m(60),
             );
         }
         assert!(t.thinking());
-        assert_eq!(plain(&t.live(60, 0)), ["  ∴ eight"]);
+        assert_eq!(plain(&t.live(m(60), 0)), ["  ∴ eight"]);
         t.set_thinking(Thinking::Full);
-        let full = t.live(60, 0);
+        let full = t.live(m(60), 0);
         assert_eq!(full.len(), STREAM_ROWS);
         assert!(
             full.iter()
@@ -2094,10 +2116,10 @@ mod tests {
         );
         assert!(plain(&full).iter().any(|line| line.contains("eight")));
         t.set_thinking(Thinking::Hidden);
-        assert!(t.live(60, 0).is_empty());
+        assert!(t.live(m(60), 0).is_empty());
         assert!(t.thinking());
         t.set_thinking(Thinking::First);
-        assert_eq!(plain(&t.live(60, 0)), ["  ∴ eight"]);
+        assert_eq!(plain(&t.live(m(60), 0)), ["  ∴ eight"]);
         t.apply(
             &ClientNotification::Delta(DeltaParams {
                 session,
@@ -2107,11 +2129,11 @@ mod tests {
                     text: "answer starts".into(),
                 },
             }),
-            60,
+            m(60),
         );
         assert!(!t.thinking());
         assert!(
-            plain(&t.live(60, 0))
+            plain(&t.live(m(60), 0))
                 .iter()
                 .all(|line| !line.contains("eight"))
         );
@@ -2121,16 +2143,16 @@ mod tests {
                 attempt: 1,
                 sequence: 0,
             }),
-            60,
+            m(60),
         );
-        assert!(t.live(60, 0).is_empty());
+        assert!(t.live(m(60), 0).is_empty());
         t.partial(&[Block::Thinking {
             text: "restored thought".into(),
             signature: None,
         }]);
-        assert_eq!(plain(&t.live(60, 0)), ["  ∴ restored thought"]);
-        t.apply(&ev(assistant(Vec::new()), 0), 60);
-        assert!(t.live(60, 0).is_empty());
+        assert_eq!(plain(&t.live(m(60), 0)), ["  ∴ restored thought"]);
+        t.apply(&ev(assistant(Vec::new()), 0), m(60));
+        assert!(t.live(m(60), 0).is_empty());
         assert!(!t.thinking());
     }
 
@@ -2150,10 +2172,13 @@ mod tests {
                 )]),
                 0,
             ),
-            100,
+            m(100),
         );
-        t.apply(&ev(decide("edit", Decision::Allow, Some("user#1")), 0), 100);
-        let rows = t.apply(&ev(result("edit", "replaced text", false), 100), 100);
+        t.apply(
+            &ev(decide("edit", Decision::Allow, Some("user#1")), 0),
+            m(100),
+        );
+        let rows = t.apply(&ev(result("edit", "replaced text", false), 100), m(100));
         let text = plain(&rows);
         assert!(text[0].starts_with("● edit source.rs"));
         assert!(text[0].ends_with("+1 −2 · user#1 · 0.1s"), "{text:?}");
@@ -2195,16 +2220,16 @@ mod tests {
                 )]),
                 0,
             ),
-            80,
+            m(80),
         );
-        let rows = plain(&t.apply(&ev(result("edit", "replaced", false), 0), 80));
+        let rows = plain(&t.apply(&ev(result("edit", "replaced", false), 0), m(80)));
         assert_eq!(rows.len(), 10);
         assert!(rows[0].ends_with("+6 −6"));
         assert_eq!(rows[8], "  + new 1");
         assert_eq!(rows[9], "    … 4 more lines · ctrl+o");
         assert!(t.details[0].diff);
         assert!(t.details[0].text.starts_with("- old 0\n"));
-        let full = t.expand(80).unwrap();
+        let full = t.expand(m(80)).unwrap();
         let text = plain(&full);
         assert!(text.iter().any(|line| line == "── end · 12 lines ──"));
         assert!(text.iter().any(|line| line == "+ new 5"));
@@ -2236,9 +2261,9 @@ mod tests {
                 )]),
                 0,
             ),
-            12,
+            m(12),
         );
-        let rows = t.apply(&ev(result("edit", "replaced", false), 0), 12);
+        let rows = t.apply(&ev(result("edit", "replaced", false), 0), m(12));
         assert!(rows.iter().all(|line| line.width() <= 12));
         assert!(rows[1].plain().ends_with('…'));
         t.apply(
@@ -2252,9 +2277,12 @@ mod tests {
                 )]),
                 0,
             ),
-            80,
+            m(80),
         );
-        let rows = plain(&t.apply(&ev(result("error", "old text did not match", true), 0), 80));
+        let rows = plain(&t.apply(
+            &ev(result("error", "old text did not match", true), 0),
+            m(80),
+        ));
         assert!(rows[0].starts_with("✕ edit x"));
         assert!(!rows[0].contains("+1"));
         assert_eq!(rows[1], "  └ old text did not match");
@@ -2278,9 +2306,9 @@ mod tests {
                 )]),
                 0,
             ),
-            80,
+            m(80),
         );
-        let rows = t.apply(&ev(result("hash", "updated", false), 0), 80);
+        let rows = t.apply(&ev(result("hash", "updated", false), 0), m(80));
         let text = plain(&rows);
         assert!(text[0].ends_with("+3"));
         assert_eq!(text[1..], ["  + one", "  + two", "  + three"]);
@@ -2305,9 +2333,9 @@ mod tests {
                     assistant(vec![use_("a", "bash", json!({"command": "test"}))]),
                     0,
                 ),
-                100,
+                m(100),
             );
-            t.apply(&ev(decide("a", Decision::Ask, None), 0), 100);
+            t.apply(&ev(decide("a", Decision::Ask, None), 0), m(100));
             t.apply(
                 &ev(
                     EventKind::ApprovalResolved {
@@ -2318,9 +2346,9 @@ mod tests {
                     },
                     0,
                 ),
-                100,
+                m(100),
             );
-            let rows = plain(&t.apply(&ev(result("a", "done", !approved), 0), 100));
+            let rows = plain(&t.apply(&ev(result("a", "done", !approved), 0), m(100)));
             assert!(rows[0].contains(expected), "{rows:?}");
         }
     }
@@ -2333,11 +2361,14 @@ mod tests {
                 assistant(vec![use_("a", "bash", json!({"command": "test"}))]),
                 0,
             ),
-            100,
+            m(100),
         );
-        t.apply(&ev(decide("a", Decision::Allow, Some("session")), 0), 100);
-        assert!(plain(&t.live(100, 0))[0].contains("allowed for this session"));
-        let rows = plain(&t.apply(&ev(result("a", "done", false), 0), 100));
+        t.apply(
+            &ev(decide("a", Decision::Allow, Some("session")), 0),
+            m(100),
+        );
+        assert!(plain(&t.live(m(100), 0))[0].contains("allowed for this session"));
+        let rows = plain(&t.apply(&ev(result("a", "done", false), 0), m(100)));
         assert!(rows[0].ends_with("allowed for this session · 0.0s"));
     }
 
@@ -2351,7 +2382,7 @@ mod tests {
                 assistant(vec![use_("a", "bash", json!({"command": "test"}))]),
                 0,
             ),
-            80,
+            m(80),
         );
         t.apply(
             &ev(
@@ -2366,7 +2397,7 @@ mod tests {
                 },
                 0,
             ),
-            80,
+            m(80),
         );
         assert!(t.asks()[0].taint);
         assert_eq!(t.asks()[0].trusted, None);
@@ -2379,7 +2410,7 @@ mod tests {
             taint: true,
             trusted: false,
         });
-        t.apply(&pending, 80);
+        t.apply(&pending, m(80));
         assert_eq!(t.asks().len(), 1);
         assert_eq!(t.asks()[0].trusted, Some(false));
     }
@@ -2397,7 +2428,7 @@ mod tests {
                 }]),
                 0,
             ),
-            80,
+            m(80),
         );
         assert_eq!(t.last_text(), Some("first response"));
         t.apply(
@@ -2412,9 +2443,9 @@ mod tests {
                 ]),
                 0,
             ),
-            80,
+            m(80),
         );
-        t.apply(&ev(result("a", "tool output", false), 0), 80);
+        t.apply(&ev(result("a", "tool output", false), 0), m(80));
         t.apply(
             &ClientNotification::Delta(DeltaParams {
                 session: SessionId::generate(),
@@ -2424,7 +2455,7 @@ mod tests {
                     text: "unfinished".into(),
                 },
             }),
-            80,
+            m(80),
         );
         assert_eq!(t.last_text(), Some("first response"));
         t.apply(
@@ -2439,7 +2470,7 @@ mod tests {
                 ]),
                 0,
             ),
-            80,
+            m(80),
         );
         assert_eq!(t.last_text(), Some("new\nresponse"));
     }
@@ -2473,11 +2504,11 @@ mod tests {
                 assistant(vec![use_("a", "bash", json!({"command": "git log"}))]),
                 0,
             ),
-            96,
+            m(96),
         );
-        t.apply(&ev(decide("a", Decision::Allow, None), 1_000), 96);
+        t.apply(&ev(decide("a", Decision::Allow, None), 1_000), m(96));
         let output = "one\ntwo\nthree\nfour\nfive\n[exit 1]\n";
-        let rows = t.apply(&ev(result("a", output, true), 2_800), 96);
+        let rows = t.apply(&ev(result("a", output, true), 2_800), m(96));
         let text = plain(&rows);
         assert!(text[0].starts_with("✕ bash git log"));
         assert!(text[0].ends_with("exit 1 · 1.8s"));
@@ -2502,7 +2533,7 @@ mod tests {
                 .iter()
                 .any(|span| span.text == "1.8s" && span.role == Role::Dim)
         );
-        let full = t.expand(96).unwrap();
+        let full = t.expand(m(96)).unwrap();
         let text = plain(&full);
         assert_eq!(text[1], "── bash · git log ──");
         assert_eq!(
@@ -2518,13 +2549,13 @@ mod tests {
                 assistant(vec![use_("a", "bash", json!({"command": "false"}))]),
                 0,
             ),
-            96,
+            m(96),
         );
-        let rows = plain(&t.apply(&ev(result("a", "[exit 1]", true), 0), 96));
+        let rows = plain(&t.apply(&ev(result("a", "[exit 1]", true), 0), m(96)));
         assert_eq!(rows.len(), 1);
         assert!(rows[0].ends_with("exit 1"));
         assert!(
-            t.expand(96).is_some(),
+            t.expand(m(96)).is_some(),
             "the removed footer remains reachable"
         );
     }
@@ -2539,9 +2570,9 @@ mod tests {
                     assistant(vec![use_("a", "bash", json!({"command": "cmd"}))]),
                     0,
                 ),
-                80,
+                m(80),
             );
-            let rows = t.apply(&ev(result("a", output, error), 0), 80);
+            let rows = t.apply(&ev(result("a", output, error), 0), m(80));
             assert!(
                 rows[0]
                     .plain()
@@ -2579,10 +2610,10 @@ mod tests {
                     )]),
                     0,
                 ),
-                cols,
+                m(cols),
             );
-            t.apply(&ev(result("a", output, false), 0), cols);
-            let lines = t.expand(cols).unwrap();
+            t.apply(&ev(result("a", output, false), 0), m(cols));
+            let lines = t.expand(m(cols)).unwrap();
             assert!(lines[1].width() <= cols.min(48), "cols {cols}");
             assert!(lines.last().unwrap().width() <= cols.min(48), "cols {cols}");
             assert!(lines[1].0.iter().all(|span| span.role == Role::Dim));
@@ -2600,7 +2631,8 @@ mod tests {
         t.sent(&first);
         t.sent(&steering);
         for own in [first, steering] {
-            let lines = plain(&t.apply_live(&ev(EventKind::UserMessage { content: own }, 0), 80));
+            let lines =
+                plain(&t.apply_live(&ev(EventKind::UserMessage { content: own }, 0), m(80)));
             assert!(lines.iter().any(|line| line.starts_with("ξ ")), "{lines:?}");
             assert!(lines.iter().all(|line| !line.contains("another client")));
         }
@@ -2611,7 +2643,7 @@ mod tests {
             },
             (24 * 60 + 14 * 60 + 22) * 60_000,
         );
-        let lines = t.apply_live(&peer, 36);
+        let lines = t.apply_live(&peer, m(36));
         let text = plain(&lines);
         let header = text.iter().position(|line| line.starts_with("» ")).unwrap();
         assert_eq!(text[header], "» from another client · 14:22");
@@ -2623,9 +2655,9 @@ mod tests {
         );
         assert!(text[header + 1..].iter().all(|line| line.starts_with("  ")));
         assert!(lines.iter().all(|line| line.width() <= 36));
-        let replay = plain(&Transcript::default().apply(&peer, 36));
+        let replay = plain(&Transcript::default().apply(&peer, m(36)));
         assert!(replay.iter().any(|line| line.starts_with("ξ peer note")));
-        let fresh = plain(&Transcript::default().apply_live(&peer, 36));
+        let fresh = plain(&Transcript::default().apply_live(&peer, m(36)));
         assert!(
             fresh
                 .iter()
@@ -2642,7 +2674,7 @@ mod tests {
                 assistant(vec![use_("task", "task", json!({"tasks": [{}, {}]}))]),
                 0,
             ),
-            96,
+            m(96),
         );
         for number in 1..=2 {
             let session = SessionId::generate();
@@ -2687,7 +2719,7 @@ mod tests {
                 usage: Default::default(),
             });
         }
-        let rows = plain(&t.apply(&ev(result("task", "parent result", false), 60_000), 96));
+        let rows = plain(&t.apply(&ev(result("task", "parent result", false), 60_000), m(96)));
         assert!(
             rows.iter()
                 .any(|line| line == "» from child 1 · check 1 · 00:01")
@@ -2703,7 +2735,7 @@ mod tests {
             2
         );
         for number in [2, 1] {
-            let full = plain(&t.expand(96).unwrap());
+            let full = plain(&t.expand(m(96)).unwrap());
             assert_eq!(
                 full[1],
                 format!("── from child {number} · check {number} ──")
@@ -2719,9 +2751,9 @@ mod tests {
                 ]
             );
         }
-        let full = plain(&t.expand(96).unwrap());
+        let full = plain(&t.expand(m(96)).unwrap());
         assert!(full.iter().any(|line| line == "parent result"));
-        assert!(t.expand(96).is_none());
+        assert!(t.expand(m(96)).is_none());
     }
 
     #[test]
@@ -2743,6 +2775,11 @@ mod client_tests {
     use xi_protocol::{Block, SessionId};
 
     use super::Transcript;
+    use crate::layout::Measure;
+
+    fn m(cols: usize) -> Measure {
+        Measure::new(cols, 36)
+    }
 
     #[test]
     fn reset_drops_an_earlier_attempt_and_restored_partial() {
@@ -2759,7 +2796,7 @@ mod client_tests {
         ]);
         assert!(
             transcript
-                .live(60, 0)
+                .live(m(60), 0)
                 .iter()
                 .any(|line| line.plain().contains("old attempt"))
         );
@@ -2769,9 +2806,9 @@ mod client_tests {
                 attempt: 1,
                 sequence: 0,
             }),
-            60,
+            m(60),
         );
-        assert!(transcript.live(60, 0).is_empty());
+        assert!(transcript.live(m(60), 0).is_empty());
         assert!(!transcript.thinking());
         transcript.apply(
             &ClientNotification::Delta(DeltaParams {
@@ -2782,10 +2819,10 @@ mod client_tests {
                     text: "new attempt".into(),
                 },
             }),
-            60,
+            m(60),
         );
         let live: Vec<_> = transcript
-            .live(60, 0)
+            .live(m(60), 0)
             .iter()
             .map(crate::style::Line::plain)
             .collect();
@@ -2806,8 +2843,8 @@ mod client_tests {
             taint: true,
             trusted: true,
         });
-        transcript.apply(&pending, 60);
-        transcript.apply(&pending, 60);
+        transcript.apply(&pending, m(60));
+        transcript.apply(&pending, m(60));
         assert_eq!(transcript.asks().len(), 1);
         assert!(transcript.asks()[0].taint);
         assert_eq!(transcript.asks()[0].trusted, Some(true));
@@ -2820,7 +2857,7 @@ mod client_tests {
                 status: Some(1),
                 message: Some("worker stopped".into()),
             }),
-            60,
+            m(60),
         );
         assert!(
             lines
@@ -2828,6 +2865,6 @@ mod client_tests {
                 .any(|line| line.plain().contains("session exited · status 1"))
         );
         assert!(transcript.asks().is_empty());
-        assert!(transcript.live(60, 0).is_empty());
+        assert!(transcript.live(m(60), 0).is_empty());
     }
 }

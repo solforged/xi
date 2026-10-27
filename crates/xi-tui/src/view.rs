@@ -81,7 +81,7 @@ impl App {
                 session: info.session,
                 event,
             });
-            let lines = self.transcript.apply(&n, self.cols);
+            let lines = self.transcript.apply(&n, self.measure());
             self.commit.extend(lines);
         }
         if self.launch.attached.running {
@@ -105,7 +105,7 @@ impl App {
         for pending in &self.launch.attached.pending_approvals {
             self.transcript.apply(
                 &ClientNotification::ApprovalPending(pending.clone()),
-                self.cols,
+                self.measure(),
             );
         }
         if replayed > 0 {
@@ -233,13 +233,14 @@ impl App {
 
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
         let cols = self.cols;
+        let m = self.measure();
         // While a frame holds the keys, the stream and the composer shrink
         // to one line each so the frame keeps its room.
         let framed = !self.overlays.is_empty();
         let mut lines = if framed {
-            self.transcript.live_under_frame(cols, self.frame)
+            self.transcript.live_under_frame(m, self.frame)
         } else {
-            self.transcript.live(cols, self.frame)
+            self.transcript.live(m, self.frame)
         };
         let transcript_rows = lines.len();
         if self.running() {

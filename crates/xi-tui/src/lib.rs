@@ -60,6 +60,7 @@ use crate::config::TuiConfig;
 use crate::editor::Editor;
 use crate::history::History;
 use crate::keys::Keymap;
+use crate::layout::Measure;
 use crate::overlay::Overlays;
 use crate::screen::{Screen, Settle};
 use crate::style::{Line, Role};
@@ -532,7 +533,7 @@ impl App {
             }
         }
         let asks = self.transcript.asks().len();
-        let lines = self.transcript.apply_live(notification, self.cols);
+        let lines = self.transcript.apply_live(notification, self.measure());
         self.commit.extend(lines);
         match notification {
             ClientNotification::Event(p) => match &p.event.kind {
@@ -691,6 +692,11 @@ impl App {
 
     fn running(&self) -> bool {
         self.started.is_some()
+    }
+
+    /// The measure of the pane drawn into.
+    fn measure(&self) -> Measure {
+        Measure::new(self.cols, self.rows)
     }
 
     fn note(&mut self, lines: Vec<Line>) {

@@ -593,7 +593,7 @@ impl App {
                 session: self.session_id(),
                 event,
             });
-            transcript.apply(&n, self.cols);
+            transcript.apply(&n, self.measure());
         }
         transcript.end_turn();
         transcript.session = self.transcript.session;
