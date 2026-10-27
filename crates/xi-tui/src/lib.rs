@@ -75,7 +75,7 @@ use crate::overlay::Overlays;
 use crate::panes::Deck;
 use crate::screen::{Screen, Settle};
 use crate::style::Line;
-use crate::transcript::{Transcript, duration, tokens};
+use crate::transcript::{Transcript, duration, notice_rows, tokens};
 
 /// A failure running the terminal client.
 #[derive(Debug, thiserror::Error)]
@@ -247,6 +247,9 @@ struct Composer {
     file_cwd: Option<PathBuf>,
     commands: Vec<CommandSpec>,
     external_requested: Option<ExternalRequest>,
+    /// Why the last key did nothing, such as a change held for the turn;
+    /// shown in the composer until the next key, not kept in the log.
+    flash: Option<Line>,
 }
 
 /// Cross-session approval bookkeeping.
@@ -476,6 +479,7 @@ impl Composer {
             file_cwd: None,
             commands: builtin_commands(),
             external_requested: None,
+            flash: None,
         }
     }
 
@@ -755,11 +759,11 @@ impl App {
         if !self.turn.running() {
             return true;
         }
-        self.notice(
-            Kind::Warn,
+        self.composer.flash = Some(
             Line::default()
+                .brass("! ")
                 .ink(format!("{action} waits for the turn to end"))
-                .dim(" · esc stops it"),
+                .dim(" · esc stops the turn"),
         );
         false
     }
@@ -962,6 +966,7 @@ impl App {
         self.commit_lines(lines);
         self.launch.attached.running = false;
         self.transcript.end_turn();
+        self.composer.flash = None;
         if let Some(approvals) = self.overlays.get_mut::<Approvals>() {
             if approvals.inbox {
                 approvals.replace_current(Vec::new(), self.launch.attached.info.session);
@@ -972,17 +977,18 @@ impl App {
         }
         let elapsed = self.turn.elapsed();
         let failed = std::mem::take(&mut self.turn.failed);
-        let (word, kind) = match &outcome {
-            Some(o) if o.cancelled => ("stopped", Kind::Warn),
-            Some(o) if o.failed => ("failed", Kind::Error),
-            None if failed => ("failed", Kind::Error),
-            _ => ("done", Kind::Done),
+        // You stopped it: a quiet square, not the warning mark.
+        let (word, mark) = match &outcome {
+            Some(o) if o.cancelled => ("stopped", Line::default().dim("■")),
+            Some(o) if o.failed => ("failed", Kind::Error.mark()),
+            None if failed => ("failed", Kind::Error.mark()),
+            _ => ("done", Kind::Done.mark()),
         };
         let turn = self.transcript.turn;
         let mut parts = vec![duration(elapsed)];
         if turn.sent() > 0 {
             parts.push(format!(
-                "↑ {}  ↓ {}",
+                "{} in · {} out",
                 tokens(turn.sent()),
                 tokens(turn.output)
             ));
@@ -997,12 +1003,12 @@ impl App {
                 parts.push(format!("${cost:.2}"));
             }
         }
-        self.notice(
-            kind,
-            Line::default()
-                .ink(word)
-                .dim(format!("  {}", parts.join("  "))),
-        );
+        // The word fills the tool-name column, so the figures start where
+        // a call's argument does.
+        let text = Line::default()
+            .ink(format!("{word:<8}"))
+            .dim(parts.join(" · "));
+        self.note(notice_rows(mark, text, self.display.measure()));
         self.turn.steering.clear();
         if !self.turn.exited && !self.turn.queued.is_empty() {
             let next = self.turn.queued.remove(0);

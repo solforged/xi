@@ -456,7 +456,7 @@ mod tests {
                 "   3 Always allow in this workspace     ",
                 "   4 Deny                               ",
                 "                                        ",
-                " i Allowed once, the next publish asks  ",
+                " ◦ Allowed once, the next publish asks  ",
                 "   again. The answer lands in the log,  ",
                 "   so any other client sees it.         ",
                 "── 1–4 choose · tab next · esc later ───",
@@ -474,7 +474,7 @@ mod tests {
                 "│   3 Always allow in this …  writes .xi/config.local.toml │",
                 "│   4 Deny                                                 │",
                 "│                                                          │",
-                "│ i Allowed once, the next publish asks again. The answer  │",
+                "│ ◦ Allowed once, the next publish asks again. The answer  │",
                 "│   lands in the log, so any other client sees it.         │",
                 "╰─ 1–4 choose · ↑↓ move · tab next ask · esc later ────────╯",
             ]
@@ -491,7 +491,7 @@ mod tests {
                 "│   3 Always allow in this workspace                          writes .xi/config.local.toml │",
                 "│   4 Deny                                                                                 │",
                 "│                                                                                          │",
-                "│ i Allowed once, the next publish asks again. The answer lands in the log, so any other   │",
+                "│ ◦ Allowed once, the next publish asks again. The answer lands in the log, so any other   │",
                 "│   client sees it.                                                                        │",
                 "╰─ 1–4 choose · ↑↓ move · tab next ask · esc later ────────────────────────────────────────╯",
             ]
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(
             wide[9],
             format!(
-                "│ i Allowed once, the next publish asks again. The answer lands in the log, so any other client sees it.{} │",
+                "│ ◦ Allowed once, the next publish asks again. The answer lands in the log, so any other client sees it.{} │",
                 " ".repeat(34)
             )
         );

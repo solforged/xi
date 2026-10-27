@@ -208,13 +208,17 @@ impl App {
                 Line::default().ink(format!("${cost:.2}")),
             ));
         }
-        // Show the worker's actual launch policy, not the current default.
-        segs.push(if info.sandbox_enabled {
-            Segment::new("sandbox", Line::default().dim("◇ sandbox"))
-                .short(Line::default().dim("◇"))
-        } else {
+        // Show the worker's actual launch policy, not the current default,
+        // and a launch that failed since the last command ran.
+        segs.push(if !info.sandbox_enabled {
             Segment::new("sandbox-off", Line::default().brass("sandbox off"))
                 .short(Line::default().brass("sbx off"))
+        } else if self.transcript.sandbox_failed {
+            Segment::new("sandbox-off", Line::default().brass("sandbox failing"))
+                .short(Line::default().brass("sbx failing"))
+        } else {
+            Segment::new("sandbox", Line::default().dim("◇ sandbox"))
+                .short(Line::default().dim("◇"))
         });
         let running = self.transcript.children().running();
         if running > 0 {
@@ -302,6 +306,9 @@ impl App {
         } else {
             "enter sends · ctrl+j new line · /help"
         };
+        let flash = self.composer.flash.clone();
+        let flash_text = flash.as_ref().map(Line::plain);
+        let hint = flash_text.as_deref().unwrap_or(hint);
         let border = if self.transcript.tainted {
             Role::Murex
         } else {
@@ -336,7 +343,7 @@ impl App {
             };
             let line = lr(
                 Line::default().dim(format!("ξ {draft}")),
-                Line::default().dim(back),
+                flash.clone().unwrap_or_else(|| Line::default().dim(back)),
                 cols,
             );
             (vec![line], (0, 0))
@@ -359,26 +366,37 @@ impl App {
                 cursor.0 += 1;
             }
             // The side panel's foot carries the model and the turn's
-            // activity, so the block keeps a row for the turn's keys.
-            // Without the panel, the model shares that row with them, each
-            // group set apart by a wider gap and its keys by tone.
+            // activity, so the block keeps a row for keys: sending while
+            // idle, steering while a turn runs, or why the last key was
+            // held. Without the panel, the model shares that row with them,
+            // each group set apart by a wider gap and its keys by tone.
             let room = cols.saturating_sub(3);
-            let keys = key_hints(&[
-                ("enter", "steers"),
-                ("alt+enter", "queues"),
-                ("esc", "stops"),
-            ]);
-            let keys = if paneled {
-                if self.turn.running() {
-                    keys.truncate(room)
-                } else {
-                    Line::default()
-                }
+            let keys = if self.turn.running() {
+                key_hints(&[
+                    ("enter", "steers"),
+                    ("alt+enter", "queues"),
+                    ("esc", "stops"),
+                ])
+            } else {
+                key_hints(&[
+                    ("enter", "sends"),
+                    ("ctrl+j", "new line"),
+                    ("/", "commands"),
+                ])
+            };
+            let keys = if let Some(flash) = flash {
+                flash.truncate(room)
+            } else if paneled {
+                keys.truncate(room)
             } else {
                 let model = self.model_line();
                 let mut right = activity.clone().unwrap_or_default();
-                if self.turn.running() && model.width() + right.width() + keys.width() + 7 <= room {
-                    right = right.ink("   ").extend(keys);
+                if model.width() + right.width() + keys.width() + 7 <= room {
+                    right = if right.0.is_empty() {
+                        keys
+                    } else {
+                        right.ink("   ").extend(keys)
+                    };
                 }
                 lr(model, right, room)
             };
@@ -466,7 +484,7 @@ impl App {
             .dim(format!(" {what}  {elapsed}s"));
         if m.durations() && turn.sent() > 0 {
             line = line.dim(format!(
-                "  ↑ {}  ↓ {}",
+                "  {} in · {} out",
                 tokens(turn.sent()),
                 tokens(turn.output)
             ));
@@ -487,7 +505,7 @@ impl App {
                 let level = model_info
                     .as_ref()
                     .map_or(info.reasoning, |m| m.resolve(info.reasoning));
-                model.dim(" · ").dim(short_reasoning(level))
+                model.dim(" · think ").muted(short_reasoning(level))
             }
         }
     }

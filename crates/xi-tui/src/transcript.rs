@@ -13,7 +13,10 @@ use xi_client::client::ClientNotification;
 use xi_protocol::event::{Decision, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::methods::client::{Delta, EventParams};
 use xi_protocol::model::Pricing;
-use xi_protocol::{Block, EventKind, OutputBlock, SessionId, Timestamp, ToolCallId, ToolOutput};
+use xi_protocol::{
+    Block, EventKind, OutputBlock, SANDBOX_START_FAILED, SessionId, Timestamp, ToolCallId,
+    ToolOutput,
+};
 
 use crate::callout::{self, Kind, markdown};
 use crate::children::Children;
@@ -376,6 +379,9 @@ pub struct Transcript {
     last_text: Option<String>,
     /// Whether the head's branch has read untrusted content.
     pub tainted: bool,
+    /// Whether the newest sandboxed launch failed before running anything,
+    /// until a command runs or the sandbox setting changes.
+    pub sandbox_failed: bool,
     /// Usage across the session.
     pub session: Totals,
     /// Usage in the running turn.
@@ -397,16 +403,18 @@ pub struct Transcript {
     sent: Vec<Vec<Block>>,
 }
 
-/// `14.2k`, `1.2M`, `950`.
+/// `14.2k`, `272k`, `1.2M`, `950`: one decimal, unless it is zero.
 #[must_use]
 pub fn tokens(n: u64) -> String {
     #[allow(clippy::cast_precision_loss)]
     let f = n as f64;
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{:.1}k", f / 1e3),
-        _ => format!("{:.1}M", f / 1e6),
-    }
+    let (value, unit) = match n {
+        0..1_000 => return n.to_string(),
+        1_000..1_000_000 => (f / 1e3, "k"),
+        _ => (f / 1e6, "M"),
+    };
+    let text = format!("{value:.1}");
+    format!("{}{unit}", text.strip_suffix(".0").unwrap_or(&text))
 }
 
 /// `4.2s`, `1m12s`.
@@ -443,6 +451,18 @@ fn relative<'a>(path: &'a str, workspace: Option<&std::path::Path>) -> &'a str {
     }
 }
 
+/// A path as a headline shows it: relative inside the workspace, `./` for
+/// the workspace itself so it reads as a directory, and under `~` when it
+/// lies elsewhere in the home directory.
+fn shown(path: &str, workspace: Option<&std::path::Path>) -> String {
+    match relative(path, workspace) {
+        "." => "./".to_owned(),
+        rest if rest.len() < path.len() => rest.to_owned(),
+        _ if path.starts_with('/') => crate::view::home(std::path::Path::new(path)),
+        _ => path.to_owned(),
+    }
+}
+
 /// The argument that matters for a call's headline. Paths inside the
 /// workspace show relative to it, and a command's leading `cd` into the
 /// workspace is dropped, since every command already starts there.
@@ -464,10 +484,10 @@ pub(crate) fn headline_arg(
             first(rest.unwrap_or(c))
         }),
         "read" => field("path").map(|p| {
-            let path = relative(p, workspace);
+            let path = shown(p, workspace);
             let number = |k: &str| input.get(k).and_then(Value::as_u64);
             match (number("offset"), number("limit")) {
-                (None, None) => path.to_owned(),
+                (None, None) => path,
                 (Some(from), None) => format!("{path}:{from}-"),
                 (from, Some(limit)) => {
                     let from = from.unwrap_or(1);
@@ -478,14 +498,15 @@ pub(crate) fn headline_arg(
                 }
             }
         }),
-        "write" | "edit" | "hashline" => field("path").map(|p| relative(p, workspace).to_owned()),
+        "write" | "edit" | "hashline" => field("path").map(|p| shown(p, workspace)),
         "search" => field("pattern").or_else(|| field("glob")).map(|query| {
             let query = match (field("pattern"), field("glob")) {
                 (Some(pattern), Some(glob)) => format!("{pattern} [{glob}]"),
                 _ => query.to_owned(),
             };
-            match field("path").map(|path| relative(path, workspace)) {
-                Some(".") | None => query,
+            match field("path").map(|path| shown(path, workspace)) {
+                Some(path) if path == "./" => query,
+                None => query,
                 Some(path) => format!("{query} in {path}"),
             }
         }),
@@ -660,10 +681,21 @@ fn argument(name: &str, arg: &str) -> Line {
                 line.dim(format!(":{range}"))
             }
         }
-        "search" => match arg.rsplit_once(" in ") {
-            Some((pattern, scope)) => Line::default().ink(pattern).dim(format!(" in {scope}")),
-            None => Line::default().ink(arg),
-        },
+        "search" => {
+            let (query, scope) = match arg.rsplit_once(" in ") {
+                Some((query, scope)) => (query, Some(scope)),
+                None => (arg, None),
+            };
+            // A pattern's file filter is dim like its scope.
+            let mut line = match query.strip_suffix(']').and_then(|q| q.rsplit_once(" [")) {
+                Some((pattern, glob)) => Line::default().ink(pattern).dim(format!(" [{glob}]")),
+                None => Line::default().ink(query),
+            };
+            if let Some(scope) = scope {
+                line = line.dim(format!(" in {scope}"));
+            }
+            line
+        }
         _ => Line::default().ink(arg),
     }
 }
@@ -879,11 +911,26 @@ impl Call {
             });
         }
         let quiet = !output.is_error && matches!(self.name.as_str(), "read" | "search");
-        if quiet {
-            meta.push(if self.name == "read" {
-                read_size(output)
-            } else {
+        if quiet && self.name == "read" {
+            // A range read in full already says how many lines it holds.
+            let size = read_size(output);
+            let span = self
+                .arg
+                .rsplit_once(':')
+                .and_then(|(_, range)| range.split_once('-'))
+                .and_then(|(from, to)| {
+                    Some((from.parse::<usize>().ok()?, to.parse::<usize>().ok()?))
+                })
+                .map(|(from, to)| to.saturating_sub(from) + 1);
+            if span.is_none_or(|span| size != counted(span, "line", "lines")) {
+                meta.push(size);
+            }
+        } else if quiet {
+            // A glob alone lists files; a pattern finds matching lines.
+            meta.push(if self.input.get("pattern").is_some() {
                 counted(count, "hit", "hits")
+            } else {
+                counted(count, "file", "files")
             });
         }
         // A failed command shows its exit code there instead.
@@ -904,8 +951,18 @@ impl Call {
             Role::Dim
         };
         let mut right = Line::default();
-        if let Some((_, code)) = exit {
-            right = right.sanguine(format!("exit {code}"));
+        // A failure says so where the outcome goes: a command's exit
+        // status, else `failed`, such as for a missing file or a sandbox
+        // that could not start. A denial already says why.
+        let status = match exit {
+            Some((_, code)) => Some(format!("exit {code}")),
+            None if output.is_error && role == Role::Dim && self.mark().plain() == "✕" => {
+                Some("failed".to_owned())
+            }
+            None => None,
+        };
+        if let Some(status) = status {
+            right = right.sanguine(status);
             if !meta.is_empty() {
                 right = right.dim(" · ");
             }
@@ -1290,12 +1347,17 @@ impl Transcript {
                         .dim(format!("from another client · {}", clock(params.event.at)))
                         .truncate(cols),
                 ];
+                let images = image_rows(content, cols.saturating_sub(2));
                 lines.extend(
-                    wrap(&blocks_text(content), m.prose)
+                    wrap(&prompt_text(content, !images.is_empty()), m.prose)
                         .into_iter()
                         .map(|row| Line::default().ink("  ").ink(row).truncate(cols)),
                 );
-                lines.extend(image_rows(content, cols));
+                lines.extend(
+                    images
+                        .into_iter()
+                        .map(|line| Line::default().ink("  ").extend(line).truncate(cols)),
+                );
                 out.extend(self.note(lines));
                 return out;
             }
@@ -1422,19 +1484,23 @@ impl Transcript {
                 self.workspace = Some(cwd.clone());
             }
             EventKind::ModelChanged { model } => {
-                self.model = Some(model.clone());
-                self.push(
-                    &mut out,
-                    notice_rows(
-                        Kind::Info.mark(),
-                        Line::default()
-                            .dim("model → ")
-                            .ink(format!("{}/{}", model.provider, model.model)),
-                        m,
-                    ),
-                );
+                let name = |model: &ModelRef| format!("{}/{}", model.provider, model.model);
+                let previous = self.model.replace(model.clone());
+                // A change to the model already in use, such as a session
+                // pinning its default, says nothing new.
+                if previous.as_ref() != Some(model) {
+                    let mut text = Line::default().dim("model ");
+                    if let Some(previous) = &previous {
+                        text = text.dim(name(previous)).dim(" → ");
+                    }
+                    self.push(
+                        &mut out,
+                        notice_rows(Kind::Info.mark(), text.ink(name(model)), m),
+                    );
+                }
             }
             EventKind::SandboxChanged { enabled } => {
+                self.sandbox_failed = false;
                 let (kind, text) = if *enabled {
                     (
                         Kind::Info,
@@ -1458,19 +1524,35 @@ impl Transcript {
             EventKind::UserMessage { content } => {
                 self.children.clear();
                 self.gap(&mut out);
-                let text = blocks_text(xi_protocol::skill::typed(content));
+                let content = xi_protocol::skill::typed(content);
+                // Previews stand in for their images; without them a
+                // `[image]` line marks where each one was.
+                let images = image_rows(content, m.prompt.min(cols.saturating_sub(3)));
+                let text = prompt_text(content, !images.is_empty());
                 // A brass bar down the prompt's left, a blank row above and
-                // below it, all on the raised surface where the deck has one.
-                let rows = wrap(&text, m.prompt);
+                // below it, all on the raised surface where the deck has one,
+                // with its images inside under a blank row of their own.
+                let rows = if text.is_empty() {
+                    Vec::new()
+                } else {
+                    wrap(&text, m.prompt)
+                };
                 let bar = || Line::default().brass("┃").raise();
-                let lines = std::iter::once(bar())
-                    .chain(
-                        rows.iter()
-                            .map(|row| bar().ink("  ").ink(row).raise().truncate(cols)),
-                    )
-                    .chain(image_rows(xi_protocol::skill::typed(content), cols))
-                    .chain(std::iter::once(bar()));
-                self.push(&mut out, lines.collect::<Vec<_>>());
+                let mut lines = vec![bar()];
+                lines.extend(
+                    rows.iter()
+                        .map(|row| bar().ink("  ").ink(row).raise().truncate(cols)),
+                );
+                if !rows.is_empty() && !images.is_empty() {
+                    lines.push(bar());
+                }
+                lines.extend(
+                    images
+                        .into_iter()
+                        .map(|line| bar().ink("  ").extend(line).raise().truncate(cols)),
+                );
+                lines.push(bar());
+                self.push(&mut out, lines);
                 self.blank = false;
                 self.gap(&mut out);
             }
@@ -1656,6 +1738,13 @@ impl Transcript {
                 spill,
             } => {
                 self.asks.retain(|a| &a.call != call);
+                let text = text_of(output);
+                let failed = text.starts_with(SANDBOX_START_FAILED)
+                    || text.contains(&format!("[{SANDBOX_START_FAILED}"));
+                let shell = self.calls.iter().any(|c| &c.id == call && c.name == "bash");
+                if failed || shell {
+                    self.sandbox_failed = failed;
+                }
                 if let Some(c) = self.calls.iter_mut().find(|c| &c.id == call) {
                     c.result = Some((output.clone(), spill.clone(), at));
                     // Calls run one at a time, so the children started
@@ -2043,19 +2132,33 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
     (rows, hidden)
 }
 
+/// Previews of a message's images, each under its size, or nothing when the
+/// terminal shows no graphics.
 fn image_rows(content: &[Block], cols: usize) -> Vec<Line> {
     content
         .iter()
         .flat_map(|block| match block {
-            Block::Image { media_type, data } => {
-                crate::images::rows(media_type, data, cols.saturating_sub(3))
-                    .into_iter()
-                    .map(|line| Line::from("   ").extend(line))
-                    .collect()
-            }
+            Block::Image { media_type, data } => crate::images::rows(media_type, data, cols),
             _ => Vec::new(),
         })
         .collect()
+}
+
+/// A prompt's text, with `[image]` for each image unless previews show
+/// them.
+fn prompt_text(content: &[Block], previewed: bool) -> String {
+    if previewed {
+        content
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        blocks_text(content)
+    }
 }
 
 pub(crate) fn blocks_text(content: &[Block]) -> String {
@@ -2191,7 +2294,17 @@ mod tests {
             0,
         );
         let mut t = Transcript::default();
-        check(&t.apply(&prompt, m(80)));
+        let own = t.apply(&prompt, m(80));
+        check(&own);
+        // Previews replace the placeholder and stay inside the prompt's bar.
+        let rows: Vec<_> = own.iter().map(Line::plain).collect();
+        assert_eq!(rows.iter().any(|row| row.contains("[image]")), !enabled);
+        assert!(
+            rows.iter()
+                .filter(|row| !row.is_empty())
+                .all(|row| row.starts_with('┃')),
+            "{rows:?}"
+        );
         check(&t.apply_live(&prompt, m(80)));
         t.sent(&content);
         check(&t.apply_live(&prompt, m(80)));
@@ -2398,8 +2511,76 @@ mod tests {
         assert!(rows[0].plain().ends_with("exit 1"));
         assert_eq!(reds[1..3], [false, false]);
         assert_eq!(reds[4..6], [true, false], "{:?}", plain(&rows));
+        assert!(plain(&rows)[3].ends_with("failed"), "{:?}", plain(&rows));
         assert!(plain(&rows)[6].starts_with("● read src:40-49"));
         assert!(plain(&rows)[6].ends_with("2 entries"));
+    }
+
+    #[test]
+    fn outcomes_skip_a_full_range_count_and_count_glob_matches_as_files() {
+        let mut t = Transcript::default();
+        let calls = assistant(vec![
+            use_(
+                "a",
+                "read",
+                json!({"path": "a.rs", "offset": 1, "limit": 2}),
+            ),
+            use_(
+                "b",
+                "read",
+                json!({"path": "b.rs", "offset": 1, "limit": 5}),
+            ),
+            use_("c", "search", json!({"glob": "**/*.md"})),
+            use_("d", "search", json!({"pattern": "fn", "glob": "*.rs"})),
+        ]);
+        t.apply(&ev(calls, 0), m(60));
+        let mut rows = Vec::new();
+        for (id, text) in [
+            ("a", "1|one\n2|two"),
+            ("b", "1|one\n2|two"),
+            ("c", "README.md\ndocs/a.md"),
+            ("d", "src/a.rs\n3|fn a()"),
+        ] {
+            rows.extend(t.apply(&ev(result(id, text, false), 0), m(60)));
+        }
+        let rows = plain(&rows);
+        assert_eq!(rows[0].trim_end(), "● read a.rs:1-2", "{rows:?}");
+        assert!(rows[1].ends_with("2 lines"), "a short file says so");
+        assert!(rows[2].ends_with("2 files"), "{rows:?}");
+        assert!(rows[3].ends_with("2 hits"), "{rows:?}");
+    }
+
+    #[test]
+    fn sandbox_launch_failures_last_until_a_command_runs_or_the_setting_changes() {
+        let mut t = Transcript::default();
+        let run = |t: &mut Transcript, id: &str, text: &str, is_error: bool| {
+            t.apply(
+                &ev(
+                    assistant(vec![use_(id, "bash", json!({"command": "ls"}))]),
+                    0,
+                ),
+                m(60),
+            );
+            t.apply(&ev(result(id, text, is_error), 0), m(60));
+        };
+        run(
+            &mut t,
+            "a",
+            "Sandbox could not start: /x/helper: missing",
+            true,
+        );
+        assert!(t.sandbox_failed);
+        run(&mut t, "b", "no such file\n[exit 1]", true);
+        assert!(!t.sandbox_failed, "a failed command still ran");
+        run(
+            &mut t,
+            "c",
+            "[Sandbox could not start: helper exited 125]\n[exit 125]",
+            true,
+        );
+        assert!(t.sandbox_failed);
+        t.apply(&ev(EventKind::SandboxChanged { enabled: false }, 0), m(60));
+        assert!(!t.sandbox_failed);
     }
 
     #[test]
@@ -2512,6 +2693,15 @@ mod tests {
             "/tmp/ranges-old/x"
         );
         assert_eq!(arg("read", json!({"path": "/etc/hosts"})), "/etc/hosts");
+        assert_eq!(arg("read", json!({"path": "/tmp/ranges"})), "./");
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            arg(
+                "read",
+                json!({"path": format!("{home}/.config/xi/AGENTS.md")})
+            ),
+            "~/.config/xi/AGENTS.md"
+        );
         assert_eq!(
             arg(
                 "read",
@@ -4047,6 +4237,8 @@ mod tests {
         assert_eq!(tokens(950), "950");
         assert_eq!(tokens(14_200), "14.2k");
         assert_eq!(tokens(1_250_000), "1.2M");
+        assert_eq!(tokens(272_000), "272k");
+        assert_eq!(tokens(1_000_000), "1M");
         assert_eq!(duration(4200), "4.2s");
         assert_eq!(duration(72_000), "1m12s");
     }

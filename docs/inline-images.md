@@ -1,9 +1,12 @@
 # Inline image previews
 
 xi shows PNG screenshots returned as tool image blocks, including `read`, and
-images in submitted messages. Previews are at most 48 columns by 12 rows and
-include the source dimensions. They appear in inline scrollback and the deck.
-The draft composer still shows an attachment count, not thumbnails.
+images in submitted messages. Previews are at most 64 columns by 16 rows, under
+a dim caption with the source dimensions, such as `png · 2634×2114`. A
+message's previews sit inside its prompt block and replace its `[image]`
+placeholders; without graphics support the placeholders stay. They appear in
+inline scrollback and the deck. The draft composer still shows an attachment
+count, not thumbnails.
 
 Graphics are detected automatically for Kitty and Ghostty (Kitty graphics), and
 iTerm2 and WezTerm (OSC 1337). Unknown terminals and sessions inside tmux or

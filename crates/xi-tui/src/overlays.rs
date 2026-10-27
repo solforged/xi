@@ -256,7 +256,7 @@ impl App {
     }
 
     async fn choose_model(&mut self, entry: ModelEntry) {
-        if !self.idle_only("model selection") {
+        if !self.idle_only("a model change") {
             return;
         }
         if !entry.available {
@@ -378,7 +378,11 @@ impl App {
         if self.turn.queued.is_empty() {
             return true;
         }
-        self.notice(Kind::Warn, "/resume waits for queued prompts to send");
+        self.composer.flash = Some(
+            Line::default()
+                .brass("! ")
+                .ink("/resume waits for queued prompts to send"),
+        );
         false
     }
 
@@ -567,7 +571,7 @@ impl App {
     /// Selects a model or role; the worker answers with the model a role
     /// resolved to, which the footer shows until the next attach.
     pub(crate) async fn set_model(&mut self, model: ModelSelector) -> bool {
-        if !self.idle_only("model selection") {
+        if !self.idle_only("a model change") {
             return false;
         }
         match self.launch.client.set_model(self.session_id(), model).await {
@@ -598,7 +602,7 @@ impl App {
     }
 
     pub(crate) async fn set_reasoning(&mut self, reasoning: Reasoning) {
-        if !self.idle_only("reasoning") {
+        if !self.idle_only("a reasoning change") {
             return;
         }
         match self
@@ -634,7 +638,7 @@ impl App {
     }
 
     pub(crate) async fn set_sandbox(&mut self, enabled: bool) {
-        if !self.idle_only("sandbox changes") {
+        if !self.idle_only("a sandbox change") {
             return;
         }
         match self

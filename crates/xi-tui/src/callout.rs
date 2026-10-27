@@ -14,7 +14,7 @@ use crate::style::{Line, Role, lr, prose, wrap_line};
 /// What a notice or callout says. It picks the mark and its pigment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// Information: a setting changed, a hint, a note. Dim `i`.
+    /// Information: a setting changed, a hint, a note. Dim `◦`.
     Info,
     /// Finished well. Verdigris `✓`.
     Done,
@@ -40,7 +40,7 @@ impl Kind {
     #[must_use]
     pub fn mark(self) -> Line {
         let glyph = match self {
-            Self::Info => "i",
+            Self::Info => "◦",
             Self::Done => "✓",
             Self::Warn => "!",
             Self::Error => "✕",
