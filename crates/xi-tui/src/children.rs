@@ -312,6 +312,12 @@ impl Children {
         rows
     }
 
+    /// Each child's session, in the order [`Self::agents`] lists them.
+    #[must_use]
+    pub fn sessions(&self) -> Vec<SessionId> {
+        self.0.iter().map(|child| child.session).collect()
+    }
+
     /// Each child as the deck's panel lists it.
     #[must_use]
     pub fn agents(&self, frame: usize) -> Vec<AgentRow> {

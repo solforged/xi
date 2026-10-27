@@ -19,9 +19,12 @@ impl App {
             outcome
         } else {
             match action {
-                Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector) => {
-                    Outcome::Stay
-                }
+                Some(
+                    Action::FocusSessions
+                    | Action::FocusLog
+                    | Action::FocusInspector
+                    | Action::FocusAgents,
+                ) => Outcome::Stay,
                 Some(Action::Interrupt) if !self.overlays.is_empty() => {
                     Outcome::Send(Box::new(Command::Dismiss))
                 }
@@ -187,7 +190,12 @@ impl Composer {
                 }
                 None
             }
-            Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector) => {
+            Some(
+                Action::FocusSessions
+                | Action::FocusLog
+                | Action::FocusInspector
+                | Action::FocusAgents,
+            ) => {
                 return Outcome::Stay;
             }
         };

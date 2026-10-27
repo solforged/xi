@@ -1,13 +1,15 @@
 //! The desktop deck, composed without terminal I/O.
 //!
 //! The log keeps the sheet at the left: retained rows from the top, the
-//! composer against the bottom. A side panel on the raised surface takes
-//! at most [`PANEL_MAX`] columns against the right edge, and the log takes
-//! every column left of it: the session's title, what waits on you, its
-//! context, what changed and its running agents while nothing has the keys; the
-//! selected log row while you walk the log; every session while you pick
-//! one. Without room for the panel, a header row carries the session's facts
-//! and the panel's views replace the log while they have the keys.
+//! composer against the bottom, and the workspace under it. A side panel on
+//! the raised surface takes at most [`PANEL_MAX`] columns against the right
+//! edge, and the log takes every column left of it. The panel ends in tabs
+//! naming its views: the session's title, what waits on you, its context and
+//! what changed while nothing has the keys; every session while you pick
+//! one; the selected log row while you walk the log; this session's
+//! subagents while you browse them. Without room for the panel, a header row
+//! carries the session's facts and the panel's views replace the log while
+//! they have the keys.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -15,7 +17,7 @@ use crate::icons::{Icon, Icons};
 use crate::layout::{PANEL_MAX, PANEL_MIN, SHEET};
 use crate::log::Inspect;
 use crate::style::{Line, Role, Span, lr, wrap};
-use crate::transcript::{counted, tokens};
+use crate::transcript::tokens;
 
 /// The widest the overview sets its rows, so counts stay near their names.
 const LIVE_MAX: usize = 72;
@@ -24,8 +26,6 @@ const ASK_ROWS: usize = 3;
 /// Rows the overview gives changed files and their directories before
 /// counting the rest.
 const CHANGED_ROWS: usize = 10;
-/// Agents the overview lists before counting the rest.
-const AGENT_ROWS: usize = 4;
 /// Blank columns on either side of the panel's text.
 const PANEL_PAD: usize = 2;
 
@@ -41,6 +41,8 @@ pub enum Focus {
     Log,
     /// The inspector.
     Inspector,
+    /// This session's subagents.
+    Agents,
 }
 
 /// A session's activity mark.
@@ -76,15 +78,18 @@ pub struct AskRow {
     pub origin: String,
 }
 
-/// A subagent of the call in flight.
+/// A subagent of this session: one the call in flight started, with its
+/// live state, or an earlier one the daemon lists.
 pub struct AgentRow {
-    /// A spinner while it works, `●` once done, `✕` once failed.
+    /// A spinner while it works, `●` once done, `✕` once failed; a listed
+    /// session's mark otherwise.
     pub mark: Line,
-    /// What it was asked, from its first prompt.
+    /// What it was asked, from its first prompt or its title.
     pub title: String,
-    /// Its open call, `thinking`, its answer's first line or its failure.
+    /// Its open call, `thinking`, its answer's first line or its failure;
+    /// empty for an earlier agent.
     pub doing: Line,
-    /// Its time so far.
+    /// Its time so far, or its model and age.
     pub detail: String,
 }
 
@@ -138,8 +143,12 @@ pub struct Panel<'a> {
     pub asks: Vec<AskRow>,
     /// Changed paths and their added and removed line counts.
     pub changed: Vec<(String, usize, usize)>,
-    /// Subagents of the call in flight.
+    /// This session's subagents, the call in flight's first.
     pub agents: Vec<AgentRow>,
+    /// The selected row in the agents view.
+    pub agent: usize,
+    /// Subagents still running, for the agents tab.
+    pub running_agents: usize,
     /// Every session, for the sessions view.
     pub sessions: SessionsPane,
     /// Context occupancy and cache.
@@ -215,8 +224,10 @@ pub fn columns(cols: usize) -> Columns {
 /// Rows available to the log and its dock, excluding deck chrome.
 pub(crate) fn log_height(cols: usize, rows: usize) -> usize {
     if columns(cols).panel.is_some() {
+        // A blank row above and below the log when there is room, and the
+        // workspace's row under it.
         let body = rows.saturating_sub(1);
-        body.saturating_sub(usize::from(body >= 8))
+        body.saturating_sub(2 * usize::from(body >= 8))
     } else {
         rows.saturating_sub(3)
     }
@@ -232,8 +243,9 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
     let Some(panel) = columns.panel else {
         return folded(scene, cols, rows);
     };
-    // Both panes end above one unraised baseline: the workspace under the
-    // log and the sessions key under the panel.
+    // The log ends a blank row above the workspace, which sits in the
+    // composer's text column; the panel runs the whole height and ends in
+    // its view tabs beside the workspace.
     let body = rows - 1;
     // A blank row above the log, when there is room, matches the panel's.
     let top = usize::from(body >= 8);
@@ -243,10 +255,16 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
     } else {
         Line::default().dim("│")
     };
-    let mut out: Vec<Line> = blank(top)
+    let place = Line::default().ink("    ").extend(elide_left(
+        scene.panel.place.clone(),
+        columns.log.saturating_sub(5),
+    ));
+    let out: Vec<Line> = blank(top)
         .into_iter()
         .chain(log)
-        .zip(panel_column(scene, panel, body))
+        .chain(blank(top))
+        .chain(std::iter::once(place))
+        .zip(panel_column(scene, panel, rows))
         .map(|(log, side)| {
             // The panel is the last columns; pad only if a row came up short.
             pad(
@@ -255,14 +273,6 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
             )
         })
         .collect();
-    // The workspace starts in the log's first column, as its rows do.
-    let place = Line::default().ink(" ").extend(elide_left(
-        scene.panel.place.clone(),
-        columns.log.saturating_sub(2),
-    ));
-    let keys = Line::default().muted("alt+1").dim(" sessions");
-    let side = Line::default().ink(" ".repeat(PANEL_PAD)).extend(keys);
-    out.push(pad(pad(place, columns.log).ink(" ").extend(side), cols));
     (out, cursor.map(|(row, col)| (top + row, col + 1)))
 }
 
@@ -281,7 +291,10 @@ fn folded(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option<(us
     let height = rows - 1;
     let inner = cols.saturating_sub(2);
     let gutter = |line: Line| Line::default().ink(" ").extend(line).truncate(cols);
-    if matches!(scene.focus, Focus::Sessions | Focus::Inspector) {
+    if matches!(
+        scene.focus,
+        Focus::Sessions | Focus::Inspector | Focus::Agents
+    ) {
         out.extend(
             panel_rows(scene, inner, height, false)
                 .into_iter()
@@ -377,25 +390,69 @@ fn log_rows(
     (lines, cursor)
 }
 
-/// The panel `width` wide on the raised surface: a blank row above and
-/// below when there is room, and [`PANEL_PAD`] columns either side.
+/// The panel `width` wide on the raised surface, the whole height of the
+/// deck: a blank row above and below its view when there is room, and
+/// [`PANEL_PAD`] columns either side, ending in its view tabs on the
+/// deck's last row.
 fn panel_column(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
-    let edge = usize::from(height >= 8);
+    let edge = usize::from(height > 8);
     let inner = width.saturating_sub(2 * PANEL_PAD);
     let margin = " ".repeat(PANEL_PAD);
-    let blank = Line::default().ink(&margin).raise().fill(width);
-    let body = panel_rows(scene, inner, height - 2 * edge, true);
-    let mut out = Vec::with_capacity(height);
-    out.extend(std::iter::repeat_n(blank.clone(), edge));
-    out.extend(body.into_iter().map(|line| {
+    let row = |line: Line| {
         Line::default()
             .ink(&margin)
             .extend(line.truncate(inner))
             .raise()
             .fill(width)
-    }));
+    };
+    let blank = row(Line::default());
+    let body = panel_rows(scene, inner, height.saturating_sub(2 * edge + 1), true);
+    let mut out = Vec::with_capacity(height);
+    out.extend(std::iter::repeat_n(blank.clone(), edge));
+    out.extend(body.into_iter().map(row));
     out.extend(std::iter::repeat_n(blank, edge));
+    out.push(row(tabs(scene, inner)));
+    out.truncate(height);
     out
+}
+
+/// The panel's views as tabs, the one shown in brass bold: the overview
+/// while the composer has the keys, then sessions (`alt+1`), the
+/// inspector (`alt+2`, `alt+3`) and the agents (`alt+4`), with how many
+/// are running.
+fn tabs(scene: &Scene<'_>, width: usize) -> Line {
+    let active = match scene.focus {
+        Focus::Composer => 0,
+        Focus::Sessions => 1,
+        Focus::Log | Focus::Inspector => 2,
+        Focus::Agents => 3,
+    };
+    let running = scene.panel.running_agents;
+    let agents = if running > 0 {
+        format!("agents {running}")
+    } else {
+        "agents".to_owned()
+    };
+    let names = ["overview", "sessions", "inspect", agents.as_str()];
+    let total: usize = names.iter().map(|name| name.len()).sum();
+    // Two cells part the tabs; a narrow panel closes them to one.
+    let gap = if total + 2 * (names.len() - 1) <= width {
+        "  "
+    } else {
+        " "
+    };
+    let mut line = Line::default();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            line = line.ink(gap);
+        }
+        line = if i == active {
+            line.strong(Role::Brass, *name)
+        } else {
+            line.dim(*name)
+        };
+    }
+    line
 }
 
 /// Exactly `height` panel rows: the focused view, then its keys while a
@@ -413,6 +470,7 @@ fn panel_rows(scene: &Scene<'_>, width: usize, height: usize, beside: bool) -> V
         Focus::Log => &["↑↓ select", "enter prints", "pgup pgdn", "esc back"],
         Focus::Inspector => &["↑↓ scroll", "alt+2 log", "esc back"],
         Focus::Sessions => &["↑↓ move", "enter resumes", "esc back"],
+        Focus::Agents => &["↑↓ move", "enter opens", "esc back"],
     };
     let keys = hint_rows(keys, width);
     let foot = if beside {
@@ -424,6 +482,7 @@ fn panel_rows(scene: &Scene<'_>, width: usize, height: usize, beside: bool) -> V
     let body = height.saturating_sub(keys.len() + gap + foot.len());
     let mut lines = match scene.focus {
         Focus::Sessions => sessions_view(&scene.panel.sessions, icons, width, body),
+        Focus::Agents => agents_view(&scene.panel, width, body),
         _ => inspector_view(&scene.panel, width, body),
     };
     lines.extend(keys);
@@ -596,29 +655,6 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
         top.push(Line::default().dim("nothing yet"));
     }
     top.extend(changes(&panel.changed, w));
-    if !panel.agents.is_empty() {
-        section(
-            &mut top,
-            label("agents"),
-            Line::default().dim(counted(panel.agents.len(), "agent", "agents")),
-        );
-        for agent in panel.agents.iter().take(AGENT_ROWS) {
-            top.push(lr(
-                agent.mark.clone().ink(" ").ink(&agent.title),
-                Line::default().dim(&agent.detail),
-                w,
-            ));
-            top.push(
-                Line::default()
-                    .ink("  ")
-                    .extend(agent.doing.clone())
-                    .truncate(w),
-            );
-        }
-        if panel.agents.len() > AGENT_ROWS {
-            top.push(Line::default().dim(format!("… {} more", panel.agents.len() - AGENT_ROWS)));
-        }
-    }
     let foot = foot(panel, w);
     // The foot keeps its rows; the sections above it are cut first, with
     // a gap between the two.
@@ -884,6 +920,55 @@ fn sessions_view(pane: &SessionsPane, icons: Icons, width: usize, height: usize)
     lines
 }
 
+/// This session's subagents, the call in flight's first, each with its
+/// detail and, while it runs, what it is doing; the selection in view.
+fn agents_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
+    let mut lines = vec![heading("Agents"), Line::default()];
+    if panel.agents.is_empty() {
+        lines.push(Line::default().dim("No subagents in this session yet."));
+    }
+    let mut at = None;
+    for (index, agent) in panel.agents.iter().enumerate() {
+        let selected = index == panel.agent;
+        let lead = if selected {
+            Line::default().brass("› ")
+        } else {
+            Line::default().ink("  ")
+        };
+        let title = if selected {
+            Line::default().brass(format!(" {}", agent.title))
+        } else {
+            Line::default().ink(format!(" {}", agent.title))
+        };
+        let left = lead.extend(agent.mark.clone()).extend(title);
+        let detail = Line::default().dim(&agent.detail);
+        if left.width() + 2 + detail.width() <= width {
+            lines.push(lr(left, detail, width));
+        } else {
+            lines.push(left.truncate(width));
+            lines.push(Line::default().ink("    ").extend(detail).truncate(width));
+        }
+        if !agent.doing.0.is_empty() {
+            lines.push(
+                Line::default()
+                    .ink("    ")
+                    .extend(agent.doing.clone())
+                    .truncate(width),
+            );
+        }
+        if selected {
+            at = Some(lines.len() - 1);
+        }
+    }
+    if let Some(at) = at
+        && at >= height
+    {
+        lines.drain(..=at - height);
+    }
+    lines.resize(height, Line::default());
+    lines
+}
+
 /// The inspected text, wrapped to `width`, with diff rows in their roles.
 fn inspected(inspect: &Inspect, width: usize) -> Vec<Line> {
     let mut body = Vec::new();
@@ -1024,14 +1109,24 @@ mod tests {
                         ("crates/xi-sandbox/src/lib.rs".into(), 21, 12),
                         ("crates/xi-tools/src/bash.rs".into(), 22, 16),
                     ],
-                    agents: vec![AgentRow {
-                        mark: Line::default().brass("┤"),
-                        title: "Audit the proxy's allow list".into(),
-                        doing: Line::default()
-                            .muted("read")
-                            .dim(" crates/xi-sandbox/src/net.rs"),
-                        detail: "12.0s".into(),
-                    }],
+                    agents: vec![
+                        AgentRow {
+                            mark: Line::default().brass("┤"),
+                            title: "Audit the allow list".into(),
+                            doing: Line::default()
+                                .muted("read")
+                                .dim(" crates/xi-sandbox/src/net.rs"),
+                            detail: "12.0s".into(),
+                        },
+                        AgentRow {
+                            mark: Line::default().dim("●"),
+                            title: "Map the egress callers".into(),
+                            doing: Line::default(),
+                            detail: "gpt-6 · 9m".into(),
+                        },
+                    ],
+                    agent: 0,
+                    running_agents: 1,
                     sessions: SessionsPane {
                         here: vec![
                             session(Mark::Current, "Route sandboxed bash", "gpt-6.1-sol · 5m"),
@@ -1175,8 +1270,8 @@ mod tests {
             let (lines, cursor) = render(&scene, cols, 40);
             assert_eq!(lines.len(), 40);
             assert!(lines.iter().all(|line| line.width() == cols));
-            // The dock stays above the shared footer.
-            assert_eq!(cursor, Some((35, 8)));
+            // The dock ends a blank row above the workspace's row.
+            assert_eq!(cursor, Some((34, 8)));
             let side = side(&plain(&lines), cols);
             assert_eq!(side[0].trim_end(), "");
             // The title splits evenly over two rows in the narrow panel.
@@ -1208,26 +1303,24 @@ mod tests {
             assert!(side[changes + 2].starts_with("  lib.rs"));
             assert!(side[changes + 2].trim_end().ends_with("+21 −12"));
             assert_eq!(side[changes + 3].trim_end(), "xi-tools/src");
-            let agents = at("agents");
-            assert!(side[agents].trim_end().ends_with("1 agent"));
-            assert!(side[agents + 1].starts_with("┤ Audit the proxy's allow list"));
-            assert!(side[agents + 1].trim_end().ends_with("12.0s"));
-            assert_eq!(
-                side[agents + 2].trim_end(),
-                "  read crates/xi-sandbox/src/net.rs"
-            );
-            // Other sessions wait for alt+1.
+            // Agents wait for their tab, as other sessions wait for alt+1.
+            assert!(!side.iter().any(|line| line.contains("Audit the allow")));
             assert!(!side.iter().any(|line| line.contains("Port footer")));
             // The newest tool row stays in the log and the inspector.
             assert!(!side.iter().any(|line| line.contains("edit ×5")));
-            // The model and the rules close the panel; the sessions key
-            // shares the log's baseline.
+            // The model and the rules end level with the composer; under a
+            // blank row the tabs share the workspace's row.
             assert_eq!(side[36].trim_end(), "chatgpt/gpt-6 · high");
             assert_eq!(side[37].trim_end(), "ask · sandboxed · trusted");
             assert_eq!(side[38].trim_end(), "");
-            assert_eq!(side[39].trim_end(), "alt+1 sessions");
-            assert!(lines[39].plain().starts_with(" ~/src/xi  main*"));
-            assert!(lines[39].0.iter().all(|span| !span.raised));
+            assert_eq!(side[39].trim_end(), "overview  sessions  inspect  agents 1");
+            assert!(lines[39].plain().starts_with("    ~/src/xi  main*"));
+            assert!(!lines[39].0[0].raised);
+            assert!(
+                lines[39].0.last().unwrap().raised,
+                "the tabs sit on the panel"
+            );
+            assert_eq!(lines[38].plain().trim(), "");
             assert_eq!(side.iter().filter(|l| l.contains("trusted")).count(), 1);
             assert!(!side.iter().any(|line| line.contains("~/src/xi")));
         }
@@ -1239,7 +1332,8 @@ mod tests {
         let mut scene = fixture.scene();
         let (lines, _) = render(&scene, 176, 40);
         let log = columns(176).log;
-        for line in &lines[..lines.len() - 1] {
+        // The panel runs the whole height, its tabs on the last row.
+        for line in &lines {
             let (mut col, mut raised) = (0, Vec::new());
             for span in &line.0 {
                 raised.extend(std::iter::repeat_n(span.raised, span.text.chars().count()));
@@ -1268,12 +1362,7 @@ mod tests {
         assert_eq!(text[0].chars().nth(log), Some(' '));
         scene.surfaces = false;
         let text = plain(&render(&scene, 176, 40).0);
-        assert!(
-            text[..text.len() - 1]
-                .iter()
-                .all(|line| line.chars().nth(log) == Some('│'))
-        );
-        assert_eq!(text.last().unwrap().chars().nth(log), Some(' '));
+        assert!(text.iter().all(|line| line.chars().nth(log) == Some('│')));
     }
 
     #[test]
@@ -1422,7 +1511,6 @@ mod tests {
                 .any(|line| line.starts_with("\u{f420} bash exec"))
         );
         assert!(text.iter().any(|line| line.starts_with("changes")));
-        assert!(text.iter().any(|line| line.starts_with("agents")));
         let mut inspect = fixture.inspect.clone();
         inspect.title = "mcp_lookup docs".into();
         assert_eq!(headline(&inspect, Icons::Nerd), "mcp_lookup docs");
@@ -1584,7 +1672,31 @@ mod tests {
                 .any(|line| line.contains("   › · ledger · Fix export offsets"))
         );
         assert!(text.iter().any(|line| line.contains("   Other workspaces")));
-        assert_eq!(cursor, Some((25, 8)));
+        assert_eq!(cursor, Some((24, 8)));
+        assert!(
+            text[29]
+                .trim_end()
+                .ends_with("overview  sessions  inspect  agents 1")
+        );
+        // alt+4 lists this session's agents: the call in flight's first,
+        // with what each is doing, then earlier ones with model and age.
+        scene.focus = Focus::Agents;
+        scene.panel.agent = 1;
+        let text = plain(&render(&scene, 200, 30).0);
+        let side = side(&text, 200);
+        assert_eq!(side[1].trim_end(), "Agents");
+        assert!(side[3].starts_with("  ┤ Audit the allow list"));
+        assert!(side[3].trim_end().ends_with("12.0s"));
+        assert_eq!(side[4].trim_end(), "    read crates/xi-sandbox/src/net.rs");
+        assert!(side[5].starts_with("› ● Map the egress callers"));
+        assert!(side[5].trim_end().ends_with("gpt-6 · 9m"));
+        assert!(
+            side.iter()
+                .any(|line| line.trim_end().ends_with("esc back"))
+        );
+        let (folded, _) = render(&scene, 120, 30);
+        assert_eq!(plain(&folded)[1], " Agents");
+        scene.focus = Focus::Sessions;
         let (folded, cursor) = render(&scene, 120, 30);
         let text = plain(&folded);
         assert!(text[0].ends_with("think xhigh · ctx 11% · cache 94%"));

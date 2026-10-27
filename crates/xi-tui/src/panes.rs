@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use xi_client::client::ClientNotification;
-use xi_protocol::Timestamp;
 use xi_protocol::methods::client::{EventParams, ListParams, SessionSummary, SettingsReport};
+use xi_protocol::{SessionId, Timestamp};
 
 use crate::approvals::Approval;
 use crate::deck::{
-    self, AskRow, ContextGauge, Focus, LogPane, Mark, Panel, Scene, SessionRow, SessionsPane,
+    self, AgentRow, AskRow, ContextGauge, Focus, LogPane, Mark, Panel, Scene, SessionRow,
+    SessionsPane,
 };
 use crate::icons::Icon;
 use crate::keys::Action;
@@ -24,7 +25,7 @@ use crate::overlay::{Command, Outcome};
 use crate::screen::Screen;
 use crate::sessions::age;
 use crate::style::{Line, Role};
-use crate::transcript::{Transcript, clock};
+use crate::transcript::{SPINNER, Transcript, clock};
 use crate::view::{home, short_reasoning};
 use crate::{App, Display, lineage};
 
@@ -62,6 +63,13 @@ pub(crate) struct Deck {
     pub focus: Focus,
     /// Every top-level session the daemon lists, newest first.
     pub sessions: Vec<SessionSummary>,
+    /// This session's subagent sessions the daemon lists, newest first.
+    pub children: Vec<SessionSummary>,
+    /// The agents view's rows by session: the call in flight's children,
+    /// then the listed ones it lacks.
+    pub agents: Vec<SessionId>,
+    /// Selected row in the agents view.
+    pub agent: usize,
     /// Asks waiting in other sessions.
     pub asks: Vec<Approval>,
     /// Effective settings, for the inspector's session line.
@@ -198,6 +206,17 @@ impl App {
             return;
         };
         if let Ok(mut sessions) = sessions {
+            let mut children: Vec<SessionSummary> = sessions
+                .iter()
+                .filter(|entry| entry.parent_session == Some(current))
+                .cloned()
+                .collect();
+            children.sort_by(|a, b| {
+                b.updated
+                    .cmp(&a.updated)
+                    .then_with(|| a.session.cmp(&b.session))
+            });
+            deck.children = children;
             sessions.retain(|entry| entry.parent_session.is_none());
             sessions.sort_by(|a, b| {
                 b.updated
@@ -219,11 +238,29 @@ impl App {
         screen: &mut Screen<W>,
     ) -> std::io::Result<()> {
         let (live, cursor, dock) = self.live();
+        let roster = self.transcript.children().sessions();
         if let Some(deck) = self.display.deck.as_mut() {
             deck.log.set_viewport(
                 live.len().saturating_sub(dock),
                 deck::log_height(self.display.cols, self.display.rows).saturating_sub(dock),
             );
+            // A child the list lacks yet asks for a fresh list soon.
+            if roster
+                .iter()
+                .any(|id| !deck.children.iter().any(|entry| entry.session == *id))
+                && deck
+                    .refreshed
+                    .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+            {
+                deck.refreshed = None;
+            }
+            deck.agents = roster;
+            for entry in &deck.children {
+                if !deck.agents.contains(&entry.session) {
+                    deck.agents.push(entry.session);
+                }
+            }
+            deck.agent = deck.agent.min(deck.agents.len().saturating_sub(1));
         }
         let meta = self.log_meta();
         let scene = self.scene(&live, cursor, dock, &meta, screen.surfaced());
@@ -517,12 +554,41 @@ impl App {
             .iter()
             .map(|file| (file.path.clone(), file.added, file.removed))
             .collect();
+        // The call in flight's children with their live state, then the
+        // earlier ones the daemon lists, in `deck.agents` order.
+        let children = self.transcript.children();
+        let roster = children.sessions();
+        let mut agents = children.agents(self.display.frame);
+        for entry in &deck.children {
+            if roster.contains(&entry.session) {
+                continue;
+            }
+            let mark = if entry.pending_approvals > 0 {
+                Line::default().brass(icons.get(Icon::Paused))
+            } else if entry.running {
+                Line::default().brass(SPINNER[self.display.frame % SPINNER.len()])
+            } else {
+                Line::default().dim("●")
+            };
+            agents.push(AgentRow {
+                mark,
+                title: entry
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| UNTITLED.to_owned()),
+                doing: Line::default(),
+                detail: format!("{} · {}", entry.model.model, age(entry.updated, now)),
+            });
+        }
         let panel = Panel {
             inspect: deck.log.selected(),
             scrolled: deck.inspector,
             asks,
             changed,
-            agents: self.transcript.children().agents(self.display.frame),
+            agents,
+            agent: deck.agent,
+            running_agents: children.running(),
             sessions,
             context,
             place: self.place(),
@@ -559,7 +625,12 @@ impl Display {
         let Some(deck) = self.deck.as_mut() else {
             return;
         };
-        if columns.panel.is_none() && matches!(deck.focus, Focus::Sessions | Focus::Inspector) {
+        if columns.panel.is_none()
+            && matches!(
+                deck.focus,
+                Focus::Sessions | Focus::Inspector | Focus::Agents
+            )
+        {
             return;
         }
         match mouse.kind {
@@ -581,6 +652,7 @@ impl Display {
             Some(Action::FocusSessions) => Some(Focus::Sessions),
             Some(Action::FocusLog) => Some(Focus::Log),
             Some(Action::FocusInspector) => Some(Focus::Inspector),
+            Some(Action::FocusAgents) => Some(Focus::Agents),
             _ => None,
         };
         if let Some(focus) = focus {
@@ -595,7 +667,7 @@ impl Display {
                     deck.inspector = 0;
                 }
                 Focus::Log => {}
-                Focus::Sessions | Focus::Inspector => deck.log.scroll_end(),
+                Focus::Sessions | Focus::Inspector | Focus::Agents => deck.log.scroll_end(),
             }
             return Some(Outcome::Stay);
         }
@@ -630,6 +702,22 @@ impl Display {
                     )
                     .nth(deck.session)
                     .cloned();
+                if let Some(session) = session {
+                    return Some(Outcome::Send(Box::new(Command::Resume(session))));
+                }
+            }
+            (Focus::Agents, KeyCode::Up) => deck.agent = deck.agent.saturating_sub(1),
+            (Focus::Agents, KeyCode::Down) => {
+                deck.agent = (deck.agent + 1).min(deck.agents.len().saturating_sub(1));
+            }
+            // Opens a listed agent; one the list lacks yet waits for it.
+            (Focus::Agents, KeyCode::Enter) => {
+                let session = deck.agents.get(deck.agent).and_then(|id| {
+                    deck.children
+                        .iter()
+                        .find(|entry| entry.session == *id)
+                        .cloned()
+                });
                 if let Some(session) = session {
                     return Some(Outcome::Send(Box::new(Command::Resume(session))));
                 }

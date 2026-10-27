@@ -45,6 +45,8 @@ pub enum Action {
     FocusLog,
     /// Focus the deck's inspector.
     FocusInspector,
+    /// Focus the deck's agents view.
+    FocusAgents,
     /// Move to the line start.
     Home,
     /// Move to the line end.
@@ -88,6 +90,7 @@ impl Action {
         Self::FocusSessions,
         Self::FocusLog,
         Self::FocusInspector,
+        Self::FocusAgents,
         Self::Home,
         Self::End,
         Self::Left,
@@ -123,6 +126,7 @@ impl Action {
             Self::FocusSessions => "focus_sessions",
             Self::FocusLog => "focus_log",
             Self::FocusInspector => "focus_inspector",
+            Self::FocusAgents => "focus_agents",
             Self::Home => "home",
             Self::End => "end",
             Self::Left => "left",
@@ -159,6 +163,7 @@ impl Action {
             Self::FocusSessions => "focus sessions (deck)",
             Self::FocusLog => "focus log (deck)",
             Self::FocusInspector => "focus inspector (deck)",
+            Self::FocusAgents => "focus agents (deck)",
             Self::Home => "line start",
             Self::End => "line end",
             Self::Left => "previous character",
@@ -339,6 +344,7 @@ impl Default for Keymap {
             (Char('1'), M::ALT, Action::FocusSessions),
             (Char('2'), M::ALT, Action::FocusLog),
             (Char('3'), M::ALT, Action::FocusInspector),
+            (Char('4'), M::ALT, Action::FocusAgents),
             (Char('a'), M::CONTROL, Action::Home),
             (Char('e'), M::CONTROL, Action::End),
             (Char('b'), M::CONTROL, Action::Left),
