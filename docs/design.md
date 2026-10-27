@@ -7,7 +7,7 @@ This document records the design decisions and the reasons behind them. Status o
 ## Goals
 
 - A kernel small enough to audit in an afternoon.
-- One extension mechanism that the built-in tools also use.
+- One tool schema and policy contract for in-process built-ins and extensions.
 - Safe by default: the agent runs without per-command prompts because the sandbox, not the user, is the first line of defense.
 - Prompt-cache-friendly context handling, because caching dominates cost and latency.
 - Sessions that can be branched, replayed and audited.
@@ -258,6 +258,8 @@ The opt-in built-in `task` tool runs children through the same in-process path. 
 The [TypeScript SDK](../sdk/typescript/README.md) runs under Node 26 or Bun without dependencies or a build step.
 
 Built-ins currently implement the same tool schema and policy contract in-process; they do not run over an extension pipe. Content-hash package pinning and hot reload remain unimplemented. Install never runs package scripts.
+
+The kernel checks each built-in's boundary crossings before running it. Execution validates the input without repeating that policy check. `edit`, `write` and `hashline` prepare a temporary file in the destination directory, preserve an existing file's mode, and rename the completed file over the destination. Interrupted preparation leaves the original intact. Search and shell cancellation return error tool results with a `cancelled` message.
 
 ### Providers
 
@@ -574,6 +576,8 @@ Tool processes run sandboxed by default; extensions always run sandboxed. The ke
 - Network: Linux uses a private network namespace with only loopback. macOS denies all IP networking, including connections to host localhost servers and binding in-sandbox loopback servers. The one exception on both platforms is the session's egress proxy ([Egress](#egress)), reached through `HTTP_PROXY`. `Network::Host` allows host IP networking on either platform. The only additional macOS Unix socket access is the system DNS resolver described below.
 - Terminal: the helper starts a new session, so there's no controlling terminal to push input into with `TIOCSTI`.
 
+The kernel's `config` module owns layered loading and trust. Its `schema` submodule defines file settings and defaults, and `approvals` builds preset rules and persists workspace allow rules. The separate `sandbox` module materializes git settings and builds the sandbox specification. Its blocking `probe_host` function gathers host git and developer-tool settings. `Config` caches that snapshot for git materialization and sandbox construction. Session constructors are synchronous, so their first probe still blocks the caller.
+
 Setup failures exit 125, an unrunnable program 126 and a missing program 127. The macOS helper resolves the program on `PATH` before sandboxing, then execs `sandbox-exec`, which execs a second helper stage that execs the target. Every exec preserves the helper's pid and process group. The internal stage requires a launcher marker, removes it from the target environment, and maps target exec failures to 126/127. Failures within Apple's profile installation itself retain `sandbox-exec`'s native status rather than 125.
 
 #### Linux mechanism
@@ -762,8 +766,8 @@ The subscription profile stays inside the Anthropic Messages adapter. It uses Cl
 | `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock, macOS Seatbelt. | Implemented |
 | `xi-kernel` egress proxy | Per-session and per-extension proxy listeners in the worker, the Seatbelt port rule and the Linux in-namespace forwarder in `xi-sandbox`. | Implemented (Linux forwarder compile-checked, not run) |
 | `xi-provider` | Anthropic Messages, OpenAI-compatible Chat and OpenAI Responses adapters, ChatGPT, Grok and opt-in Anthropic subscription sign-in, model registry, hosted web search requests and the Exa search client. Responses replays encrypted reasoning statelessly and speaks Responses Lite for the GPT-6 models. | Implemented (Anthropic subscription CLI verified against a local server; Anthropic live path untested; ChatGPT `gpt-6.1-sol` verified live; hosted search verified live on `chatgpt` and `claude`; Exa verified against a mock and a live key rejection) |
-| `xi-tools` | `read`, exact-string `edit`, `write`, `bash`, `search`, plus opt-in `hashline` edits and `fetch`. | Implemented |
-| `xi-kernel` | Agent loop, context builder, layered config, workspace trust, sandboxed extension host and worker entry point over the daemon pipe. | Implemented |
+| `xi-tools` | In-process `read`, exact-string `edit`, atomic `write`, `bash`, `search`, plus opt-in atomic `hashline` edits and `fetch`. File mutations preserve existing mode bits. | Implemented |
+| `xi-kernel` | Agent loop, context builder, layered config schema and loading, workspace trust, approval synthesis, sandbox materialization, sandboxed extension host and worker entry point over the daemon pipe. | Implemented |
 | `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler, socket activation, unit installation and private-instance mode. | Implemented |
 | `xi-cli` | The `xi` binary: daemon-backed line mode and TUI launch, private-instance headless `-p`, client-protocol `serve`, `trust`, `daemon`, `daemon install`/`uninstall` and internal `worker`. | Implemented |
 | `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |

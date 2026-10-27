@@ -70,8 +70,7 @@ pub(crate) fn run(
     ctx: &Context,
     anchors: bool,
 ) -> Result<Ran, String> {
-    // Tool::run has already validated the arguments before dispatch.
-    let input: Input = parse(value)?;
+    let input = input(value)?;
     let root = paths::resolve(&input.path, ctx)?;
     let matcher = input.matcher()?;
     let glob = input.glob()?;
@@ -90,7 +89,7 @@ pub(crate) fn run(
     let mut truncated = false;
     for entry in builder.build() {
         if ctx.cancel.is_cancelled() {
-            return Err("Search cancelled".into());
+            return Ok(output::text(call, "[cancelled]".into(), true, ctx));
         }
         let entry = entry.map_err(|error| error.to_string())?;
         if !entry.file_type().is_some_and(|ty| ty.is_file()) {

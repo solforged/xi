@@ -83,6 +83,20 @@ pub(crate) fn truncate(
     }
 }
 
+// Retain a complete UTF-8 code point at each clipped buffer boundary.
+const UTF8_BOUNDARY_SLACK: usize = 4;
+
+fn retain_tail(tail: &mut VecDeque<u8>, bytes: &[u8], capacity: usize) {
+    if bytes.len() >= capacity {
+        tail.clear();
+        tail.extend(&bytes[bytes.len() - capacity..]);
+    } else {
+        let discard = (tail.len() + bytes.len()).saturating_sub(capacity);
+        tail.drain(..discard);
+        tail.extend(bytes);
+    }
+}
+
 // Before spilling, head holds the complete output. After spilling, only a
 // bounded prefix and ring-buffer suffix remain. Writes stream straight to disk.
 pub(crate) struct Capture {
@@ -109,28 +123,20 @@ impl Capture {
             self.head.extend_from_slice(bytes);
             return Ok(());
         }
+        let head_limit = self.limit.div_ceil(2).saturating_add(UTF8_BOUNDARY_SLACK);
+        let tail_limit = (self.limit / 2).saturating_add(UTF8_BOUNDARY_SLACK);
         if self.file.is_none() {
             fs::create_dir_all(self.path.parent().expect("spill directory"))?;
             let mut file = File::create(&self.path)?;
             file.write_all(&self.head)?;
-            let start = self.head.len().saturating_sub(self.limit / 2 + 4);
-            self.tail.extend(&self.head[start..]);
-            self.head.truncate(self.limit.div_ceil(2).saturating_add(4));
+            retain_tail(&mut self.tail, &self.head, tail_limit);
+            self.head.truncate(head_limit);
             self.file = Some(file);
         }
         self.file.as_mut().expect("spill opened").write_all(bytes)?;
-        let head_limit = self.limit.div_ceil(2).saturating_add(4);
         let take = bytes.len().min(head_limit.saturating_sub(self.head.len()));
         self.head.extend_from_slice(&bytes[..take]);
-        let capacity = self.limit / 2 + 4;
-        if bytes.len() >= capacity {
-            self.tail.clear();
-            self.tail.extend(&bytes[bytes.len() - capacity..]);
-        } else {
-            let discard = (self.tail.len() + bytes.len()).saturating_sub(capacity);
-            self.tail.drain(..discard);
-            self.tail.extend(bytes);
-        }
+        retain_tail(&mut self.tail, bytes, tail_limit);
         Ok(())
     }
 

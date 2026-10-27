@@ -16,6 +16,7 @@ pub mod context;
 mod egress;
 mod extension_session;
 pub mod extensions;
+pub mod sandbox;
 pub mod settings;
 mod task;
 pub mod title;
@@ -475,7 +476,12 @@ impl Session {
         let spill = spill.canonicalize()?;
         let tmp = tmp.canonicalize()?;
         let git = log.file_path().with_extension("git");
-        config::write_sandbox_git(&git, &config.paths, config.sandbox.ssh_agent)?;
+        sandbox::write_sandbox_git(
+            &git,
+            &config.paths,
+            config.sandbox.ssh_agent,
+            config.host_probe(),
+        )?;
         let git = git.canonicalize()?;
         let mut sandbox = config.sandbox_spec(&tmp, &spill, &system.skill_roots, &git)?;
         let listener = if sandbox.enabled {
@@ -846,7 +852,7 @@ impl Session {
         let mut sandbox = state.tools_context.sandbox.clone();
         sandbox.enabled = enabled;
         let listener = if enabled {
-            config::validate_sandbox(&sandbox)?;
+            sandbox::validate_sandbox(&sandbox)?;
             let listener = egress::Listener::bind("tools")?;
             sandbox.egress = Some(listener.egress().clone());
             Some(listener)

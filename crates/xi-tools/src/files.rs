@@ -1,5 +1,8 @@
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, Write as _};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use serde::Deserialize;
@@ -302,7 +305,7 @@ pub(crate) fn write(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<R
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     check_cancel(ctx)?;
-    fs::write(&path, &input.content).map_err(|e| e.to_string())?;
+    atomic_write(&path, input.content.as_bytes()).map_err(|e| e.to_string())?;
     Ok(output::text(
         call,
         format!(
@@ -333,7 +336,7 @@ pub(crate) fn edit(call: &ToolCallId, input: &Value, ctx: &Context) -> Result<Ra
     }
     let changed = text.replace(&input.old, &input.new);
     check_cancel(ctx)?;
-    fs::write(&path, changed).map_err(|e| e.to_string())?;
+    atomic_write(&path, changed.as_bytes()).map_err(|e| e.to_string())?;
     Ok(output::text(
         call,
         format!("Replaced {count} occurrence(s) in {}.", input.path),
@@ -442,7 +445,7 @@ pub(crate) fn hashline(call: &ToolCallId, input: &Value, ctx: &Context) -> Resul
         }
     }
     check_cancel(ctx)?;
-    fs::write(&path, changed).map_err(|e| e.to_string())?;
+    atomic_write(&path, changed.as_bytes()).map_err(|e| e.to_string())?;
     let mut out = format!("Edited {}.\n", input.path);
     let mut shown = 0;
     for (start, end) in regions {
@@ -474,5 +477,83 @@ fn check_cancel(ctx: &Context) -> Result<(), String> {
         Err("Tool cancelled; no changes written".into())
     } else {
         Ok(())
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write_with(path, bytes, |temporary, target| {
+        fs::rename(temporary, target)
+    })
+}
+
+fn atomic_write_with(
+    path: &Path,
+    bytes: &[u8],
+    commit: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let parent = path.parent().expect("resolved file has a parent");
+    let (temporary, mut file) = loop {
+        let name = format!(
+            ".xi-write-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let temporary = parent.join(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(
+                permissions
+                    .as_ref()
+                    .map_or(0o644, |mode| mode.mode() & 0o777),
+            );
+        }
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let prepared = (|| {
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()
+    })();
+    drop(file);
+    let result = prepared.and_then(|()| commit(&temporary, path));
+    // On failure the original remains intact. A crash can leave only this
+    // temporary file behind, never a partially overwritten destination.
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_atomic_write_leaves_original_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("original");
+        fs::write(&target, "original").unwrap();
+        let result = atomic_write_with(&target, b"replacement", |temporary, destination| {
+            assert_eq!(temporary.parent(), destination.parent());
+            assert_eq!(fs::read(temporary).unwrap(), b"replacement");
+            assert_eq!(fs::read(destination).unwrap(), b"original");
+            Err(io::Error::other("interrupted before rename"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }
