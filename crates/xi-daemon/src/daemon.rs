@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -15,9 +13,9 @@ use tokio::time::Instant;
 use xi_kernel::config::{DaemonSettings, Paths, sessions_root};
 use xi_protocol::event::EventKind;
 use xi_protocol::methods::{client::*, worker::*};
-use xi_protocol::rpc::{RequestId, RpcError};
+use xi_protocol::rpc::{NotificationMethod, RequestId, RequestMethod, RpcError};
 use xi_protocol::{Block, Decision, Event, EventId, SessionId, Timestamp, ToolCallId};
-use xi_rpc::{Incoming, Peer, PeerError};
+use xi_rpc::{Incoming, Peer, PeerError, decode_notification, decode_request, encode_result};
 
 use crate::scheduler::Scheduler;
 use crate::spawn::{Spawner, WorkerProcess};
@@ -397,8 +395,8 @@ impl Router {
         let Some(connection) = self.clients.get(&client) else {
             return Ok(());
         };
-        if method == "initialize" {
-            let params: InitializeParams = decode(params)?;
+        if method == Initialize::METHOD {
+            let params = decode_request::<Initialize>(params)?;
             if params.protocol_version != xi_protocol::PROTOCOL_VERSION {
                 return Err(RpcError::with_data(
                     RpcError::VERSION_MISMATCH,
@@ -414,7 +412,7 @@ impl Router {
             self.respond(
                 client,
                 id,
-                encode(InitializeResult {
+                encode_result::<Initialize>(InitializeResult {
                     protocol_version: xi_protocol::PROTOCOL_VERSION,
                     daemon_version: env!("CARGO_PKG_VERSION").into(),
                     capabilities: Capabilities {
@@ -431,20 +429,33 @@ impl Router {
             ));
         }
         match method {
-            "session/create" => {
-                self.start(client, id, WorkerStartParams::Create(decode(params)?))?
-            }
-            "session/open" => self.start(client, id, WorkerStartParams::Open(decode(params)?))?,
-            "session/attach" => {
-                let attach: AttachParams = decode_ref(&params)?;
+            SessionCreate::METHOD => self.start(
+                client,
+                id,
+                WorkerStartParams::Create(decode_request::<SessionCreate>(params)?),
+            )?,
+            SessionOpen::METHOD => self.start(
+                client,
+                id,
+                WorkerStartParams::Open(decode_request::<SessionOpen>(params)?),
+            )?,
+            SessionAttach::METHOD => {
+                // Attach is forwarded unchanged. Decode only to register the
+                // attachment here; the worker owns the typed response.
+                let attach: <SessionAttach as RequestMethod>::Params =
+                    serde::Deserialize::deserialize(&params).map_err(
+                        |error: serde_json::Error| {
+                            RpcError::new(RpcError::INVALID_PARAMS, error.to_string())
+                        },
+                    )?;
                 let worker = self.require_worker(attach.session)?;
                 if let Some(connection) = self.clients.get_mut(&client) {
                     connection.attached.insert(attach.session);
                 }
                 self.forward(Some(client), Some(id), worker, method, params);
             }
-            "session/detach" => {
-                let session: SessionRef = decode(params)?;
+            SessionDetach::METHOD => {
+                let session = decode_request::<SessionDetach>(params)?;
                 if let Some(connection) = self.clients.get_mut(&client) {
                     connection.attached.remove(&session.session);
                 }
@@ -455,10 +466,10 @@ impl Router {
                 {
                     worker.reset_idle();
                 }
-                self.respond(client, id, Ok(Value::Null));
+                self.respond(client, id, encode_result::<SessionDetach>(()));
             }
-            "session/list" => {
-                let filters: ListParams = decode(params)?;
+            SessionList::METHOD => {
+                let filters = decode_request::<SessionList>(params)?;
                 if filters.running == Some(true)
                     && let Some(connection) = self.clients.get_mut(&client)
                 {
@@ -503,14 +514,14 @@ impl Router {
                         })
                         .await
                         .map_err(internal)?
-                        .and_then(encode)
+                        .and_then(encode_result::<SessionList>)
                     }
                     .await;
                     let _ = peer.respond(id, result);
                 });
             }
-            "config/settings" => {
-                let params: SettingsParams = decode(params)?;
+            ConfigSettings::METHOD => {
+                let params = decode_request::<ConfigSettings>(params)?;
                 settings_paths(&params.cwd, &params.configs)?;
                 let paths = self.options.paths.clone();
                 let Some(peer) = self
@@ -528,12 +539,12 @@ impl Router {
                     .await
                     .map_err(internal)
                     .and_then(|result| result)
-                    .and_then(encode);
+                    .and_then(encode_result::<ConfigSettings>);
                     let _ = peer.respond(id, result);
                 });
             }
-            "config/set" => {
-                let params: SetSettingParams = decode(params)?;
+            ConfigSet::METHOD => {
+                let params = decode_request::<ConfigSet>(params)?;
                 settings_paths(&params.cwd, &params.configs)?;
                 let paths = self.options.paths.clone();
                 let edits = self.config_edits.clone();
@@ -560,12 +571,12 @@ impl Router {
                     .await
                     .map_err(internal)
                     .and_then(|result| result)
-                    .and_then(encode);
+                    .and_then(encode_result::<ConfigSet>);
                     let _ = peer.respond(id, result);
                 });
             }
-            "approval/list" => {
-                decode::<()>(params)?;
+            ApprovalList::METHOD => {
+                decode_request::<ApprovalList>(params)?;
                 let mut approvals: Vec<_> = self.inbox.values().cloned().collect();
                 approvals.sort_by(|(at, a), (bt, b)| {
                     (at, a.session, &a.call).cmp(&(bt, b.session, &b.call))
@@ -573,7 +584,7 @@ impl Router {
                 self.respond(
                     client,
                     id,
-                    encode(
+                    encode_result::<ApprovalList>(
                         approvals
                             .into_iter()
                             .map(|(_, approval)| approval)
@@ -581,12 +592,12 @@ impl Router {
                     ),
                 );
             }
-            "daemon/status" => {
-                decode::<()>(params)?;
+            DaemonStatus::METHOD => {
+                decode_request::<DaemonStatus>(params)?;
                 self.respond(
                     client,
                     id,
-                    encode(StatusResult {
+                    encode_result::<DaemonStatus>(StatusResult {
                         version: env!("CARGO_PKG_VERSION").into(),
                         pid: std::process::id(),
                         uptime_secs: self.started.elapsed().as_secs(),
@@ -596,25 +607,32 @@ impl Router {
                     }),
                 );
             }
-            "daemon/shutdown" => {
-                let shutdown: ShutdownParams = decode(params)?;
-                self.respond(client, id, Ok(Value::Null));
+            DaemonShutdown::METHOD => {
+                let shutdown = decode_request::<DaemonShutdown>(params)?;
+                self.respond(client, id, encode_result::<DaemonShutdown>(()));
                 self.begin_shutdown(shutdown.when);
             }
-            "session/close"
-            | "session/prompt"
-            | "session/cancel"
-            | "session/checkout"
-            | "session/compact"
-            | "session/set_model"
-            | "session/set_reasoning"
-            | "session/set_sandbox"
-            | "session/rename"
-            | "session/models"
-            | "session/commands"
-            | "session/command"
-            | "approval/resolve" => {
-                let session: SessionRef = decode_ref(&params)?;
+            SessionClose::METHOD
+            | SessionPrompt::METHOD
+            | SessionCancel::METHOD
+            | SessionCheckout::METHOD
+            | SessionCompact::METHOD
+            | SessionSetModel::METHOD
+            | SessionSetReasoning::METHOD
+            | SessionSetSandbox::METHOD
+            | SessionRename::METHOD
+            | SessionModels::METHOD
+            | SessionCommands::METHOD
+            | SessionCommand::METHOD
+            | ApprovalResolve::METHOD => {
+                // These session requests and their results pass through
+                // unchanged. The worker decodes the full method parameters;
+                // the daemon reads only the routing session.
+                let session: SessionRef = serde::Deserialize::deserialize(&params).map_err(
+                    |error: serde_json::Error| {
+                        RpcError::new(RpcError::INVALID_PARAMS, error.to_string())
+                    },
+                )?;
                 let worker = self.require_worker(session.session)?;
                 self.forward(Some(client), Some(id), worker, method, params);
             }
@@ -820,7 +838,8 @@ impl Router {
                 } else {
                     result.pending_approvals.clear();
                 }
-                self.respond(client, request, encode(result));
+                // Forward the worker's readiness result to create/open.
+                self.respond(client, request, encode_result::<WorkerStart>(result));
                 for (method, params) in buffered {
                     self.notification(key, &method, params);
                 }
@@ -849,21 +868,21 @@ impl Router {
         let Some(worker) = self.workers.get_mut(&key) else {
             return;
         };
-        if method == "session/compact" {
+        if method == SessionCompact::METHOD {
             worker.compactions += 1;
         }
-        if matches!(method, "session/prompt" | "session/compact") {
+        if matches!(method, SessionPrompt::METHOD | SessionCompact::METHOD) {
             worker.reset_idle();
         }
-        if method == "session/close" {
+        if method == SessionClose::METHOD {
             worker.begin_close(key, &self.commands);
         }
         self.forwards += 1;
         let commands = self.commands.clone();
-        let checkout = if method == "session/checkout" {
+        let checkout = if method == SessionCheckout::METHOD {
             params
                 .get("event")
-                .and_then(|value| decode_ref::<EventId>(value).ok())
+                .and_then(|value| serde::Deserialize::deserialize(value).ok())
         } else {
             None
         };
@@ -897,38 +916,38 @@ impl Router {
         self.forwards = self.forwards.saturating_sub(1);
         let mut wait_exit = false;
         if let Some(worker) = self.workers.get_mut(&key) {
-            if method == "session/compact" {
+            if method == SessionCompact::METHOD {
                 worker.compactions = worker.compactions.saturating_sub(1);
             }
-            if matches!(method, "session/prompt" | "session/compact") {
+            if matches!(method, SessionPrompt::METHOD | SessionCompact::METHOD) {
                 worker.reset_idle();
             }
             if result.is_ok() {
-                if method == "session/attach" {
+                if method == SessionAttach::METHOD {
                     if let Some(info) = result
                         .as_ref()
                         .ok()
                         .and_then(|value| value.get("info"))
-                        .and_then(|value| decode_ref::<SessionDetails>(value).ok())
+                        .and_then(|value| serde::Deserialize::deserialize(value).ok())
                     {
                         worker.info = Some(info);
                     }
-                } else if method == "session/checkout" {
+                } else if method == SessionCheckout::METHOD {
                     if let (Some(info), Some(head)) = (&mut worker.info, checkout) {
                         info.head = head;
                     }
-                } else if matches!(method, "session/prompt" | "session/compact")
+                } else if matches!(method, SessionPrompt::METHOD | SessionCompact::METHOD)
                     && let Some(head) = result
                         .as_ref()
                         .ok()
                         .and_then(|value| value.get("head"))
-                        .and_then(|head| decode_ref::<EventId>(head).ok())
+                        .and_then(|head| serde::Deserialize::deserialize(head).ok())
                     && let Some(info) = &mut worker.info
                 {
                     info.head = head;
                 }
             }
-            if method == "session/close" {
+            if method == SessionClose::METHOD {
                 if result.is_ok() {
                     worker.begin_close(key, &self.commands);
                 } else if worker.kill.is_some() && self.shutdown != Some(ShutdownWhen::Now) {
@@ -956,7 +975,7 @@ impl Router {
                 let Some(peer) = self.workers.get(&key).map(|worker| worker.peer.clone()) else {
                     return;
                 };
-                if method != "model/lease" {
+                if method != ModelLease::METHOD {
                     let _ = peer.respond(
                         id,
                         Err(RpcError::new(
@@ -966,7 +985,7 @@ impl Router {
                     );
                     return;
                 }
-                match decode::<LeaseParams>(params) {
+                match decode_request::<ModelLease>(params) {
                     Ok(params) => grant(self.scheduler.acquire(key, params.endpoint, (peer, id))),
                     Err(error) => {
                         let _ = peer.respond(id, Err(error));
@@ -974,13 +993,13 @@ impl Router {
                 }
             }
             Incoming::Notification { method, params } => {
-                if method == "model/release" {
-                    if let Ok(params) = decode::<LeaseParams>(params) {
+                if method == ModelRelease::METHOD {
+                    if let Ok(params) = decode_notification::<ModelRelease>(params) {
                         grant(self.scheduler.release(key, &params.endpoint));
                     }
                 } else if matches!(
                     method.as_str(),
-                    "event/appended" | "stream/delta" | "stream/reset"
+                    EventAppended::METHOD | StreamDelta::METHOD | StreamReset::METHOD
                 ) {
                     let Some(worker) = self.workers.get_mut(&key) else {
                         return;
@@ -1005,9 +1024,15 @@ impl Router {
             return;
         };
         let notification = match method {
-            "event/appended" => decode(params).map(WorkerNotification::Event),
-            "stream/delta" => decode(params).map(WorkerNotification::Delta),
-            "stream/reset" => decode(params).map(WorkerNotification::Reset),
+            EventAppended::METHOD => {
+                decode_notification::<EventAppended>(params).map(WorkerNotification::Event)
+            }
+            StreamDelta::METHOD => {
+                decode_notification::<StreamDelta>(params).map(WorkerNotification::Delta)
+            }
+            StreamReset::METHOD => {
+                decode_notification::<StreamReset>(params).map(WorkerNotification::Reset)
+            }
             _ => return,
         };
         let Ok(notification) = notification else {
@@ -1112,7 +1137,7 @@ impl Router {
             self.respond(client, id, Err(worker_exited()));
         }
         for (client, id) in worker.close_replies {
-            self.respond(client, id, Ok(Value::Null));
+            self.respond(client, id, encode_result::<SessionClose>(()));
         }
         if let Some(info) = worker.info {
             self.inbox
@@ -1156,10 +1181,12 @@ impl Router {
                 let commands = self.commands.clone();
                 tokio::spawn(async move {
                     let params = json!({ "session": session });
-                    let _ = peer.request_value("session/cancel", params.clone()).await;
+                    let _ = peer
+                        .request_value(SessionCancel::METHOD, params.clone())
+                        .await;
                     let result = loop {
                         let result = peer
-                            .request_value("session/close", params.clone())
+                            .request_value(SessionClose::METHOD, params.clone())
                             .await
                             .map_err(peer_error);
                         if matches!(&result, Err(error) if error.code == RpcError::SESSION_RUNNING)
@@ -1173,7 +1200,7 @@ impl Router {
                         client: None,
                         id: None,
                         worker: key,
-                        method: "session/close".into(),
+                        method: SessionClose::METHOD.into(),
                         checkout: None,
                         result,
                     });
@@ -1264,7 +1291,7 @@ impl Router {
                 None,
                 None,
                 key,
-                "session/close",
+                SessionClose::METHOD,
                 json!({ "session": session }),
             );
         } else {
@@ -1333,7 +1360,7 @@ fn worker_running(
 ) -> Result<impl Future<Output = Result<bool, RpcError>> + Send + 'static + use<>, RpcError> {
     let reply = peer
         .start_request_value(
-            "session/attach",
+            SessionAttach::METHOD,
             json!({ "session": info.session, "since": info.head }),
         )
         .map_err(peer_error)?;
@@ -1577,7 +1604,7 @@ impl LogIndex {
 
 fn grant(replies: Vec<Reply>) {
     for (peer, id) in replies {
-        let _ = peer.respond(id, Ok(Value::Null));
+        let _ = peer.respond(id, encode_result::<ModelLease>(()));
     }
 }
 
@@ -1595,20 +1622,6 @@ fn settings_paths(cwd: &Path, configs: &[PathBuf]) -> Result<(), RpcError> {
         ));
     }
     Ok(())
-}
-
-fn decode<T: DeserializeOwned>(value: Value) -> Result<T, RpcError> {
-    serde_json::from_value(value)
-        .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))
-}
-
-fn decode_ref<T: DeserializeOwned>(value: &Value) -> Result<T, RpcError> {
-    serde::Deserialize::deserialize(value)
-        .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))
-}
-
-fn encode(value: impl Serialize) -> Result<Value, RpcError> {
-    serde_json::to_value(value).map_err(internal)
 }
 
 fn internal(error: impl std::fmt::Display) -> RpcError {
@@ -1742,7 +1755,11 @@ mod tests {
                 during: during.map(Into::into),
                 extension: extension.map(Into::into),
             };
-            router.notification(1, "event/appended", json!(EventParams { session, event }));
+            router.notification(
+                1,
+                EventAppended::METHOD,
+                json!(EventParams { session, event }),
+            );
             assert_eq!(router.inbox[&(session, id.into())].1.tool, tool);
         }
         assert_eq!(router.inbox.len(), 5);
@@ -1755,7 +1772,11 @@ mod tests {
                 by: xi_protocol::event::Approver::User,
                 remember: xi_protocol::event::Remember::Once,
             };
-            router.notification(1, "event/appended", json!(EventParams { session, event }));
+            router.notification(
+                1,
+                EventAppended::METHOD,
+                json!(EventParams { session, event }),
+            );
             assert!(!router.inbox.contains_key(&(session, id.into())));
             assert_eq!(router.workers[&1].tools[&"bash-call".into()], "bash");
         }
