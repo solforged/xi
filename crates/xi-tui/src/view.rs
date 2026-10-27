@@ -249,7 +249,8 @@ impl App {
     }
 
     /// The live region, its cursor, and how many of its last rows the deck
-    /// keeps against the bottom: frames, the composer and its status row.
+    /// keeps against the bottom: frames and the composer, whose model row
+    /// carries the turn's activity.
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>, usize) {
         let m = self.measure();
         let cols = m.out;
@@ -324,9 +325,18 @@ impl App {
             };
             let (mut block, cursor) = self.editor.render(cols, border, "", form);
             let bar = || Line::default().span(border, false, "┃");
+            // The model shares its row with the turn's activity, and the
+            // keys while there is room, so the block ends on the bottom
+            // row as the panel does.
+            let room = cols.saturating_sub(3);
+            let model = self.model_line();
+            let mut right = activity.clone().unwrap_or_default();
+            if self.running() && model.width() + right.width() + hint.len() + 6 <= room {
+                right = right.dim(" · ").dim(hint);
+            }
             // A blank row parts the draft from the model, as above it.
             block.push(bar().raise());
-            block.push(bar().ink("  ").extend(self.model_line()).raise());
+            block.push(bar().ink("  ").extend(lr(model, right, room)).raise());
             block.push(bar().raise());
             (block, cursor)
         } else {
@@ -376,14 +386,6 @@ impl App {
         lines.extend(composer);
         if !deck {
             lines.push(self.footer(cols));
-        } else if !framed {
-            // The deck's keys need no reminder until a turn changes them.
-            let keys = if self.running() {
-                Line::default().dim(hint)
-            } else {
-                Line::default()
-            };
-            lines.push(lr(activity.unwrap_or_default(), keys, cols));
         }
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
         let hidden = lines.len().saturating_sub(m.live_rows());

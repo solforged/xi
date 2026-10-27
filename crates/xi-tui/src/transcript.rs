@@ -81,8 +81,11 @@ impl Thinking {
                     .skip(skip)
                     .enumerate()
                     .map(|(i, row)| {
-                        let lead = if i == 0 { "  ∴" } else { "  │" };
-                        let line = Line::default().dim(lead);
+                        let line = if i == 0 {
+                            Line::default().ink("  ").rubric("∴")
+                        } else {
+                            Line::default().ink("  ").dim("│")
+                        };
                         if row.width() == 0 {
                             line
                         } else {
@@ -96,7 +99,8 @@ impl Thinking {
                 .rfind(|line| !line.trim().is_empty())
                 .map(|row| {
                     Line::default()
-                        .dim("  ∴ ")
+                        .ink("  ")
+                        .rubric("∴ ")
                         .extend(inline(row, Role::Dim).italic())
                         .truncate(m.out)
                 })
@@ -113,9 +117,9 @@ impl Thinking {
             return Vec::new();
         }
         let (title, body) = titled(text);
-        let head = Line::default().dim("∴ ");
+        let head = Line::default().rubric("∴ ");
         let head = match title {
-            Some(title) => head.strong(Role::Ink, inline(title, Role::Ink).plain()),
+            Some(title) => head.strong(Role::Muted, inline(title, Role::Ink).plain()),
             None => head.dim("thinking"),
         };
         let meta = if m.durations() {
@@ -1452,7 +1456,13 @@ impl Transcript {
                         Block::RedactedThinking { .. }
                             if self.thinking_display != Thinking::Hidden =>
                         {
-                            vec![Line::default().dim("  ∴ redacted thinking").truncate(cols)]
+                            vec![
+                                Line::default()
+                                    .ink("  ")
+                                    .rubric("∴ ")
+                                    .dim("redacted thinking")
+                                    .truncate(cols),
+                            ]
                         }
                         _ => Vec::new(),
                     };
@@ -1800,7 +1810,13 @@ impl Transcript {
             };
             lines.extend(display.live_rows(&self.stream_thinking, m));
             if self.redacted_thinking && display != Thinking::Hidden {
-                lines.push(Line::default().dim("  ∴ redacted thinking").truncate(cols));
+                lines.push(
+                    Line::default()
+                        .ink("  ")
+                        .rubric("∴ ")
+                        .dim("redacted thinking")
+                        .truncate(cols),
+                );
             }
         }
         if !self.edits.is_empty() {
@@ -2580,10 +2596,12 @@ mod tests {
         t.set_thinking(Thinking::Full);
         let full = t.live(m(60), 0);
         assert_eq!(full.len(), m(60).stream_rows());
+        // Past the rubric `∴` and the dim bar, the text stays dim.
         assert!(
             full.iter()
-                .all(|line| line.0.iter().all(|span| span.role == Role::Dim))
+                .all(|line| { line.0.iter().skip(2).all(|span| span.role == Role::Dim) })
         );
+        assert_eq!(full[0].0[1].role, Role::Rubric);
         assert!(
             plain(&full)
                 .iter()
@@ -3422,7 +3440,7 @@ mod tests {
                 .unwrap();
             assert_eq!(rows[head].width(), m(cols).out);
             assert!(rows[head].0.iter().any(|span| {
-                span.text == "Planning the spawn path" && span.role == Role::Ink && span.bold
+                span.text == "Planning the spawn path" && span.role == Role::Muted && span.bold
             }));
             assert!(rows[head].plain().ends_with(if cols == 60 {
                 "14.0s"
