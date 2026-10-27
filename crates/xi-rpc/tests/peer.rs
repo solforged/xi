@@ -6,8 +6,8 @@ use futures::poll;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
 use tokio::time::timeout;
-use xi_rpc::{Incoming, Peer, PeerError};
 use xi_protocol::rpc::{Message, NotificationMethod, Outcome, RequestId, RequestMethod, RpcError};
+use xi_rpc::{Incoming, Peer, PeerError};
 
 struct Echo;
 

@@ -7,7 +7,6 @@ use tokio::io::{duplex, split};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use xi_client::client::{Client, ClientError, ClientNotification};
-use xi_rpc::{Incoming, Peer, PeerError};
 use xi_protocol::content::Block;
 use xi_protocol::event::{Event, EventKind, ModelRef, Remember};
 use xi_protocol::ids::{EventId, SessionId, Timestamp};
@@ -16,6 +15,7 @@ use xi_protocol::methods::client::*;
 use xi_protocol::methods::extension::CommandResult;
 use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestId, RequestMethod, RpcError};
+use xi_rpc::{Incoming, Peer, PeerError};
 
 async fn request(incoming: &mut mpsc::UnboundedReceiver<Incoming>) -> (RequestId, String, Value) {
     let Incoming::Request { id, method, params } = timeout(Duration::from_secs(1), incoming.recv())

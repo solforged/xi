@@ -8,7 +8,6 @@ use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::{Notify, mpsc, oneshot};
-use xi_rpc::{Incoming, Peer, PeerError};
 use xi_daemon::{Daemon, DaemonOptions, InProcessSpawner, Spawner, WorkerProcess};
 use xi_kernel::Backend;
 use xi_kernel::config::{DaemonSettings, Paths};
@@ -18,6 +17,7 @@ use xi_protocol::model::{ModelInfo, Reasoning};
 use xi_protocol::rpc::{RequestMethod, RpcError};
 use xi_protocol::{Block, EventId, EventKind, SessionId, Timestamp};
 use xi_provider::{Provider, Request, Response};
+use xi_rpc::{Incoming, Peer, PeerError};
 
 struct Script(Mutex<VecDeque<Response>>);
 
