@@ -11,6 +11,12 @@
 //! on a tainted branch. [`WebSearch`] resolves the service when the
 //! toolset is built; the session runs the call, as it does for `task`.
 
+mod exa;
+mod results;
+
+use exa::ExaResult;
+use results::{WebResults, web_results};
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -19,7 +25,7 @@ use xi_protocol::event::{ModelRef, StopReason};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::model::Reasoning;
 use xi_protocol::{Block, OutputBlock, ToolCallId, ToolOutput};
-use xi_provider::{Api, ExaResult, Message, Request, WebResults};
+use xi_provider::{Api, Message, Request};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 use crate::config::{Config, SearchBackend};
@@ -45,7 +51,7 @@ impl Service {
     fn host(&self) -> &str {
         match self {
             Self::Hosted { host, .. } => host,
-            Self::Exa => xi_provider::EXA_HOST,
+            Self::Exa => exa::EXA_HOST,
         }
     }
 }
@@ -168,8 +174,8 @@ impl Session {
             Service::Exa => tokio::select! {
                 biased;
                 () = cancel.cancelled() => return error_output("cancelled"),
-                result = xi_provider::exa_search(&state.config.web_search.exa, &query) => {
-                    result.map(|results| exa_output(&results)).map_err(|error| error.to_string())
+                result = exa::exa_search(&state.config.web_search.exa, &query) => {
+                    result.map(|results| exa_output(&results))
                 }
             },
             Service::Hosted { model, .. } => self
@@ -233,7 +239,7 @@ impl Session {
         if response.stop == StopReason::Cancelled {
             return Err("cancelled".into());
         }
-        Ok(xi_provider::web_results(&response.content))
+        Ok(web_results(&response.content))
     }
 }
 
@@ -293,7 +299,7 @@ fn exa_output(results: &[ExaResult]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use xi_provider::Source;
+    use super::results::Source;
 
     use super::*;
     use crate::config::Paths;

@@ -8,12 +8,12 @@ use base64::Engine;
 use common::*;
 use serde_json::{Value, json};
 use wiremock::MockServer;
-use xi_protocol::{Block, event::ModelRef, model::Reasoning};
+use xi_protocol::{Block, Signature, event::ModelRef, model::Reasoning};
 use xi_provider::{Api, Auth, LoginService, Message, Provider};
 
 fn subscription(server: &MockServer, model: &str) -> (tempfile::TempDir, Arc<dyn Provider>) {
     let credentials = tempfile::tempdir().unwrap();
-    let file = xi_provider::anthropic_file(credentials.path());
+    let file = xi_auth::anthropic_file(credentials.path());
     std::fs::write(
         &file,
         json!({"access_token":"subscription-test-token","refresh_token":"refresh-test-token","expires_at":4_102_444_800_u64}).to_string(),
@@ -104,7 +104,7 @@ async fn tool_names_and_metadata_remain_executable_and_round_trip() {
         response.content[0],
         Block::Thinking {
             text: "keep".into(),
-            signature: Some("signed-history".into()),
+            signature: Some(Signature::Anthropic("signed-history".into())),
         }
     );
     assert_eq!(

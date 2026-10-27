@@ -21,7 +21,7 @@ pub mod skill;
 
 use std::pin::Pin;
 
-pub use content::{Block, OutputBlock, ToolOutput};
+pub use content::{Block, OutputBlock, ProviderTag, Signature, ToolOutput};
 pub use event::{Decision, Event, EventKind, Remember};
 pub use ids::{EventId, ExtensionId, SessionId, Timestamp, ToolCallId};
 

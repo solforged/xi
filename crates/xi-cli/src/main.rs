@@ -310,13 +310,13 @@ fn executable() -> std::io::Result<PathBuf> {
 async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
     match account {
         LoginAccount::Chatgpt => {
-            let login = xi_provider::Login::start().await?;
+            let login = xi_auth::Login::start().await?;
             let line = login_input(
                 login.url(),
                 "ChatGPT",
                 "Signing in on another machine? Paste the address the browser ends up on here.",
             );
-            let file = xi_provider::chatgpt_file(&paths.credentials());
+            let file = xi_auth::chatgpt_file(&paths.credentials());
             let account = login.finish(&file, async { line.await.ok() }).await?;
             let who = match (account.email, account.plan) {
                 (Some(email), Some(plan)) => format!(" as {email} ({plan})"),
@@ -327,13 +327,13 @@ async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
             println!("Signed in to ChatGPT{who}. Use `xi -m chatgpt/gpt-6.1-sol`.");
         }
         LoginAccount::Grok => {
-            let login = xi_provider::GrokLogin::start().await?;
+            let login = xi_auth::GrokLogin::start().await?;
             let line = login_input(
                 login.url(),
                 "Grok",
                 "Signing in on another machine? Paste the final redirect URL here.",
             );
-            let file = xi_provider::grok_file(&paths.credentials());
+            let file = xi_auth::grok_file(&paths.credentials());
             login.finish(&file, async { line.await.ok() }).await?;
             println!("Signed in to Grok. Use `xi -m grok/grok-4.7`.");
         }
@@ -343,13 +343,13 @@ async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
                  This uses Claude Code's OAuth client and may stop working or affect your account.\n\
                  https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use"
             );
-            let login = xi_provider::AnthropicLogin::start().await?;
+            let login = xi_auth::AnthropicLogin::start().await?;
             let line = login_input(
                 login.url(),
                 "Anthropic",
                 "You may paste the final redirect URL or authorization code#state here.",
             );
-            let file = xi_provider::anthropic_file(&paths.credentials());
+            let file = xi_auth::anthropic_file(&paths.credentials());
             login.finish(&file, async { line.await.ok() }).await?;
             println!(
                 "Signed in to Anthropic. Tokens saved to {}.\n\

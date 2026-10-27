@@ -1,16 +1,15 @@
 //! The OpenAI Responses API, as served by `api.openai.com` and by the
 //! ChatGPT Codex backend.
 //!
-//! Requests are stateless (`store: false`). Reasoning comes back encrypted
-//! and is kept as [`Block::Thinking`] whose signature is the JSON object
-//! `{"id", "encrypted_content"}`, so it can be replayed on the next request.
-//! Thinking from other providers has no such signature and is left out.
+//! Requests are stateless (`store: false`). Encrypted reasoning is kept in
+//! [`Signature::Responses`] so it can be replayed on the next request.
+//! Unsigned and foreign thinking is left out.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use xi_protocol::OutputBlock;
+use xi_protocol::{OutputBlock, ProviderTag, Signature};
 
 use crate::sse::Events;
 use crate::transport::{Shape, decode};
@@ -144,27 +143,23 @@ fn assistant(blocks: &[Block], lite: bool, input: &mut Vec<Value>) {
             }
             Block::Thinking {
                 text: summary,
-                signature: Some(signature),
+                signature:
+                    Some(Signature::Responses {
+                        id,
+                        encrypted_content,
+                    }),
             } => {
-                let Some(sealed) = serde_json::from_str::<Value>(signature)
-                    .ok()
-                    .filter(|value| value["encrypted_content"].is_string())
-                else {
-                    continue; // Another provider's signature.
-                };
                 flush(&mut text, input, at);
-                let mut item = json!({
+                let item = json!({
                     "type": "reasoning",
                     "summary": if summary.is_empty() {
                         json!([])
                     } else {
                         json!([{"type": "summary_text", "text": summary}])
                     },
-                    "encrypted_content": sealed["encrypted_content"],
+                    "id": id,
+                    "encrypted_content": encrypted_content,
                 });
-                if let Some(id) = sealed["id"].as_str() {
-                    item["id"] = id.into();
-                }
                 input.push(item);
             }
             Block::ToolUse {
@@ -179,7 +174,10 @@ fn assistant(blocks: &[Block], lite: bool, input: &mut Vec<Value>) {
                     "arguments": arguments.to_string(),
                 }));
             }
-            Block::Opaque { provider, value } if provider == "openai" && value.is_object() => {
+            Block::Opaque {
+                provider: ProviderTag::Openai,
+                value,
+            } if value.is_object() => {
                 flush(&mut text, input, at);
                 input.push(value.clone());
             }
@@ -331,13 +329,16 @@ fn finish(
                     .filter_map(|part| part["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                let signature = item["encrypted_content"].as_str().map(|sealed| {
-                    let mut value = json!({"encrypted_content": sealed});
-                    if let Some(id) = item["id"].as_str() {
-                        value["id"] = id.into();
-                    }
-                    value.to_string()
-                });
+                let signature = match item["encrypted_content"].as_str() {
+                    Some(sealed) => Some(Signature::Responses {
+                        id: item["id"]
+                            .as_str()
+                            .ok_or_else(|| decode("Responses reasoning has no id"))?
+                            .into(),
+                        encrypted_content: sealed.into(),
+                    }),
+                    None => None,
+                };
                 if !text.is_empty() || signature.is_some() {
                     content.push(Block::Thinking { text, signature });
                 }
@@ -361,7 +362,7 @@ fn finish(
                 });
             }
             _ => content.push(Block::Opaque {
-                provider: "openai".into(),
+                provider: ProviderTag::Openai,
                 value: item,
             }),
         }

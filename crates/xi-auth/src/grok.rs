@@ -12,10 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use xi_protocol::BoxFuture;
 
 use crate::oauth;
-use crate::transport::network;
+use crate::network;
 use crate::{Error, ErrorKind};
 
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -139,12 +138,15 @@ impl Login {
     }
 }
 
-pub(crate) struct Signer {
+/// Stored Grok tokens and request authentication headers.
+pub struct Credentials {
     file: PathBuf,
 }
 
-impl Signer {
-    pub(crate) fn new(file: PathBuf) -> Self {
+impl Credentials {
+    /// Uses the token file produced by [`Login::finish`].
+    #[must_use]
+    pub fn new(file: PathBuf) -> Self {
         Self { file }
     }
 
@@ -175,29 +177,29 @@ impl Signer {
     }
 }
 
-impl crate::transport::Signer for Signer {
-    fn sign<'a>(
-        &'a self,
-        client: &'a reqwest::Client,
-        headers: &'a mut HeaderMap,
-    ) -> BoxFuture<'a, Result<(), Error>> {
-        Box::pin(async move {
-            let tokens = self.tokens(client, TOKEN_URL).await?;
-            let mut bearer = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
-                .map_err(|_| malformed())?;
-            bearer.set_sensitive(true);
-            headers.insert(AUTHORIZATION, bearer);
-            headers.insert("x-xai-token-auth", HeaderValue::from_static("xai-grok-cli"));
-            Ok(())
-        })
+impl Credentials {
+    /// Refreshes tokens when needed and sets Grok authentication headers.
+    pub async fn sign(
+        &self,
+        client: &reqwest::Client,
+        headers: &mut HeaderMap,
+    ) -> Result<(), Error> {
+        let tokens = self.tokens(client, TOKEN_URL).await?;
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
+            .map_err(|_| malformed())?;
+        bearer.set_sensitive(true);
+        headers.insert(AUTHORIZATION, bearer);
+        headers.insert("x-xai-token-auth", HeaderValue::from_static("xai-grok-cli"));
+        Ok(())
     }
 
-    fn rejected<'a>(
-        &'a self,
-        client: &'a reqwest::Client,
-        headers: &'a HeaderMap,
-    ) -> BoxFuture<'a, Result<bool, Error>> {
-        Box::pin(self.retry(client, headers, TOKEN_URL))
+    /// Refreshes rejected credentials once, without replaying model requests.
+    pub async fn rejected(
+        &self,
+        client: &reqwest::Client,
+        headers: &HeaderMap,
+    ) -> Result<bool, Error> {
+        self.retry(client, headers, TOKEN_URL).await
     }
 }
 
@@ -445,7 +447,6 @@ async fn serve(listener: &TcpListener, redirect: &str, state: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::Signer as _;
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -635,7 +636,7 @@ mod tests {
         let file = grok_file(dir.path());
         oauth::save(&file, &tokens()).unwrap();
         let mut headers = HeaderMap::new();
-        Signer::new(file)
+        Credentials::new(file)
             .sign(&oauth::client().unwrap(), &mut headers)
             .await
             .unwrap();
@@ -660,7 +661,7 @@ mod tests {
                 .set_body_json(json!({"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600})))
             .expect(1).mount(&server).await;
         let client = oauth::client().unwrap();
-        let signer = Signer::new(file.clone());
+        let signer = Credentials::new(file.clone());
         let url = server.uri();
         let (first, second) =
             tokio::join!(signer.tokens(&client, &url), signer.tokens(&client, &url));
@@ -703,7 +704,7 @@ mod tests {
             HeaderValue::from_static("Bearer opaque-access"),
         );
         assert!(
-            Signer::new(file.clone())
+            Credentials::new(file.clone())
                 .retry(&oauth::client().unwrap(), &headers, &server.uri())
                 .await
                 .unwrap()

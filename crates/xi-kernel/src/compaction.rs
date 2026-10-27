@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio_util::sync::CancellationToken;
 use xi_protocol::event::Usage;
 use xi_protocol::methods::client::CompactResult;
-use xi_protocol::{Block, Event, EventKind, OutputBlock, ToolCallId};
+use xi_protocol::{Block, Event, EventKind, OutputBlock, ProviderTag, Signature, ToolCallId};
 use xi_provider::{Message, Request};
 
 use crate::{Backend, Error, Result, Session, State, context};
@@ -130,7 +130,21 @@ fn value_chars(value: &serde_json::Value) -> u64 {
 fn block_chars(block: &Block) -> u64 {
     match block {
         Block::Text { text } => chars(text),
-        Block::Thinking { text, signature } => chars(text) + signature.as_deref().map_or(0, chars),
+        Block::Thinking { text, signature } => {
+            chars(text)
+                + signature.as_ref().map_or(0, |signature| match signature {
+                    Signature::Anthropic(signature) => chars(signature),
+                    Signature::Responses {
+                        id,
+                        encrypted_content,
+                    } => {
+                        chars("id")
+                            + chars(id)
+                            + chars("encrypted_content")
+                            + chars(encrypted_content)
+                    }
+                })
+        }
         Block::Image { media_type, data } => chars(media_type) + chars(data),
         Block::RedactedThinking { data } => chars(data),
         Block::ToolUse {
@@ -147,7 +161,13 @@ fn block_chars(block: &Block) -> u64 {
                     .map(|(provider, value)| chars(provider) + value_chars(value))
                     .sum::<u64>()
         }
-        Block::Opaque { provider, value } => chars(provider) + value_chars(value),
+        Block::Opaque { provider, value } => {
+            let provider_chars = match provider {
+                ProviderTag::Anthropic => 9,
+                ProviderTag::Openai => 6,
+            };
+            provider_chars + value_chars(value)
+        }
     }
 }
 
@@ -376,5 +396,39 @@ impl Session {
             head: state.head,
             tokens_before,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimates_include_each_reasoning_signature_payload() {
+        let unsigned = block_chars(&Block::Thinking {
+            text: "thought".into(),
+            signature: None,
+        });
+        for signature in [
+            Signature::Anthropic("signature".into()),
+            Signature::Responses {
+                id: "rs_1".into(),
+                encrypted_content: "sealed".into(),
+            },
+        ] {
+            let signed = block_chars(&Block::Thinking {
+                text: "thought".into(),
+                signature: Some(signature),
+            });
+            assert!(signed > unsigned);
+        }
+        for provider in [ProviderTag::Anthropic, ProviderTag::Openai] {
+            assert!(
+                block_chars(&Block::Opaque {
+                    provider,
+                    value: serde_json::json!({"type":"future", "payload":"retained"}),
+                }) > 0
+            );
+        }
     }
 }

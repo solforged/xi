@@ -16,10 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use xi_protocol::BoxFuture;
 
+use crate::network;
 use crate::oauth::{client, random, save};
-use crate::transport::network;
 use crate::{Error, ErrorKind};
 
 const ISSUER: &str = "https://auth.openai.com";
@@ -151,64 +150,64 @@ impl Login {
     }
 }
 
-/// Signs model requests with the stored tokens: the bearer token, the
-/// account id and the `originator` the sign-in used.
-pub(crate) struct Signer {
+/// Adds the bearer credential, account id and sign-in originator to requests.
+pub struct Credentials {
     file: PathBuf,
 }
 
-impl Signer {
-    pub(crate) fn new(file: PathBuf) -> Self {
+impl Credentials {
+    /// Uses the tokens stored at `file`.
+    #[must_use]
+    pub fn new(file: PathBuf) -> Self {
         Self { file }
     }
-}
 
-impl crate::transport::Signer for Signer {
-    /// Refreshes the tokens first when the access token expires within five
-    /// minutes.
-    fn sign<'a>(
-        &'a self,
-        client: &'a reqwest::Client,
-        headers: &'a mut HeaderMap,
-    ) -> BoxFuture<'a, Result<(), Error>> {
-        Box::pin(async move {
-            let tokens = load(&self.file)?;
-            let tokens = if expiring(&tokens.access_token, SystemTime::now()) {
-                renew(client, &self.file, &tokens.access_token, &token_url()).await?
-            } else {
-                tokens
-            };
-            let invalid = |_| Error::new(ErrorKind::Auth, "The ChatGPT credential is malformed");
-            let mut bearer = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
-                .map_err(invalid)?;
-            bearer.set_sensitive(true);
-            headers.insert(AUTHORIZATION, bearer);
-            headers.insert(
-                "chatgpt-account-id",
-                HeaderValue::from_str(&tokens.account_id).map_err(invalid)?,
-            );
-            headers.insert("originator", HeaderValue::from_static(ORIGINATOR));
-            Ok(())
-        })
+    /// Adds authentication headers, refreshing tokens near expiry first.
+    ///
+    /// # Errors
+    /// Returns an error when reading, refreshing or decoding credentials fails.
+    pub async fn sign(
+        &self,
+        client: &reqwest::Client,
+        headers: &mut HeaderMap,
+    ) -> Result<(), Error> {
+        let tokens = load(&self.file)?;
+        let tokens = if expiring(&tokens.access_token, SystemTime::now()) {
+            renew(client, &self.file, &tokens.access_token, &token_url()).await?
+        } else {
+            tokens
+        };
+        let invalid = |_| Error::new(ErrorKind::Auth, "The ChatGPT credential is malformed");
+        let mut bearer =
+            HeaderValue::from_str(&format!("Bearer {}", tokens.access_token)).map_err(invalid)?;
+        bearer.set_sensitive(true);
+        headers.insert(AUTHORIZATION, bearer);
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_str(&tokens.account_id).map_err(invalid)?,
+        );
+        headers.insert("originator", HeaderValue::from_static(ORIGINATOR));
+        Ok(())
     }
 
-    /// Refreshes the rejected token, unless another process already has.
-    fn rejected<'a>(
-        &'a self,
-        client: &'a reqwest::Client,
-        headers: &'a HeaderMap,
-    ) -> BoxFuture<'a, Result<bool, Error>> {
-        Box::pin(async move {
-            let Some(rejected) = headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
-            else {
-                return Ok(false);
-            };
-            renew(client, &self.file, rejected, &token_url()).await?;
-            Ok(true)
-        })
+    /// Refreshes a rejected bearer token, unless another process already has.
+    ///
+    /// # Errors
+    /// Returns an error when reading, refreshing or saving credentials fails.
+    pub async fn rejected(
+        &self,
+        client: &reqwest::Client,
+        headers: &HeaderMap,
+    ) -> Result<bool, Error> {
+        let Some(rejected) = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return Ok(false);
+        };
+        renew(client, &self.file, rejected, &token_url()).await?;
+        Ok(true)
     }
 }
 

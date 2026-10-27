@@ -16,6 +16,7 @@ clap.workspace = true
 rustyline.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
+xi-auth.workspace = true
 xi-client.workspace = true
 xi-daemon.workspace = true
 xi-kernel.workspace = true

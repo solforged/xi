@@ -8,8 +8,8 @@
 //!
 //! `auth = { login = "chatgpt" }`, `{ login = "anthropic" }` or
 //! `{ login = "grok" }` signs requests with stored OAuth tokens instead of an
-//! API key. [`Login`], [`AnthropicLogin`] and [`GrokLogin`] obtain them;
-//! requests refresh them.
+//! API key. [`xi_auth::Login`], [`xi_auth::AnthropicLogin`] and
+//! [`xi_auth::GrokLogin`] obtain them; requests refresh them.
 //! Providers that speak the same [`Api`] differently say so in [`Compat`].
 //!
 //! The [`Registry`] knows which providers and models exist. It starts from a
@@ -29,30 +29,24 @@
 //! OpenAI-compatible stream plus a tool-result round trip without credentials.
 
 mod anthropic;
-mod anthropic_login;
-mod chatgpt;
+mod auth;
 mod claude_code;
-mod grok;
-mod oauth;
+
 mod openai;
 mod registry;
 mod responses;
 mod sse;
 mod transport;
-mod web;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use anthropic_login::{Login as AnthropicLogin, anthropic_file};
-pub use chatgpt::{Account, Login, chatgpt_file};
-pub use grok::{Login as GrokLogin, grok_file};
+
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-pub use web::{EXA_HOST, ExaResult, Source, WebResults, exa_search, web_results};
 use xi_protocol::BoxFuture;
 use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
@@ -167,6 +161,19 @@ impl Error {
             self.kind,
             ErrorKind::Network | ErrorKind::RateLimited | ErrorKind::Unavailable
         )
+    }
+}
+
+impl From<xi_auth::Error> for Error {
+    fn from(error: xi_auth::Error) -> Self {
+        let kind = match error.kind {
+            xi_auth::ErrorKind::Auth => ErrorKind::Auth,
+            xi_auth::ErrorKind::Config => ErrorKind::Config,
+            xi_auth::ErrorKind::Network => ErrorKind::Network,
+            xi_auth::ErrorKind::RateLimited => ErrorKind::RateLimited,
+            xi_auth::ErrorKind::Unavailable => ErrorKind::Unavailable,
+        };
+        Self::new(kind, error.message)
     }
 }
 

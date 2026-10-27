@@ -250,13 +250,13 @@ impl Mirror {
                         }
                         Auth::File(path) => path.exists(),
                         Auth::Login(LoginService::Chatgpt) => {
-                            xi_provider::chatgpt_file(&self.credentials).exists()
+                            xi_auth::chatgpt_file(&self.credentials).exists()
                         }
                         Auth::Login(LoginService::Anthropic) => {
-                            xi_provider::anthropic_file(&self.credentials).exists()
+                            xi_auth::anthropic_file(&self.credentials).exists()
                         }
                         Auth::Login(LoginService::Grok) => {
-                            xi_provider::grok_file(&self.credentials).exists()
+                            xi_auth::grok_file(&self.credentials).exists()
                         }
                     }),
                 info: info.clone(),

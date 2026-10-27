@@ -464,12 +464,12 @@ async fn model_catalog_checks_credentials_child() {
     std::fs::create_dir_all(fixture.paths.credentials()).unwrap();
     std::fs::write(&credential, "never-return-this-file-secret").unwrap();
     std::fs::write(
-        xi_provider::chatgpt_file(&fixture.paths.credentials()),
+        xi_auth::chatgpt_file(&fixture.paths.credentials()),
         "never-return-this-login-secret",
     )
     .unwrap();
     std::fs::write(
-        xi_provider::anthropic_file(&fixture.paths.credentials()),
+        xi_auth::anthropic_file(&fixture.paths.credentials()),
         "never-return-this-anthropic-secret",
     )
     .unwrap();
@@ -573,8 +573,8 @@ async fn model_catalog_checks_credentials_child() {
         assert!(!text.contains(private));
     }
     std::fs::remove_file(&credential).unwrap();
-    std::fs::remove_file(xi_provider::chatgpt_file(&fixture.paths.credentials())).unwrap();
-    std::fs::remove_file(xi_provider::anthropic_file(&fixture.paths.credentials())).unwrap();
+    std::fs::remove_file(xi_auth::chatgpt_file(&fixture.paths.credentials())).unwrap();
+    std::fs::remove_file(xi_auth::anthropic_file(&fixture.paths.credentials())).unwrap();
     let models = request::<SessionModels>(&harness.peer, &SessionRef { session })
         .await
         .unwrap();
