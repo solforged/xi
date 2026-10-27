@@ -19,7 +19,13 @@ pub(crate) fn body(request: &Request, reasoning: bool, max_tokens: u32) -> Resul
                 } else {
                     "assistant"
                 };
-                let content = blocks.iter().map(block).collect::<Result<Vec<_>, _>>()?;
+                let content = blocks
+                    .iter()
+                    .filter_map(|content| block(content).transpose())
+                    .collect::<Result<Vec<_>, _>>()?;
+                if content.is_empty() {
+                    continue;
+                }
                 messages.push(json!({"role": role, "content": content}));
                 previous_results = false;
             }
@@ -134,8 +140,8 @@ fn configure_thinking(body: &mut Value, request: &Request, max_tokens: u32) -> R
     Ok(())
 }
 
-fn block(block: &Block) -> Result<Value, Error> {
-    Ok(match block {
+fn block(block: &Block) -> Result<Option<Value>, Error> {
+    Ok(Some(match block {
         Block::Text { text } => json!({"type": "text", "text": text}),
         Block::Image { media_type, data } => image(media_type, data),
         Block::Thinking {
@@ -145,10 +151,9 @@ fn block(block: &Block) -> Result<Value, Error> {
         Block::Thinking {
             signature: None, ..
         } => {
-            return Err(Error::new(
-                ErrorKind::InvalidRequest,
-                "Anthropic thinking requires its original signature",
-            ));
+            // Cancelled streams and other providers can leave unsigned thinking
+            // in history. Keep it in the log, but Anthropic cannot replay it.
+            return Ok(None);
         }
         Block::RedactedThinking { data } => json!({"type": "redacted_thinking", "data": data}),
         Block::ToolUse {
@@ -178,7 +183,7 @@ fn block(block: &Block) -> Result<Value, Error> {
                 "Cannot replay a foreign or malformed opaque block to Anthropic",
             ));
         }
-    })
+    }))
 }
 
 fn output(block: &OutputBlock) -> Value {
@@ -466,6 +471,90 @@ fn take_string(value: &mut Value, key: &str) -> Result<String, Error> {
 mod tests {
     use super::*;
 
+    fn request(messages: Vec<Message>) -> Request {
+        Request {
+            model: "claude-sonnet-4-6".into(),
+            system: String::new(),
+            messages,
+            tools: Vec::new(),
+            max_tokens: 8192,
+            reasoning: Reasoning::Medium,
+            cache_key: None,
+        }
+    }
+
+    #[test]
+    fn unsigned_thinking_only_turns_are_omitted() {
+        let unsigned = Block::Thinking {
+            text: "Unfinished reasoning".into(),
+            signature: None,
+        };
+        let request = request(vec![
+            Message::User(vec![Block::Text {
+                text: "Hello".into(),
+            }]),
+            Message::Assistant(vec![unsigned.clone()]),
+            Message::User(vec![Block::Text {
+                text: "Resume".into(),
+            }]),
+            Message::Assistant(vec![unsigned]),
+        ]);
+        let history = request.messages.clone();
+        let body = body(&request, true, request.max_tokens).unwrap();
+        assert_eq!(request.messages, history);
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role":"user","content":[{"type":"text","text":"Hello"}]},
+                {"role":"user","content":[{"type":"text","text":"Resume","cache_control":{"type":"ephemeral"}}]},
+            ])
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_is_omitted_without_losing_replayable_blocks() {
+        let request = request(vec![
+            Message::User(vec![Block::Text {
+                text: "Hello".into(),
+            }]),
+            Message::Assistant(vec![
+                Block::Thinking {
+                    text: "Unsigned reasoning".into(),
+                    signature: None,
+                },
+                Block::Thinking {
+                    text: "Signed reasoning".into(),
+                    signature: Some("original-signature".into()),
+                },
+                Block::RedactedThinking {
+                    data: "encrypted".into(),
+                },
+                Block::Text {
+                    text: "Reading".into(),
+                },
+                Block::ToolUse {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    input: json!({"path":"a.rs"}),
+                    extra: Default::default(),
+                },
+            ]),
+        ]);
+        let history = request.messages.clone();
+        let body = body(&request, true, request.max_tokens).unwrap();
+        assert_eq!(request.messages, history);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["messages"][1],
+            json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"Signed reasoning","signature":"original-signature"},
+                {"type":"redacted_thinking","data":"encrypted"},
+                {"type":"text","text":"Reading"},
+                {"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.rs"},"cache_control":{"type":"ephemeral"}},
+            ]})
+        );
+    }
+
     #[test]
     fn tool_metadata_stays_executable_and_round_trips_without_a_server() {
         for metadata in [
@@ -479,10 +568,10 @@ mod tests {
             wire["input"] = json!({"path":"a"});
             let call = decode_block(wire.clone()).unwrap();
             assert!(matches!(call, Block::ToolUse { .. }));
-            assert_eq!(block(&call).unwrap(), wire);
+            assert_eq!(block(&call).unwrap(), Some(wire.clone()));
             let persisted: Block =
                 serde_json::from_value(serde_json::to_value(&call).unwrap()).unwrap();
-            assert_eq!(block(&persisted).unwrap(), wire);
+            assert_eq!(block(&persisted).unwrap(), Some(wire));
         }
     }
 
@@ -505,10 +594,10 @@ mod tests {
         };
         assert_eq!(
             block(&call).unwrap(),
-            json!({
+            Some(json!({
                 "type":"tool_use", "id":"call", "name":"read", "input":{"path":"a"},
                 "caller":{"type":"direct"},
-            })
+            }))
         );
     }
 }
