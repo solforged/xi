@@ -620,6 +620,7 @@ impl Config {
             }
         }
         spec.readable.extend(skills.iter().cloned());
+        spec.readable.push(self.paths.config.join("AGENTS.md"));
         spec.readable.push(spill.to_owned());
         spec.readable.push(git.to_owned());
         spec.vars.insert(
