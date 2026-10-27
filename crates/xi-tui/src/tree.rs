@@ -12,7 +12,7 @@ use xi_protocol::{Block, Event, EventId, EventKind, Timestamp};
 
 use crate::frame::{Body, Frame, Hint, Note, Tone};
 use crate::keys::{Action, Keymap};
-use crate::style::{Line, Role, lr};
+use crate::style::{Line, Role, row};
 use crate::transcript::tokens;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,7 +319,7 @@ impl Tree {
         } else {
             right.dim(ago(now, node.at))
         };
-        lr(left, right, cols)
+        row(left, right, cols)
     }
 
     /// The border, title, branch count and keys.

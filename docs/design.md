@@ -375,7 +375,7 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 
 #### Settings view
 
-`/settings` opens a view of the settings that matter day to day. Each row shows the effective value and the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted. `up` and `down` move, `enter` or `space` changes the selected row, `e` opens the global `config.toml` in the external editor and reloads the view afterwards, and `esc` closes.
+`/settings` opens a view of the settings that matter day to day, in four sections: this session, defaults, tools and read only. Each row shows the effective value and, at the right, the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted. `up` and `down` move, `enter` or `space` changes the selected row, `e` opens the global `config.toml` in the external editor and reloads the view afterwards, and `esc` closes. The top border names the global config file; results and errors show as a note under the rows. In an inline token field, `enter` saves and `esc` cancels the edit.
 
 | Row | Scope | Change |
 |---|---|---|

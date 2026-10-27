@@ -325,27 +325,25 @@ impl App {
                     search.body(&self.history, inner),
                 )
             }),
-            _ => None,
+            Focus::Settings => self.settings.as_ref().map(|settings| {
+                let info = &self.launch.attached.info;
+                (
+                    settings.frame(&self.keymap),
+                    settings.body(
+                        inner,
+                        &info.model,
+                        info.reasoning,
+                        self.transcript.thinking_display(),
+                        self.launch.tui_config.as_deref(),
+                    ),
+                )
+            }),
+            Focus::Composer => None,
         };
         if let Some((framed, body)) = framed {
             let (rows, cursor) = frame::draw(&framed, body, cols, overlay_rows.max(4));
             overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
             lines.extend(rows);
-        }
-        if self.focus == Focus::Settings
-            && let Some(settings) = &self.settings
-        {
-            let info = &self.launch.attached.info;
-            let (overlay, cursor) = settings.render(
-                cols,
-                overlay_rows,
-                &info.model,
-                info.reasoning,
-                self.transcript.thinking_display(),
-                self.launch.tui_config.as_deref(),
-            );
-            overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
-            lines.extend(overlay);
         }
         if self.focus == Focus::Composer
             && let Some(menu) = &self.completion

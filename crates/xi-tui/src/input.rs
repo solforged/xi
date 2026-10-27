@@ -90,12 +90,13 @@ impl App {
     }
 
     async fn settings_key(&mut self, key: KeyEvent) {
+        let action = self.keymap.action(key);
         let info = &self.launch.attached.info;
         let Some(settings) = self.settings.as_mut() else {
             self.focus = Focus::Composer;
             return;
         };
-        match settings.key(key, &info.model, info.reasoning) {
+        match settings.key(key, action, &info.model, info.reasoning) {
             settings::Action::None => {}
             settings::Action::Close => self.close_overlay(),
             settings::Action::Models => self.open_models().await,

@@ -8,7 +8,7 @@ use xi_protocol::{SessionId, ToolCallId};
 
 use crate::frame::{Body, Frame, Hint, Note, Tone};
 use crate::keys::{Action, Keymap};
-use crate::style::{Line, Role, lr};
+use crate::style::{Line, Role, row};
 
 /// An ask with the workspace information needed by the inbox.
 #[derive(Clone)]
@@ -339,7 +339,7 @@ impl Approvals {
                     ),
                 );
                 if *choice == Choice::Workspace {
-                    lr(
+                    row(
                         left,
                         Line::default().dim("writes .xi/config.local.toml"),
                         inner,
