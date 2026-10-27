@@ -8,6 +8,8 @@
 //! The deck (alternate screen with the log and a side panel) is a
 //! [`Layout`] choice on top. `layout = "auto"`, the default, takes it when
 //! xi starts wide enough for the panel beside the sheet ([`DECK_FROM`]).
+//! The panel grows with the window only up to [`PANEL_MAX`]; further
+//! columns go to the log, so the panel stays against the right edge.
 
 /// Columns below which the client is a slit.
 pub const SLIT_BELOW: usize = 72;
@@ -21,6 +23,10 @@ pub const PROSE: usize = 88;
 pub const SHORT_BELOW: usize = 20;
 /// The narrowest side panel the deck shows beside the log.
 pub const PANEL_MIN: usize = 36;
+/// The widest side panel beside the log. It stays against the right edge;
+/// columns past it go to the log, so resizing a wide terminal does not
+/// stretch the panel.
+pub const PANEL_MAX: usize = 64;
 /// The size from which `layout = "auto"` chooses the deck at start: the
 /// sheet with its gutter and margin, a separator and the narrowest panel.
 pub const DECK_FROM: (usize, usize) = (SHEET + 3 + PANEL_MIN, 30);

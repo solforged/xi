@@ -207,6 +207,7 @@ impl Child {
                 title,
                 diff: false,
                 text: text.to_owned(),
+                thinking: false,
                 error,
                 spill: None,
             },

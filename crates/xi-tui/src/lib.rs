@@ -48,7 +48,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, EventStream, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -110,20 +112,46 @@ pub fn available() -> bool {
 }
 
 /// Restores the terminal however the client exits.
-struct Raw;
+struct Raw {
+    mouse: bool,
+}
 
 impl Raw {
-    fn enter() -> std::io::Result<Self> {
+    fn enter(mouse: bool) -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        let raw = Self;
-        crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
+        let mut raw = Self { mouse: false };
+        // Modified enter is indistinguishable from enter in legacy input.
+        // Terminals without the keyboard protocol ignore this request.
+        crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableBracketedPaste
+        )?;
+        raw.set_mouse(mouse)?;
         Ok(raw)
+    }
+
+    fn set_mouse(&mut self, enabled: bool) -> std::io::Result<()> {
+        if enabled != self.mouse {
+            self.mouse = enabled;
+            if enabled {
+                crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+            } else {
+                crossterm::execute!(std::io::stdout(), DisableMouseCapture)?;
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for Raw {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+        let _ = self.set_mouse(false);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags
+        );
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -268,7 +296,7 @@ struct Terminal {
 impl Terminal {
     fn enter(cols: u16, display: &Display) -> std::io::Result<Self> {
         let title = TitleStack::push()?;
-        let raw = Raw::enter()?;
+        let raw = Raw::enter(false)?;
         let color = std::env::var_os("NO_COLOR").is_none();
         let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
         // Query before the key reader can consume the terminal's answer.
@@ -298,7 +326,7 @@ impl Terminal {
         drop(self.raw.take());
         let settings = matches!(&request, ExternalRequest::Settings(_));
         let result = composer.edit_external(request);
-        self.raw = Some(Raw::enter()?);
+        self.raw = Some(Raw::enter(self.on_deck)?);
         // The editor may have set its own title.
         display.title_written = false;
         crossterm::execute!(
@@ -318,6 +346,10 @@ impl Terminal {
             } else {
                 self.screen.leave_deck()?;
             }
+            self.raw
+                .as_mut()
+                .expect("terminal input resumed")
+                .set_mouse(deck)?;
             self.on_deck = deck;
         }
         Ok(())
@@ -673,6 +705,7 @@ impl App {
             event = keys.next() => match event {
                 Some(Ok(TermEvent::Key(key))) if key.kind != KeyEventKind::Release => self.key(key).await?,
                 Some(Ok(TermEvent::Paste(text))) if self.overlays.is_empty() => self.composer.paste(&text),
+                Some(Ok(TermEvent::Mouse(mouse))) if self.overlays.is_empty() => self.display.deck_mouse(mouse),
                 // Query the current size before drawing, not a queued resize.
                 Some(Ok(TermEvent::Resize(..))) => {}
                 Some(Ok(_)) => {}
@@ -948,7 +981,7 @@ impl App {
         let mut parts = vec![duration(elapsed)];
         if turn.sent() > 0 {
             parts.push(format!(
-                "↑ {} ↓ {}",
+                "↑ {}  ↓ {}",
                 tokens(turn.sent()),
                 tokens(turn.output)
             ));
@@ -967,7 +1000,7 @@ impl App {
             kind,
             Line::default()
                 .ink(word)
-                .dim(format!(" · {}", parts.join(" · "))),
+                .dim(format!("  {}", parts.join("  "))),
         );
         self.turn.steering.clear();
         if !self.turn.exited && !self.turn.queued.is_empty() {

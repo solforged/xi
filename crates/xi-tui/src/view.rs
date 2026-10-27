@@ -260,6 +260,8 @@ impl App {
         let framed = !self.overlays.is_empty();
         let mut lines = if framed {
             self.transcript.live_under_frame(m, self.display.frame)
+        } else if deck {
+            self.transcript.live_in_log(m, self.display.frame)
         } else {
             self.transcript.live(m, self.display.frame)
         };
@@ -303,6 +305,11 @@ impl App {
         } else {
             Role::Brass
         };
+        let attachment = (!self.composer.images.is_empty()).then(|| {
+            let count = self.composer.images.len();
+            let noun = if count == 1 { "image" } else { "images" };
+            Line::default().dim(format!("{count} {noun} attached"))
+        });
         let (composer, (row, col)) = if framed && m.short {
             (Vec::new(), (0, 0))
         } else if framed {
@@ -329,11 +336,20 @@ impl App {
                 rows: m.composer_rows(),
                 shape: Shape::Bar,
             };
-            let (mut block, cursor) = self.composer.editor.render(cols, border, "", form);
+            let (mut block, mut cursor) = self.composer.editor.render(cols, border, "", form);
             let bar = || Line::default().span(border, false, "┃");
-            // The model shares its row with the turn's activity, and the
-            // keys while there is room, so the block ends on the bottom
-            // row as the panel does.
+            if let Some(attachment) = &attachment {
+                block.insert(
+                    1,
+                    bar()
+                        .ink("  ")
+                        .extend(attachment.clone())
+                        .truncate(cols)
+                        .raise(),
+                );
+                cursor.0 += 1;
+            }
+            // The model shares its row with the turn's activity and keys.
             let room = cols.saturating_sub(3);
             let model = self.model_line();
             let mut right = activity.clone().unwrap_or_default();
@@ -356,12 +372,13 @@ impl App {
             };
             self.composer.editor.render(cols, border, hint, form)
         };
-        let attachment_rows = usize::from(!self.composer.images.is_empty());
+        let attachment_rows = usize::from(attachment.is_some() && (!deck || framed));
+        let composer_gap = usize::from(deck && !framed);
         // The frame gets what is left after the composer, the status line
         // and the turn's own rows; streamed rows above it scroll off first.
-        let reserved = composer.len() + 1 + attachment_rows + lines.len() - transcript_rows;
+        let fixed = composer.len() + 1 + attachment_rows + composer_gap;
+        let reserved = fixed + lines.len() - transcript_rows;
         let overlay_rows = self.display.rows.saturating_sub(1 + reserved);
-        let fixed = composer.len() + 1 + attachment_rows;
         let frame_rows = if m.short {
             m.frame_rows(overlay_rows.max(4))
                 .min(m.live_rows().saturating_sub(fixed))
@@ -375,18 +392,17 @@ impl App {
             .draw(&mut ctx, self.waiting(), cols, frame_rows);
         let overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
         lines.extend(rows);
+        if composer_gap > 0 {
+            lines.push(Line::default());
+        }
         if !framed && let Some(menu) = &self.composer.completion {
             let menu_rows = overlay_rows.min(8).min(frame_rows);
             lines.extend(menu.render(cols, menu_rows));
         }
-        if !self.composer.images.is_empty() {
-            let count = self.composer.images.len();
-            let noun = if count == 1 { "image" } else { "images" };
-            lines.push(
-                Line::default()
-                    .brass(format!("  {count} {noun} attached"))
-                    .truncate(cols),
-            );
+        if attachment_rows > 0
+            && let Some(attachment) = attachment
+        {
+            lines.push(Line::default().ink("  ").extend(attachment).truncate(cols));
         }
         let top = lines.len();
         lines.extend(composer);
@@ -394,7 +410,11 @@ impl App {
             lines.push(self.footer(cols));
         }
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
-        let hidden = lines.len().saturating_sub(m.live_rows());
+        let hidden = if deck {
+            0
+        } else {
+            lines.len().saturating_sub(m.live_rows())
+        };
         if hidden > 0 {
             lines.drain(..hidden);
         }
@@ -429,7 +449,9 @@ impl App {
     /// The model and its reasoning level, under the deck's composer.
     fn model_line(&self) -> Line {
         let info = &self.launch.attached.info;
-        let model = Line::default().ink(format!("{}/{}", info.model.provider, info.model.model));
+        let model = Line::default()
+            .dim(format!("{}/", info.model.provider))
+            .ink(&info.model.model);
         match &info.model_info {
             Some(model_info) if model_info.reasoning.is_empty() => model.dim(" · no think"),
             model_info => {
