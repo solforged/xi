@@ -3416,10 +3416,25 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
         "● edit src/a.rs",
         "● read docs/policies.md",
         "\u{f440} Changes · 1 file",
-        "\u{f442} alt+1  \u{f451} alt+2  \u{f441} alt+3",
+        "\u{f45e} \u{f49c} \u{f4a1}",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
+    assert!(
+        !text.contains("alt+2"),
+        "the composer's panel has no keys row"
+    );
+    // The header spells out only the unusual: sandbox off, untrusted.
+    app.launch.attached.info.sandbox_enabled = false;
+    app.launch.attached.info.trusted = false;
+    let mut out = Vec::new();
+    let mut screen = Screen::new(&mut out, false, 250);
+    app.draw(&mut screen).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("\u{f45e} \u{f513} sandbox off \u{f4a3} untrusted"),
+        "{text}"
+    );
     // alt+1 lists every session; idle ones stay out of the live view.
     let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
     app.key(alt('1')).await.unwrap();

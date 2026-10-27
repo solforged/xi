@@ -47,10 +47,6 @@ pub enum Icon {
     Context,
     /// The cache hit rate.
     Cache,
-    /// Tokens sent.
-    Sent,
-    /// Tokens received.
-    Received,
     /// The approval mode.
     Approvals,
     /// The sandbox is on.
@@ -61,12 +57,6 @@ pub enum Icon {
     Trusted,
     /// The workspace is untrusted.
     Untrusted,
-    /// The tool count.
-    Tools,
-    /// The retained log.
-    Log,
-    /// The inspector.
-    Inspector,
     /// An unanswered approval.
     Ask,
     /// The attached session.
@@ -156,16 +146,11 @@ fn table(icon: Icon) -> (&'static str, &'static str, &'static str) {
         Icon::Sessions => ("\u{f442}", "", ""),  // comment_discussion
         Icon::Context => ("\u{f463}", "ctx ", ""), // meter
         Icon::Cache => ("\u{f49b}", "cache ", ""), // cache
-        Icon::Sent => ("\u{f431}", "↑ ", ""),    // arrow_up
-        Icon::Received => ("\u{f433}", "↓ ", ""), // arrow_down
         Icon::Approvals => ("\u{f45e}", "approvals ", ""), // checklist
         Icon::Sandbox => ("\u{f49c}", "◇ ", ""), // shield
         Icon::SandboxOff => ("\u{f513}", "", ""), // shield_x
         Icon::Trusted => ("\u{f4a1}", "", ""),   // verified
         Icon::Untrusted => ("\u{f4a3}", "", ""), // unverified
-        Icon::Tools => ("\u{f425}", "", " tools"), // tools
-        Icon::Log => ("\u{f451}", "", ""),       // list_unordered
-        Icon::Inspector => ("\u{f441}", "", ""), // eye
         Icon::Ask => ("\u{f420}", "? ", ""),     // question
         Icon::Current => ("\u{f444}", "● ", ""), // dot_fill
         Icon::Running => ("\u{f46a}", "┤ ", ""), // sync
