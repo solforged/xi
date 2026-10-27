@@ -1198,7 +1198,7 @@ fn read_call() -> EventKind {
 }
 
 #[tokio::test]
-async fn children_get_live_rows_then_commit_one_line_each_under_their_call() {
+async fn children_keep_live_roster_rows_then_commit_answer_slips() {
     let (launch, _) = launch(snapshot(true)).await;
     let mut app = App::new(launch, 120, 30);
     let parent = app.session_id();
@@ -1267,15 +1267,20 @@ async fn children_get_live_rows_then_commit_one_line_each_under_their_call() {
         committed.iter().any(|l| l.starts_with("● task 3 tasks")),
         "{text}"
     );
-    assert!(text.contains("├─ ● 1  all keys match"), "{text}");
+    assert!(text.contains("» from child 1 · "), "{text}");
+    assert!(text.contains("\n  all keys match\n"), "{text}");
+    assert!(text.contains("» from child 2 · "), "{text}");
     assert!(
-        text.contains("└─ ✕ 3  failed · provider unavailable"),
+        text.contains("\n  4 fixtures still use archived keys\n  more detail\n"),
         "{text}"
     );
+    assert!(!text.contains("**"), "{text}");
+    assert!(text.contains("✕ from child 3 · "), "{text}");
+    assert!(text.contains("\n  provider unavailable"), "{text}");
     assert!(!text.contains("Task 1 [done]"), "{text}");
     assert!(
         app.transcript.collapsed(),
-        "the full result stays one ctrl+o away"
+        "the full results stay reachable through ctrl+o"
     );
     assert!(!live_text(&app).contains("─ "));
 

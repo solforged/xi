@@ -4,16 +4,19 @@
 //! events arrive alongside the parent's, tagged with the child's session id.
 //! While the call that started them runs, each child gets a row in the live
 //! region: its number in start order, what it is doing now, and its calls and
-//! time so far. When the call's result lands, the rows commit under the
-//! call's headline with each child's answer in place of what it was doing.
+//! time so far. When the call's result lands, each finished child commits an
+//! open-sided slip with its answer and keeps the whole answer for ctrl+o.
 
 use std::path::Path;
 
 use xi_protocol::event::StopReason;
 use xi_protocol::{Block, Event, EventKind, SessionId, Timestamp, ToolCallId};
 
-use crate::style::{Line, Role, inline, lr};
-use crate::transcript::{SPINNER, Totals, counted, duration, headline_arg};
+use crate::style::{Line, Role, inline, lr, prose};
+use crate::transcript::{
+    Detail, RESULT_LINES, SPINNER, Totals, blocks_text, clock, counted, duration, headline_arg,
+    more_lines,
+};
 
 /// Rows the live region gives children before the rest collapse to a count.
 const LIVE_ROWS: usize = 8;
@@ -28,6 +31,7 @@ struct Child {
     session: SessionId,
     started: Timestamp,
     ended: Option<Timestamp>,
+    label: Option<String>,
     calls: usize,
     /// Calls without a result yet, oldest first: (id, tool, argument).
     open: Vec<(ToolCallId, String, String)>,
@@ -42,6 +46,20 @@ impl Child {
 
     fn event(&mut self, event: &Event, workspace: Option<&Path>) {
         match &event.kind {
+            EventKind::UserMessage { content } if self.label.is_none() => {
+                let text = blocks_text(content);
+                self.label = Some(
+                    Line::default()
+                        .ink(
+                            text.lines()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or("")
+                                .trim(),
+                        )
+                        .truncate(32)
+                        .plain(),
+                );
+            }
             EventKind::AssistantMessage {
                 content,
                 stop,
@@ -65,14 +83,12 @@ impl Child {
                 let text = || {
                     content
                         .iter()
-                        .filter_map(|b| match b {
-                            Block::Text { text } => text.lines().find(|l| !l.trim().is_empty()),
+                        .filter_map(|block| match block {
+                            Block::Text { text } => Some(text.as_str()),
                             _ => None,
                         })
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_owned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 };
                 self.state = match stop {
                     StopReason::ToolUse => State::Running,
@@ -87,7 +103,7 @@ impl Child {
             }
             EventKind::ToolResult { call, .. } => self.open.retain(|(id, ..)| id != call),
             EventKind::TurnFailed { message } => {
-                self.state = State::Failed(message.lines().next().unwrap_or("").to_owned());
+                self.state = State::Failed(message.clone());
                 self.ended = Some(event.at);
             }
             _ => {}
@@ -95,20 +111,12 @@ impl Child {
     }
 
     /// `├─ ● 2  what` on the left, `3 calls · 12.0s` on the right.
-    fn row(
-        &self,
-        number: usize,
-        width: usize,
-        last: bool,
-        live: Option<usize>,
-        cols: usize,
-    ) -> Line {
+    fn row(&self, number: usize, width: usize, last: bool, frame: usize, cols: usize) -> Line {
         let elbow = Line::default().dim(if last { "  └─ " } else { "  ├─ " });
-        let mark = match (&self.state, live) {
-            (State::Running, Some(frame)) => Line::default().brass(SPINNER[frame % SPINNER.len()]),
-            (State::Running, None) => Line::default().dim("·"),
-            (State::Done(_), _) => Line::default().verdigris("●"),
-            (State::Failed(_), _) => Line::default().sanguine("✕"),
+        let mark = match &self.state {
+            State::Running => Line::default().brass(SPINNER[frame % SPINNER.len()]),
+            State::Done(_) => Line::default().verdigris("●"),
+            State::Failed(_) => Line::default().sanguine("✕"),
         };
         let mut left = elbow
             .extend(mark)
@@ -116,8 +124,8 @@ impl Child {
             .strong(Role::Ink, format!("{number:<width$}"))
             .ink("  ");
         left = match &self.state {
-            State::Running => match (self.open.first(), live) {
-                (Some((_, tool, arg)), Some(_)) => {
+            State::Running => match self.open.first() {
+                Some((_, tool, arg)) => {
                     let line = left.dim(tool);
                     if arg.is_empty() {
                         line
@@ -125,12 +133,20 @@ impl Child {
                         line.ink(" ").ink(arg)
                     }
                 }
-                (None, Some(_)) => left.dim("thinking"),
-                (_, None) => left.dim("no answer"),
+                None => left.dim("thinking"),
             },
-            State::Done(text) if text.is_empty() => left.dim("done"),
-            State::Done(text) => left.extend(inline(text, Role::Ink)),
-            State::Failed(message) => left.sanguine("failed").dim(" · ").ink(message),
+            State::Done(text) if text.trim().is_empty() => left.dim("done"),
+            State::Done(text) => left.extend(inline(
+                text.lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("")
+                    .trim(),
+                Role::Ink,
+            )),
+            State::Failed(message) => left
+                .sanguine("failed")
+                .dim(" · ")
+                .ink(message.lines().next().unwrap_or("")),
         };
         let now = Timestamp::now();
         let elapsed = self.ended.unwrap_or(now).0.saturating_sub(self.started.0);
@@ -140,6 +156,57 @@ impl Child {
             duration(elapsed)
         ));
         lr(left, right, cols)
+    }
+
+    fn slip(&self, number: usize, cols: usize) -> Option<(Vec<Line>, Detail)> {
+        let (text, error) = match &self.state {
+            State::Running => return None,
+            State::Done(text) => (text.as_str(), false),
+            State::Failed(reason) => (reason.as_str(), true),
+        };
+        let mut title = format!("from child {number}");
+        if let Some(label) = self.label.as_ref().filter(|label| !label.is_empty()) {
+            title.push_str(" · ");
+            title.push_str(label);
+        }
+        let head = if error {
+            Line::default().sanguine("✕ ")
+        } else {
+            Line::default().dim("» ")
+        };
+        let mut lines = vec![
+            head.dim(format!(
+                "{title} · {}",
+                clock(self.ended.unwrap_or(self.started))
+            ))
+            .truncate(cols),
+        ];
+        let rows = prose(
+            text.trim(),
+            cols.saturating_sub(2),
+            if error { Role::Sanguine } else { Role::Ink },
+        );
+        let hidden = rows.len().saturating_sub(RESULT_LINES);
+        for row in rows.into_iter().take(RESULT_LINES) {
+            lines.push(Line::default().ink("  ").extend(row).truncate(cols));
+        }
+        if hidden > 0 {
+            lines.push(
+                Line::default()
+                    .dim(format!("  {}", more_lines(hidden)))
+                    .truncate(cols),
+            );
+        }
+        Some((
+            lines,
+            Detail {
+                title,
+                diff: false,
+                text: text.to_owned(),
+                error,
+                spill: None,
+            },
+        ))
     }
 }
 
@@ -169,6 +236,7 @@ impl Children {
                 self.0.push(Child {
                     session,
                     started: event.at,
+                    label: None,
                     ended: None,
                     calls: 0,
                     open: Vec::new(),
@@ -225,7 +293,7 @@ impl Children {
             .enumerate()
             .map(|(n, &i)| {
                 let last = hidden == 0 && n + 1 == shown.len();
-                self.0[i].row(i + 1, width, last, Some(frame), cols)
+                self.0[i].row(i + 1, width, last, frame, cols)
             })
             .collect();
         if hidden > 0 {
@@ -239,15 +307,17 @@ impl Children {
         rows
     }
 
-    /// Every child with its answer, for the call's committed block.
-    #[must_use]
-    pub fn committed(&self, cols: usize) -> Vec<Line> {
-        let width = self.0.len().to_string().len();
-        self.0
-            .iter()
-            .enumerate()
-            .map(|(i, c)| c.row(i + 1, width, i + 1 == self.0.len(), None, cols))
-            .collect()
+    /// Open-sided slips and complete answers for the call's finished children.
+    pub(crate) fn committed(&self, cols: usize) -> (Vec<Line>, Vec<Detail>) {
+        let mut lines = Vec::new();
+        let mut details = Vec::new();
+        for (index, child) in self.0.iter().enumerate() {
+            if let Some((slip, detail)) = child.slip(index + 1, cols) {
+                lines.extend(slip);
+                details.push(detail);
+            }
+        }
+        (lines, details)
     }
 
     /// Forgets every child.
@@ -302,6 +372,114 @@ mod tests {
         assert!(rows[6].starts_with("  ├─ ✕ 10"), "{rows:#?}");
         assert_eq!(rows[7], "  └─ … 3 more · 3 running");
         assert_eq!(children.running(), 9);
-        assert_eq!(children.committed(100).len(), 10);
+        let (slips, details) = children.committed(100);
+        assert_eq!(slips.len(), 2);
+        assert_eq!(details.len(), 1);
+    }
+
+    fn child() -> Child {
+        Child {
+            session: SessionId::generate(),
+            started: Timestamp(0),
+            ended: None,
+            label: None,
+            calls: 0,
+            open: Vec::new(),
+            usage: Totals::default(),
+            state: State::Running,
+        }
+    }
+
+    #[test]
+    fn finished_child_slip_keeps_the_full_answer_and_first_prompt_label() {
+        let mut child = child();
+        for prompt in ["check keys", "later steering"] {
+            child.event(
+                &event(EventKind::UserMessage {
+                    content: vec![Block::Text {
+                        text: prompt.into(),
+                    }],
+                }),
+                None,
+            );
+        }
+        let mut answer = event(EventKind::AssistantMessage {
+            model: ModelRef {
+                provider: "p".into(),
+                model: "m".into(),
+            },
+            content: vec![
+                Block::Text {
+                    text: "one\ntwo\nthree\nfour".into(),
+                },
+                Block::Text {
+                    text: "five".into(),
+                },
+            ],
+            stop: StopReason::EndTurn,
+            usage: Default::default(),
+        });
+        answer.at = Timestamp((14 * 60 + 22) * 60_000);
+        child.event(&answer, None);
+        let live = child.row(1, 1, true, 0, 96).plain();
+        assert!(live.starts_with("  └─ ● 1  one"), "{live}");
+        let (lines, detail) = child.slip(1, 96).unwrap();
+        let text: Vec<_> = lines.iter().map(Line::plain).collect();
+        assert_eq!(
+            text,
+            [
+                "» from child 1 · check keys · 14:22",
+                "  one",
+                "  two",
+                "  three",
+                "  … 2 more lines · ctrl+o",
+            ]
+        );
+        assert!(lines[0].0.iter().all(|span| span.role == Role::Dim));
+        assert_eq!(detail.title, "from child 1 · check keys");
+        assert_eq!(detail.text, "one\ntwo\nthree\nfour\nfive");
+        assert!(!detail.error);
+    }
+
+    #[test]
+    fn child_slips_wrap_and_count_display_rows_without_boxes() {
+        let child = Child {
+            state: State::Done("abcdefghij".into()),
+            ended: Some(Timestamp(60_000)),
+            ..child()
+        };
+        let (lines, detail) = child.slip(2, 4).unwrap();
+        let text: Vec<_> = lines.iter().map(Line::plain).collect();
+        assert_eq!(text[1..4], ["  ab", "  cd", "  ef"]);
+        assert!(lines.iter().all(|line| line.width() <= 4));
+        assert_eq!(detail.text, "abcdefghij");
+        assert_eq!(detail.title, "from child 2");
+        let (lines, _) = child.slip(2, 28).unwrap();
+        assert_eq!(lines[0].plain(), "» from child 2 · 00:01");
+        assert_eq!(lines[1].plain(), "  abcdefghij");
+    }
+
+    #[test]
+    fn failed_children_keep_a_sanguine_mark_and_reason_and_running_children_do_not_commit() {
+        let mut child = child();
+        assert!(child.slip(1, 80).is_none());
+        child.event(
+            &event(EventKind::TurnFailed {
+                message: "first reason\nsecond reason".into(),
+            }),
+            None,
+        );
+        let (lines, detail) = child.slip(1, 80).unwrap();
+        assert!(lines[0].plain().starts_with("✕ from child 1 · "));
+        assert_eq!(lines[0].0[0].role, Role::Sanguine);
+        assert_eq!(lines[1].plain(), "  first reason");
+        assert_eq!(lines[2].plain(), "  second reason");
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| line.0.last().unwrap().role == Role::Sanguine)
+        );
+        assert!(detail.error);
+        assert_eq!(detail.text, "first reason\nsecond reason");
     }
 }

@@ -9,12 +9,14 @@
 //!
 //! Type anything to start the scripted turn. Nothing runs and nothing leaves
 //! the machine; the session log is written to a temporary directory.
+//! Pass `--peer` to inject a steering note from a second prompt source.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use xi_client::client::ClientNotification;
 use xi_kernel::config::{Config, Paths};
 use xi_protocol::event::{StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
@@ -272,7 +274,7 @@ async fn main() -> Result<(), xi_tui::Error> {
         })),
     };
     let (reader, writer) = xi_daemon::private(paths, Arc::new(spawner));
-    let (client, notifications) =
+    let (client, mut notifications) =
         xi_client::client::Client::over(reader, writer, "xi-demo").await?;
     let template = CreateParams {
         cwd: workspace,
@@ -280,6 +282,40 @@ async fn main() -> Result<(), xi_tui::Error> {
         options: Default::default(),
     };
     let attached = client.create(template.clone()).await?;
+    if std::env::args().any(|arg| arg == "--peer") {
+        let peer = client.clone();
+        let session = attached.info.session;
+        let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut inject = true;
+            while let Some(notification) = notifications.recv().await {
+                if inject
+                    && matches!(&notification, ClientNotification::Event(params)
+                    if matches!(&params.event.kind, xi_protocol::EventKind::UserMessage { .. }))
+                {
+                    inject = false;
+                    let peer = peer.clone();
+                    // The App did not send this prompt, just as when another
+                    // attached terminal steers the same session.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let _ = peer
+                            .prompt(
+                                session,
+                                vec![Block::Text {
+                                    text: "Keep archived rows out of the export, please.".into(),
+                                }],
+                            )
+                            .await;
+                    });
+                }
+                if send.send(notification).is_err() {
+                    break;
+                }
+            }
+        });
+        notifications = receive;
+    }
     xi_tui::run(xi_tui::Launch {
         client,
         notifications,

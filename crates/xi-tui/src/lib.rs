@@ -505,7 +505,7 @@ impl App {
             }
         }
         let asks = self.transcript.asks().len();
-        let lines = self.transcript.apply(notification, self.cols);
+        let lines = self.transcript.apply_live(notification, self.cols);
         self.commit.extend(lines);
         match notification {
             ClientNotification::Event(p) => match &p.event.kind {
@@ -651,6 +651,7 @@ impl App {
         } else {
             self.steering.push(content.clone());
         }
+        self.transcript.sent(&content);
         self.launch.attached.running = true;
         let client = self.launch.client.clone();
         let session = self.session_id();
