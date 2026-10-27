@@ -984,9 +984,14 @@ pub mod extension {
         pub session: SessionId,
         /// The child's first user message.
         pub prompt: String,
+        /// Short display name, persisted as the child's user-assigned title.
+        /// When present, its trimmed value must be one line of 1 to 80 characters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
         /// Built-in tools the child may use, a subset of the parent's.
-        /// Absent means all of the parent's built-in tools. Extension tools
-        /// are never offered to a child, so subagents do not nest.
+        /// Absent means all of the parent's built-in tools, including enabled
+        /// `web_search` and `fetch`. Neither `task` nor extension tools are
+        /// offered to a child, so subagents do not nest.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tools: Option<Vec<String>>,
         /// Model or role for the child; the parent's model when absent.
@@ -1476,6 +1481,27 @@ mod tests {
             }),
         );
     }
+
+    #[test]
+    fn agent_run_name_is_optional_and_round_trips() {
+        use super::extension::AgentRunParams;
+
+        let old = json!({"session": SessionId::generate(), "prompt": "inspect history"});
+        let unnamed: AgentRunParams = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(unnamed.name, None);
+        assert_eq!(serde_json::to_value(&unnamed).unwrap(), old);
+        let named = AgentRunParams {
+            name: Some("History model".into()),
+            ..unnamed
+        };
+        let wire = serde_json::to_value(&named).unwrap();
+        assert_eq!(wire["name"], "History model");
+        assert_eq!(
+            serde_json::from_value::<AgentRunParams>(wire).unwrap(),
+            named
+        );
+    }
+
     #[test]
     fn approval_and_session_metadata_are_backward_compatible() {
         use crate::Remember;

@@ -56,7 +56,7 @@ After these, in rough order of daily value: `!cmd` and `!!cmd` run in the sessio
 
 Session titles are done: `/rename` and `session/rename` record a user title, and the `tiny` model names sessions from their first prompt and again after its first turn. See [Session titles](design.md#session-titles).
 
-Children of a running call now get live rows under it and commit one line each when the call's result lands, with running children in the footer; a mid-call attach replays them. Opening a child in its own view, letting a child ask through the parent instead of being denied headlessly, and naming children are next.
+Children of a running call get live rows under it and commit answer slips when the call's result lands, with running children in the footer; a mid-call attach replays them. Parents can assign short names, persisted as child titles and shown beside stable numbers in the task rows, sidebar and results. Children inherit enabled `web_search` and `fetch`, or an explicit tool subset. Opening a child in its own view and letting a child ask through the parent instead of being denied headlessly are next.
 
 Self-hosting outside the client: tools reach the network only through the egress proxy, so `cargo add` and `git push` ask once per host unless a `net` rule allows it. Daily use runs the `mise run install` build; workers keep the binary they started with, so rebuilding the repository does not disturb running sessions.
 

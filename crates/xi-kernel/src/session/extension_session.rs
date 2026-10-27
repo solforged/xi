@@ -368,17 +368,24 @@ impl Session {
         let parent_id = self.id();
         let parent_snapshot = self.0.snapshot.clone();
         let prepared = move || -> Result<_> {
+            let name = params
+                .name
+                .as_deref()
+                .map(super::task::child_name)
+                .transpose()
+                .map_err(Error::Config)?;
+            let child_tool = |name: &str| super::is_tool_name(name) && name != super::task::NAME;
             let names = params.tools.unwrap_or_else(|| {
                 parent_specs
                     .iter()
-                    .filter(|s| xi_tools::is_builtin(&s.name))
+                    .filter(|s| child_tool(&s.name))
                     .map(|s| s.name.clone())
                     .collect()
             });
             let mut tools = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for name in &names {
-                if !xi_tools::is_builtin(name) || !parent_tools.contains_key(name) {
+                if !child_tool(name) || !parent_tools.contains_key(name) {
                     return Err(Error::Config(format!(
                         "child tool {name} is not one of the parent's built-in tools"
                     )));
@@ -415,7 +422,7 @@ impl Session {
                 Some(backend),
                 Some((parent_id, parent_snapshot)),
             )?;
-            Ok((child, params.prompt))
+            Ok((child, params.prompt, name))
         };
         // Reserve order before spawning: scheduler order must not renumber children.
         let ticket = self
@@ -439,7 +446,10 @@ impl Session {
         let cancel = cancel.clone();
         let stop = self.0.stop.clone();
         Box::pin(async move {
-            let (child, prompt) = prepared.await.map_err(|_| Error::Stopped)??;
+            let (child, prompt, name) = prepared.await.map_err(|_| Error::Stopped)??;
+            if let Some(name) = name {
+                child.rename(&name).await?;
+            }
             let mut reply = child.submit(vec![Block::Text { text: prompt }]);
             let outcome = tokio::select! {
                 biased;

@@ -368,10 +368,12 @@ impl Session {
                         let params = xi_protocol::methods::extension::AgentRunParams {
                             session: self.id(),
                             prompt: child.prompt,
+                            name: child.name.clone(),
                             tools: child.tools,
                             model: child.model,
                         };
-                        self.run_child(state, params, cancel)
+                        let run = self.run_child(state, params, cancel);
+                        async move { (child.name, run.await) }
                     })
                     .collect();
                 let all = async { Ok(futures::future::join_all(runs).await) };

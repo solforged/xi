@@ -67,6 +67,17 @@ pub(crate) struct Update {
     generation: u64,
 }
 
+/// Validates and trims a user-assigned session title.
+pub(crate) fn validate(title: &str) -> Result<&str> {
+    let title = title.trim();
+    if title.is_empty() || title.contains(['\n', '\r']) || title.chars().count() > MAX_CHARS {
+        return Err(Error::Config(format!(
+            "a title is one line of 1 to {MAX_CHARS} characters"
+        )));
+    }
+    Ok(title)
+}
+
 impl Session {
     /// Sets the user's title: at once when idle, otherwise at the running
     /// turn's next model boundary. Automatic naming stops for good.
@@ -75,12 +86,7 @@ impl Session {
     /// Returns `Config` unless the trimmed title is one line of 1 to 80
     /// characters, and log errors when appending it.
     pub async fn rename(&self, title: &str) -> Result<()> {
-        let title = title.trim();
-        if title.is_empty() || title.contains(['\n', '\r']) || title.chars().count() > MAX_CHARS {
-            return Err(Error::Config(format!(
-                "a title is one line of 1 to {MAX_CHARS} characters"
-            )));
-        }
+        let title = validate(title)?;
         self.deliver(Update {
             title: title.into(),
             by: TitleSource::User,

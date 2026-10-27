@@ -3733,6 +3733,12 @@ mod tests {
                 xi_version: "test".into(),
                 parent_session: Some(parent),
             });
+            child_event(EventKind::SessionTitled {
+                title: format!("Check {number}"),
+                by: xi_protocol::event::TitleSource::User,
+                model: None,
+                usage: None,
+            });
             child_event(EventKind::UserMessage {
                 content: vec![Block::Text {
                     text: format!("check {number}"),
@@ -3753,11 +3759,11 @@ mod tests {
         let rows = plain(&t.apply(&ev(result("task", "parent result", false), 60_000), m(96)));
         assert!(
             rows.iter()
-                .any(|line| line == "» from child 1 · check 1 · 00:01")
+                .any(|line| line == "» from 1 · Check 1 · 00:01")
         );
         assert!(
             rows.iter()
-                .any(|line| line == "» from child 2 · check 2 · 00:01")
+                .any(|line| line == "» from 2 · Check 2 · 00:01")
         );
         assert_eq!(
             rows.iter()
@@ -3769,7 +3775,7 @@ mod tests {
             let full = plain(&t.expand(m(96)).unwrap());
             assert_eq!(
                 full[1],
-                format!("── from child {number} · check {number} ──")
+                format!("── from {number} · Check {number} ──")
             );
             assert_eq!(
                 full[2..],

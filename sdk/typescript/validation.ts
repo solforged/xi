@@ -34,7 +34,7 @@ function valid<M extends keyof Methods, I extends 0 | 1>(method: M, part: I, val
       case "tool/invoke": return typeof value.call === "string" && typeof value.tool === "string" && json(value.input);
       case "command/run": return typeof value.name === "string" && typeof value.args === "string";
       case "session/append_custom": return typeof value.kind === "string" && json(value.data);
-      case "agent/run": return typeof value.prompt === "string" && (value.tools === undefined || strings(value.tools)) && (value.model === undefined || (object(value.model) && ((typeof value.model.provider === "string" && typeof value.model.model === "string") || ["slow", "default", "smol", "tiny"].includes(value.model.role as string))));
+      case "agent/run": return typeof value.prompt === "string" && (value.name === undefined || typeof value.name === "string") && (value.tools === undefined || strings(value.tools)) && (value.model === undefined || (object(value.model) && ((typeof value.model.provider === "string" && typeof value.model.model === "string") || ["slow", "default", "smol", "tiny"].includes(value.model.role as string))));
       case "hook/run":
         switch (value.point) {
           case "pre_tool": return typeof value.call === "string" && typeof value.tool === "string" && json(value.input);

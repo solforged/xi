@@ -1608,6 +1608,16 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
     for child in [one, two, three] {
         child_event(&mut app, child, child_root(parent, child));
     }
+    child_event(
+        &mut app,
+        two,
+        EventKind::SessionTitled {
+            title: "Rollback UI".into(),
+            by: TitleSource::User,
+            model: None,
+            usage: None,
+        },
+    );
     child_event(&mut app, one, read_call());
     child_event(
         &mut app,
@@ -1639,15 +1649,15 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
     assert_eq!(app.transcript.children().sent(), 2_000);
     let rows: Vec<&str> = live.lines().filter(|l| l.contains("─ ")).collect();
     assert_eq!(rows.len(), 3, "{live}");
-    assert!(rows[0].starts_with("  ├─ ") && rows[0].contains(" 1  read docs/policies.md"));
+    assert!(rows[0].starts_with("  ├─ ") && rows[0].contains(" Agent 1  read docs/policies.md"));
     assert!(rows[0].contains("1 call · "));
-    assert!(rows[1].contains("● 2  4 fixtures still use archived keys"));
+    assert!(rows[1].contains("● 2 · Rollback UI  4 fixtures still use archived keys"));
     assert!(!rows[1].contains("**") && !rows[1].contains("more detail"));
-    assert!(rows[2].starts_with("  └─ ✕ 3  failed · provider unavailable"));
+    assert!(rows[2].starts_with("  └─ ✕ Agent 3  failed · provider unavailable"));
     assert_eq!(app.transcript.children().running(), 1);
 
     child_event(&mut app, one, result("read-call", "1|x"));
-    assert!(live_text(&app).contains(" 1  thinking"));
+    assert!(live_text(&app).contains(" Agent 1  thinking"));
     child_event(
         &mut app,
         one,
@@ -1669,15 +1679,15 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
         committed.iter().any(|l| l.starts_with("● task    3 tasks")),
         "{text}"
     );
-    assert!(text.contains("» from child 1 · "), "{text}");
+    assert!(text.contains("» from Agent 1 · "), "{text}");
     assert!(text.contains("\n  all keys match\n"), "{text}");
-    assert!(text.contains("» from child 2 · "), "{text}");
+    assert!(text.contains("» from 2 · Rollback UI · "), "{text}");
     assert!(
         text.contains("\n  4 fixtures still use archived keys\n  more detail\n"),
         "{text}"
     );
     assert!(!text.contains("**"), "{text}");
-    assert!(text.contains("✕ from child 3 · "), "{text}");
+    assert!(text.contains("✕ from Agent 3 · "), "{text}");
     assert!(text.contains("\n  provider unavailable"), "{text}");
     assert!(!text.contains("Task 1 [done]"), "{text}");
     assert!(
@@ -1734,7 +1744,7 @@ async fn attaching_mid_call_shows_children_already_running() {
     let app = App::new(launch, 120, 30);
     let live = live_text(&app);
     assert!(live.contains("└─ "), "{live}");
-    assert!(live.contains(" 1  read docs/policies.md"), "{live}");
+    assert!(live.contains(" Agent 1  read docs/policies.md"), "{live}");
     assert_eq!(app.transcript.children().running(), 1);
 }
 
