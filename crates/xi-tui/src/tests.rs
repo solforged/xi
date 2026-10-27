@@ -997,6 +997,61 @@ async fn steering_matches_the_image_payload_not_just_the_text() {
 }
 
 #[tokio::test]
+async fn skill_invocations_are_prompts_whose_echo_shows_only_the_typed_text() {
+    let (launch, mut requests) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 100, 24);
+    let typed = Block::Text {
+        text: "/skill:review the diff".into(),
+    };
+    app.editor.set_text("/skill:review the diff");
+    app.submit(false).await.unwrap();
+    assert_eq!(app.steering, vec![vec![typed.clone()]]);
+    app.commit.clear();
+    app.notify(&ClientNotification::Event(EventParams {
+        session: app.session_id(),
+        event: Event {
+            id: EventId::generate(),
+            parent: Some(app.launch.attached.info.head),
+            at: Timestamp(1),
+            kind: EventKind::UserMessage {
+                content: vec![
+                    xi_protocol::skill::instructions("review", "/skills/review", "SKILL_BODY"),
+                    typed.clone(),
+                ],
+            },
+        },
+    }));
+    assert!(app.steering.is_empty());
+    let shown: Vec<_> = app.commit.iter().map(|line| line.plain()).collect();
+    assert!(
+        !shown.iter().any(|line| line.contains("another client")),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|line| line.contains("SKILL_BODY")),
+        "{shown:?}"
+    );
+    assert_eq!(
+        prompt_line(&[
+            xi_protocol::skill::instructions("review", "/skills/review", "SKILL_BODY"),
+            typed.clone(),
+        ]),
+        Some("/skill:review the diff".into())
+    );
+    let reply = app.pending.next().await.unwrap();
+    app.replied(reply);
+    let mut methods = Vec::new();
+    while let Ok((method, params)) = requests.try_recv() {
+        if method == "session/prompt" {
+            assert_eq!(params["content"], json!([typed]));
+        }
+        methods.push(method);
+    }
+    assert!(methods.iter().any(|method| method == "session/prompt"));
+    assert!(!methods.iter().any(|method| method == "session/command"));
+}
+
+#[tokio::test]
 async fn draft_images_can_be_removed_and_do_not_count_as_an_empty_composer() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 100, 24);

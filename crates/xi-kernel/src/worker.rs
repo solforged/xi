@@ -350,7 +350,7 @@ where
                             if method == "session/models" {
                                 encode(active.mirror.models())
                             } else {
-                                encode(&*active.session.0.commands.lock().expect("command catalog"))
+                                encode(active.session.commands())
                             }
                         });
                         let _ = peer.respond(id, result);

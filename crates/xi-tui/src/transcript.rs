@@ -1079,6 +1079,7 @@ impl Transcript {
         if let ClientNotification::Event(params) = notification
             && let EventKind::UserMessage { content } = &params.event.kind
         {
+            let content = xi_protocol::skill::typed(content);
             if let Some(index) = self.sent.iter().position(|sent| sent == content) {
                 self.sent.remove(index);
             } else {
@@ -1238,7 +1239,7 @@ impl Transcript {
             EventKind::UserMessage { content } => {
                 self.children.clear();
                 self.gap(&mut out);
-                let text = blocks_text(content);
+                let text = blocks_text(xi_protocol::skill::typed(content));
                 let rows = wrap(&text, m.prose);
                 let lines = rows.iter().enumerate().map(|(i, row)| {
                     let lead = if i == 0 {

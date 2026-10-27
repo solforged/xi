@@ -146,6 +146,11 @@ impl App {
                         .ink("  /name args            ")
                         .dim("run an extension command"),
                 );
+                lines.push(
+                    Line::default()
+                        .ink("  /skill:name args      ")
+                        .dim("send a prompt with a skill's instructions"),
+                );
                 self.note(lines);
             }
             Some(Builtin::Quit) => self.quit = true,

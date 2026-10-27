@@ -1547,10 +1547,10 @@ impl LogIndex {
         match event.kind {
             EventKind::UserMessage { content } if !self.prompted => {
                 self.prompted = true;
-                let text: String = content
-                    .into_iter()
+                let text: String = xi_protocol::skill::typed(&content)
+                    .iter()
                     .filter_map(|block| match block {
-                        Block::Text { text } => Some(text),
+                        Block::Text { text } => Some(text.as_str()),
                         _ => None,
                     })
                     .collect();
