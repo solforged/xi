@@ -10,11 +10,12 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use xi_protocol::BoxFuture;
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::extension::AgentRunResult;
 use xi_protocol::model::ModelSelector;
 use xi_protocol::{OutputBlock, ToolCallId, ToolOutput};
-use xi_tools::{BoxFuture, Context, Crossing, Ran, Tool};
+use xi_tools::{Context, Crossing, Ran, Tool};
 
 /// The tool name in `tools` and in the model's catalog.
 pub(crate) const NAME: &str = "task";

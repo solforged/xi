@@ -10,12 +10,13 @@ use serde_json::json;
 use tempfile::TempDir;
 use xi_kernel::config::{Config, Paths};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Session, TurnOptions};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{Approver, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
 use xi_protocol::model::ModelInfo;
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, ToolCallId, ToolOutput};
-use xi_provider::{BoxFuture, Provider, Request, Response};
+use xi_provider::{Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
 
 struct Script(Mutex<VecDeque<Response>>);

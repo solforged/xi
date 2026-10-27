@@ -5,12 +5,12 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
+use xi_protocol::BoxFuture;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
     ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, ChildEvents, Delta, EventAppended,

@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use xi_policy::{Action, ActionKind, Taint};
+use xi_protocol::BoxFuture;
 use xi_protocol::event::{Approver, Remember, Usage};
 use xi_protocol::methods::extension::{
     AgentRunParams, AgentRunResult, AppendCustomParams, CommandParams, CommandResult,

@@ -38,9 +38,9 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+use xi_protocol::BoxFuture;
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::{ToolCallId, ToolOutput};
 use xi_sandbox::Spec;
