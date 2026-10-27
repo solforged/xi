@@ -9,18 +9,54 @@ use crate::sessions::Sessions;
 use crate::style::Line;
 use crate::{App, Error, ExternalRequest, Focus, config, settings};
 
+/// What a key does in a filtered list overlay.
+enum ListKey {
+    Choose,
+    Close,
+    Tab,
+    Up,
+    Down,
+    Older,
+    Backspace,
+    Type(char),
+    Other,
+}
+
 impl App {
+    /// Plain characters type into the filter; everything else goes through
+    /// the keymap, so the frame's hints and the keys agree.
+    fn list_key(&self, key: KeyEvent) -> ListKey {
+        if let KeyCode::Char(c) = key.code
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return ListKey::Type(c);
+        }
+        match self.keymap.action(key) {
+            Some(Action::Send) => ListKey::Choose,
+            Some(Action::Escape) => ListKey::Close,
+            Some(Action::Complete) => ListKey::Tab,
+            Some(Action::Up) => ListKey::Up,
+            Some(Action::Down) => ListKey::Down,
+            Some(Action::Search) => ListKey::Older,
+            Some(Action::Backspace) => ListKey::Backspace,
+            _ => ListKey::Other,
+        }
+    }
+
     async fn sessions_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => self.close_overlay(),
-            KeyCode::Enter => {
+        let key = self.list_key(key);
+        match key {
+            ListKey::Close => self.close_overlay(),
+            ListKey::Choose => {
                 if let Some(session) = self.sessions.as_ref().and_then(Sessions::selected).cloned()
                     && let Err(error) = self.resume(session).await
                 {
                     self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
                 }
             }
-            KeyCode::Tab => {
+            ListKey::Tab => {
                 let all = self.sessions.as_ref().is_some_and(|picker| !picker.all);
                 let cwd = (!all).then(|| self.launch.attached.info.cwd.clone());
                 match self
@@ -41,17 +77,11 @@ impl App {
             }
             _ => {
                 if let Some(picker) = self.sessions.as_mut() {
-                    match key.code {
-                        KeyCode::Up => picker.up(),
-                        KeyCode::Down => picker.down(),
-                        KeyCode::Backspace => picker.backspace(),
-                        KeyCode::Char(c)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            picker.input(c)
-                        }
+                    match key {
+                        ListKey::Up => picker.up(),
+                        ListKey::Down => picker.down(),
+                        ListKey::Backspace => picker.backspace(),
+                        ListKey::Type(c) => picker.input(c),
                         _ => {}
                     }
                 }
@@ -136,51 +166,47 @@ impl App {
     }
 
     async fn model_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Enter {
-            let entry = self.picker.as_ref().and_then(Picker::selected).cloned();
-            if let Some(entry) = entry {
-                if !self.idle_only("model selection") {
-                    return;
-                }
-                if !entry.available {
-                    let hint = if entry.model.provider == "chatgpt" {
-                        " · xi login chatgpt"
-                    } else {
-                        ""
-                    };
-                    self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
-                } else if self.set_model(entry.model).await {
-                    self.launch.attached.info.model_info = Some(entry.info);
-                    self.close_models();
+        let key = self.list_key(key);
+        match key {
+            ListKey::Choose => {
+                let entry = self.picker.as_ref().and_then(Picker::selected).cloned();
+                if let Some(entry) = entry {
+                    if !self.idle_only("model selection") {
+                        return;
+                    }
+                    if !entry.available {
+                        let hint = if entry.model.provider == "chatgpt" {
+                            " · xi login chatgpt"
+                        } else {
+                            ""
+                        };
+                        self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
+                    } else if self.set_model(entry.model).await {
+                        self.launch.attached.info.model_info = Some(entry.info);
+                        self.close_models();
+                    }
                 }
             }
-            return;
-        }
-        if key.code == KeyCode::Esc {
-            self.close_models();
-            return;
-        }
-        if let Some(picker) = self.picker.as_mut() {
-            match key.code {
-                KeyCode::Up => picker.up(),
-                KeyCode::Down => picker.down(),
-                KeyCode::Backspace => picker.backspace(),
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    picker.input(c)
+            ListKey::Close => self.close_models(),
+            _ => {
+                if let Some(picker) = self.picker.as_mut() {
+                    match key {
+                        ListKey::Up => picker.up(),
+                        ListKey::Down => picker.down(),
+                        ListKey::Backspace => picker.backspace(),
+                        ListKey::Type(c) => picker.input(c),
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
     }
 
     fn search_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => self.close_overlay(),
-            KeyCode::Enter => {
+        let key = self.list_key(key);
+        match key {
+            ListKey::Close => self.close_overlay(),
+            ListKey::Choose => {
                 let selected = self
                     .search
                     .as_ref()
@@ -195,18 +221,11 @@ impl App {
             }
             _ => {
                 if let Some(search) = self.search.as_mut() {
-                    match key.code {
-                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            search.older()
-                        }
-                        KeyCode::Backspace => search.backspace(),
-                        KeyCode::Char(c)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            search.input(c)
-                        }
+                    match key {
+                        ListKey::Older | ListKey::Down => search.older(),
+                        ListKey::Up => search.newer(&self.history),
+                        ListKey::Backspace => search.backspace(),
+                        ListKey::Type(c) => search.input(c),
                         _ => {}
                     }
                 }

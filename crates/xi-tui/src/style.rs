@@ -49,6 +49,9 @@ pub struct Span {
     pub role: Role,
     /// Set in bold.
     pub bold: bool,
+    /// Underlined, for marks that must not change the text's role, such as
+    /// a search match on a selected row.
+    pub underline: bool,
 }
 
 /// One terminal row of spans.
@@ -126,7 +129,12 @@ impl Line {
     pub fn span(mut self, role: Role, bold: bool, text: impl AsRef<str>) -> Self {
         let text = clean(text.as_ref());
         if !text.is_empty() {
-            self.0.push(Span { text, role, bold });
+            self.0.push(Span {
+                text,
+                role,
+                bold,
+                underline: false,
+            });
         }
         self
     }
@@ -137,6 +145,21 @@ impl Line {
     #[must_use]
     pub fn strong(self, role: Role, text: impl AsRef<str>) -> Self {
         self.span(role, true, text)
+    }
+
+    /// Appends underlined text in a role.
+    #[must_use]
+    pub fn underline(mut self, role: Role, text: impl AsRef<str>) -> Self {
+        let text = clean(text.as_ref());
+        if !text.is_empty() {
+            self.0.push(Span {
+                text,
+                role,
+                bold: false,
+                underline: true,
+            });
+        }
+        self
     }
 
     /// Appends another line's spans.
@@ -196,21 +219,24 @@ impl Line {
     /// Writes the line with SGR codes, or plain when `color` is off.
     pub fn write_ansi(&self, out: &mut String, color: bool) {
         for span in &self.0 {
-            let code = match (color, span.role.sgr(), span.bold) {
-                (false, _, _) | (true, None, false) => None,
-                (true, Some(c), false) => Some(c.to_owned()),
-                (true, None, true) => Some("1".to_owned()),
-                (true, Some(c), true) => Some(format!("1;{c}")),
-            };
-            match code {
-                Some(code) => {
-                    out.push_str("\x1b[");
-                    out.push_str(&code);
-                    out.push('m');
-                    out.push_str(&span.text);
-                    out.push_str("\x1b[0m");
+            let mut codes = Vec::new();
+            if color {
+                if span.bold {
+                    codes.push("1");
                 }
-                None => out.push_str(&span.text),
+                if span.underline {
+                    codes.push("4");
+                }
+                codes.extend(span.role.sgr());
+            }
+            if codes.is_empty() {
+                out.push_str(&span.text);
+            } else {
+                out.push_str("\x1b[");
+                out.push_str(&codes.join(";"));
+                out.push('m');
+                out.push_str(&span.text);
+                out.push_str("\x1b[0m");
             }
         }
     }
@@ -533,7 +559,8 @@ mod tests {
             [Span {
                 text: "Considering scope".into(),
                 role: Role::Dim,
-                bold: true
+                bold: true,
+                underline: false,
             }]
         );
         let fenced = prose("```sh\nls `pwd` **x**\n```\n`y`", 40, Role::Ink);

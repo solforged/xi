@@ -3,7 +3,10 @@
 use xi_protocol::methods::client::SessionSummary;
 use xi_protocol::{SessionId, Timestamp};
 
-use crate::style::{Line, Role};
+use crate::frame::{Body, Cursor, Frame, Hint, Tone};
+use crate::keys::{Action, Keymap};
+use crate::style::{Line, lr};
+use crate::transcript::SPINNER;
 
 /// A filterable list of top-level sessions, newest activity first.
 pub struct Sessions {
@@ -104,85 +107,114 @@ impl Sessions {
             .map(|index| &self.sessions[*index])
     }
 
-    /// Draws the query and visible rows, keeping the selection in view.
+    /// The border, the scope and position, and the keys.
     #[must_use]
-    pub fn render(&self, cols: usize, rows: usize, now: Timestamp) -> Vec<Line> {
-        if rows == 0 {
-            return Vec::new();
-        }
+    pub fn frame(&self, keys: &Keymap) -> Frame {
         let scope = if self.all {
             "all workspaces"
         } else {
             "this workspace"
         };
-        let query = if self.query.is_empty() {
-            "type to filter"
+        let info = if self.matches.is_empty() {
+            scope.to_owned()
         } else {
-            self.query.as_str()
+            format!("{scope} · {} of {}", self.selected + 1, self.matches.len())
         };
-        let mut lines = vec![
-            Line::default()
-                .brass("sessions")
-                .dim(format!(
-                    " · {scope} · {query} · tab toggles · enter selects · esc closes"
-                ))
-                .truncate(cols),
-        ];
-        if rows == 1 {
-            return lines;
+        let mut hints: Vec<Hint> = Hint::key(keys, Action::Send, "opens", 0)
+            .into_iter()
+            .collect();
+        if let Some(tab) = keys.key(Action::Complete) {
+            let (long, short) = if self.all {
+                ("this workspace", "this")
+            } else {
+                ("all workspaces", "all")
+            };
+            hints.push(Hint::new(format!("{tab} {long}"), 2).short(format!("{tab} {short}")));
         }
+        hints.extend(Hint::key(keys, Action::Escape, "closes", 0));
+        Frame {
+            tone: Tone::Focus,
+            title: Line::default().ink("sessions"),
+            info: Some(Line::default().dim(info)),
+            hints,
+        }
+    }
+
+    /// The filter row and one row per session, `inner` wide: `●` the one
+    /// you're in, a spinner for a running one, `?` for one waiting on you.
+    #[must_use]
+    pub fn body(&self, inner: usize, now: Timestamp) -> Body {
+        let head = vec![Line::default().dim("filter ").ink(&self.query)];
+        let cursor = Some(Cursor::Head(
+            0,
+            unicode_width::UnicodeWidthStr::width(format!("filter {}", self.query).as_str()),
+        ));
         if self.matches.is_empty() {
-            lines.push(Line::default().dim("  no matching sessions").truncate(cols));
-            return lines;
-        }
-        let capacity = rows - 1;
-        let start = self.selected.saturating_sub(capacity.saturating_sub(1) / 2);
-        for (position, index) in self.matches.iter().enumerate().skip(start).take(capacity) {
-            let entry = &self.sessions[*index];
-            let cursor = if position == self.selected {
-                "›"
-            } else {
-                " "
+            return Body {
+                head,
+                list: vec![Line::default().dim("no matching sessions")],
+                cursor,
+                ..Body::default()
             };
-            let current = if entry.session == self.current {
-                "●"
-            } else {
-                " "
-            };
-            let title = entry
-                .title
-                .as_deref()
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or("(no prompt yet)");
-            let mut label = format!(
-                "{cursor} {current} {title} · {} · {}",
-                entry.model.model,
-                age(entry.updated, now)
-            );
-            if self.all {
-                label.push_str(&format!(" · {}", crate::view::home(&entry.cwd)))
-            }
-            if entry.running {
-                label.push_str(" · running")
-            }
-            if entry.pending_approvals > 0 {
-                label.push_str(&format!(" · ? {}", entry.pending_approvals))
-            }
-            lines.push(
-                Line::default()
-                    .span(
-                        if position == self.selected {
-                            Role::Brass
-                        } else {
-                            Role::Ink
-                        },
-                        false,
-                        label,
-                    )
-                    .truncate(cols),
-            );
         }
-        lines
+        let list = self
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(position, index)| {
+                let entry = &self.sessions[*index];
+                let here = position == self.selected;
+                let mark = if entry.session == self.current {
+                    Line::default().brass("●")
+                } else if entry.pending_approvals > 0 {
+                    Line::default().brass("?")
+                } else if entry.running {
+                    Line::default().brass(SPINNER[0])
+                } else {
+                    Line::default().ink(" ")
+                };
+                let title = entry
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or("(no prompt yet)");
+                let left = if here {
+                    Line::default()
+                        .brass("› ")
+                        .extend(mark)
+                        .brass(format!(" {title}"))
+                } else {
+                    Line::default()
+                        .ink("  ")
+                        .extend(mark)
+                        .ink(format!(" {title}"))
+                };
+                let mut right = Line::default();
+                if entry.pending_approvals > 0 {
+                    right = right
+                        .brass(format!("? {} waiting", entry.pending_approvals))
+                        .dim(" · ");
+                } else if entry.running {
+                    right = right.dim("running · ");
+                }
+                if self.all {
+                    right = right.dim(format!("{} · ", crate::view::home(&entry.cwd)));
+                }
+                right = right.dim(format!(
+                    "{} · {}",
+                    entry.model.model,
+                    age(entry.updated, now)
+                ));
+                lr(left, right, inner)
+            })
+            .collect();
+        Body {
+            head,
+            list,
+            selected: Some(self.selected),
+            cursor,
+            ..Body::default()
+        }
     }
 }
 

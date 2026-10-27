@@ -297,17 +297,32 @@ impl App {
         let reserved = composer.len() + 1 + attachment_rows + lines.len() - transcript_rows;
         let overlay_rows = self.rows.saturating_sub(1 + reserved);
         let mut overlay_cursor = None;
+        let inner = frame::inner(cols);
         let framed = match self.focus {
             Focus::Approval => self.approvals.as_ref().map(|approvals| {
                 (
                     approvals.frame(&self.keymap),
-                    approvals.body(frame::inner(cols), self.session_id()),
+                    approvals.body(inner, self.session_id()),
                 )
             }),
-            Focus::Tree => self.tree.as_ref().map(|tree| {
+            Focus::Tree => self
+                .tree
+                .as_ref()
+                .map(|tree| (tree.frame(&self.keymap), tree.body(inner, Timestamp::now()))),
+            Focus::Models => self.picker.as_ref().map(|picker| {
+                let back = self.settings.is_some().then_some("settings");
+                (picker.frame(&self.keymap, back), picker.body(inner))
+            }),
+            Focus::Sessions => self.sessions.as_ref().map(|sessions| {
                 (
-                    tree.frame(&self.keymap),
-                    tree.body(frame::inner(cols), Timestamp::now()),
+                    sessions.frame(&self.keymap),
+                    sessions.body(inner, Timestamp::now()),
+                )
+            }),
+            Focus::Search => self.search.as_ref().map(|search| {
+                (
+                    search.frame(&self.history, &self.keymap),
+                    search.body(&self.history, inner),
                 )
             }),
             _ => None,
@@ -316,16 +331,6 @@ impl App {
             let (rows, cursor) = frame::draw(&framed, body, cols, overlay_rows.max(4));
             overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
             lines.extend(rows);
-        }
-        if self.focus == Focus::Models
-            && let Some(picker) = &self.picker
-        {
-            lines.extend(picker.render(cols, overlay_rows));
-        }
-        if self.focus == Focus::Sessions
-            && let Some(sessions) = &self.sessions
-        {
-            lines.extend(sessions.render(cols, overlay_rows, Timestamp::now()));
         }
         if self.focus == Focus::Settings
             && let Some(settings) = &self.settings
@@ -341,16 +346,6 @@ impl App {
             );
             overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
             lines.extend(overlay);
-        }
-        if self.focus == Focus::Search
-            && let Some(search) = &self.search
-        {
-            lines.extend(
-                search
-                    .render(&self.history, cols)
-                    .into_iter()
-                    .take(overlay_rows),
-            );
         }
         if self.focus == Focus::Composer
             && let Some(menu) = &self.completion

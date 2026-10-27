@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::style::{Line, Role};
+use crate::frame::{Body, Cursor, Frame, Hint, Tone};
+use crate::keys::{Action, Keymap};
+use crate::style::{Line, Role, lr};
 
 const MAX_ENTRIES: usize = 5_000;
 
@@ -105,6 +107,14 @@ impl History {
     /// Current-workspace matches precede other workspaces, newest first in each.
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<&str> {
+        self.matches(query)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    /// [`History::search`] with whether each match is from this workspace.
+    fn matches(&self, query: &str) -> Vec<(&str, bool)> {
         let query = query.to_lowercase();
         let mut seen = HashSet::new();
         let mut matches = Vec::new();
@@ -114,7 +124,7 @@ impl History {
                     && (query.is_empty() || entry.text.to_lowercase().contains(&query))
                     && seen.insert(entry.text.as_str())
                 {
-                    matches.push(entry.text.as_str());
+                    matches.push((entry.text.as_str(), local));
                 }
             }
         }
@@ -174,6 +184,12 @@ impl Search {
         self.index = self.index.saturating_add(1);
     }
 
+    /// Selects the next newer match.
+    pub fn newer(&mut self, history: &History) {
+        let last = history.search(&self.query).len().saturating_sub(1);
+        self.index = self.index.min(last).saturating_sub(1);
+    }
+
     /// The selected match, if any.
     #[must_use]
     pub fn current<'a>(&self, history: &'a History) -> Option<&'a str> {
@@ -189,33 +205,91 @@ impl Search {
         &self.draft
     }
 
-    /// Renders a search header and the selected prompt, highlighting the query.
+    /// The border, the match count and the keys.
     #[must_use]
-    pub fn render(&self, history: &History, cols: usize) -> Vec<Line> {
-        let mut lines = vec![
-            Line::default()
-                .dim("history search · ")
-                .brass(&self.query)
-                .truncate(cols),
-        ];
-        let Some(text) = self.current(history) else {
-            lines.push(Line::default().dim("no matches").truncate(cols));
-            return lines;
+    pub fn frame(&self, history: &History, keys: &Keymap) -> Frame {
+        let count = history.search(&self.query).len();
+        let info = match count {
+            0 => "no matches".to_owned(),
+            1 => "1 match".to_owned(),
+            n => format!("{n} matches · this workspace first"),
         };
-        for row in text.split('\n') {
-            lines.push(highlight(row, &self.query).truncate(cols));
+        let mut hints: Vec<Hint> = Hint::key(keys, Action::Send, "uses", 0)
+            .into_iter()
+            .collect();
+        hints.extend(Hint::key(keys, Action::Search, "older", 2));
+        hints.extend(Hint::moves(keys, 3));
+        hints.extend(
+            keys.key(Action::Escape)
+                .map(|key| Hint::new(format!("{key} restores draft"), 0).short(key)),
+        );
+        Frame {
+            tone: Tone::Focus,
+            title: Line::default().ink("history"),
+            info: Some(Line::default().dim(info)),
+            hints,
         }
-        lines
+    }
+
+    /// The query row and one row per matching prompt, `inner` wide, with
+    /// the match underlined so the selection's brass still reads.
+    #[must_use]
+    pub fn body(&self, history: &History, inner: usize) -> Body {
+        let head = vec![Line::default().dim("search ").ink(&self.query)];
+        let cursor = Some(Cursor::Head(
+            0,
+            unicode_width::UnicodeWidthStr::width(format!("search {}", self.query).as_str()),
+        ));
+        let matches = history.matches(&self.query);
+        if matches.is_empty() {
+            return Body {
+                head,
+                list: vec![Line::default().dim("no matches")],
+                cursor,
+                ..Body::default()
+            };
+        }
+        let selected = self.index.min(matches.len() - 1);
+        let list = matches
+            .iter()
+            .enumerate()
+            .map(|(i, (text, local))| {
+                let text = text.replace('\n', " ");
+                let left = if i == selected {
+                    Line::default()
+                        .brass("› ")
+                        .extend(highlight(&text, &self.query, Role::Brass))
+                } else {
+                    Line::default()
+                        .ink("  ")
+                        .extend(highlight(&text, &self.query, Role::Ink))
+                };
+                let right = if *local {
+                    Line::default()
+                } else {
+                    Line::default().dim("other workspace")
+                };
+                lr(left, right, inner)
+            })
+            .collect();
+        Body {
+            head,
+            list,
+            selected: Some(selected),
+            cursor,
+            ..Body::default()
+        }
     }
 }
 
-fn highlight(text: &str, query: &str) -> Line {
+fn highlight(text: &str, query: &str, role: Role) -> Line {
+    let plain = || Line::default().span(role, false, text);
     if query.is_empty() {
-        return Line::default().ink(text);
+        return plain();
     }
     let query = query.to_lowercase();
     let Some(start) = text.to_lowercase().find(&query) else {
-        return Line::default().ink(text);
+        return plain();
     };
     let end = start + query.len();
     let mut lowered = 0;
@@ -233,12 +307,12 @@ fn highlight(text: &str, query: &str) -> Line {
         }
     }
     let Some(first) = first else {
-        return Line::default().ink(text);
+        return plain();
     };
     Line::default()
-        .ink(&text[..first])
-        .strong(Role::Brass, &text[first..last])
-        .ink(&text[last..])
+        .span(role, false, &text[..first])
+        .underline(role, &text[first..last])
+        .span(role, false, &text[last..])
 }
 
 #[cfg(test)]
@@ -357,24 +431,39 @@ mod tests {
     }
 
     #[test]
-    fn search_render_bounds_width_and_highlights_unicode_case_insensitively() {
+    fn search_lists_matches_and_underlines_unicode_case_insensitively() {
         let (mut history, _) = History::load(None, Path::new("/here"));
         history.push("hello Ξ and more\nsecond line").unwrap();
+        history.entries.push(Entry {
+            cwd: "/elsewhere".into(),
+            text: "ξ elsewhere".into(),
+        });
         let mut search = Search::new(String::new());
         search.input('ξ');
-        let lines = search.render(&history, 20);
-        assert!(lines.iter().all(|line| line.width() <= 20));
+        let body = search.body(&history, 40);
+        let rows: Vec<String> = body.list.iter().map(Line::plain).collect();
         assert!(
-            lines[1]
-                .0
-                .iter()
-                .any(|span| span.text == "Ξ" && span.role == Role::Brass)
+            rows[0].starts_with("› hello Ξ and more second line"),
+            "{rows:?}"
         );
-        assert!(
+        assert!(rows[1].ends_with("other workspace"), "{rows:?}");
+        let matched = body.list[0].0.iter().find(|span| span.text == "Ξ").unwrap();
+        assert!(matched.underline && matched.role == Role::Brass);
+        search.older();
+        search.older();
+        assert_eq!(search.body(&history, 40).selected, Some(1));
+        search.newer(&history);
+        assert_eq!(
+            search.current(&history),
+            Some("hello Ξ and more\nsecond line")
+        );
+        assert_eq!(
             search
-                .render(&history, 0)
-                .iter()
-                .all(|line| line.width() == 0)
+                .frame(&history, &Keymap::default())
+                .info
+                .unwrap()
+                .plain(),
+            "2 matches · this workspace first"
         );
     }
 }
