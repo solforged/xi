@@ -862,6 +862,37 @@ fn sandbox_runtime_directory_guard_child() {
     }
 }
 
+#[tokio::test]
+async fn enabling_the_live_sandbox_rechecks_the_runtime_directory_guard() {
+    let fixture = Fixture::new();
+    let mut config = fixture.config();
+    config.sandbox.enabled = false;
+    config
+        .sandbox
+        .readable
+        .push(xi_protocol::runtime::dir().unwrap());
+    let session = Session::create(
+        config,
+        None,
+        EventBus::default(),
+        opts(),
+        Some(Backend {
+            provider: Script::new(vec![]),
+            model: model(),
+            tools: vec![],
+        }),
+    )
+    .unwrap();
+    let error = session.set_sandbox(true).await.unwrap_err();
+    assert!(matches!(
+        error,
+        xi_kernel::Error::Config(message) if message.contains("is inside sandbox root")
+    ));
+    // A failed enable must leave the worker off and append no audit event.
+    session.set_sandbox(false).await.unwrap();
+    assert_eq!(session.info().await.events.len(), 1);
+}
+
 #[test]
 fn env_command_fills_only_passed_through_variables() {
     let fixture = Fixture::new();

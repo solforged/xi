@@ -608,6 +608,7 @@ impl Router {
             | "session/compact"
             | "session/set_model"
             | "session/set_reasoning"
+            | "session/set_sandbox"
             | "session/rename"
             | "session/models"
             | "session/commands"
@@ -1034,6 +1035,7 @@ impl Router {
                 match &event.event.kind {
                     EventKind::ModelChanged { model } => info.model = model.clone(),
                     EventKind::ReasoningChanged { reasoning } => info.reasoning = *reasoning,
+                    EventKind::SandboxChanged { enabled } => info.sandbox_enabled = *enabled,
                     _ => {}
                 }
             }

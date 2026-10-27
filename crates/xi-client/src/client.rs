@@ -249,6 +249,13 @@ impl Client {
             .await
     }
 
+    /// Enables or disables the live worker's tool sandbox while idle.
+    /// Does not change the saved default or extension sandboxes.
+    pub async fn set_sandbox(&self, session: SessionId, enabled: bool) -> Result<(), ClientError> {
+        self.request::<SessionSetSandbox>(&SetSandboxParams { session, enabled })
+            .await
+    }
+
     /// Sets a session's title, at once when idle or at the running turn's
     /// next model boundary.
     pub async fn rename(

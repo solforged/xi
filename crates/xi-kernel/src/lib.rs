@@ -828,6 +828,36 @@ impl Session {
         Ok(())
     }
 
+    /// Changes the live worker's tool sandbox at an idle prompt. Records
+    /// an audit event, but leaves saved defaults and extension sandboxes alone.
+    /// Reopening the session uses configuration rather than this override.
+    pub async fn set_sandbox(&self, enabled: bool) -> Result<()> {
+        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
+        let control = self.0.control.lock().expect("control lock");
+        if control.running {
+            return Err(Error::Running);
+        }
+        if enabled == state.config.sandbox.enabled {
+            return Ok(());
+        }
+        let mut sandbox = state.tools_context.sandbox.clone();
+        sandbox.enabled = enabled;
+        let listener = if enabled {
+            config::validate_sandbox(&sandbox)?;
+            let listener = egress::Listener::bind("tools")?;
+            sandbox.egress = Some(listener.egress().clone());
+            Some(listener)
+        } else {
+            sandbox.egress = None;
+            None
+        };
+        self.append(&mut state, EventKind::SandboxChanged { enabled })?;
+        state.tools_context.sandbox = sandbox;
+        state.config.sandbox.enabled = enabled;
+        state.egress.listener = listener;
+        Ok(())
+    }
+
     fn append(&self, state: &mut State, kind: EventKind) -> Result<()> {
         let event = state.log.append(state.head, kind)?.clone();
         state.head = event.id;

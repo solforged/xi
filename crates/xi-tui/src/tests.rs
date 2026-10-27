@@ -147,6 +147,7 @@ struct FakeData {
     settings: Option<SettingsReport>,
     reject_settings: bool,
     reject_setting: bool,
+    reject_sandbox: bool,
     /// Keep answered asks in `approval/list`, as the daemon does until
     /// the resolution event arrives.
     lagging_inbox: bool,
@@ -262,6 +263,10 @@ async fn launch_with(
                         Some(_) => json!(response.info.model),
                         None => params["model"].clone(),
                     }),
+                    "session/set_sandbox" if data.reject_sandbox => Err(RpcError::new(
+                        RpcError::SESSION_RUNNING,
+                        "session is running",
+                    )),
                     "session/commands" => {
                         Ok(json!([{ "name": "known", "description": "an extension command" }]))
                     }
@@ -663,6 +668,71 @@ async fn footer_git_state_is_collected_asynchronously_and_scoped_to_the_workspac
     );
     app.launch.attached.info.cwd = "/different-workspace".into();
     assert!(!app.footer(200).plain().contains("footer-test"));
+}
+
+#[tokio::test]
+async fn alt_s_toggles_the_live_sandbox_without_saving_a_default() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 160, 24);
+    app.editor.insert("keep this draft");
+    for enabled in [false, true] {
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "session/set_sandbox");
+        assert_eq!(params["session"], json!(app.session_id()));
+        assert_eq!(params["enabled"], enabled);
+        assert_eq!(app.launch.attached.info.sandbox_enabled, enabled);
+        assert_eq!(app.footer(160).plain().contains("sandbox off"), !enabled);
+        assert_eq!(app.editor.text(), "keep this draft");
+        assert!(
+            requests.try_recv().is_err(),
+            "must not save a global default"
+        );
+    }
+    for (command, enabled) in [
+        ("/sandbox off", false),
+        ("/sandbox", true),
+        ("/sandbox on", true),
+    ] {
+        app.command(command).await.unwrap();
+        assert_eq!(
+            request(&mut requests, "session/set_sandbox")["enabled"],
+            enabled
+        );
+    }
+    app.commit.clear();
+    app.command("/sandbox invalid").await.unwrap();
+    assert!(requests.try_recv().is_err());
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("expects on or off"))
+    );
+}
+
+#[tokio::test]
+async fn rejected_sandbox_changes_keep_the_active_state() {
+    let (launch, mut requests) = launch_with(
+        snapshot(false),
+        FakeData {
+            reject_sandbox: true,
+            ..FakeData::default()
+        },
+    )
+    .await;
+    let mut app = App::new(launch, 160, 24);
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT))
+        .await
+        .unwrap();
+    request(&mut requests, "session/set_sandbox");
+    assert!(app.launch.attached.info.sandbox_enabled);
+    assert!(app.footer(160).plain().contains("◇ sandbox"));
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("session is running"))
+    );
 }
 
 #[tokio::test]
@@ -1198,13 +1268,18 @@ async fn history_search_walks_older_matches_and_restores_the_draft() {
 }
 
 #[tokio::test]
-async fn model_reasoning_and_compaction_changes_are_refused_while_running() {
+async fn model_reasoning_sandbox_and_compaction_changes_are_refused_while_running() {
     let (launch, mut requests) = launch(snapshot(true)).await;
     let mut app = App::new(launch, 80, 24);
     app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
         .await
         .unwrap();
     app.command("/model demo/second").await.unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT))
+        .await
+        .unwrap();
+    app.command("/sandbox off").await.unwrap();
+    assert!(app.launch.attached.info.sandbox_enabled);
     app.command("/compact").await.unwrap();
     app.command("/new").await.unwrap();
     assert!(!app.clear_scrollback);
@@ -1221,13 +1296,14 @@ async fn model_reasoning_and_compaction_changes_are_refused_while_running() {
 }
 
 #[tokio::test]
-async fn reasoning_and_model_events_from_other_clients_update_metadata() {
+async fn reasoning_model_and_sandbox_events_from_other_clients_update_metadata() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 160, 24);
     for kind in [
         EventKind::ReasoningChanged {
             reasoning: Reasoning::Low,
         },
+        EventKind::SandboxChanged { enabled: false },
         EventKind::ModelChanged {
             model: ModelRef {
                 provider: "demo".into(),
@@ -1247,6 +1323,13 @@ async fn reasoning_and_model_events_from_other_clients_update_metadata() {
     }
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::Low);
     assert_eq!(app.launch.attached.info.model.model, "other");
+    assert!(!app.launch.attached.info.sandbox_enabled);
+    assert!(app.footer(160).plain().contains("sandbox off"));
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("unrestricted host files and network"))
+    );
     assert!(app.refresh);
     assert!(app.footer(160).plain().contains("think low"));
     assert!(

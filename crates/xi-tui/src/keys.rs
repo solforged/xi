@@ -33,6 +33,8 @@ pub enum Action {
     Models,
     /// Cycle reasoning depth.
     Reasoning,
+    /// Toggle the live session's tool sandbox while idle.
+    Sandbox,
     /// Expand a collapsed result.
     Expand,
     /// Cycle the thinking display.
@@ -80,6 +82,7 @@ impl Action {
         Self::PasteImage,
         Self::Models,
         Self::Reasoning,
+        Self::Sandbox,
         Self::Expand,
         Self::Thinking,
         Self::FocusSessions,
@@ -114,6 +117,7 @@ impl Action {
             Self::PasteImage => "paste_image",
             Self::Models => "models",
             Self::Reasoning => "reasoning",
+            Self::Sandbox => "sandbox",
             Self::Expand => "expand",
             Self::Thinking => "thinking",
             Self::FocusSessions => "focus_sessions",
@@ -149,6 +153,7 @@ impl Action {
             Self::PasteImage => "attach a clipboard image; backspace on empty removes the last",
             Self::Models => "open the model picker",
             Self::Reasoning => "cycle reasoning through the model's levels",
+            Self::Sandbox => "toggle this session's tool sandbox while idle",
             Self::Expand => "expand the newest collapsed result; repeat for older",
             Self::Thinking => "cycle thinking display: full, first line, hidden",
             Self::FocusSessions => "focus sessions (deck)",
@@ -328,6 +333,7 @@ impl Default for Keymap {
             (Char('v'), M::CONTROL, Action::PasteImage),
             (Char('m'), M::ALT, Action::Models),
             (BackTab, M::NONE, Action::Reasoning),
+            (Char('s'), M::ALT, Action::Sandbox),
             (Char('o'), M::CONTROL, Action::Expand),
             (Char('t'), M::CONTROL, Action::Thinking),
             (Char('1'), M::ALT, Action::FocusSessions),

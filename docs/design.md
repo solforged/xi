@@ -141,6 +141,7 @@ Client → daemon requests:
 | `session/checkout` | `{session, event}` → null | Route to the worker; move the head to an earlier event to branch. Idle only. |
 | `session/compact` | `{session}` → `{head, tokens_before}` | Route to the worker; summarize older context at an idle prompt. |
 | `session/set_model` | `{session, model}` → `ModelRef` | Idle only. `model` is a `ModelRef` or `{role}`. Resolve a role, record `model_changed` with the concrete model when it changes, and return it. |
+| `session/set_sandbox` | `{session, enabled}` → null | Idle only; toggle the live worker's tool sandbox and record `sandbox_changed` when it changes. Saved defaults and extension sandboxes are unchanged. Reopening a worker uses configuration, not prior sandbox events. |
 | `session/set_reasoning` | `{session, reasoning}` → null | Idle only; record `reasoning_changed` when the level changes. A model that reasons must list the level, or the request fails with the levels it accepts. Reopening a log restores the last level on the head's lineage. Models without reasoning keep the setting and ignore it. |
 | `session/rename` | `{session, title}` → null | Record a user [title](#session-titles), one line of 1 to 80 characters after trimming. Applies at once when idle, otherwise at the running turn's next model boundary. |
 | `session/models` | `{session}` → `{current, reasoning, roles, models: [{model, info, available}]}` | Route to the worker; list the session's model registry with `ModelInfo`. `roles` maps each [model role](#model-roles) to its model after fallbacks. `available` is false when the provider's credential is missing. No credential value is ever returned. |
@@ -192,7 +193,7 @@ On the daemon ↔ worker link, the first request must be `worker/start`. Its res
 | `model/lease` | Worker → daemon request | `{endpoint}` → null | Wait for permission to make a model request. |
 | `model/release` | Worker → daemon notification | `{endpoint}` | Release a granted lease. |
 
-After startup, the daemon forwards `session/attach`, `session/close`, `session/prompt`, `session/cancel`, `session/checkout`, `session/compact`, `session/set_model`, `session/set_reasoning`, `session/rename`, `session/models`, `session/commands`, `session/command` and `approval/resolve` unchanged. A worker's attach response is a snapshot, not a subscription; the daemon owns client subscriptions. Workers send `event/appended`, `stream/delta` and `stream/reset` notifications to the daemon. Before each model request a worker requests a lease for the endpoint and waits for a grant. It releases the lease when the response ends, fails or is cancelled. Leases are FIFO per endpoint; retries of the same request keep the lease, and worker exit releases its leases implicitly.
+After startup, the daemon forwards `session/attach`, `session/close`, `session/prompt`, `session/cancel`, `session/checkout`, `session/compact`, `session/set_model`, `session/set_reasoning`, `session/set_sandbox`, `session/rename`, `session/models`, `session/commands`, `session/command` and `approval/resolve` unchanged. A worker's attach response is a snapshot, not a subscription; the daemon owns client subscriptions. Workers send `event/appended`, `stream/delta` and `stream/reset` notifications to the daemon. Before each model request a worker requests a lease for the endpoint and waits for a grant. It releases the lease when the response ends, fails or is cancelled. Leases are FIFO per endpoint; retries of the same request keep the lease, and worker exit releases its leases implicitly.
 
 Errors use the JSON-RPC server range; `data` carries structured detail:
 
@@ -422,6 +423,7 @@ Composer keys are unique. Keys inside an overlay apply only while it has focus.
 | `ctrl+r` | Search prompt history. |
 | `ctrl+g` | Edit the prompt in the external editor. |
 | `ctrl+v` | Attach an image from the local clipboard. Backspace with empty text removes the last attachment. |
+| `alt+s` (Option+S on macOS) | Toggle this session's tool sandbox while idle. Does not change the saved default. |
 | `alt+m` | Open the model picker. |
 | `shift+tab` | Cycle reasoning through the levels the model accepts and save the level as the global default. |
 | `ctrl+o` | Expand the newest collapsed result; repeat to walk back. |
@@ -437,6 +439,7 @@ Alt keys need the terminal to send Option as Meta on macOS; every alt binding ex
 [keys]
 search = "ctrl+r"                          # a key string or an array; replaces the action's defaults
 kill_word = ["ctrl+w", "alt+backspace"]
+sandbox = "alt+s"                          # toggle the live session's tool sandbox
 
 [display]
 thinking = "first"                         # full | first | hidden
@@ -459,6 +462,7 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 | `/model [PROVIDER/MODEL \| @ROLE]` | Switch model; without an argument, open the model picker. A role prints the model it resolved to in line mode. |
 | `/reasoning [LEVEL]` | Set reasoning and save it as the global default; without an argument, show it and the levels the model accepts. |
 | `/layout [inline\|deck\|auto]` | Change and save the client layout; without an argument, show the choice, tier and pane size. |
+| `/sandbox [on\|off]` | Toggle this session's tool sandbox, or set it explicitly. Idle only; leaves saved defaults and extension sandboxes unchanged. |
 | `/compact` | Summarize older context now. |
 | `/rename TITLE` | Set the session's title; see [Session titles](#session-titles). Line mode has it too. |
 | `/approvals` | Open the approvals inbox for all sessions. |
@@ -531,7 +535,7 @@ Rows that `--config`, the project file or the local file set cannot be changed f
 
 The footer shows workspace and Git branch on the left; model, reasoning, context use, cache hit rate, cost when pricing is known, sandbox, running children, trust, taint and waiting approvals on the right. Labels and separators are dim; values use normal ink. Unknown context capacity and cache usage before the first request show `–`, not a fabricated percentage. Context, taint, approvals and trust never drop. As the terminal narrows, each optional segment shortens and then drops before the next changes: sandbox, cache, branch, reasoning, cost, workspace, model, children. Safety labels shorten last; if even their shortest forms cannot fit, the row visibly truncates with an ellipsis. Reasoning shows the level the model runs at, such as `think off`, `think med` or `think xhigh`, and `no think` for models without reasoning.
 
-Git state refreshes asynchronously about every three seconds, including while idle. `main*` means staged, unstaged or untracked changes; a detached head shows `@` and its short commit ID. Missing Git, non-repositories and failed or timed-out probes omit the segment. Probes do not refresh the index or run fsmonitor hooks; switching workspaces clears the old branch immediately. `◇ sandbox` (short form `◇`) names the worker's fail-closed execution policy, not a health check or a claim that the current workspace is trusted. Sandbox setup failures prevent tool execution; they do not enable an unsandboxed fallback. A worker started with `sandbox.enabled = false` shows a brass `sandbox off` warning (short form `sbx off`), which stays visible with the other safety labels as the terminal narrows. This reports the worker's active setting, even after the global default changes.
+Git state refreshes asynchronously about every three seconds, including while idle. `main*` means staged, unstaged or untracked changes; a detached head shows `@` and its short commit ID. Missing Git, non-repositories and failed or timed-out probes omit the segment. Probes do not refresh the index or run fsmonitor hooks; switching workspaces clears the old branch immediately. `◇ sandbox` (short form `◇`) names the worker's fail-closed execution policy, not a health check or a claim that the current workspace is trusted. Sandbox setup failures prevent tool execution; they do not enable an unsandboxed fallback. A worker with its tool sandbox disabled shows a brass `sandbox off` warning (short form `sbx off`), which stays visible with the other safety labels as the terminal narrows. This reports the worker's active setting, including session-local toggles, even after the global default changes.
 
 Tool results show an open-sided headline and at most three lines; `ctrl+o` expands the rest. A failed `bash` shows `✕` and its trailing numeric exit status in sanguine on the headline, such as `exit 1 · 1.8s`, with the duration dim. Its `[exit N]` footer is omitted from the preview and its hidden-line count. The full output keeps that footer. Expansion prints the unindented result between dim rules such as `── bash · git log … ──` and `── end · 5 lines ──`, each at most 48 cells and never wider than the terminal. Long expanded output lines use the terminal's own soft wrap so copying keeps the original line breaks. A spill path follows the end rule. A successful `edit` renders as a diff instead: the lines shared by the start and end of the old and new text are cut to one line of context on each side, then the removed and added lines, at most eight rows, with `+N −M` in the headline; `hashline` edits show their added lines. Expanded diffs keep their removal and addition colours without the preview's indent. Thinking blocks follow the thinking display setting, `first` by default: `full` shows the whole text dimmed, `first` its first line, and `hidden` nothing; streaming thinking follows the same setting in the live region. `ctrl+t` changes it for output from then on. Images show as a placeholder.
 
@@ -617,7 +621,9 @@ Changes apply when opening a session. The daemon must receive the Proton Pass `S
 
 #### Disabling the tool sandbox
 
-Use `/settings` → **Tool sandbox**, or set the default in `$XDG_CONFIG_HOME/xi/config.toml` (normally `~/.config/xi/config.toml`):
+Press **Option+S** (`alt+s`), or use `/sandbox`, to toggle the current session's tool sandbox at an idle prompt. `/sandbox on` and `/sandbox off` set it explicitly. The `sandbox` action in `tui.toml` can rebind the shortcut. On macOS, the terminal must send Option as Meta. Running turns refuse changes; only future commands are affected. Re-enabling does not revoke access from processes launched while the sandbox was off or undo their changes. Extension sandboxes stay enforced. The override is local to the live worker; reopening the session reloads configuration. Changes are recorded as `sandbox_changed` audit events and shown to all attached clients.
+
+Use `/settings` → **Tool sandbox**, or set the default for newly opened workers in `$XDG_CONFIG_HOME/xi/config.toml` (normally `~/.config/xi/config.toml`):
 
 ```toml
 [sandbox]

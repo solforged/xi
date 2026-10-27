@@ -154,6 +154,12 @@ pub enum EventKind {
         /// The new reasoning depth.
         reasoning: Reasoning,
     },
+    /// The user changed the live worker's tool sandbox. This is an audit
+    /// event; reopening a session uses configuration, not this value.
+    SandboxChanged {
+        /// Whether future tool commands run sandboxed.
+        enabled: bool,
+    },
     /// The session's display title. The latest in file order names the
     /// session on every branch. Context building ignores it.
     SessionTitled {

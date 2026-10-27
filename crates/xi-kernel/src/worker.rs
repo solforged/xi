@@ -16,7 +16,7 @@ use xi_protocol::methods::client::{
     ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, ChildEvents, Delta, EventAppended,
     EventParams, ModelEntry, ModelsResult, PendingApproval, PromptParams, PromptResult,
     RenameParams, ResolveParams, SessionCommandParams, SessionDetails, SessionOptions, SessionRef,
-    SetModelParams, SetReasoningParams, StreamDelta, StreamReset,
+    SetModelParams, SetReasoningParams, SetSandboxParams, StreamDelta, StreamReset,
 };
 use xi_protocol::methods::worker::{LeaseParams, ModelLease, ModelRelease, WorkerStartParams};
 use xi_protocol::model::{ModelRole, Reasoning};
@@ -129,6 +129,9 @@ impl Mirror {
             }
             EventKind::ReasoningChanged { reasoning } => {
                 self.info.reasoning = *reasoning;
+            }
+            EventKind::SandboxChanged { enabled } => {
+                self.info.sandbox_enabled = *enabled;
             }
             EventKind::ToolDecision {
                 call,
@@ -575,6 +578,8 @@ async fn start(
     mirror.checkout(state.head);
     // Replaying the log must not overwrite an explicit open-time override.
     mirror.info.reasoning = state.config.reasoning;
+    // Sandbox events audit prior workers; they never restore an override.
+    mirror.info.sandbox_enabled = state.config.sandbox.enabled;
     drop(state);
     Ok(Worker { session, mirror })
 }
@@ -676,6 +681,15 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
             check_session(&session, params.session)?;
             session
                 .set_reasoning(params.reasoning)
+                .await
+                .map_err(kernel_error)?;
+            Value::Null
+        }
+        "session/set_sandbox" => {
+            let params: SetSandboxParams = decode(params)?;
+            check_session(&session, params.session)?;
+            session
+                .set_sandbox(params.enabled)
                 .await
                 .map_err(kernel_error)?;
             Value::Null
