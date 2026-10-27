@@ -1292,7 +1292,7 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
     (rows, hidden)
 }
 
-fn blocks_text(content: &[Block]) -> String {
+pub(crate) fn blocks_text(content: &[Block]) -> String {
     content
         .iter()
         .filter_map(|b| match b {

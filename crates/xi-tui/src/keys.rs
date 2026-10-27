@@ -27,6 +27,8 @@ pub enum Action {
     Search,
     /// Edit the prompt externally.
     External,
+    /// Attach an image from the local system clipboard.
+    PasteImage,
     /// Open the model picker.
     Models,
     /// Cycle reasoning depth.
@@ -69,6 +71,7 @@ impl Action {
         Self::Complete,
         Self::Search,
         Self::External,
+        Self::PasteImage,
         Self::Models,
         Self::Reasoning,
         Self::Expand,
@@ -99,6 +102,7 @@ impl Action {
             Self::Complete => "complete",
             Self::Search => "search",
             Self::External => "external",
+            Self::PasteImage => "paste_image",
             Self::Models => "models",
             Self::Reasoning => "reasoning",
             Self::Expand => "expand",
@@ -130,6 +134,7 @@ impl Action {
             Self::Complete => "accept a completion; otherwise answer a waiting approval",
             Self::Search => "search prompt history; repeat for older matches",
             Self::External => "edit the prompt in the external editor",
+            Self::PasteImage => "attach a clipboard image; backspace on empty removes the last",
             Self::Models => "open the model picker",
             Self::Reasoning => "cycle reasoning through the model's levels",
             Self::Expand => "expand the newest collapsed result; repeat for older",
@@ -287,6 +292,7 @@ impl Default for Keymap {
             (Tab, M::NONE, Action::Complete),
             (Char('r'), M::CONTROL, Action::Search),
             (Char('g'), M::CONTROL, Action::External),
+            (Char('v'), M::CONTROL, Action::PasteImage),
             (Char('m'), M::ALT, Action::Models),
             (BackTab, M::NONE, Action::Reasoning),
             (Char('o'), M::CONTROL, Action::Expand),
@@ -461,6 +467,10 @@ mod tests {
             Some(Action::Thinking)
         );
         assert_eq!(
+            map.action(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Some(Action::PasteImage)
+        );
+        assert_eq!(
             map.action(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
             None
         );
@@ -494,7 +504,7 @@ mod tests {
             assert_eq!(row.1, action.description());
         }
         assert_eq!(rows[2].0, "shift+enter, ctrl+j");
-        assert_eq!(rows[15].0, "ctrl+a, home");
+        assert_eq!(rows[16].0, "ctrl+a, home");
         map.bind(Action::Send, Vec::new());
         assert_eq!(map.help()[0].0, "alt+enter");
     }

@@ -20,6 +20,7 @@ xi-sandbox = { path = "crates/xi-sandbox" }
 xi-session = { path = "crates/xi-session" }
 xi-tools = { path = "crates/xi-tools" }
 xi-tui = { path = "crates/xi-tui" }
+arboard = { version = "3", features = ["wayland-data-control"] }
 aws-lc-rs = "1"
 base64 = "0.22"
 bytes = "1"
@@ -31,6 +32,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 httpdate = "1"
 ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 landlock = "0.4.7"
 libc = "0.2"
 listenfd = "1"

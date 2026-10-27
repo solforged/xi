@@ -9,7 +9,7 @@ use xi_protocol::model::Reasoning;
 use crate::screen::Screen;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
-use crate::transcript::{SPINNER, tokens};
+use crate::transcript::{SPINNER, blocks_text, tokens};
 use crate::{App, Focus, lineage};
 
 /// The footer's form of a level.
@@ -248,7 +248,9 @@ impl App {
                 lines.push(Line::default());
             }
             let composer = self.editor.render(cols, Role::Dim, "").0.len();
-            let rows = self.rows.saturating_sub(composer + 3);
+            let rows = self
+                .rows
+                .saturating_sub(composer + 3 + usize::from(!self.images.is_empty()));
             lines.extend(tree.render(cols, rows, Timestamp::now()));
         }
         if self.running() {
@@ -274,29 +276,30 @@ impl App {
             }
             lines.push(line.dim(" · esc stop").truncate(cols));
         }
-        for text in &self.steering {
+        for content in &self.steering {
             lines.push(lr(
                 Line::default()
                     .ink("  ")
                     .brass("» steer ")
-                    .ink(text.replace('\n', " ")),
+                    .ink(blocks_text(content).replace('\n', " ")),
                 Line::default().dim("at the next request"),
                 cols,
             ));
         }
-        for text in &self.queued {
+        for content in &self.queued {
             lines.push(lr(
                 Line::default()
                     .ink("  ")
                     .dim("» queued ")
-                    .ink(text.replace('\n', " ")),
+                    .ink(blocks_text(content).replace('\n', " ")),
                 Line::default().dim("after this turn"),
                 cols,
             ));
         }
+        let attachment_rows = usize::from(!self.images.is_empty());
         let overlay_rows = self
             .rows
-            .saturating_sub(self.editor.render(cols, Role::Dim, "").0.len() + 3);
+            .saturating_sub(self.editor.render(cols, Role::Dim, "").0.len() + 3 + attachment_rows);
         if self.focus == Focus::Models
             && let Some(picker) = &self.picker
         {
@@ -350,6 +353,15 @@ impl App {
         } else {
             "enter sends · ctrl+j new line · /help"
         };
+        if !self.images.is_empty() {
+            let count = self.images.len();
+            let noun = if count == 1 { "image" } else { "images" };
+            lines.push(
+                Line::default()
+                    .brass(format!("  {count} {noun} attached"))
+                    .truncate(cols),
+            );
+        }
         let (composer, (row, col)) = self.editor.render(cols, border, hint);
         let top = lines.len();
         lines.extend(composer);

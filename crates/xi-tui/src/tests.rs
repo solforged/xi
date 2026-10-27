@@ -390,7 +390,9 @@ async fn prompt_runs_off_the_ui_and_finishes_from_the_daemon_outcome() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 80, 24);
     app.commit.clear();
-    app.send("hello".into());
+    app.send(vec![Block::Text {
+        text: "hello".into(),
+    }]);
     assert!(app.running());
     assert_eq!(app.pending.len(), 1);
     let reply = app.pending.next().await.unwrap();
@@ -758,6 +760,178 @@ async fn submitted_prompts_are_persisted_but_commands_are_not() {
     assert_eq!(entries[0]["cwd"], json!(app.launch.attached.info.cwd));
     app.editor.history_back();
     assert_eq!(app.editor.text(), "persist this prompt");
+}
+
+fn pasted_image() -> Block {
+    Block::Image {
+        media_type: "image/png".into(),
+        data: "cGl4ZWxz".into(),
+    }
+}
+
+#[tokio::test]
+async fn image_only_and_mixed_prompts_send_all_blocks_without_storing_images_in_history() {
+    for text in ["", "explain these images"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prompts.jsonl");
+        let (mut launch, mut requests) = launch(snapshot(false)).await;
+        launch.history = Some(path.clone());
+        let mut app = App::new(launch, 100, 24);
+        app.editor.set_text(text);
+        app.images = vec![pasted_image(), pasted_image()];
+        assert_eq!(app.editor.text(), text);
+        let live = app.live().0;
+        assert!(
+            live.iter()
+                .any(|line| line.plain() == "  2 images attached")
+        );
+        assert!(!live.iter().any(|line| {
+            let text = line.plain();
+            text.contains("cGl4ZWxz") || text.contains("ctrl+v")
+        }));
+
+        app.submit(false).await.unwrap();
+        assert!(app.editor.is_empty());
+        assert!(app.images.is_empty());
+        let reply = app.pending.next().await.unwrap();
+        app.replied(reply);
+        let mut expected = Vec::new();
+        if !text.is_empty() {
+            expected.push(Block::Text { text: text.into() });
+        }
+        expected.extend([pasted_image(), pasted_image()]);
+        let mut sent = Vec::new();
+        while let Ok((method, params)) = requests.try_recv() {
+            if method == "session/prompt" {
+                sent.push(params);
+            }
+        }
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["content"], json!(expected));
+        let history = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(!history.contains("cGl4ZWxz"));
+        assert_eq!(history.lines().count(), usize::from(!text.is_empty()));
+    }
+}
+
+#[tokio::test]
+async fn queued_images_survive_until_the_next_turn() {
+    let (launch, mut requests) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 100, 24);
+    app.images.push(pasted_image());
+    app.submit(true).await.unwrap();
+    assert!(app.images.is_empty());
+    assert!(app.pending.is_empty());
+    assert_eq!(app.queued, vec![vec![pasted_image()]]);
+    assert!(app.live().0.iter().any(|line| {
+        let text = line.plain();
+        text.contains("queued") && text.contains("[image]")
+    }));
+
+    app.finish_turn(None);
+    assert!(app.queued.is_empty());
+    let reply = app.pending.next().await.unwrap();
+    app.replied(reply);
+    let mut sent = Vec::new();
+    while let Ok((method, params)) = requests.try_recv() {
+        if method == "session/prompt" {
+            sent.push(params["content"].clone());
+        }
+    }
+    assert_eq!(sent, vec![json!([pasted_image()])]);
+}
+
+#[tokio::test]
+async fn steering_matches_the_image_payload_not_just_the_text() {
+    let (launch, _) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 100, 24);
+    let first = pasted_image();
+    let second = Block::Image {
+        media_type: "image/png".into(),
+        data: "b3RoZXI=".into(),
+    };
+    for image in [&first, &second] {
+        app.images.push(image.clone());
+        app.submit(false).await.unwrap();
+    }
+    assert_eq!(app.steering.len(), 2);
+    app.notify(&ClientNotification::Event(EventParams {
+        session: app.session_id(),
+        event: Event {
+            id: EventId::generate(),
+            parent: Some(app.launch.attached.info.head),
+            at: Timestamp(1),
+            kind: EventKind::UserMessage {
+                content: vec![second],
+            },
+        },
+    }));
+    assert_eq!(app.steering, vec![vec![first]]);
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("[image]"))
+    );
+    assert!(
+        !app.live()
+            .0
+            .iter()
+            .any(|line| line.plain().contains("cGl4ZWxz"))
+    );
+}
+
+#[tokio::test]
+async fn draft_images_can_be_removed_and_do_not_count_as_an_empty_composer() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 100, 24);
+    app.images = vec![pasted_image(), pasted_image()];
+    app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(!app.quit);
+    assert_eq!(app.images.len(), 2);
+    app.editor.set_text("x");
+    app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.editor.is_empty());
+    assert_eq!(app.images.len(), 2);
+    app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.images.len(), 1);
+    app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.images.is_empty());
+    assert!(!app.quit);
+}
+
+#[tokio::test]
+async fn commands_keep_draft_images_but_switching_sessions_clears_them() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 100, 24);
+    app.images.push(pasted_image());
+    app.editor.set_text("/help");
+    app.submit(false).await.unwrap();
+    assert_eq!(app.images, vec![pasted_image()]);
+    assert!(app.pending.is_empty());
+    app.editor.set_text("/new");
+    app.submit(false).await.unwrap();
+    assert!(app.images.is_empty());
+}
+
+#[tokio::test]
+async fn exited_sessions_keep_unsent_images_in_the_draft() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 100, 24);
+    app.exited = true;
+    app.images.push(pasted_image());
+    app.editor.set_text("unsent");
+    app.submit(false).await.unwrap();
+    assert_eq!(app.images, vec![pasted_image()]);
+    assert_eq!(app.editor.text(), "unsent");
+    assert!(app.pending.is_empty());
 }
 
 #[tokio::test]

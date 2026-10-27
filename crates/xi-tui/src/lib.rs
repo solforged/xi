@@ -131,6 +131,8 @@ struct App {
     git: git::Status,
     transcript: Transcript,
     editor: Editor,
+    /// Images attached to the current composer draft, not prompt history.
+    images: Vec<Block>,
     focus: Focus,
     /// The session tree overlay, while it is open.
     tree: Option<Tree>,
@@ -158,9 +160,9 @@ struct App {
     pending: FuturesUnordered<Reply>,
     started: Option<Instant>,
     /// Sent during a turn, shown until the worker takes them in.
-    steering: Vec<String>,
+    steering: Vec<Vec<Block>>,
     /// Held until the turn ends, then sent in order.
-    queued: Vec<String>,
+    queued: Vec<Vec<Block>>,
     frame: usize,
     cols: usize,
     rows: usize,
@@ -314,6 +316,7 @@ impl App {
             git: git::Status::default(),
             transcript,
             editor,
+            images: Vec::new(),
             focus: Focus::Composer,
             tree: None,
             picker: None,
@@ -542,14 +545,7 @@ impl App {
                         self.transcript.begin_turn();
                     }
                     self.launch.attached.running = true;
-                    let text: String = content
-                        .iter()
-                        .filter_map(|b| match b {
-                            Block::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if let Some(i) = self.steering.iter().position(|s| *s == text) {
+                    if let Some(i) = self.steering.iter().position(|s| s == content) {
                         self.steering.remove(i);
                     }
                 }
@@ -573,7 +569,11 @@ impl App {
             _ => {}
         }
         let now = self.transcript.asks().len();
-        if now > asks && self.editor.is_empty() && self.focus == Focus::Composer {
+        if now > asks
+            && self.editor.is_empty()
+            && self.images.is_empty()
+            && self.focus == Focus::Composer
+        {
             self.open_own_approvals();
         }
         if self.focus == Focus::Approval {
@@ -673,7 +673,7 @@ impl App {
         }
     }
 
-    fn send(&mut self, text: String) {
+    fn send(&mut self, content: Vec<Block>) {
         if self.exited {
             self.note(vec![
                 Line::default().dim("  session exited · /new starts another"),
@@ -684,14 +684,14 @@ impl App {
             self.started = Some(Instant::now());
             self.transcript.begin_turn();
         } else {
-            self.steering.push(text.clone());
+            self.steering.push(content.clone());
         }
         self.launch.attached.running = true;
         let client = self.launch.client.clone();
         let session = self.session_id();
         let (send, reply) = oneshot::channel();
         tokio::spawn(async move {
-            let _ = send.send(client.prompt(session, vec![Block::Text { text }]).await);
+            let _ = send.send(client.prompt(session, content).await);
         });
         self.pending.push(reply);
     }
@@ -749,15 +749,29 @@ impl App {
         Ok(())
     }
 
+    async fn paste_image(&mut self) {
+        let image = tokio::task::spawn_blocking(clipboard::image)
+            .await
+            .unwrap_or_else(|error| Err(error.into()));
+        match image {
+            Ok(image) => {
+                self.images.push(image);
+                self.completion = None;
+            }
+            Err(error) => self.note(vec![Line::default().dim(format!("  paste image: {error}"))]),
+        }
+    }
+
     async fn submit(&mut self, queue: bool) -> Result<(), Error> {
         let text = self.editor.text().trim().to_owned();
         self.editor.clear();
         self.completion = None;
-        if text.is_empty() {
-            return Ok(());
-        }
         if text.starts_with('/') && !text.contains('\n') {
+            // Commands leave attachments in the draft unless they switch sessions.
             return self.command(&text).await;
+        }
+        if text.is_empty() && self.images.is_empty() {
+            return Ok(());
         }
         if self.exited {
             self.note(vec![
@@ -767,16 +781,23 @@ impl App {
             self.update_completion();
             return Ok(());
         }
-        if let Err(error) = self.history.push(&text) {
-            self.note(vec![
-                Line::default().dim(format!("  prompt history: {error}")),
-            ]);
+        if !text.is_empty() {
+            if let Err(error) = self.history.push(&text) {
+                self.note(vec![
+                    Line::default().dim(format!("  prompt history: {error}")),
+                ]);
+            }
+            self.editor.set_history(self.history.workspace());
         }
-        self.editor.set_history(self.history.workspace());
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(Block::Text { text });
+        }
+        content.append(&mut self.images);
         if queue && self.running() {
-            self.queued.push(text);
+            self.queued.push(content);
         } else {
-            self.send(text);
+            self.send(content);
         }
         Ok(())
     }
