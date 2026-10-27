@@ -252,8 +252,20 @@ impl App {
         self.close_empty_approvals();
     }
 
+    /// Whether the TUI may leave this session. A running turn keeps running
+    /// in its worker, but queued prompts live only here and would be lost.
+    fn can_leave(&mut self) -> bool {
+        if self.queued.is_empty() {
+            return true;
+        }
+        self.note(vec![
+            Line::default().dim("  /resume waits for queued prompts to send"),
+        ]);
+        false
+    }
+
     pub(crate) async fn open_sessions(&mut self) {
-        if !self.idle_only("/resume") {
+        if !self.can_leave() {
             return;
         }
         match self
@@ -318,7 +330,7 @@ impl App {
             self.close_overlay();
             return Ok(());
         }
-        if !self.idle_only("/resume") {
+        if !self.can_leave() {
             return Ok(());
         }
         let result = if session.head.is_some() {
