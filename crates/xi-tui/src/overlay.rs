@@ -123,6 +123,11 @@ impl Overlays {
         self.0.is_empty()
     }
 
+    /// How many overlays are open.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Opens an overlay on top.
     pub fn push(&mut self, overlay: Box<dyn Overlay>) {
         self.0.push(overlay);
