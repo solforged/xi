@@ -82,6 +82,61 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Copies the task's `hidden/` files into the workspace for the check, which
+/// the agent never sees. Returns the files and directories it created, in
+/// creation order, for [`conceal`].
+fn reveal(task: &Task, workspace: &Path) -> Result<Vec<PathBuf>> {
+    let mut created = Vec::new();
+    let hidden = task.root.join("hidden");
+    if hidden.is_dir() {
+        reveal_dir(&hidden, &task.root.join("repo"), workspace, &mut created)?;
+    }
+    Ok(created)
+}
+
+fn reveal_dir(source: &Path, repo: &Path, target: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
+    if !target.is_dir() {
+        fs::create_dir(target)?;
+        created.push(target.to_owned());
+    }
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let dest = target.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            reveal_dir(&entry.path(), &repo.join(&name), &dest, created)?;
+        } else if kind.is_file() {
+            if repo.join(&name).exists() {
+                return Err(
+                    format!("hidden file {} shadows a repo file", entry.path().display()).into(),
+                );
+            }
+            if dest.is_dir() {
+                fs::remove_dir_all(&dest)?;
+            }
+            fs::copy(entry.path(), &dest)?;
+            created.push(dest);
+        } else {
+            return Err(format!("unsupported hidden entry {}", entry.path().display()).into());
+        }
+    }
+    Ok(())
+}
+
+/// Removes what [`reveal`] created, so the diff and protected-path checks see
+/// only the agent's work.
+fn conceal(created: &[PathBuf]) -> Result<()> {
+    for path in created.iter().rev() {
+        if path.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
 async fn git(workspace: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
@@ -299,6 +354,7 @@ async fn verify_task(task: &Task) -> Result<(Outcome, Outcome)> {
     let workspace = temp.path().join("repo");
     copy_tree(&task.root.join("repo"), &workspace)?;
     let baseline = initialize(&workspace).await?;
+    let hidden = reveal(task, &workspace)?;
     let before = execute(
         &task.spec.check,
         &BTreeMap::new(),
@@ -308,6 +364,7 @@ async fn verify_task(task: &Task) -> Result<(Outcome, Outcome)> {
         "before",
     )
     .await?;
+    conceal(&hidden)?;
     if before.success() || before.timed_out || before.error.is_some() || before.exit_code.is_none()
     {
         return Err(format!("fresh check must fail normally: {before:?}").into());
@@ -318,6 +375,7 @@ async fn verify_task(task: &Task) -> Result<(Outcome, Outcome)> {
         &["apply", patch.to_str().ok_or("non-UTF-8 patch path")?],
     )
     .await?;
+    let hidden = reveal(task, &workspace)?;
     let after = execute(
         &task.spec.check,
         &BTreeMap::new(),
@@ -327,6 +385,7 @@ async fn verify_task(task: &Task) -> Result<(Outcome, Outcome)> {
         "after",
     )
     .await?;
+    conceal(&hidden)?;
     if !after.success() {
         return Err(format!(
             "reference check failed: {after:?}\n{}\n{}",
@@ -455,6 +514,7 @@ async fn run_one(
         "agent",
     )
     .await?;
+    let hidden = reveal(task, &workspace)?;
     let check = execute(
         &task.spec.check,
         &BTreeMap::new(),
@@ -464,6 +524,7 @@ async fn run_one(
         "check",
     )
     .await?;
+    conceal(&hidden)?;
     let protected_status = protected_status(task, &workspace, &baseline).await?;
     let protected_untouched = protected_status.is_empty();
     let diff_stat = git(&workspace, &["diff", "--stat", &baseline]).await?;
@@ -586,6 +647,64 @@ mod tests {
                 .unwrap()
                 .contains("tests/check.py")
         );
+    }
+
+    #[tokio::test]
+    async fn hidden_files_reach_the_check_and_leave_no_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let task_root = temp.path().join("task");
+        fs::create_dir_all(task_root.join("repo/tests")).unwrap();
+        fs::write(task_root.join("repo/tests/visible.py"), "visible\n").unwrap();
+        fs::create_dir_all(task_root.join("hidden/tests/extra")).unwrap();
+        fs::write(task_root.join("hidden/tests/answer.py"), "answer\n").unwrap();
+        fs::write(task_root.join("hidden/tests/extra/deep.py"), "deep\n").unwrap();
+        let task = Task {
+            name: "hidden".into(),
+            root: task_root.clone(),
+            spec: crate::config::Spec {
+                prompt: "test".into(),
+                check: vec!["test".into(), "-f".into(), "tests/extra/deep.py".into()],
+                timeout_seconds: 1,
+                protected_paths: vec!["tests".into()],
+                tags: vec![],
+            },
+        };
+        let workspace = temp.path().join("workspace");
+        copy_tree(&task_root.join("repo"), &workspace).unwrap();
+        let baseline = initialize(&workspace).await.unwrap();
+        // An agent file at a hidden path is replaced for the check.
+        fs::write(workspace.join("tests/answer.py"), "guess\n").unwrap();
+
+        let hidden = reveal(&task, &workspace).unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join("tests/answer.py")).unwrap(),
+            "answer\n"
+        );
+        let check = execute(
+            &task.spec.check,
+            &BTreeMap::new(),
+            &workspace,
+            Duration::from_secs(5),
+            temp.path(),
+            "check",
+        )
+        .await
+        .unwrap();
+        assert!(check.success());
+        conceal(&hidden).unwrap();
+
+        assert!(!workspace.join("tests/answer.py").exists());
+        assert!(!workspace.join("tests/extra").exists());
+        assert!(workspace.join("tests/visible.py").exists());
+        assert!(
+            protected_status(&task, &workspace, &baseline)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::write(task_root.join("hidden/tests/visible.py"), "shadow\n").unwrap();
+        assert!(reveal(&task, &workspace).is_err());
     }
 
     #[tokio::test]
