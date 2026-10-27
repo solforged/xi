@@ -255,9 +255,10 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
             )
         })
         .collect();
-    let place = Line::default().ink("    ").extend(elide_left(
+    // The workspace starts in the log's first column, as its rows do.
+    let place = Line::default().ink(" ").extend(elide_left(
         scene.panel.place.clone(),
-        columns.log.saturating_sub(5),
+        columns.log.saturating_sub(2),
     ));
     let keys = Line::default().muted("alt+1").dim(" sessions");
     let side = Line::default().ink(" ".repeat(PANEL_PAD)).extend(keys);
@@ -571,7 +572,13 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
             top.push(Line::default().dim(format!("  … {} more", panel.asks.len() - ASK_ROWS)));
         }
     }
-    section(&mut top, label("context"), Line::default());
+    let percent = (panel.context.window > 0)
+        .then(|| u128::from(panel.context.used) * 100 / u128::from(panel.context.window));
+    section(
+        &mut top,
+        label("context"),
+        percent.map_or_else(Line::default, |p| Line::default().muted(format!("{p}%"))),
+    );
     top.extend(context(panel.context, w));
     let (added, removed) = panel
         .changed
@@ -667,9 +674,10 @@ fn wrap_items(line: &Line, width: usize) -> Vec<Line> {
 /// line counts.
 type Changed = (String, usize, usize);
 
-/// A section's name, set as a rubric label.
+/// A section's name, in muted bold so it reads apart from its rows and
+/// from failures.
 fn label(name: &str) -> Line {
-    Line::default().rubric(name)
+    Line::default().strong(Role::Muted, name)
 }
 
 /// Changed files under their directories, in the order each directory was
@@ -754,10 +762,9 @@ fn context(context: ContextGauge, w: usize) -> Vec<Line> {
         }
         return vec![line];
     }
-    // The footer truncates; the overview agrees with it.
-    let percent = u128::from(context.used) * 100 / u128::from(context.window);
-    let label = format!(" {percent}%");
-    let bar = w.saturating_sub(label.len());
+    // The footer truncates; the overview agrees with it. The percentage
+    // sits on the section's row, so the bar spans the panel's text column.
+    let bar = w;
     let filled = usize::try_from(
         (u128::from(context.used) * bar as u128).div_ceil(u128::from(context.window)),
     )
@@ -765,8 +772,7 @@ fn context(context: ContextGauge, w: usize) -> Vec<Line> {
     .min(bar);
     let gauge = Line::default()
         .brass("━".repeat(filled))
-        .faint("━".repeat(bar - filled))
-        .muted(label);
+        .faint("━".repeat(bar - filled));
     let mut numbers = Line::default()
         .muted(tokens(context.used))
         .dim(" of ")
@@ -1183,14 +1189,17 @@ mod tests {
             assert!(side[6].starts_with("? bash exec  cargo update -p tokio"));
             let at = |name: &str| side.iter().position(|line| line.starts_with(name)).unwrap();
             let context = at("context");
-            // The gauge ends where the flush-right "tab answers" does.
+            // The percentage sits on the section's row, flush right where
+            // "tab answers" ends, and the gauge spans the same width.
+            assert!(side[context].trim_end().ends_with(" 10%"));
             let gauge = side[context + 1].trim_end();
-            assert!(
-                gauge.starts_with('━') && gauge.ends_with("━ 10%"),
-                "{gauge}"
-            );
+            assert!(gauge.chars().all(|c| c == '━'), "{gauge}");
             assert_eq!(gauge.chars().count(), side[5].trim_end().chars().count());
-            assert_eq!(side[context + 2].trim_end(), "29.8k of 272.0k · 94% cached");
+            assert_eq!(
+                side[context].trim_end().chars().count(),
+                gauge.chars().count()
+            );
+            assert_eq!(side[context + 2].trim_end(), "29.8k of 272k · 94% cached");
             let changes = at("changes");
             assert!(side[changes].trim_end().ends_with("+43 −28"));
             // Paths group under their directories, less the `crates/` they
@@ -1217,7 +1226,7 @@ mod tests {
             assert_eq!(side[37].trim_end(), "ask · sandboxed · trusted");
             assert_eq!(side[38].trim_end(), "");
             assert_eq!(side[39].trim_end(), "alt+1 sessions");
-            assert!(lines[39].plain().starts_with("    ~/src/xi  main*"));
+            assert!(lines[39].plain().starts_with(" ~/src/xi  main*"));
             assert!(lines[39].0.iter().all(|span| !span.raised));
             assert_eq!(side.iter().filter(|l| l.contains("trusted")).count(), 1);
             assert!(!side.iter().any(|line| line.contains("~/src/xi")));

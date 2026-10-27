@@ -307,9 +307,10 @@ impl App {
         line
     }
 
-    /// The approval mode, sandbox and trust in words,
-    /// with what differs from the usual in brass: approvals other than
-    /// `ask`, the sandbox off, an untrusted workspace.
+    /// The approval mode, sandbox and trust in words, with what differs
+    /// from the usual in brass: approvals other than `ask`, the sandbox off
+    /// or failing to start, an untrusted workspace. A setting's name is dim
+    /// and its value muted, as `approvals ask`.
     fn facts(&self) -> Line {
         let info = &self.launch.attached.info;
         let mode = self
@@ -319,34 +320,27 @@ impl App {
             .and_then(|deck| deck.settings.as_ref())
             .and_then(|report| report.settings.iter().find(|s| s.key == "approvals"))
             .and_then(|setting| setting.value.as_str().map(str::to_owned));
-        let facts = [
-            match mode.as_deref() {
-                None | Some("ask") => ("approvals ask".to_owned(), false),
-                Some(mode) => (format!("approvals {mode}"), true),
-            },
-            if info.sandbox_enabled {
-                ("sandboxed".to_owned(), false)
-            } else {
-                ("sandbox off".to_owned(), true)
-            },
-            if info.trusted {
-                ("trusted".to_owned(), false)
-            } else {
-                ("untrusted".to_owned(), true)
-            },
-        ];
-        let mut line = Line::default();
-        for (words, unusual) in facts {
-            if !line.0.is_empty() {
-                line = line.dim(" · ");
-            }
-            line = if unusual {
-                line.brass(words)
-            } else {
-                line.dim(words)
-            };
-        }
-        line
+        let approvals = match mode.as_deref() {
+            None | Some("ask") => Line::default().dim("approvals ").muted("ask"),
+            Some(mode) => Line::default().brass(format!("approvals {mode}")),
+        };
+        let sandbox = if !info.sandbox_enabled {
+            Line::default().brass("sandbox off")
+        } else if self.transcript.sandbox_failed {
+            Line::default().brass("sandbox failing")
+        } else {
+            Line::default().dim("sandboxed")
+        };
+        let trust = if info.trusted {
+            Line::default().dim("trusted")
+        } else {
+            Line::default().brass("untrusted")
+        };
+        approvals
+            .dim(" · ")
+            .extend(sandbox)
+            .dim(" · ")
+            .extend(trust)
     }
 
     /// The workspace with its last component and the branch set apart.

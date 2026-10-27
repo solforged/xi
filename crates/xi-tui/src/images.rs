@@ -60,13 +60,8 @@ pub(crate) fn rows(media_type: &str, data: &str, cols: usize) -> Vec<Line> {
     if Protocol::detect().is_none() {
         return Vec::new();
     }
-    prepare(media_type, data, cols).unwrap_or_else(|| {
-        vec![
-            Line::default()
-                .dim("[image: preview unavailable]")
-                .truncate(cols),
-        ]
-    })
+    prepare(media_type, data, cols)
+        .unwrap_or_else(|| vec![Line::default().dim("image · no preview").truncate(cols)])
 }
 
 fn prepare(media_type: &str, data: &str, cols: usize) -> Option<Vec<Line>> {
@@ -87,8 +82,10 @@ fn prepare(media_type: &str, data: &str, cols: usize) -> Option<Vec<Line>> {
         return None;
     }
     // Terminal cells are approximately twice as tall as they are wide.
-    // Explicit cell dimensions keep previews within the transcript column.
-    let thumb = image.thumbnail(width.min((cols.min(48) * 8) as u32), height.min(12 * 16));
+    // Explicit cell dimensions keep previews within the transcript column;
+    // 64 by 16 cells keeps a screenshot's text legible without taking the
+    // whole log.
+    let thumb = image.thumbnail(width.min((cols.min(64) * 8) as u32), height.min(16 * 16));
     let preview = Arc::new(Preview {
         cols: (thumb.width() as usize).div_ceil(8),
         rows: (thumb.height() as usize).div_ceil(16),
@@ -100,7 +97,7 @@ fn prepare(media_type: &str, data: &str, cols: usize) -> Option<Vec<Line>> {
     });
     let mut lines = vec![
         Line::default()
-            .dim(format!("[image {width}×{height}]"))
+            .dim(format!("png · {width}×{height}"))
             .truncate(cols),
     ];
     for row in 0..preview.rows {

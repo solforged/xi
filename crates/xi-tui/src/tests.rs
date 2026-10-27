@@ -1043,13 +1043,16 @@ async fn deck_composer_groups_attachments_and_leaves_room_after_completion() {
         let (row, col) = cursor.unwrap();
         assert_eq!(text[row], "┃  second line");
         assert_eq!(col, 3 + "second line".len());
-        // The panel's foot carries the model; the block's keys row stays
-        // empty while no turn runs.
+        // The panel's foot carries the model; the block's keys row says
+        // how to send while no turn runs.
         let foot: Vec<_> = text[text.len() - 3..]
             .iter()
             .map(|row| row.trim_end())
             .collect();
-        assert_eq!(foot, ["┃", "┃", "┃"]);
+        assert_eq!(
+            foot,
+            ["┃", "┃  enter sends  ctrl+j new line  / commands", "┃"]
+        );
         let model = &app.launch.attached.info.model.model;
         assert!(!text.iter().any(|row| row.contains(model.as_str())));
     }
@@ -1106,12 +1109,12 @@ async fn steering_matches_the_image_payload_not_just_the_text() {
         },
     }));
     assert_eq!(app.turn.steering, vec![vec![first]]);
-    assert!(
-        app.display
-            .commit
-            .iter()
-            .any(|line| line.plain().contains("[image]"))
-    );
+    // The echo marks the image: a placeholder, or a preview's caption
+    // where the terminal shows graphics.
+    assert!(app.display.commit.iter().any(|line| {
+        let text = line.plain();
+        text.contains("[image]") || text.contains("image · no preview")
+    }));
     assert!(
         !app.live()
             .0
@@ -1352,6 +1355,25 @@ async fn model_reasoning_sandbox_and_compaction_changes_are_refused_while_runnin
     assert!(app.turn.running());
     assert!(app.turn.pending.is_empty());
     assert!(app.overlays.is_empty());
+    // Why the key did nothing shows in the composer, not the log, until
+    // the next key.
+    let held = |app: &App| {
+        app.live().0.iter().any(|line| {
+            line.plain()
+                .contains("/new waits for the turn to end · esc stops the turn")
+        })
+    };
+    assert!(held(&app));
+    assert!(
+        !app.display
+            .commit
+            .iter()
+            .any(|line| line.plain().contains("waits for the turn"))
+    );
+    app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!held(&app));
 }
 
 #[tokio::test]
@@ -1613,7 +1635,7 @@ async fn children_keep_live_roster_rows_then_commit_answer_slips() {
 
     let live = live_text(&app);
     assert!(live.contains("task    3 tasks"), "{live}");
-    assert!(live.contains("↑ 2.0k"), "{live}");
+    assert!(live.contains("↑ 2k"), "{live}");
     assert_eq!(app.transcript.children().sent(), 2_000);
     let rows: Vec<&str> = live.lines().filter(|l| l.contains("─ ")).collect();
     assert_eq!(rows.len(), 3, "{live}");
@@ -3610,8 +3632,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
         .plain();
     assert!(activity.contains("working  0s"), "{activity}");
     assert!(activity.ends_with("esc stop"));
-    assert!(!activity.contains('↑'));
-    assert!(!activity.contains('↓'));
+    assert!(!activity.contains(" in · "));
     app.display.cols = 250;
     let (lines, ..) = app.live();
     let activity = lines
@@ -3620,7 +3641,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
         .unwrap()
         .plain();
     assert!(
-        activity.contains(&format!("↑ {}  ↓ {}", tokens(1_000), tokens(10))),
+        activity.contains(&format!("{} in · {} out", tokens(1_000), tokens(10))),
         "{activity}"
     );
 }
@@ -3667,7 +3688,7 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
     let mut app = App::new(launch, 250, 36);
     assert!(app.display.deck.is_some(), "auto opens the deck at 250×36");
     app.command("/layout").await.unwrap();
-    assert!(committed(&app).contains(&"i layout auto · sheet, 250×36".to_owned()));
+    assert!(committed(&app).contains(&"◦ layout auto · sheet, 250×36".to_owned()));
     for (name, layout, deck) in [
         ("deck", Layout::Deck, true),
         ("inline", Layout::Inline, false),
@@ -3675,7 +3696,7 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
         app.command(&format!("/layout {name}")).await.unwrap();
         assert_eq!(app.display.layout, layout);
         assert_eq!(app.display.deck.is_some(), deck);
-        assert!(committed(&app).contains(&format!("i layout → {name}")));
+        assert!(committed(&app).contains(&format!("◦ layout → {name}")));
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains(&format!("layout = \"{name}\"")), "{saved}");
         assert!(path.is_file());
@@ -4003,8 +4024,8 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
     assert!(
-        !text.contains("alt+2") && !text.contains("enter sends"),
-        "the composer's panel has no keys row and an idle dock no hint"
+        !text.contains("alt+2") && text.contains("enter sends"),
+        "the composer's panel has no keys row and an idle dock shows how to send"
     );
     app.launch.attached.info.sandbox_enabled = false;
     app.launch.attached.info.trusted = false;
@@ -4053,7 +4074,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     let edit = rows
         .iter()
         .position(|row| row.starts_with("● edit    src/a.rs"));
-    let note = rows.iter().position(|row| row == "i layout → inline");
+    let note = rows.iter().position(|row| row == "◦ layout → inline");
     assert!(
         edit.is_some_and(|edit| note.is_some_and(|note| edit < note)),
         "{rows:?}"
@@ -4160,5 +4181,5 @@ async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it(
         !rows.iter().any(|row| row.starts_with("● edit    src/a.rs")),
         "{rows:?}"
     );
-    assert!(rows.contains(&"i layout → inline".to_owned()), "{rows:?}");
+    assert!(rows.contains(&"◦ layout → inline".to_owned()), "{rows:?}");
 }

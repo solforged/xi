@@ -9,6 +9,7 @@ use crate::{App, Composer, Error};
 impl App {
     /// Routes a key to the focused component and executes its command.
     pub(crate) async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
+        self.composer.flash = None;
         let action = self.keymap.action(key);
         let outcome = if self.overlays.is_empty()
             && let Some(outcome) =
