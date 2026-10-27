@@ -268,7 +268,7 @@ fn eligible(event: &Event) -> Option<String> {
     let EventKind::UserMessage { content } = &event.kind else {
         return None;
     };
-    let text = content
+    let text = xi_protocol::skill::typed(content)
         .iter()
         .filter_map(|block| match block {
             Block::Text { text } => Some(text.as_str()),

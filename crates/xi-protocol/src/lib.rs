@@ -7,6 +7,7 @@
 //! - [`manifest`]: extension package manifests and runtime registration.
 //! - [`model`]: provider-neutral model metadata and reasoning settings.
 //! - [`runtime`]: per-user daemon runtime paths.
+//! - [`skill`]: explicit skill invocations in user messages.
 
 pub mod content;
 pub mod event;
@@ -16,6 +17,7 @@ pub mod methods;
 pub mod model;
 pub mod rpc;
 pub mod runtime;
+pub mod skill;
 
 pub use content::{Block, OutputBlock, ToolOutput};
 pub use event::{Decision, Event, EventKind, Remember};

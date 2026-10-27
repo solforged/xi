@@ -150,7 +150,7 @@ impl Summary {
 }
 
 fn prompt_text(content: &[Block]) -> String {
-    content
+    xi_protocol::skill::typed(content)
         .iter()
         .filter_map(|b| match b {
             Block::Text { text } => Some(text.as_str()),

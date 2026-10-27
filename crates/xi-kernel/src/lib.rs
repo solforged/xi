@@ -329,6 +329,8 @@ struct Inner {
     state: tokio::sync::Mutex<State>,
     control: Mutex<Control>,
     commands: Mutex<Vec<xi_protocol::manifest::CommandSpec>>,
+    /// The catalog from session start; `/skill:NAME` prompts expand from it.
+    skills: Vec<context::Skill>,
     bus: EventBus,
     options: TurnOptions,
     stop: CancellationToken,
@@ -503,6 +505,7 @@ impl Session {
         };
         let backend = backend.map(Into::into);
         let titles = title::Titles::from_events(log.events());
+        let skills = system.skills.clone();
         let session = Self(Arc::new(Inner {
             id,
             state: tokio::sync::Mutex::new(State {
@@ -524,6 +527,7 @@ impl Session {
             }),
             control: Mutex::new(Control::default()),
             commands: Mutex::new(Vec::new()),
+            skills,
             bus,
             options,
             stop: CancellationToken::new(),
@@ -617,12 +621,39 @@ impl Session {
         }
     }
 
+    /// Slash commands for completion: extension commands in registration
+    /// order, then one `skill:NAME` per indexed skill.
+    #[must_use]
+    pub fn commands(&self) -> Vec<xi_protocol::manifest::CommandSpec> {
+        let mut commands = self.0.commands.lock().expect("command catalog").clone();
+        commands.extend(self.0.skills.iter().map(|skill| {
+            xi_protocol::manifest::CommandSpec {
+                name: format!("skill:{}", skill.name),
+                description: skill
+                    .description
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }
+        }));
+        commands
+    }
+
     /// Queues a prompt immediately. Its reply waits for the consuming turn.
+    /// A prompt starting `/skill:NAME` carries that skill's instructions; an
+    /// unknown name fails without queueing.
     pub fn submit(
         &self,
         content: Vec<Block>,
     ) -> oneshot::Receiver<std::result::Result<TurnOutcome, String>> {
         let (reply, rx) = oneshot::channel();
+        let content = match context::expand_skill(&self.0.skills, content) {
+            Ok(content) => content,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return rx;
+            }
+        };
         let mut control = self.0.control.lock().expect("control lock");
         if self.0.stop.is_cancelled() {
             let _ = reply.send(Err("daemon connection lost".into()));

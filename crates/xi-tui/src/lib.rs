@@ -385,9 +385,10 @@ fn first_prompt(events: &[Event]) -> Option<String> {
     })
 }
 
-/// The first non-blank line of `content`, trimmed and cut to 80 characters.
+/// The first non-blank typed line of `content`, trimmed and cut to 80
+/// characters. Injected skill instructions are skipped.
 fn prompt_line(content: &[Block]) -> Option<String> {
-    let text = crate::transcript::blocks_text(content);
+    let text = crate::transcript::blocks_text(xi_protocol::skill::typed(content));
     let first = text.lines().find(|line| !line.trim().is_empty())?;
     let mut chars = first.trim().chars();
     let mut line: String = chars.by_ref().take(80).collect();
@@ -661,6 +662,7 @@ impl App {
                         self.transcript.begin_turn();
                     }
                     self.launch.attached.running = true;
+                    let content = xi_protocol::skill::typed(content);
                     if let Some(i) = self.steering.iter().position(|s| s == content) {
                         self.steering.remove(i);
                     }
@@ -908,7 +910,10 @@ impl App {
         let text = self.editor.text().trim().to_owned();
         self.editor.clear();
         self.completion = None;
-        if text.starts_with('/') && !text.contains('\n') {
+        if text.starts_with('/')
+            && !text.contains('\n')
+            && xi_protocol::skill::invocation(&text).is_none()
+        {
             // Commands leave attachments in the draft unless they switch sessions.
             return self.command(&text).await;
         }

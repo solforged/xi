@@ -48,7 +48,7 @@ impl Child {
     fn event(&mut self, event: &Event, workspace: Option<&Path>) {
         match &event.kind {
             EventKind::UserMessage { content } if self.label.is_none() => {
-                let text = blocks_text(content);
+                let text = blocks_text(xi_protocol::skill::typed(content));
                 self.label = Some(
                     Line::default()
                         .ink(

@@ -948,6 +948,29 @@ fn instructions_order_skills_frontmatter_and_workspace_trust() {
         &nested.join(".agents/skills/local/SKILL.md"),
         "---\nname: local-skill\ndescription: project\n---\nSECRET_BODY",
     );
+    // Repository-root skills load too, and a project skill shadows a user
+    // skill of the same name.
+    write(
+        &fixture.workspace.join(".agents/skills/root/SKILL.md"),
+        "---\nname: root-skill\ndescription: repository root\n---\nSECRET_BODY",
+    );
+    write(
+        &nested.join(".agents/skills/shadow/SKILL.md"),
+        "---\nname: user-skill\ndescription: project wins\n---\nSECRET_BODY",
+    );
+    // Broken skills are skipped instead of failing the session.
+    write(
+        &fixture.paths.config.join("skills/undescribed/SKILL.md"),
+        "---\nname: undescribed\n---\nSECRET_BODY",
+    );
+    write(
+        &fixture.paths.config.join("skills/unterminated/SKILL.md"),
+        "---\nname: unterminated\ndescription: never closed\n",
+    );
+    write(
+        &fixture.paths.config.join("skills/invalid/SKILL.md"),
+        "---\nname: [unclosed\ndescription: bad yaml\n---\n",
+    );
     let config = Config::load(fixture.paths.clone(), &nested, &[]).unwrap();
     let context = xi_kernel::context::SystemContext::build(&config).unwrap();
     let positions: Vec<_> = [
@@ -963,12 +986,94 @@ fn instructions_order_skills_frontmatter_and_workspace_trust() {
     assert!(context.prompt.contains("a folded description"));
     assert!(context.prompt.contains("quoted: value"));
     assert!(!context.prompt.contains("SECRET_BODY"));
-    assert!(!context.prompt.contains("local-skill"));
+    for absent in [
+        "local-skill",
+        "root-skill",
+        "project wins",
+        "undescribed",
+        "never closed",
+        "bad yaml",
+    ] {
+        assert!(!context.prompt.contains(absent), "{absent}");
+    }
     fixture.paths.trust(&nested).unwrap();
     let config = Config::load(fixture.paths.clone(), &nested, &[]).unwrap();
     let context = xi_kernel::context::SystemContext::build(&config).unwrap();
-    assert!(context.prompt.contains("local-skill"));
+    let names: Vec<_> = context
+        .skills
+        .iter()
+        .map(|skill| (skill.name.as_str(), skill.description.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("local-skill", "project"),
+            ("user-skill", "project wins"),
+            ("root-skill", "repository root"),
+            ("global-skill", "a folded description"),
+        ]
+    );
+    assert!(!context.prompt.contains("quoted: value"));
     assert!(context.skill_roots.contains(&nested.join(".agents/skills")));
+    assert!(
+        context
+            .skill_roots
+            .contains(&fixture.workspace.join(".agents/skills"))
+    );
+}
+
+#[test]
+fn the_skills_section_is_omitted_without_skills() {
+    let fixture = Fixture::new();
+    let context = xi_kernel::context::SystemContext::build(&fixture.config()).unwrap();
+    assert!(context.skills.is_empty());
+    assert!(!context.prompt.contains("Skills"));
+}
+
+#[tokio::test]
+async fn skill_invocations_carry_the_body_and_unknown_names_fail() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.paths.config.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Review\n  a diff.\n---\n\nREVIEW_BODY\n",
+    );
+    let script = Script::new(vec![Step::Reply(done())]);
+    let (session, _) = fixture.session(script.clone(), FakeTool { gate: None }, opts());
+    assert!(
+        session.commands().iter().any(
+            |command| command.name == "skill:review" && command.description == "Review a diff."
+        )
+    );
+    let error = session
+        .prompt(input("/skill:missing do it"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown skill \"missing\""),
+        "{error}"
+    );
+    assert!(script.requests.lock().unwrap().is_empty());
+
+    session
+        .prompt(input("/skill:review the diff"))
+        .await
+        .unwrap();
+    let requests = script.requests.lock().unwrap();
+    let xi_provider::Message::User(content) = &requests[0].messages[0] else {
+        panic!("{:?}", requests[0].messages[0]);
+    };
+    let [Block::Text { text: injected }, typed] = content.as_slice() else {
+        panic!("{content:?}");
+    };
+    assert_eq!(*typed, input("/skill:review the diff")[0]);
+    assert!(injected.contains("REVIEW_BODY"));
+    assert!(!injected.contains("description:"));
+    let directory = fixture.paths.config.join("skills/review");
+    assert!(injected.contains(&format!("Skill directory: {}", directory.display())));
+    assert_eq!(
+        xi_protocol::skill::typed(content),
+        std::slice::from_ref(typed)
+    );
 }
 
 #[tokio::test]

@@ -474,7 +474,10 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                 }
                 continue;
             }
-            if let Some(command) = line.strip_prefix('/') {
+            if let Some(command) = line
+                .strip_prefix('/')
+                .filter(|_| xi_protocol::skill::invocation(line).is_none())
+            {
                 let (name, args) = command
                     .split_once(char::is_whitespace)
                     .unwrap_or((command, ""));
@@ -485,7 +488,7 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                         }
                     }
                     Ok(None) => eprintln!(
-                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /rename TITLE, /model PROVIDER/MODEL, /reasoning [LEVEL]"
+                        "Unknown command: /{name}. Commands: /quit, /new, /compact, /rename TITLE, /model PROVIDER/MODEL, /reasoning [LEVEL], /skill:NAME [ARGS]"
                     ),
                     Err(error) => eprintln!("xi: {error}"),
                 }
