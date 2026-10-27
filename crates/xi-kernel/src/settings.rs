@@ -17,7 +17,7 @@ pub(crate) const KEYS: [&str; 19] = [
     "approvals",
     "tools",
     "compaction.enabled",
-    "compaction.trigger_tokens",
+    "compaction.trigger",
     "compaction.keep_recent_tokens",
     "sandbox.enabled",
     "extensions",
@@ -47,7 +47,7 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
         json!(config.approvals),
         json!(config.tools),
         json!(config.compaction.enabled),
-        json!(config.compaction.trigger_tokens),
+        json!(config.compaction.trigger),
         json!(config.compaction.keep_recent_tokens),
         json!(config.sandbox.enabled),
         json!(config.extensions),
@@ -146,6 +146,8 @@ fn replace(table: &mut dyn TableLike, key: &str, replacement: Option<toml_edit::
     if let Some(item) = table.get_mut(key) {
         if let Some(previous) = item.as_value() {
             *value.decor_mut() = previous.decor().clone();
+        } else if let Some(previous) = item.as_table() {
+            *value.decor_mut() = previous.decor().clone();
         }
         *item = Item::Value(value);
     } else {
@@ -192,7 +194,18 @@ fn validate_value(key: &str, value: &Value) -> Result<Option<toml_edit::Value>> 
         "compaction.enabled" | "sandbox.enabled" => {
             toml_edit::Value::from(value.as_bool().ok_or_else(invalid)?)
         }
-        "compaction.trigger_tokens" | "compaction.keep_recent_tokens" => {
+        "compaction.trigger" => {
+            let trigger = serde_json::from_value::<crate::compaction::Trigger>(value.clone())
+                .map_err(|_| invalid())?;
+            let (unit, amount) = match trigger {
+                crate::compaction::Trigger::Percent(percent) => ("percent", i64::from(percent)),
+                crate::compaction::Trigger::Tokens(tokens) => ("tokens", tokens as i64),
+            };
+            let mut table = toml_edit::InlineTable::new();
+            table.insert(unit, toml_edit::Value::from(amount));
+            toml_edit::Value::from(table)
+        }
+        "compaction.keep_recent_tokens" => {
             let tokens = value
                 .as_i64()
                 .filter(|tokens| *tokens > 0)

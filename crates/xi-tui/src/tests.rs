@@ -84,7 +84,7 @@ fn settings_report() -> SettingsReport {
             json!(["read", "edit", "write", "bash", "search", "hashline"]),
         ),
         ("compaction.enabled", json!(true)),
-        ("compaction.trigger_tokens", Value::Null),
+        ("compaction.trigger", json!({ "percent": 80 })),
         ("compaction.keep_recent_tokens", json!(16_000)),
         ("sandbox.enabled", json!(true)),
         ("extensions", json!(["/tmp/extensions"])),
@@ -213,8 +213,13 @@ async fn launch_with(
                             .iter_mut()
                             .find(|row| json!(row.key) == params["key"])
                             .unwrap();
-                        row.value = params["value"].clone();
-                        row.source = SettingLayer::Global;
+                        if params["key"] == "compaction.trigger" && params["value"].is_null() {
+                            row.value = json!({ "percent": 80 });
+                            row.source = SettingLayer::Default;
+                        } else {
+                            row.value = params["value"].clone();
+                            row.source = SettingLayer::Global;
+                        }
                         Ok(serde_json::to_value(&settings).unwrap())
                     }
                     "session/models" => Ok(json!({
@@ -2261,6 +2266,22 @@ async fn settings_down(app: &mut App, count: usize) {
     }
 }
 
+async fn settings_number(app: &mut App, text: &str) {
+    app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    for c in text.chars() {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
     let mut report = settings_report();
@@ -2307,7 +2328,6 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
         "Tool hashline",
         "Tool sandbox",
         "Automatic compaction",
-        "80% of window",
         "Kept tail",
         "Sandbox readable",
         "/tmp/notes",
@@ -2496,7 +2516,7 @@ async fn settings_refuses_to_remove_the_last_tool() {
 }
 
 #[tokio::test]
-async fn settings_cycles_approvals_and_edits_nullable_and_positive_token_counts() {
+async fn settings_cycles_approvals_and_edits_kept_tail_tokens() {
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
@@ -2509,67 +2529,305 @@ async fn settings_cycles_approvals_and_edits_nullable_and_positive_token_counts(
         assert_eq!(params["key"], "approvals");
         assert_eq!(params["value"], approval);
     }
-    settings_down(&mut app, 2).await;
+    settings_down(&mut app, 3).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
     let (live, cursor) = app.live();
-    let (row, col) = cursor.expect("the number field holds the cursor");
+    let (row, col) = cursor.expect("the token field holds the cursor");
     let field = live[row].plain();
     assert!(
-        field.contains("Compaction trigger") && field.contains("[]"),
+        field.contains("Kept tail") && field.contains("tokens [16000]"),
         "{field}"
     );
-    assert_eq!(field.chars().nth(col - 1), Some('['), "{field}");
-    for c in "24000".chars() {
-        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    assert_eq!(field.chars().nth(col), Some(']'), "{field}");
+    for invalid in ["", "0", "9223372036854775808"] {
+        settings_number(&mut app, invalid).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
+        assert!(live_text(&app).contains("enter a positive token count"));
+        assert!(requests.try_recv().is_err());
+        assert!(app.live().1.is_some());
     }
-    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    let params = request(&mut requests, "config/set");
-    assert_eq!(params["key"], "compaction.trigger_tokens");
-    assert_eq!(params["value"], 24_000);
-    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    for _ in 0..5 {
-        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-            .await
-            .unwrap();
-    }
-    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(request(&mut requests, "config/set")["value"].is_null());
-    assert!(live_text(&app).contains("80% of window"));
-    settings_down(&mut app, 1).await;
-    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    for _ in 0..5 {
-        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-            .await
-            .unwrap();
-    }
-    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(live_text(&app).contains("enter a positive token count"));
-    assert!(requests.try_recv().is_err());
-    for c in "8000".chars() {
-        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-            .await
-            .unwrap();
-    }
+    settings_number(&mut app, "8000").await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
     let params = request(&mut requests, "config/set");
     assert_eq!(params["key"], "compaction.keep_recent_tokens");
     assert_eq!(params["value"], 8_000);
+    assert!(live_text(&app).contains("8000 tokens"));
+}
+
+#[tokio::test]
+async fn settings_trigger_saves_percent_and_preserves_threshold_when_switching_units() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    settings_down(&mut app, 6).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let text = live_text(&app);
+    assert!(text.contains("% [80]"));
+    assert!(text.contains("u switches %/tokens"));
+    assert!(text.contains("r resets to inherited/80%"));
+    settings_number(&mut app, "50").await;
+    assert!(live_text(&app).contains("128000 tokens"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let params = request(&mut requests, "config/set");
+    assert_eq!(params["key"], "compaction.trigger");
+    assert_eq!(params["value"], json!({ "percent": 50 }));
+    assert!(live_text(&app).contains("50%"));
+    assert!(live_text(&app).contains("128000 tokens"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(live_text(&app).contains("tokens [128000]"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "config/set")["value"],
+        json!({ "tokens": 128_000 })
+    );
+    assert!(live_text(&app).contains("128000 tokens (fixed)"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(live_text(&app).contains("% [50]"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "config/set")["value"],
+        json!({ "percent": 50 })
+    );
+}
+
+#[tokio::test]
+async fn settings_trigger_rejects_invalid_percentages_and_accepts_boundaries() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    settings_down(&mut app, 6).await;
+    for valid in [1, 100] {
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        for invalid in ["", "0", "101", "18446744073709551616"] {
+            settings_number(&mut app, invalid).await;
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            assert!(live_text(&app).contains("enter a percentage from 1 to 100"));
+            assert!(requests.try_recv().is_err());
+            assert!(app.live().1.is_some());
+        }
+        settings_number(&mut app, &valid.to_string()).await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&mut requests, "config/set")["value"],
+            json!({ "percent": valid })
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_trigger_reset_removes_the_override_from_editor_or_row() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    settings_down(&mut app, 6).await;
+    for reset_in_editor in [true, false] {
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        settings_number(&mut app, "50").await;
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        request(&mut requests, "config/set");
+        if reset_in_editor {
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            settings_number(&mut app, "").await;
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            assert!(requests.try_recv().is_err(), "blank must not reset");
+        }
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "compaction.trigger");
+        assert!(params["value"].is_null());
+        let setting = app
+            .overlays
+            .get::<Settings>()
+            .unwrap()
+            .report
+            .settings
+            .iter()
+            .find(|setting| setting.key == "compaction.trigger")
+            .unwrap();
+        assert_eq!(setting.value, json!({ "percent": 80 }));
+        assert_eq!(setting.source, SettingLayer::Default);
+        assert!(live_text(&app).contains("204800 tokens"));
+        assert!(app.live().1.is_none());
+    }
+}
+
+#[tokio::test]
+async fn settings_trigger_recalculates_for_selected_model_and_handles_unknown_window() {
+    let mut report = settings_report();
+    report
+        .settings
+        .iter_mut()
+        .find(|setting| setting.key == "compaction.trigger")
+        .unwrap()
+        .value = json!({ "percent": 50 });
+    let (launch, mut requests) = launch_with(
+        snapshot(false),
+        FakeData {
+            settings: Some(report),
+            ..FakeData::default()
+        },
+    )
+    .await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    assert!(live_text(&app).contains("128000 tokens"));
+    app.launch.attached.info.model.model = "second".into();
+    app.launch.attached.info.model_info = Some(xi_protocol::model::ModelInfo {
+        id: "second".into(),
+        context_window: 128_000,
+        ..model_info()
+    });
+    assert!(live_text(&app).contains("64000 tokens"));
+    app.launch
+        .attached
+        .info
+        .model_info
+        .as_mut()
+        .unwrap()
+        .context_window = u64::MAX;
+    assert!(live_text(&app).contains("9223372036854775807 tokens"));
+    for info in [
+        Some(xi_protocol::model::ModelInfo {
+            context_window: 0,
+            ..model_info()
+        }),
+        None,
+    ] {
+        app.launch.attached.info.model_info = info;
+        assert!(live_text(&app).contains("50%"));
+        assert!(live_text(&app).contains("token count unknown"));
+    }
+    assert!(requests.try_recv().is_err());
+    let setting = app
+        .overlays
+        .get::<Settings>()
+        .unwrap()
+        .report
+        .settings
+        .iter()
+        .find(|setting| setting.key == "compaction.trigger")
+        .unwrap();
+    assert_eq!(setting.value, json!({ "percent": 50 }));
+    settings_down(&mut app, 6).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(live_text(&app).contains("tokens []"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(requests.try_recv().is_err());
+    settings_number(&mut app, "24000").await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "config/set")["value"],
+        json!({ "tokens": 24_000 })
+    );
+    assert!(live_text(&app).contains("24000 tokens (fixed)"));
+}
+
+#[tokio::test]
+async fn settings_trigger_nonintegral_unit_conversion_requires_new_value_and_keeps_cursor_visible()
+{
+    let mut report = settings_report();
+    report
+        .settings
+        .iter_mut()
+        .find(|setting| setting.key == "compaction.trigger")
+        .unwrap()
+        .value = json!({ "tokens": 24_000 });
+    let (launch, mut requests) = launch_with(
+        snapshot(false),
+        FakeData {
+            settings: Some(report),
+            ..FakeData::default()
+        },
+    )
+    .await;
+    let mut app = App::new(launch, 80, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    settings_down(&mut app, 6).await;
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(live_text(&app).contains("% []"));
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(requests.try_recv().is_err());
+    settings_number(&mut app, "50").await;
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    for cols in [16, 24, 40, 80] {
+        app.cols = cols;
+        let (live, cursor) = app.live();
+        let (row, col) = cursor.expect("the inline cursor survives a narrow terminal");
+        let field = live[row].plain();
+        assert!(live[row].width() <= cols, "{field}");
+        assert!(field.contains("tokens"), "{field}");
+        assert_eq!(field.chars().nth(col), Some(']'), "{field}");
+    }
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut requests, "config/set")["value"],
+        json!({ "tokens": 128_000 })
+    );
 }
 
 #[tokio::test]

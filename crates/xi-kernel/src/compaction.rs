@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio_util::sync::CancellationToken;
 use xi_protocol::event::Usage;
 use xi_protocol::methods::client::CompactResult;
@@ -11,14 +11,48 @@ use xi_provider::{Message, Request};
 
 use crate::{Backend, Error, Result, Session, State, context};
 
+/// The model-relative percentage or fixed token estimate that triggers compaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    /// An integer percentage of the selected model's context window, from 1 to 100.
+    Percent(u8),
+    /// A positive token count that fits in a TOML integer.
+    Tokens(u64),
+}
+
+impl<'de> Deserialize<'de> for Trigger {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Value {
+            Percent(u8),
+            Tokens(u64),
+        }
+
+        match Value::deserialize(deserializer)? {
+            Value::Percent(percent @ 1..=100) => Ok(Self::Percent(percent)),
+            Value::Tokens(tokens) if tokens > 0 && tokens <= i64::MAX as u64 => {
+                Ok(Self::Tokens(tokens))
+            }
+            Value::Percent(_) => Err(serde::de::Error::custom(
+                "compaction trigger percent must be between 1 and 100",
+            )),
+            Value::Tokens(_) => Err(serde::de::Error::custom(
+                "compaction trigger tokens must be between 1 and 9223372036854775807",
+            )),
+        }
+    }
+}
+
 /// Automatic compaction settings. Manual compaction ignores `enabled`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Enable threshold and context-overflow compaction.
     pub enabled: bool,
-    /// Trigger at this estimate, or at 80% of the selected context window.
-    pub trigger_tokens: Option<u64>,
+    /// A percentage of the selected context window or a fixed token estimate.
+    pub trigger: Trigger,
     /// Approximate size of the recent conversation retained verbatim.
     pub keep_recent_tokens: u64,
 }
@@ -27,7 +61,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            trigger_tokens: None,
+            trigger: Trigger::Percent(80),
             keep_recent_tokens: 20_000,
         }
     }
@@ -37,8 +71,12 @@ impl Config {
     /// Effective threshold for the selected model.
     #[must_use]
     pub fn trigger(&self, context_window: u64) -> u64 {
-        self.trigger_tokens
-            .unwrap_or_else(|| context_window.saturating_mul(4) / 5)
+        match self.trigger {
+            Trigger::Percent(percent) => {
+                (u128::from(context_window) * u128::from(percent) / 100) as u64
+            }
+            Trigger::Tokens(tokens) => tokens,
+        }
     }
 
     /// Keep at most half the trigger, leaving room for a useful summary.
@@ -54,7 +92,7 @@ impl Config {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Layer {
     enabled: Option<bool>,
-    trigger_tokens: Option<u64>,
+    trigger: Option<Trigger>,
     keep_recent_tokens: Option<u64>,
 }
 
@@ -63,8 +101,8 @@ impl Layer {
         if let Some(enabled) = self.enabled {
             config.enabled = enabled;
         }
-        if let Some(trigger) = self.trigger_tokens {
-            config.trigger_tokens = Some(trigger);
+        if let Some(trigger) = self.trigger {
+            config.trigger = trigger;
         }
         if let Some(keep) = self.keep_recent_tokens {
             config.keep_recent_tokens = keep;
