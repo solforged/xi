@@ -1,7 +1,8 @@
 //! Pigments, spans and width-bounded lines.
 //!
 //! Every pigment maps to an ANSI index, so the user's terminal theme decides
-//! the hue. The one exception is the raised surface: the deck lifts the
+//! the hue. Text steps through four tones, bright, ink, muted and dim, so
+//! what matters reads first without a hue of its own. The one exception is the raised surface: the deck lifts the
 //! terminal's own background a little behind its panel, prompts and
 //! composer, when the terminal reports that background. A line never
 //! exceeds the width it was built for: anything wider is cut with `…`,
@@ -15,11 +16,20 @@ pub type Rgb = [u8; 3];
 /// A colour role. Each has exactly one meaning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
+    /// What the eye lands on first: a title, the file in a path. ANSI
+    /// bright white.
+    Bright,
     /// What you read. The terminal's default foreground.
     Ink,
+    /// What you read second: tool names and their output. ANSI white.
+    Muted,
     /// Apparatus: metadata, connectors, hints, and the model's reasoning.
     /// ANSI bright black.
     Dim,
+    /// Hairlines that only group rows, and may vanish. ANSI black.
+    Faint,
+    /// Labels: section names and list marks. ANSI bright red.
+    Rubric,
     /// You and now, anything waiting on you, and warnings. ANSI yellow.
     Brass,
     /// Done, passed, added. ANSI green.
@@ -35,8 +45,12 @@ pub enum Role {
 impl Role {
     fn sgr(self) -> Option<&'static str> {
         match self {
+            Self::Bright => Some("97"),
             Self::Ink => None,
+            Self::Muted => Some("37"),
             Self::Dim => Some("90"),
+            Self::Faint => Some("30"),
+            Self::Rubric => Some("91"),
             Self::Brass => Some("33"),
             Self::Verdigris => Some("32"),
             Self::Sanguine => Some("31"),
@@ -163,7 +177,18 @@ impl Line {
         self
     }
 
-    role_methods!(ink => Ink, dim => Dim, brass => Brass, verdigris => Verdigris, sanguine => Sanguine, murex => Murex);
+    role_methods!(
+        bright => Bright,
+        ink => Ink,
+        muted => Muted,
+        dim => Dim,
+        faint => Faint,
+        rubric => Rubric,
+        brass => Brass,
+        verdigris => Verdigris,
+        sanguine => Sanguine,
+        murex => Murex,
+    );
 
     /// Appends bold text in a role.
     #[must_use]
@@ -558,21 +583,136 @@ pub fn inline(text: &str, role: Role) -> Line {
     marked(line, current, role, &run)
 }
 
-/// Word-wraps prose like [`wrap`], in `role`, setting `**strong**` in bold
-/// and `` `code` `` apart. Lines inside a fenced code block stay literal.
+/// Word-wraps one line of prose in `role`, setting its inline markdown.
+/// `literal` keeps the markers, as inside a fenced code block.
+fn set(text: &str, cols: usize, role: Role, literal: bool) -> Vec<Line> {
+    let (text, set) = if literal {
+        let n = text.chars().count();
+        (text.to_owned(), vec![Mark::Plain; n])
+    } else {
+        marks(text)
+    };
+    let chars: Vec<char> = text.chars().collect();
+    // A row is the line's characters in order, less the spaces wrapping
+    // dropped, so each row character finds its mark by skipping ahead.
+    let mut at = 0;
+    let mut lines = Vec::new();
+    for row in wrap(&text, cols) {
+        let mut line = Line::default();
+        let mut run = String::new();
+        let mut current = Mark::Plain;
+        for c in row.chars() {
+            while at < chars.len() && chars[at] != c {
+                at += 1;
+            }
+            let mark = set.get(at).copied().unwrap_or(Mark::Plain);
+            at += 1;
+            if mark != current {
+                line = marked(line, current, role, &std::mem::take(&mut run));
+                current = mark;
+            }
+            run.push(c);
+        }
+        lines.push(marked(line, current, role, &run));
+    }
+    lines
+}
+
+/// `body` wrapped beside `lead`, its later rows hanging under the body's
+/// first column.
+fn hang(lead: Line, body: &str, cols: usize, role: Role) -> Vec<Line> {
+    let width = lead.width();
+    set(body, cols.saturating_sub(width).max(1), role, false)
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let lead = if i == 0 {
+                lead.clone()
+            } else {
+                Line::default().ink(" ".repeat(width))
+            };
+            lead.extend(row)
+        })
+        .collect()
+}
+
+/// Every span of `line` in `role`.
+fn recolor(mut line: Line, role: Role) -> Line {
+    for span in &mut line.0 {
+        span.role = role;
+    }
+    line
+}
+
+/// One line of prose outside a fence: a heading in bold, a
+/// task with an open `○` or a done `✓`, a list item behind its bullet or
+/// number, or a paragraph.
+fn block(raw: &str, cols: usize, role: Role) -> Vec<Line> {
+    let body = raw.trim_start();
+    let indent = Line::default().ink(" ".repeat(raw.len() - body.len()));
+    let label = if role == Role::Ink {
+        Role::Rubric
+    } else {
+        role
+    };
+    let hashes = body.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && body[hashes..].starts_with(' ') {
+        let heading = if role == Role::Ink { Role::Brass } else { role };
+        return set(body[hashes..].trim(), cols, role, false)
+            .into_iter()
+            .map(|row| {
+                let mut row = recolor(row, heading);
+                for span in &mut row.0 {
+                    span.bold = true;
+                }
+                row
+            })
+            .collect();
+    }
+    if let Some(item) = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|bullet| body.strip_prefix(bullet))
+    {
+        let task = ["[ ] ", "[x] ", "[X] "].iter().find_map(|box_| {
+            item.strip_prefix(box_)
+                .map(|rest| (box_.as_bytes()[1] != b' ', rest))
+        });
+        return match task {
+            Some((false, rest)) => hang(indent.dim("○ "), rest, cols, role),
+            // The tick keeps its colour; the text recedes.
+            Some((true, rest)) => hang(indent.verdigris("✓ "), rest, cols, Role::Dim),
+            None => hang(indent.span(label, false, "• "), item, cols, role),
+        };
+    }
+    let digits = body.chars().take_while(char::is_ascii_digit).count();
+    if (1..=3).contains(&digits)
+        && let Some(rest) = body[digits..]
+            .strip_prefix(". ")
+            .or_else(|| body[digits..].strip_prefix(") "))
+    {
+        let number = format!("{} ", &body[..=digits]);
+        return hang(indent.span(label, false, number), rest, cols, role);
+    }
+    set(raw, cols, role, false)
+}
+
+/// Word-wraps prose like [`wrap`], in `role`, setting `**strong**` in bold,
+/// `` `code` `` apart, and markdown's headings, lists and tasks as blocks.
+/// Lines inside a fenced code block stay literal, with their fences dim.
+/// Quotes and callouts are [`crate::callout::markdown`]'s.
 #[must_use]
 pub fn prose(text: &str, cols: usize, role: Role) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut fenced = false;
-    for raw in clean_lines(text) {
-        let fence = raw.trim_start().starts_with("```");
-        let line = if fenced || fence {
-            Line::default().span(role, false, &raw)
+    for line in clean_lines(text) {
+        let fence = line.trim_start().starts_with("```");
+        if fenced || fence {
+            fenced ^= fence;
+            let code = if fence { Role::Dim } else { role };
+            lines.extend(set(&line, cols, code, true));
         } else {
-            inline(&raw, role)
-        };
-        fenced ^= fence;
-        lines.extend(wrap_line(&line, cols));
+            lines.extend(block(&line, cols, role));
+        }
     }
     lines
 }
@@ -737,5 +877,52 @@ mod tests {
         let fenced = prose("```sh\nls `pwd` **x**\n```\n`y`", 40, Role::Ink);
         assert_eq!(fenced[1].plain(), "ls `pwd` **x**");
         assert_eq!(fenced[3].plain(), "y");
+    }
+
+    #[test]
+    fn prose_sets_tasks_lists_and_headings_as_blocks() {
+        let rows = prose(
+            "## Next\n- [x] protocol done\n- [ ] tui: wire the key\n- a bullet that wraps past the width\n2. second",
+            20,
+            Role::Ink,
+        );
+        assert_eq!(
+            rows.iter().map(Line::plain).collect::<Vec<_>>(),
+            [
+                "Next",
+                "✓ protocol done",
+                "○ tui: wire the key",
+                "• a bullet that",
+                "  wraps past the",
+                "  width",
+                "2. second",
+            ]
+        );
+        assert!(rows[0].0.iter().all(|s| s.role == Role::Brass && s.bold));
+        // A finished task keeps its tick and lets its text recede.
+        assert_eq!(rows[1].0[0].role, Role::Verdigris);
+        assert!(rows[1].0[1..].iter().all(|s| s.role == Role::Dim));
+        assert_eq!(rows[2].0[0].role, Role::Dim);
+        assert_eq!(rows[2].0[1].role, Role::Ink);
+        assert_eq!(rows[3].0[0].role, Role::Rubric);
+        // Thinking keeps its own role for the marks.
+        let dim = prose("- a\n# b", 20, Role::Dim);
+        assert!(dim.iter().flat_map(|l| &l.0).all(|s| s.role == Role::Dim));
+    }
+
+    #[test]
+    fn tones_and_italic_have_their_own_codes() {
+        let line = Line::default()
+            .bright("a")
+            .muted("b")
+            .faint("c")
+            .rubric("d")
+            .extend(Line::default().dim("e").italic());
+        let mut out = String::new();
+        line.write_ansi(&mut out, true, None);
+        assert_eq!(
+            out,
+            "\x1b[97ma\x1b[0m\x1b[37mb\x1b[0m\x1b[30mc\x1b[0m\x1b[91md\x1b[0m\x1b[3;90me\x1b[0m"
+        );
     }
 }

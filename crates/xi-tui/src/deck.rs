@@ -3,7 +3,7 @@
 //! The log keeps the sheet at the left: retained rows from the top, the
 //! composer against the bottom. A side panel on the raised surface takes
 //! every column beside it: the session's title, what waits on you, its
-//! context, what changed and what else runs while nothing has the keys; the
+//! context, what changed and its running agents while nothing has the keys; the
 //! selected log row while you walk the log; every session while you pick
 //! one. Without room for the panel, a header row carries the session's facts
 //! and the panel's views replace the log while they have the keys.
@@ -14,19 +14,19 @@ use crate::icons::{Icon, Icons};
 use crate::layout::{PANEL_MIN, SHEET};
 use crate::log::Inspect;
 use crate::style::{Line, Role, Span, lr, wrap};
-use crate::transcript::tokens;
+use crate::transcript::{counted, tokens};
 
 /// The widest the overview sets its rows, so counts stay near their names.
 const LIVE_MAX: usize = 72;
 /// Asks the overview lists before counting the rest.
 const ASK_ROWS: usize = 3;
-/// Changed files the overview lists before counting the rest.
-const CHANGED_ROWS: usize = 8;
-/// Sessions the overview lists: running or waiting ones first, then this
-/// workspace's latest.
-const SESSION_ROWS: usize = 5;
-/// Of those, the most that are this workspace's idle sessions.
-const RECENT_ROWS: usize = 3;
+/// Rows the overview gives changed files and their directories before
+/// counting the rest.
+const CHANGED_ROWS: usize = 10;
+/// The longest the context gauge runs.
+const GAUGE_MAX: usize = 32;
+/// Agents the overview lists before counting the rest.
+const AGENT_ROWS: usize = 4;
 /// Blank columns on either side of the panel's text.
 const PANEL_PAD: usize = 2;
 
@@ -75,6 +75,18 @@ pub struct AskRow {
     pub body: String,
     /// Session title and age.
     pub origin: String,
+}
+
+/// A subagent of the call in flight.
+pub struct AgentRow {
+    /// A spinner while it works, `●` once done, `✕` once failed.
+    pub mark: Line,
+    /// What it was asked, from its first prompt.
+    pub title: String,
+    /// Its open call, `thinking`, its answer's first line or its failure.
+    pub doing: Line,
+    /// Its time so far.
+    pub detail: String,
 }
 
 /// Every top-level session the daemon lists.
@@ -127,7 +139,9 @@ pub struct Panel<'a> {
     pub asks: Vec<AskRow>,
     /// Changed paths and their added and removed line counts.
     pub changed: Vec<(String, usize, usize)>,
-    /// Every session, for the overview's active ones and the full list.
+    /// Subagents of the call in flight.
+    pub agents: Vec<AgentRow>,
+    /// Every session, for the sessions view.
     pub sessions: SessionsPane,
     /// Context occupancy and cache.
     pub context: ContextGauge,
@@ -150,7 +164,7 @@ pub struct Scene<'a> {
     pub status: Line,
     /// The attached session's title.
     pub title: &'a str,
-    /// When it started, its head and event count.
+    /// When it started.
     pub meta: &'a str,
     /// The attached session's output and composer.
     pub log: LogPane<'a>,
@@ -436,8 +450,8 @@ fn elide_left(line: Line, cols: usize) -> Line {
 }
 
 /// The session at a glance while the composer has the keys: its title, what
-/// waits on you, its context, what changed and what else runs, with where
-/// it runs and under what rules against the bottom.
+/// waits on you, its context, what changed and its running agents, with
+/// where it runs and under what rules against the bottom.
 fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     let panel = &scene.panel;
     let icons = panel.icons;
@@ -450,7 +464,7 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
         } else {
             row.clone()
         };
-        top.push(Line::default().strong(Role::Ink, text).truncate(w));
+        top.push(Line::default().strong(Role::Bright, text).truncate(w));
     }
     if !scene.meta.is_empty() {
         top.push(Line::default().dim(scene.meta).truncate(w));
@@ -468,7 +482,7 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     if !panel.asks.is_empty() {
         section(
             &mut top,
-            Line::default().strong(Role::Brass, format!("Waiting · {}", panel.asks.len())),
+            Line::default().brass(format!("waiting · {}", panel.asks.len())),
             Line::default().dim("tab answers"),
         );
         for ask in panel.asks.iter().take(ASK_ROWS) {
@@ -484,8 +498,8 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
             top.push(Line::default().dim(format!("  … {} more", panel.asks.len() - ASK_ROWS)));
         }
     }
-    section(&mut top, heading("Context"), Line::default());
-    top.extend(context(panel.context));
+    section(&mut top, label("context"), Line::default());
+    top.extend(context(panel.context, w));
     let (added, removed) = panel
         .changed
         .iter()
@@ -497,65 +511,44 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     } else {
         counts(added, removed)
     };
-    section(&mut top, heading("Changes"), total);
+    section(&mut top, label("changes"), total);
     if panel.changed.is_empty() {
         top.push(Line::default().dim("nothing yet"));
     }
-    for (path, added, removed) in panel.changed.iter().take(CHANGED_ROWS) {
-        let counts = counts(*added, *removed);
-        let room = w.saturating_sub(counts.width() + 2);
-        top.push(lr(elide_left(Line::default().ink(path), room), counts, w));
-    }
-    if panel.changed.len() > CHANGED_ROWS {
-        top.push(Line::default().dim(format!(
-            "… {} more files",
-            panel.changed.len() - CHANGED_ROWS
-        )));
-    }
-    let sessions = &panel.sessions;
-    let others: Vec<&SessionRow> = sessions
-        .here
-        .iter()
-        .chain(&sessions.elsewhere)
-        .filter(|session| session.mark != Mark::Current)
-        .collect();
-    if !others.is_empty() {
-        let active = others
-            .iter()
-            .filter(|session| matches!(session.mark, Mark::Running | Mark::Waiting))
-            .take(SESSION_ROWS);
-        let room = SESSION_ROWS
-            .saturating_sub(active.clone().count())
-            .min(RECENT_ROWS);
-        let recent = sessions
-            .here
-            .iter()
-            .filter(|session| session.mark == Mark::Idle)
-            .take(room);
-        let shown: Vec<&SessionRow> = active.copied().chain(recent).collect();
-        section(&mut top, heading("Sessions"), Line::default().dim("alt+1"));
-        for session in &shown {
+    top.extend(changes(&panel.changed, w));
+    if !panel.agents.is_empty() {
+        section(
+            &mut top,
+            label("agents"),
+            Line::default().dim(counted(panel.agents.len(), "agent", "agents")),
+        );
+        for agent in panel.agents.iter().take(AGENT_ROWS) {
             top.push(lr(
-                mark(session.mark, icons).ink(format!(" {}", session.title)),
-                Line::default().dim(&session.detail),
+                agent.mark.clone().ink(" ").ink(&agent.title),
+                Line::default().dim(&agent.detail),
                 w,
             ));
+            top.push(
+                Line::default()
+                    .ink("  ")
+                    .extend(agent.doing.clone())
+                    .truncate(w),
+            );
         }
-        if others.len() > shown.len() {
-            top.push(Line::default().dim(format!("{} more", others.len() - shown.len())));
+        if panel.agents.len() > AGENT_ROWS {
+            top.push(Line::default().dim(format!("… {} more", panel.agents.len() - AGENT_ROWS)));
         }
     }
     let foot: Vec<Line> = [
-        elide_left(panel.place.clone(), w),
+        lr(
+            elide_left(panel.place.clone(), w.saturating_sub(16)),
+            Line::default().dim("alt+1 sessions"),
+            w,
+        ),
         panel.facts.clone().truncate(w),
-        Line::default()
-            .brass("ξ ")
-            .strong(Role::Ink, "xi")
-            .dim(format!(" {}", env!("CARGO_PKG_VERSION")))
-            .truncate(w),
     ]
     .into_iter()
-    .filter(|line| !line.0.is_empty())
+    .filter(|line| !line.plain().trim().is_empty())
     .collect();
     // The foot keeps its rows; the sections above it are cut first, with
     // a gap between the two.
@@ -573,31 +566,121 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     lines
 }
 
-/// Context occupancy, then the cache hit rate when known.
-fn context(context: ContextGauge) -> Vec<Line> {
-    let mut rows = vec![if context.window == 0 {
-        Line::default()
-            .ink(tokens(context.used))
-            .dim(" used · window unknown")
-    } else {
-        // The footer truncates; the overview agrees with it.
-        let percent = u128::from(context.used) * 100 / u128::from(context.window);
-        Line::default()
-            .ink(tokens(context.used))
-            .dim(" of ")
-            .ink(tokens(context.window))
-            .dim(" · ")
-            .ink(format!("{percent}%"))
-            .dim(" used")
-    }];
-    if let Some(percent) = context.cache_percent {
-        rows.push(
-            Line::default()
-                .ink(format!("{percent}%"))
-                .dim(" from cache"),
-        );
+/// A changed path's file, or the path itself, with its added and removed
+/// line counts.
+type Changed = (String, usize, usize);
+
+/// A section's name, set as a rubric label.
+fn label(name: &str) -> Line {
+    Line::default().rubric(name)
+}
+
+/// Changed files under their directories, in the order each directory was
+/// first touched, without the directories every path shares.
+fn changes(changed: &[(String, usize, usize)], w: usize) -> Vec<Line> {
+    let split = |path: &str| -> (String, String) {
+        match path.rsplit_once('/') {
+            Some((dir, file)) => (dir.to_owned(), file.to_owned()),
+            None => (String::new(), path.to_owned()),
+        }
+    };
+    let dirs: Vec<String> = changed.iter().map(|(path, ..)| split(path).0).collect();
+    // Whole directories every changed path starts with, such as `crates/`.
+    let shared = dirs.first().map_or(0, |first| {
+        let mut shared = 0;
+        for (at, _) in first.match_indices('/') {
+            let prefix = &first[..=at];
+            if dirs.iter().all(|dir| format!("{dir}/").starts_with(prefix)) {
+                shared = at + 1;
+            }
+        }
+        // Only directories that differ are worth cutting down to; one
+        // directory, or a path in the shared one itself, keeps them whole.
+        if dirs.iter().any(|dir| dir.len() <= shared) || dirs.iter().all(|dir| dir == first) {
+            0
+        } else {
+            shared
+        }
+    });
+    // Each directory with its files and their counts.
+    let mut groups: Vec<(String, Vec<Changed>)> = Vec::new();
+    for (path, added, removed) in changed {
+        let (dir, file) = split(path);
+        let dir = dir.get(shared..).unwrap_or(&dir).to_owned();
+        match groups.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, files)) => files.push((file, *added, *removed)),
+            None => groups.push((dir, vec![(file, *added, *removed)])),
+        }
     }
-    rows
+    let mut lines = Vec::new();
+    let mut shown = 0;
+    'groups: for (dir, files) in &groups {
+        if !dir.is_empty() {
+            if lines.len() + 2 > CHANGED_ROWS {
+                break;
+            }
+            lines.push(elide_left(Line::default().dim(dir), w));
+        }
+        let indent = if dir.is_empty() { "" } else { "  " };
+        for (file, added, removed) in files {
+            if lines.len() + 1 > CHANGED_ROWS {
+                break 'groups;
+            }
+            let counts = counts(*added, *removed);
+            let room = w.saturating_sub(counts.width() + 2 + indent.len());
+            lines.push(lr(
+                Line::default()
+                    .ink(indent)
+                    .extend(elide_left(Line::default().ink(file), room)),
+                counts,
+                w,
+            ));
+            shown += 1;
+        }
+    }
+    if changed.len() > shown {
+        let hidden = changed.len() - shown;
+        let noun = if hidden == 1 { "file" } else { "files" };
+        lines.push(Line::default().dim(format!("… {hidden} more {noun}")));
+    }
+    lines
+}
+
+/// Context occupancy as a gauge, then the numbers and the cache hit rate.
+fn context(context: ContextGauge, w: usize) -> Vec<Line> {
+    if context.window == 0 {
+        let mut line = Line::default()
+            .muted(tokens(context.used))
+            .dim(" used · window unknown");
+        if let Some(percent) = context.cache_percent {
+            line = line.dim(" · ").muted(format!("{percent}%")).dim(" cached");
+        }
+        return vec![line];
+    }
+    // The footer truncates; the overview agrees with it.
+    let percent = u128::from(context.used) * 100 / u128::from(context.window);
+    let label = format!(" {percent}%");
+    let bar = w.saturating_sub(label.len()).min(GAUGE_MAX);
+    let filled = usize::try_from(
+        (u128::from(context.used) * bar as u128).div_ceil(u128::from(context.window)),
+    )
+    .unwrap_or(bar)
+    .min(bar);
+    let gauge = Line::default()
+        .brass("━".repeat(filled))
+        .faint("━".repeat(bar - filled))
+        .muted(label);
+    let mut numbers = Line::default()
+        .muted(tokens(context.used))
+        .dim(" of ")
+        .muted(tokens(context.window));
+    if let Some(percent) = context.cache_percent {
+        numbers = numbers
+            .dim(" · ")
+            .muted(format!("{percent}%"))
+            .dim(" cached");
+    }
+    vec![gauge, numbers]
 }
 
 /// An inspected row's headline without its live mark, a built-in tool's
@@ -809,7 +892,7 @@ mod tests {
                 header_right: Line::default().dim("chatgpt/gpt-6.1-sol · think xhigh"),
                 status: Line::default().dim("ctx 11% · cache 94%"),
                 title: "Route sandboxed bash through the egress proxy",
-                meta: "14:02 · a3f9c2e1 · 41 events",
+                meta: "started 14:02",
                 log: LogPane {
                     rows: &self.retained,
                     selected: None,
@@ -831,6 +914,14 @@ mod tests {
                         ("crates/xi-sandbox/src/lib.rs".into(), 21, 12),
                         ("crates/xi-tools/src/bash.rs".into(), 22, 16),
                     ],
+                    agents: vec![AgentRow {
+                        mark: Line::default().brass("┤"),
+                        title: "Audit the proxy's allow list".into(),
+                        doing: Line::default()
+                            .muted("read")
+                            .dim(" crates/xi-sandbox/src/net.rs"),
+                        detail: "12.0s".into(),
+                    }],
                     sessions: SessionsPane {
                         here: vec![
                             session(Mark::Current, "Route sandboxed bash", "gpt-6.1-sol · 5m"),
@@ -921,31 +1012,41 @@ mod tests {
                 side[1].trim_end(),
                 "Route sandboxed bash through the egress proxy"
             );
-            assert_eq!(side[2].trim_end(), "14:02 · a3f9c2e1 · 41 events");
+            assert_eq!(side[2].trim_end(), "started 14:02");
             assert!(
-                side[4].starts_with("Waiting · 1") && side[4].trim_end().ends_with("tab answers")
+                side[4].starts_with("waiting · 1") && side[4].trim_end().ends_with("tab answers")
             );
             assert!(side[5].starts_with("? bash exec  cargo update -p tokio"));
             let at = |name: &str| side.iter().position(|line| line.starts_with(name)).unwrap();
-            let context = at("Context");
-            assert_eq!(side[context + 1].trim_end(), "29.8k of 272.0k · 10% used");
-            assert_eq!(side[context + 2].trim_end(), "94% from cache");
-            assert!(side[at("Changes")].trim_end().ends_with("+43 −28"));
-            let sessions = at("Sessions");
-            assert!(side[sessions].trim_end().ends_with("alt+1"));
-            assert!(side[sessions + 1].starts_with("┤ Port footer fit to deck"));
-            assert!(side[sessions + 2].starts_with("? Bump tokio to 1.48"));
-            // This workspace's idle sessions follow; other workspaces' are
-            // counted.
-            assert!(side[sessions + 3].starts_with("· Settings frame hints"));
-            assert!(side[sessions + 3].trim_end().ends_with("yesterday"));
-            assert_eq!(side[sessions + 4].trim_end(), "1 more");
-            assert!(!side.iter().any(|line| line.contains("Fix export offsets")));
+            let context = at("context");
+            assert_eq!(
+                side[context + 1].trim_end(),
+                format!("{} 10%", "━".repeat(GAUGE_MAX))
+            );
+            assert_eq!(side[context + 2].trim_end(), "29.8k of 272.0k · 94% cached");
+            let changes = at("changes");
+            assert!(side[changes].trim_end().ends_with("+43 −28"));
+            // Paths group under their directories, less the `crates/` they
+            // share.
+            assert_eq!(side[changes + 1].trim_end(), "xi-sandbox/src");
+            assert!(side[changes + 2].starts_with("  lib.rs"));
+            assert!(side[changes + 2].trim_end().ends_with("+21 −12"));
+            assert_eq!(side[changes + 3].trim_end(), "xi-tools/src");
+            let agents = at("agents");
+            assert!(side[agents].trim_end().ends_with("1 agent"));
+            assert!(side[agents + 1].starts_with("┤ Audit the proxy's allow list"));
+            assert!(side[agents + 1].trim_end().ends_with("12.0s"));
+            assert_eq!(
+                side[agents + 2].trim_end(),
+                "  read crates/xi-sandbox/src/net.rs"
+            );
+            // Other sessions wait for alt+1.
+            assert!(!side.iter().any(|line| line.contains("Port footer")));
             // The newest tool row stays in the log and the inspector.
             assert!(!side.iter().any(|line| line.contains("edit ×5")));
-            assert_eq!(side[36].trim_end(), "~/src/xi:main*");
-            assert_eq!(side[37].trim_end(), "ask · sandboxed · trusted");
-            assert!(side[38].starts_with("ξ xi "));
+            assert!(side[37].starts_with("~/src/xi:main*"));
+            assert!(side[37].trim_end().ends_with("alt+1 sessions"));
+            assert_eq!(side[38].trim_end(), "ask · sandboxed · trusted");
             assert_eq!(side[39].trim_end(), "");
         }
     }
@@ -1014,28 +1115,24 @@ mod tests {
         let scene = fixture.scene();
         let text = plain(&overview(&scene, 60, 12));
         assert_eq!(text.len(), 12);
-        assert_eq!(text[7], "…");
-        assert_eq!(text[8], "");
-        assert_eq!(text[9], "~/src/xi:main*");
-        assert!(text[11].starts_with("ξ xi"));
+        assert_eq!(text[8], "…");
+        assert_eq!(text[9], "");
+        assert!(text[10].starts_with("~/src/xi:main*"));
+        assert_eq!(text[11], "ask · sandboxed · trusted");
         assert_eq!(
-            plain(&overview(&scene, 60, 2)),
-            [
-                "ask · sandboxed · trusted".to_owned(),
-                format!("ξ xi {}", env!("CARGO_PKG_VERSION"))
-            ]
+            plain(&overview(&scene, 60, 1)),
+            ["ask · sandboxed · trusted"]
         );
         assert!(overview(&scene, 60, 0).is_empty());
     }
 
     #[test]
-    fn the_overview_says_when_nothing_changed_and_drops_lone_sessions() {
+    fn the_overview_says_when_nothing_changed_and_drops_idle_agents() {
         let fixture = Fixture::new();
         let mut scene = fixture.scene();
         scene.panel.asks.clear();
         scene.panel.changed.clear();
-        scene.panel.sessions.here.truncate(1);
-        scene.panel.sessions.elsewhere.clear();
+        scene.panel.agents.clear();
         scene.panel.context = ContextGauge {
             used: 2_400,
             window: 0,
@@ -1046,12 +1143,12 @@ mod tests {
             text[..9],
             [
                 "Route sandboxed bash through the egress proxy",
-                "14:02 · a3f9c2e1 · 41 events",
+                "started 14:02",
                 "",
-                "Context",
+                "context",
                 "2.4k used · window unknown",
                 "",
-                "Changes",
+                "changes",
                 "nothing yet",
                 "",
             ]
@@ -1059,14 +1156,14 @@ mod tests {
         assert!(
             !text
                 .iter()
-                .any(|line| line.starts_with("Waiting") || line.starts_with("Sessions"))
+                .any(|line| line.starts_with("waiting") || line.starts_with("agents"))
         );
         // Long titles take two rows and cut the rest.
         scene.title = "a title that runs on well past the width of one panel row and then a second";
         let text = plain(&overview(&scene, 30, 20));
         assert_eq!(text[0], "a title that runs on well past");
         assert!(text[1].ends_with('…') && text[1].chars().count() == 30);
-        assert!(text[2].starts_with("14:02"));
+        assert_eq!(text[2], "started 14:02");
     }
 
     #[test]
@@ -1085,12 +1182,20 @@ mod tests {
         let text = plain(&overview(&scene, 40, 40));
         let first = text
             .iter()
-            .position(|line| line.starts_with("Changes"))
+            .position(|line| line.starts_with("changes"))
             .unwrap();
-        assert!(text[first + 1].starts_with('…'));
-        assert!(text[first + 1].contains("module_0.rs"));
-        assert!(text[first + 1].ends_with("+0 −1"));
-        assert_eq!(text[first + 1 + CHANGED_ROWS], "… 3 more files");
+        // One directory keeps its whole path.
+        assert_eq!(text[first + 1], "crates/xi-kernel/src/deeply/nested");
+        assert!(text[first + 2].starts_with("  module_0.rs"));
+        assert!(text[first + 2].ends_with("+0 −1"));
+        assert_eq!(text[first + 1 + CHANGED_ROWS], "… 2 more files");
+        scene.panel.changed.truncate(2);
+        scene.panel.changed.push(("README.md".into(), 1, 0));
+        let text = plain(&overview(&scene, 60, 40));
+        assert!(
+            text.iter().any(|line| line.starts_with("README.md")),
+            "a file at the top keeps no directory row: {text:?}"
+        );
         let path = |text: &str, cols| elide_left(Line::default().ink(text), cols).plain();
         assert_eq!(path("abc", 3), "abc");
         assert_eq!(path("abcdef", 4), "…def");
@@ -1117,12 +1222,8 @@ mod tests {
             text.iter()
                 .any(|line| line.starts_with("\u{f420} bash exec"))
         );
-        assert!(
-            text.iter()
-                .any(|line| line.starts_with("\u{f46a} Port footer"))
-        );
-        assert!(text.iter().any(|line| line.starts_with("Sessions")));
-        assert!(text.iter().any(|line| line.starts_with("Changes")));
+        assert!(text.iter().any(|line| line.starts_with("changes")));
+        assert!(text.iter().any(|line| line.starts_with("agents")));
         let mut inspect = fixture.inspect.clone();
         inspect.title = "mcp_lookup docs".into();
         assert_eq!(headline(&inspect, Icons::Nerd), "mcp_lookup docs");
@@ -1293,7 +1394,7 @@ mod tests {
         let (folded, cursor) = render(&scene, 120, 30);
         let text = plain(&folded);
         assert!(text[1].starts_with(" Route sandboxed bash"));
-        assert!(text[1].ends_with("41 events"));
+        assert!(text[1].ends_with("started 14:02"));
         assert!(text[3].starts_with(" ┃ route"));
         assert_eq!(cursor, Some((26, 8)));
     }

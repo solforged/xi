@@ -28,6 +28,11 @@ pub const SPINNER: [&str; 8] = ["┤", "┘", "┴", "└", "├", "┌", "┬",
 pub(crate) const RESULT_LINES: usize = 3;
 /// Diff rows shown before the rest is kept for ctrl+o.
 const DIFF_ROWS: usize = 8;
+/// The column tool names are set in, so a run of calls reads as a ledger.
+const NAME_WIDTH: usize = 6;
+/// Cells before a call's argument: its mark, a space, the name column and
+/// two spaces. Diffs and output hang under the argument.
+const ARG_COLUMN: usize = 2 + NAME_WIDTH + 2;
 
 /// How visible model reasoning is displayed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -569,16 +574,74 @@ struct Diff<'a> {
     removed: Option<usize>,
 }
 
-fn diff_line(role: Role, text: &str, cols: usize) -> Line {
-    let lead = match role {
-        Role::Sanguine => "  - ",
-        Role::Verdigris => "  + ",
-        _ => "    ",
+/// A diff row hung under the call's argument behind a faint rule.
+fn diff_line(role: Role, text: &str, m: Measure) -> Line {
+    let sign = match role {
+        Role::Sanguine => "- ",
+        Role::Verdigris => "+ ",
+        _ => "  ",
     };
-    Line::default()
-        .span(role, false, lead)
+    hung(m)
+        .faint("▏ ")
+        .span(role, false, sign)
         .span(role, false, text)
-        .truncate(cols)
+        .truncate(m.out)
+}
+
+/// The indent that hangs a row under a call's argument; a slit keeps it
+/// short.
+fn hung(m: Measure) -> Line {
+    let cells = if m.durations() { ARG_COLUMN } else { 4 };
+    Line::default().ink(" ".repeat(cells))
+}
+
+/// A call's argument: a path's directory dim and its file in ink, with a
+/// read's line range dim, or a search's scope dim after its pattern.
+fn argument(name: &str, arg: &str) -> Line {
+    match name {
+        "read" | "edit" | "write" | "hashline" => {
+            let (path, range) = arg
+                .rsplit_once(':')
+                .filter(|(_, range)| {
+                    name == "read"
+                        && !range.is_empty()
+                        && range.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                })
+                .unwrap_or((arg, ""));
+            let mut line = Line::default();
+            match path.rsplit_once('/') {
+                Some((dir, file)) if !file.is_empty() => {
+                    line = line.dim(format!("{dir}/")).ink(file);
+                }
+                _ => line = line.ink(path),
+            }
+            if range.is_empty() {
+                line
+            } else {
+                line.dim(format!(":{range}"))
+            }
+        }
+        "search" => match arg.rsplit_once(" in ") {
+            Some((pattern, scope)) => Line::default().ink(pattern).dim(format!(" in {scope}")),
+            None => Line::default().ink(arg),
+        },
+        _ => Line::default().ink(arg),
+    }
+}
+
+/// A headline's mark, its tool's name in the name column, and its argument.
+/// A slit has no cells for the column and keeps one space.
+fn ledger(mark: Line, name: &str, arg: Line, m: Measure) -> Line {
+    let line = mark.ink(" ");
+    if arg.0.is_empty() {
+        return line.muted(name);
+    }
+    let line = if m.durations() {
+        line.muted(format!("{name:<NAME_WIDTH$}")).ink("  ")
+    } else {
+        line.muted(name).ink(" ")
+    };
+    line.extend(arg)
 }
 
 fn diff_text(diff: &Diff<'_>) -> String {
@@ -600,11 +663,21 @@ fn edit_head(edits: &[Call], m: Measure) -> Line {
     if edits.len() == 1 {
         first.head(first.mark(), m)
     } else {
-        Line::default()
-            .dim("▸ ")
-            .strong(Role::Ink, format!("edit ×{}", edits.len()))
-            .ink(" ")
-            .ink(first.headline_arg(m))
+        ledger(
+            Line::default().verdigris("●"),
+            &format!("edit×{}", edits.len()),
+            argument("edit", first.headline_arg(m)),
+            m,
+        )
+    }
+}
+
+/// An edit run's title for the inspector and ctrl+o.
+fn edit_title(edits: &[Call]) -> String {
+    match edits {
+        [one] => one.title(),
+        [first, ..] => format!("edit ×{} {}", edits.len(), first.arg),
+        [] => String::new(),
     }
 }
 
@@ -632,11 +705,20 @@ impl Call {
     }
 
     fn head(&self, mark: Line, m: Measure) -> Line {
-        let line = mark.ink(" ").strong(Role::Ink, &self.name);
+        ledger(
+            mark,
+            &self.name,
+            argument(&self.name, self.headline_arg(m)),
+            m,
+        )
+    }
+
+    /// The name and argument, plainly, for the inspector.
+    fn title(&self) -> String {
         if self.arg.is_empty() {
-            line
+            self.name.clone()
         } else {
-            line.ink(" ").ink(self.headline_arg(m))
+            format!("{} {}", self.name, self.arg)
         }
     }
 
@@ -786,11 +868,7 @@ impl Call {
         }
         right = right.span(role, false, meta.join(" · "));
         let mut inspect = Inspect {
-            title: self
-                .head(Line::default(), m)
-                .plain()
-                .trim_start()
-                .to_owned(),
+            title: self.title(),
             meta: right.plain(),
             diff: diff.is_some(),
             ..Inspect::default()
@@ -823,15 +901,11 @@ impl Call {
                 diff.rows
                     .iter()
                     .take(DIFF_ROWS)
-                    .map(|(role, row)| diff_line(*role, row, cols)),
+                    .map(|(role, row)| diff_line(*role, row, m)),
             );
             let hidden = diff.rows.len().saturating_sub(DIFF_ROWS);
             if hidden > 0 {
-                lines.push(
-                    Line::default()
-                        .dim(format!("    {}", more_lines(hidden)))
-                        .truncate(cols),
-                );
+                lines.push(hung(m).dim(more_lines(hidden)).truncate(cols));
                 let text = diff_text(&diff);
                 inspect.note = format!("{} lines", diff.rows.len());
                 inspect.text.clone_from(&text);
@@ -872,16 +946,18 @@ impl Call {
             .map(|(index, line)| (red.contains(&index), *line))
             .collect();
         let shown = &rows[..rows.len().min(RESULT_LINES)];
+        let indent = hung(m).width().saturating_sub(2);
         for (i, (red, row)) in shown.iter().enumerate() {
+            let lead = Line::default().ink(" ".repeat(indent));
             let lead = if i == 0 {
-                Line::default().dim("  └ ")
+                lead.faint("└ ")
             } else {
-                Line::default().ink("    ")
+                lead.ink("  ")
             };
             let body = if *red {
                 Line::default().sanguine(row)
             } else {
-                Line::default().ink(row)
+                Line::default().muted(row)
             };
             lines.push(lead.extend(body).truncate(cols));
         }
@@ -894,8 +970,7 @@ impl Call {
             more.push(format!("full output in {}", path.display()));
         }
         if !more.is_empty() {
-            let more = format!("    {}", more.join(" · "));
-            lines.push(Line::default().dim(more).truncate(cols));
+            lines.push(hung(m).dim(more.join(" · ")).truncate(cols));
         }
         if !text.is_empty() {
             inspect.note = format!("{count} lines");
@@ -1050,7 +1125,7 @@ impl Transcript {
         self.inspects.push((
             out.len(),
             Inspect {
-                title: head.plain().trim_start_matches("▸ ").to_owned(),
+                title: edit_title(&edits),
                 meta: meta.clone(),
                 note: format!("net diff · {} edits", edits.len()),
                 diff: true,
@@ -1064,14 +1139,14 @@ impl Transcript {
                 .flatten()
                 .flat_map(|diff| &diff.rows)
                 .take(DIFF_ROWS)
-                .map(|(role, row)| diff_line(*role, row, m.out)),
+                .map(|(role, row)| diff_line(*role, row, m)),
         );
         let hidden = count.saturating_sub(DIFF_ROWS);
         if hidden > 0 {
             lines.push(
-                Line::default()
+                hung(m)
                     .dim(format!(
-                        "    … {hidden} more lines in {} edits · ctrl+o",
+                        "… {hidden} more lines in {} edits · ctrl+o",
                         edits.len()
                     ))
                     .truncate(m.out),
@@ -1994,7 +2069,7 @@ mod tests {
             assert_eq!(t.asks()[0].call, "net1".into());
             assert_eq!(t.asks()[0].tool, "bash");
             let live = plain(&t.live(m(100), 0));
-            assert!(live[0].starts_with("┤ bash curl github.com"));
+            assert!(live[0].starts_with("┤ bash    curl github.com"));
             assert_eq!(live[1], "  ⇄ net github.com:443 · asked");
             assert_eq!(live[2], "  ⇄ net github.com:443 · allowed by user#2");
             t.apply(
@@ -2020,10 +2095,10 @@ mod tests {
                     .is_empty()
             );
             let rows = plain(&t.apply(&ev(result("a", "", false), 5), m(100)));
-            assert!(rows[0].starts_with("● bash curl github.com"), "{rows:?}");
+            assert!(rows[0].starts_with("● bash    curl github.com"), "{rows:?}");
             assert_eq!(rows[1], format!("  ⇄ net github.com:443 · {status}"));
             assert_eq!(rows[2], "  ⇄ net github.com:443 · allowed by user#2");
-            assert!(rows[3].starts_with("● read file"), "{rows:?}");
+            assert!(rows[3].starts_with("● read    file"), "{rows:?}");
             assert!(t.live(m(100), 0).is_empty());
         }
     }
@@ -2584,21 +2659,29 @@ mod tests {
         );
         let rows = t.flush(m(100));
         let text = plain(&rows);
-        assert!(text[0].starts_with("● edit source.rs"));
+        assert!(text[0].starts_with("● edit    source.rs"));
         assert!(text[0].ends_with("+1 −2 · user#1 · 0.1s"), "{text:?}");
         assert_eq!(
             text[1..],
             [
-                "    before",
-                "  - old one",
-                "  - old two",
-                "  + new one",
-                "    after"
+                "          ▏   before",
+                "          ▏ - old one",
+                "          ▏ - old two",
+                "          ▏ + new one",
+                "          ▏   after"
             ]
         );
-        assert!(rows[1].0.iter().all(|span| span.role == Role::Dim));
-        assert!(rows[2].0.iter().all(|span| span.role == Role::Sanguine));
-        assert!(rows[4].0.iter().all(|span| span.role == Role::Verdigris));
+        // Past the indent and the faint rule, each row takes its role.
+        let roles = |row: &Line| {
+            row.0
+                .iter()
+                .skip(2)
+                .map(|span| span.role)
+                .collect::<Vec<_>>()
+        };
+        assert!(roles(&rows[1]).iter().all(|&role| role == Role::Dim));
+        assert!(roles(&rows[2]).iter().all(|&role| role == Role::Sanguine));
+        assert!(roles(&rows[4]).iter().all(|&role| role == Role::Verdigris));
         assert!(!t.collapsed());
     }
 
@@ -2633,8 +2716,8 @@ mod tests {
         let rows = plain(&t.flush(m(80)));
         assert_eq!(rows.len(), 10);
         assert!(rows[0].ends_with("+6 −6"));
-        assert_eq!(rows[8], "  + new 1");
-        assert_eq!(rows[9], "    … 4 more lines · ctrl+o");
+        assert_eq!(rows[8], "          ▏ + new 1");
+        assert_eq!(rows[9], "          … 4 more lines · ctrl+o");
         assert!(t.details[0].diff);
         assert!(t.details[0].text.starts_with("- old 0\n"));
         let full = t.expand(m(80)).unwrap();
@@ -2695,9 +2778,9 @@ mod tests {
             &ev(result("error", "old text did not match", true), 0),
             m(80),
         ));
-        assert!(rows[0].starts_with("✕ edit x"));
+        assert!(rows[0].starts_with("✕ edit    x"));
         assert!(!rows[0].contains("+1"));
-        assert_eq!(rows[1], "  └ old text did not match");
+        assert_eq!(rows[1], "        └ old text did not match");
     }
 
     #[test]
@@ -2727,12 +2810,20 @@ mod tests {
         let rows = t.flush(m(80));
         let text = plain(&rows);
         assert!(text[0].ends_with("+3"));
-        assert_eq!(text[1..], ["  + one", "  + two", "  + three"]);
-        assert!(
-            rows[1..]
-                .iter()
-                .all(|line| line.0.iter().all(|span| span.role == Role::Verdigris))
+        assert_eq!(
+            text[1..],
+            [
+                "          ▏ + one",
+                "          ▏ + two",
+                "          ▏ + three"
+            ]
         );
+        assert!(rows[1..].iter().all(|line| {
+            line.0
+                .iter()
+                .skip(2)
+                .all(|span| span.role == Role::Verdigris)
+        }));
     }
 
     #[test]
@@ -2926,15 +3017,15 @@ mod tests {
         let output = "one\ntwo\nthree\nfour\nfive\n[exit 1]\n";
         let rows = t.apply(&ev(result("a", output, true), 2_800), m(96));
         let text = plain(&rows);
-        assert!(text[0].starts_with("✕ bash git log"));
+        assert!(text[0].starts_with("✕ bash    git log"));
         assert!(text[0].ends_with("exit 1 · 1.8s"));
         assert_eq!(
             text[1..],
             [
-                "  └ one",
-                "    two",
-                "    three",
-                "    … 2 more lines · ctrl+o"
+                "        └ one",
+                "          two",
+                "          three",
+                "          … 2 more lines · ctrl+o"
             ]
         );
         assert!(
@@ -2998,16 +3089,16 @@ mod tests {
             assert_eq!(
                 rows[2].plain(),
                 if error {
-                    "    [exit unknown]"
+                    "          [exit unknown]"
                 } else {
-                    "    [exit 0]"
+                    "          [exit 0]"
                 }
             );
             assert_eq!(
                 rows[1].0.last().unwrap().role,
-                if error { Role::Sanguine } else { Role::Ink }
+                if error { Role::Sanguine } else { Role::Muted }
             );
-            assert_eq!(rows[2].0.last().unwrap().role, Role::Ink);
+            assert_eq!(rows[2].0.last().unwrap().role, Role::Muted);
         }
     }
 
@@ -3389,24 +3480,28 @@ mod tests {
             assert!(t.changed().is_empty());
             let live = t.live(m(cols), 0);
             assert_eq!(live.len(), 1);
-            assert!(live[0].plain().starts_with("▸ edit ×2 "));
+            assert!(live[0].plain().starts_with("● edit×2 "));
             assert!(live[0].plain().ends_with("done"));
             let rows = t.flush(m(cols));
             assert_eq!(rows.len(), DIFF_ROWS + 2);
             assert_eq!(rows[0].width(), m(cols).out);
             assert!(rows[0].plain().starts_with(if cols == 60 {
-                "▸ edit ×2 lib.rs"
+                "● edit×2 lib.rs"
             } else {
-                "▸ edit ×2 crates/src/lib.rs"
+                "● edit×2  crates/src/lib.rs"
             }));
             assert!(rows[0].plain().ends_with(if cols == 60 {
                 "+7 −6"
             } else {
                 "+7 −6 · 0.2s"
             }));
-            assert_eq!(rows[1].plain(), "  - a");
-            assert_eq!(rows[8].plain(), "  + h");
-            assert_eq!(rows[9].plain(), "    … 5 more lines in 2 edits · ctrl+o");
+            let hung = if cols == 60 { "    " } else { "          " };
+            assert_eq!(rows[1].plain(), format!("{hung}▏ - a"));
+            assert_eq!(rows[8].plain(), format!("{hung}▏ + h"));
+            assert_eq!(
+                rows[9].plain(),
+                format!("{hung}… 5 more lines in 2 edits · ctrl+o")
+            );
             assert_eq!(t.details.len(), 2);
             assert_eq!(t.details[0].title, "edit · crates/src/lib.rs · 1 of 2");
             assert_eq!(t.details[1].title, "edit · crates/src/lib.rs · 2 of 2");
@@ -3465,7 +3560,7 @@ mod tests {
             let mut t = Transcript::default();
             hold_edits(&mut t, m(250));
             let rows = t.apply(&ev(boundary, 400), m(250));
-            assert!(rows[0].plain().starts_with("▸ edit ×2 crates/src/lib.rs"));
+            assert!(rows[0].plain().starts_with("● edit×2  crates/src/lib.rs"));
             assert_eq!(t.take_inspects()[0].0, 0);
             assert!(t.edits.is_empty());
         }
@@ -3491,7 +3586,7 @@ mod tests {
             t.apply(&ev(result("c", "updated", false), 500), m(250))
                 .is_empty()
         );
-        assert!(t.flush(m(250))[0].plain().starts_with("▸ edit ×3"));
+        assert!(t.flush(m(250))[0].plain().starts_with("● edit×3"));
         assert_eq!(t.details.len(), 3);
 
         let mut t = Transcript::default();
@@ -3504,7 +3599,7 @@ mod tests {
             }),
             m(250),
         );
-        assert!(rows[0].plain().starts_with("▸ edit ×2"));
+        assert!(rows[0].plain().starts_with("● edit×2"));
         assert!(rows.last().unwrap().plain().contains("session exited"));
     }
 
@@ -3564,7 +3659,7 @@ mod tests {
             .unwrap();
         assert!(next > 0);
         assert_eq!(rows[next - 1].plain(), "");
-        assert!(rows[anchors[0].0].plain().starts_with("▸ edit ×2"));
+        assert!(rows[anchors[0].0].plain().starts_with("● edit×2"));
     }
 
     #[test]
