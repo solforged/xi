@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::ops::Range;
 use std::path::Path;
 
+use unicode_width::UnicodeWidthStr;
 use xi_protocol::manifest::CommandSpec;
 
 use crate::style::{Line, Role};
@@ -237,10 +238,18 @@ impl Menu {
         self.range.clone()
     }
 
-    /// Renders at most `rows` width-bounded candidates, keeping selection visible.
+    /// Renders at most `rows` width-bounded candidates, keeping selection
+    /// visible. Command descriptions share one column after the longest
+    /// label, so it holds still while the selection scrolls.
     #[must_use]
     pub fn render(&self, cols: usize, rows: usize) -> Vec<Line> {
         let start = self.selected.saturating_add(1).saturating_sub(rows);
+        let column = self
+            .items
+            .iter()
+            .map(|item| item.label.width())
+            .max()
+            .unwrap_or(0);
         self.items
             .iter()
             .enumerate()
@@ -253,7 +262,8 @@ impl Menu {
                     .span(role, active, if active { "› " } else { "  " })
                     .span(role, active, &item.label);
                 if self.kind == Kind::Command && !item.detail.is_empty() {
-                    line = line.dim("  ").dim(&item.detail);
+                    let pad = column - item.label.width() + 2;
+                    line = line.ink(" ".repeat(pad)).dim(&item.detail);
                 }
                 line.truncate(cols)
             })
@@ -446,6 +456,16 @@ mod tests {
         );
         assert!(menu.render(12, 0).is_empty());
         assert!(menu.render(0, 2).iter().all(|line| line.width() == 0));
+        // Descriptions line up after the longest label, `/three`.
+        let starts: Vec<_> = menu
+            .render(40, 3)
+            .iter()
+            .map(|line| {
+                let text = line.plain();
+                text[..text.find("Use ").unwrap()].chars().count()
+            })
+            .collect();
+        assert_eq!(starts, [10, 10, 10]);
         menu.up();
         assert_eq!(menu.selected().unwrap().label, "/three");
     }
