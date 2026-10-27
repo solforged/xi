@@ -259,6 +259,24 @@ impl Binding {
         label
     }
 
+    /// The short form hints show: arrows as `↑` `↓` `←` `→`, the rest as
+    /// [`Binding::label`].
+    #[must_use]
+    pub fn glyph(&self) -> String {
+        let arrow = match self.code {
+            KeyCode::Up => "↑",
+            KeyCode::Down => "↓",
+            KeyCode::Left => "←",
+            KeyCode::Right => "→",
+            _ => return self.label(),
+        };
+        if self.modifiers.is_empty() {
+            arrow.into()
+        } else {
+            self.label()
+        }
+    }
+
     fn normalized(mut self) -> Self {
         if self.code == KeyCode::BackTab {
             self.modifiers.remove(KeyModifiers::SHIFT);
@@ -343,6 +361,15 @@ impl Keymap {
             .iter()
             .filter_map(|(binding, a)| (*a == action).then_some(*binding))
             .collect()
+    }
+
+    /// The first key bound to an action, as hints show it.
+    #[must_use]
+    pub fn key(&self, action: Action) -> Option<String> {
+        self.bindings
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map(|(binding, _)| binding.glyph())
     }
 
     /// Replaces an action's bindings, taking shared bindings from other actions.

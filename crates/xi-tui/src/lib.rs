@@ -17,6 +17,7 @@ pub mod complete;
 pub mod config;
 pub mod editor;
 pub mod external;
+pub mod frame;
 mod git;
 pub mod history;
 mod input;
