@@ -322,6 +322,8 @@ impl App {
             };
             let (mut block, cursor) = self.editor.render(cols, border, "", form);
             let bar = || Line::default().span(border, false, "┃");
+            // A blank row parts the draft from the model, as above it.
+            block.push(bar().raise());
             block.push(bar().ink("  ").extend(self.model_line()).raise());
             block.push(bar().raise());
             (block, cursor)
@@ -373,11 +375,13 @@ impl App {
         if !deck {
             lines.push(self.footer(cols));
         } else if !framed {
-            lines.push(lr(
-                activity.unwrap_or_default(),
-                Line::default().dim(hint),
-                cols,
-            ));
+            // The deck's keys need no reminder until a turn changes them.
+            let keys = if self.running() {
+                Line::default().dim(hint)
+            } else {
+                Line::default()
+            };
+            lines.push(lr(activity.unwrap_or_default(), keys, cols));
         }
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
         let hidden = lines.len().saturating_sub(m.live_rows());

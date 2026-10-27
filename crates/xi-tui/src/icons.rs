@@ -37,6 +37,16 @@ pub enum Icon {
     Context,
     /// The cache hit rate.
     Cache,
+    /// The approval mode.
+    Approvals,
+    /// The sandbox is on.
+    Sandbox,
+    /// The sandbox is off.
+    SandboxOff,
+    /// The workspace is trusted.
+    Trusted,
+    /// The workspace is untrusted.
+    Untrusted,
     /// An unanswered approval.
     Ask,
     /// The attached session.
@@ -121,6 +131,11 @@ fn table(icon: Icon) -> (&'static str, &'static str, &'static str) {
         Icon::Waiting => ("\u{f49a}", "? ", " waiting"), // bell
         Icon::Context => ("\u{f463}", "ctx ", ""), // meter
         Icon::Cache => ("\u{f49b}", "cache ", ""), // cache
+        Icon::Approvals => ("\u{f45e}", "", ""), // checklist
+        Icon::Sandbox => ("\u{f49c}", "", ""),   // shield
+        Icon::SandboxOff => ("\u{f513}", "", ""), // shield_x
+        Icon::Trusted => ("\u{f4a1}", "", ""),   // verified
+        Icon::Untrusted => ("\u{f4a3}", "", ""), // unverified
         Icon::Ask => ("\u{f420}", "? ", ""),     // question
         Icon::Current => ("\u{f444}", "● ", ""), // dot_fill
         Icon::Running => ("\u{f46a}", "┤ ", ""), // sync
