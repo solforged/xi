@@ -67,7 +67,10 @@ fn script() -> Script {
             "",
             vec![
                 ("read", json!({"path": "policies/archive.py", "offset": 10})),
-                ("edit", json!({"path": "policies/archive.py"})),
+                (
+                    "edit",
+                    json!({"path": "policies/archive.py", "old": "    key = \"archived\"", "new": "    key = \"archive\""}),
+                ),
             ],
         ),
         t(

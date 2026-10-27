@@ -277,7 +277,7 @@ mod tests {
             let (config, warnings) = TuiConfig::load(path);
             assert!(warnings.is_empty());
             assert_eq!(config.thinking, Thinking::First);
-            assert_eq!(config.layout, Layout::Inline);
+            assert_eq!(config.layout, Layout::Auto);
             assert_eq!(config.keymap.help(), Keymap::default().help());
         }
     }

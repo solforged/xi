@@ -7,14 +7,13 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
+use xi_client::client::ClientNotification;
 use xi_protocol::Timestamp;
-use xi_protocol::methods::client::{ListParams, SessionSummary, SettingsReport};
+use xi_protocol::methods::client::{EventParams, ListParams, SessionSummary, SettingsReport};
 
-use crate::App;
 use crate::approvals::Approval;
 use crate::deck::{
-    self, AskRow, ContextGauge, Focus, InspectorPane, LogPane, Mark, Scene, SessionRow,
-    SessionsPane,
+    self, AskRow, ContextGauge, Focus, LogPane, Mark, Panel, Scene, SessionRow, SessionsPane,
 };
 use crate::keys::Action;
 use crate::layout::Measure;
@@ -22,32 +21,33 @@ use crate::log::{Inspect, Log};
 use crate::screen::Screen;
 use crate::sessions::age;
 use crate::style::{Line, Role};
-use crate::transcript::clock;
+use crate::transcript::{Transcript, clock};
 use crate::view::home;
+use crate::{App, lineage};
 
 /// How long the sessions and asks lists stay fresh.
 const REFRESH: Duration = Duration::from_secs(5);
 
-/// Segments of the inline footer the deck's status row keeps.
-const STATUS: [&str; 6] = [
-    "context",
-    "cache",
-    "sandbox",
-    "sandbox-off",
-    "taint",
-    "approvals",
-];
+/// Footer segments the deck's header carries beside the title.
+const HEADER: [&str; 5] = ["model", "reasoning", "children", "taint", "approvals"];
+
+/// Footer segments the header adds when the side panel, which shows them,
+/// is folded.
+const STATUS: [&str; 4] = ["context", "cache", "sandbox", "sandbox-off"];
 
 /// The deck's state while the client owns the screen.
 #[derive(Default)]
 pub(crate) struct Deck {
     /// Committed rows and the rows the inspector can open.
     pub log: Log,
+    /// Leading log rows already in scrollback, which leaving the deck must
+    /// not print again.
+    pub printed: usize,
     /// The pane with the keys.
     pub focus: Focus,
     /// Every top-level session the daemon lists, newest first.
     pub sessions: Vec<SessionSummary>,
-    /// Asks waiting across sessions, this session's first.
+    /// Asks waiting in other sessions.
     pub asks: Vec<Approval>,
     /// Effective settings, for the inspector's session line.
     pub settings: Option<SettingsReport>,
@@ -61,20 +61,70 @@ pub(crate) struct Deck {
 }
 
 impl App {
-    /// Enters the deck: committed rows go to the retained log from here on.
+    /// Enters the deck. The log starts with the head's branch replayed, as
+    /// scrollback already shows it, and committed rows go to it from here on.
     pub(crate) fn enter_deck(&mut self) {
-        if self.deck.is_none() {
-            self.deck = Some(Deck::default());
-            self.completion = None;
+        if self.deck.is_some() {
+            return;
+        }
+        self.deck = Some(Deck::default());
+        self.completion = None;
+        let (rows, anchors) = self.replay();
+        if let Some(deck) = self.deck.as_mut() {
+            deck.printed = rows.len();
+            deck.log.extend(rows, anchors);
         }
     }
 
-    /// Leaves the deck, printing its log to scrollback ahead of anything
-    /// committed since.
+    /// The head's branch as the log commits it at the current measure, with
+    /// its inspector anchors. Rows the live transcript still holds stay out.
+    fn replay(&self) -> (Vec<Line>, Vec<(usize, Inspect)>) {
+        let m = self.measure();
+        let session = self.session_id();
+        let mut transcript = Transcript::default();
+        transcript.set_thinking(self.transcript.thinking_display());
+        let mut rows = Vec::new();
+        let mut anchors = Vec::new();
+        let mut take = |transcript: &mut Transcript, lines: Vec<Line>| {
+            let base = rows.len();
+            anchors.extend(
+                transcript
+                    .take_inspects()
+                    .into_iter()
+                    .map(|(at, inspect)| (base + at, inspect)),
+            );
+            rows.extend(lines);
+        };
+        let info = &self.launch.attached.info;
+        for event in lineage(&self.launch.attached.events, info.head) {
+            let n = ClientNotification::Event(EventParams { session, event });
+            let lines = transcript.apply(&n, m);
+            take(&mut transcript, lines);
+        }
+        if !self.running() {
+            let lines = transcript.flush(m);
+            take(&mut transcript, lines);
+        }
+        (rows, anchors)
+    }
+
+    /// Leaves the deck, printing the log rows scrollback lacks ahead of
+    /// anything committed since.
     pub(crate) fn leave_deck(&mut self) {
         if let Some(mut deck) = self.deck.take() {
-            let rows = deck.log.take();
+            let mut rows = deck.log.take();
+            rows.drain(..deck.printed.min(rows.len()));
             self.commit.splice(0..0, rows);
+        }
+    }
+
+    /// Starts the log over for a newly attached session.
+    pub(crate) fn reset_deck_log(&mut self) {
+        if let Some(deck) = self.deck.as_mut() {
+            deck.log = Log::default();
+            deck.printed = 0;
+            deck.inspector = 0;
+            deck.refreshed = None;
         }
     }
 
@@ -99,8 +149,9 @@ impl App {
         } else {
             None
         };
+        // This session's own asks are read live when the scene is built.
         let current = self.session_id();
-        let mut asks = self.own_approvals();
+        let mut asks = Vec::new();
         if let Ok(pending) = pending {
             asks.extend(
                 pending
@@ -138,6 +189,7 @@ impl App {
     /// pane with the focus.
     pub(crate) async fn deck_key(&mut self, key: KeyEvent, action: Option<Action>) -> bool {
         let page = self.rows / 2;
+        let cols = self.cols;
         let Some(deck) = self.deck.as_mut() else {
             return false;
         };
@@ -153,16 +205,23 @@ impl App {
             } else {
                 focus
             };
-            if deck.focus != Focus::Log {
-                deck.log.scroll_end();
+            match deck.focus {
+                Focus::Composer => {
+                    deck.log.select_newest();
+                    deck.inspector = 0;
+                }
+                Focus::Log => {}
+                Focus::Sessions | Focus::Inspector => deck.log.scroll_end(),
             }
             return true;
         }
         match (deck.focus, key.code) {
             (Focus::Composer, _) => return false,
             (_, KeyCode::Esc) => {
+                // Back at the composer the panel follows the newest row.
                 deck.focus = Focus::Composer;
-                deck.log.scroll_end();
+                deck.log.select_newest();
+                deck.inspector = 0;
             }
             (Focus::Sessions, KeyCode::Up) => deck.session = deck.session.saturating_sub(1),
             (Focus::Sessions, KeyCode::Down) => {
@@ -177,8 +236,14 @@ impl App {
                     self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
                 }
             }
-            (Focus::Log, KeyCode::Up) => deck.log.up(),
-            (Focus::Log, KeyCode::Down) => deck.log.down(),
+            (Focus::Log, KeyCode::Up) => {
+                deck.log.up();
+                deck.inspector = 0;
+            }
+            (Focus::Log, KeyCode::Down) => {
+                deck.log.down();
+                deck.inspector = 0;
+            }
             (Focus::Log, KeyCode::PageUp) => deck.log.scroll_up(page),
             (Focus::Log, KeyCode::PageDown) => deck.log.scroll_down(page),
             (Focus::Log, KeyCode::Enter) => {
@@ -188,7 +253,14 @@ impl App {
                 }
             }
             (Focus::Inspector, KeyCode::Up) => deck.inspector = deck.inspector.saturating_sub(1),
-            (Focus::Inspector, KeyCode::Down) => deck.inspector += 1,
+            (Focus::Inspector, KeyCode::Down) => {
+                let last = deck
+                    .log
+                    .selected()
+                    .map_or(0, |inspect| deck::inspector_rows(inspect, cols))
+                    .saturating_sub(1);
+                deck.inspector = (deck.inspector + 1).min(last);
+            }
             _ => return false,
         }
         true
@@ -220,8 +292,8 @@ impl App {
         screen.draw_deck(&rows, cursor)
     }
 
-    /// The log's meta row: when the session started, its model, head and
-    /// event count.
+    /// The log's meta row: when the session started, its head and event
+    /// count.
     fn log_meta(&self) -> String {
         let info = &self.launch.attached.info;
         let started = self
@@ -229,15 +301,14 @@ impl App {
             .as_ref()
             .and_then(|deck| deck.sessions.iter().find(|e| e.session == info.session))
             .and_then(|entry| entry.started);
-        let mut meta = String::from("○ ");
+        let mut meta = String::new();
         if let Some(started) = started {
             meta.push_str(&clock(started));
             meta.push_str(" · ");
         }
         let head = info.head.to_string();
         meta.push_str(&format!(
-            "{} · head #{} · {} events",
-            info.model.model,
+            "head #{} · {} events",
             &head[..head.len().min(8)],
             self.launch.attached.events.len()
         ));
@@ -257,12 +328,12 @@ impl App {
         let cwd = &info.cwd;
         let mut header_left = Line::default()
             .brass("ξ ")
-            .strong(Role::Ink, "XI")
+            .strong(Role::Ink, "xi")
             .ink(format!("  {}", home(cwd)));
         if let Some(branch) = self.git.label(cwd) {
             header_left = header_left.dim(format!("  {branch}"));
         }
-        let header_right = self.joined(|name| matches!(name, "model" | "reasoning"));
+        let header_right = self.joined(|name| HEADER.contains(&name));
         let mark = |entry: &SessionSummary| {
             if entry.session == info.session {
                 Mark::Current
@@ -318,21 +389,22 @@ impl App {
                 row(entry, base)
             })
             .collect();
-        let asks = deck
-            .asks
+        let own = self.own_approvals();
+        let asks = own
             .iter()
+            .chain(&deck.asks)
             .map(|ask| {
                 let owner = deck
                     .sessions
                     .iter()
                     .find(|entry| entry.session == ask.pending.session);
                 let origin = match owner {
+                    _ if ask.pending.session == info.session => "this session".to_owned(),
                     Some(entry) => format!(
                         "{} · {}",
                         entry.title.as_deref().unwrap_or("(no prompt yet)"),
                         age(entry.updated, now)
                     ),
-                    None if ask.pending.session == info.session => "this session".to_owned(),
                     None => ask
                         .cwd
                         .as_deref()
@@ -346,11 +418,9 @@ impl App {
             })
             .collect();
         let sessions = SessionsPane {
-            cwd: home(cwd),
             here,
             elsewhere,
-            asks,
-            selected: (deck.focus == Focus::Sessions).then_some(deck.session),
+            selected: deck.session,
         };
         let current = deck
             .sessions
@@ -364,9 +434,10 @@ impl App {
             title,
             meta,
             rows: deck.log.rows(),
-            selected: (deck.focus == Focus::Log)
+            selected: matches!(deck.focus, Focus::Log | Focus::Inspector)
                 .then(|| deck.log.selected_row())
                 .flatten(),
+            reveal: deck.log.reveal(),
             scrolled: deck.log.scrolled(),
             live,
             cursor,
@@ -388,11 +459,6 @@ impl App {
             .changed()
             .iter()
             .map(|file| (file.path.clone(), file.added, file.removed))
-            .collect();
-        let queued = self
-            .queued
-            .iter()
-            .map(|content| crate::transcript::blocks_text(content).replace('\n', " "))
             .collect();
         let mut facts = Vec::new();
         if let Some(report) = &deck.settings {
@@ -426,23 +492,21 @@ impl App {
                 "untrusted".to_owned()
             },
         );
-        let inspector = InspectorPane {
+        let panel = Panel {
             inspect: deck.log.selected(),
-            context,
-            changed,
-            queued,
-            session: facts.join(" · "),
             scrolled: deck.inspector,
+            asks,
+            changed,
+            sessions,
+            context,
+            facts: facts.join(" · "),
         };
-        let status = self.joined(|name| STATUS.contains(&name));
         Scene {
             header_left,
             header_right,
-            sessions: Some(sessions),
+            status: self.joined(|name| STATUS.contains(&name)),
             log,
-            inspector,
-            status,
-            footer: self.footer(self.cols),
+            panel,
             focus: deck.focus,
         }
     }
@@ -450,11 +514,11 @@ impl App {
     /// The measure of the log column on the deck.
     pub(crate) fn deck_measure(&self) -> Measure {
         let columns = deck::columns(self.cols);
-        // One cell of margin at each side of the log column; the header,
-        // footer, title, meta and gap rows are the deck's.
+        // A gutter cell and a cell of margin beside the log's rows; the
+        // header, the title and the gap under it are the deck's.
         Measure::new(
             columns.log.saturating_sub(2),
-            self.rows.saturating_sub(5).max(4),
+            self.rows.saturating_sub(3).max(4),
         )
     }
 
@@ -481,7 +545,7 @@ fn open(inspect: &Inspect, m: Measure) -> Vec<Line> {
         .truncate(m.out);
     let mut lines = vec![title];
     if inspect.text.is_empty() {
-        lines.push(Line::default().dim("  nothing cut short").truncate(m.out));
+        lines.push(Line::default().dim("  no output").truncate(m.out));
         return lines;
     }
     for row in inspect.text.lines() {

@@ -332,7 +332,10 @@ impl App {
             None
         };
         self.editor.set_history(self.history.workspace());
-        if clear_scrollback {
+        if self.deck.is_some() {
+            // The deck's log shows the attached session alone.
+            self.reset_deck_log();
+        } else if clear_scrollback {
             self.commit.clear();
             self.clear_scrollback = true;
         } else {

@@ -7,7 +7,7 @@
 use crate::style::Line;
 
 /// What the inspector shows for a row of the log: a call's headline, its
-/// outcome and the whole text the row cut short.
+/// outcome and its whole output or diff.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inspect {
     /// The headline, as plain text: `edit ×5 crates/xi-tools/src/bash.rs`.
@@ -19,7 +19,7 @@ pub struct Inspect {
     /// Whether `text` is a diff whose rows start with `- `, `+ ` or two
     /// spaces.
     pub diff: bool,
-    /// The whole text, or empty when the row showed everything.
+    /// The whole text, or empty when the call produced none.
     pub text: String,
 }
 
@@ -34,6 +34,8 @@ pub struct Log {
     selected: Option<usize>,
     /// Rows scrolled up from the bottom.
     scrolled: usize,
+    /// Whether the rows shown follow the selection, after it moved.
+    reveal: bool,
 }
 
 impl Log {
@@ -56,6 +58,7 @@ impl Log {
         self.anchors.clear();
         self.selected = None;
         self.scrolled = 0;
+        self.reveal = false;
         std::mem::take(&mut self.rows)
     }
 
@@ -76,19 +79,33 @@ impl Log {
         Some(self.selected.map_or(last, |at| at.min(last)))
     }
 
-    /// Selects the row above.
+    /// Selects the row above and brings it into view.
     pub fn up(&mut self) {
         if let Some(at) = self.selected_at() {
             self.selected = Some(at.saturating_sub(1));
+            self.follow();
         }
     }
 
-    /// Selects the row below; at the newest the selection follows new rows.
+    /// Selects the row below and brings it into view; at the newest the
+    /// selection follows new rows.
     pub fn down(&mut self) {
         if let Some(at) = self.selected_at() {
             let last = self.anchors.len() - 1;
             self.selected = (at + 1 < last).then_some(at + 1);
+            self.follow();
         }
+    }
+
+    fn follow(&mut self) {
+        self.scrolled = 0;
+        self.reveal = true;
+    }
+
+    /// Whether the rows shown follow the selection.
+    #[must_use]
+    pub fn reveal(&self) -> bool {
+        self.reveal
     }
 
     /// Rows scrolled up from the bottom.
@@ -97,19 +114,29 @@ impl Log {
         self.scrolled
     }
 
-    /// Scrolls `by` rows up, keeping at least one row visible.
+    /// Scrolls `by` rows up, keeping at least one row visible, and lets
+    /// the selection leave the rows shown.
     pub fn scroll_up(&mut self, by: usize) {
         self.scrolled = (self.scrolled + by).min(self.rows.len().saturating_sub(1));
+        self.reveal = false;
     }
 
     /// Scrolls `by` rows back down.
     pub fn scroll_down(&mut self, by: usize) {
         self.scrolled = self.scrolled.saturating_sub(by);
+        self.reveal = false;
     }
 
     /// Follows the newest rows again.
     pub fn scroll_end(&mut self) {
         self.scrolled = 0;
+        self.reveal = false;
+    }
+
+    /// Selects the newest row again and follows new rows.
+    pub fn select_newest(&mut self) {
+        self.selected = None;
+        self.scroll_end();
     }
 }
 

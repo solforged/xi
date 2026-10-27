@@ -1556,9 +1556,11 @@ async fn tab_answers_a_waiting_ask_over_another_overlay_and_records_it() {
     assert!(!live_text(&app).contains("waiting"));
 }
 
+/// The live region's composer row, above the footer inline; the deck has
+/// no footer.
 fn composer_line(app: &App) -> String {
     let lines = app.live().0;
-    lines[lines.len() - 2].plain()
+    lines[lines.len() - 1 - usize::from(app.deck.is_none())].plain()
 }
 
 #[tokio::test]
@@ -2030,9 +2032,9 @@ async fn resume_mid_turn_leaves_the_turn_running_unless_prompts_are_queued() {
     app.command("/resume").await.unwrap();
     assert!(app.overlays.is_empty());
     assert!(
-        app.commit
+        committed(&app)
             .iter()
-            .any(|line| line.plain().contains("waits for queued prompts"))
+            .any(|line| line.contains("waits for queued prompts"))
     );
     app.queued.clear();
     app.command("/resume").await.unwrap();
@@ -2355,9 +2357,11 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
         .unwrap();
     app.commit.clear();
     app.command("/help").await.unwrap();
-    assert!(app.commit.iter().any(|line| {
-        line.plain().contains("/settings") && line.plain().contains("show and change settings")
-    }));
+    assert!(
+        committed(&app).iter().any(|line| {
+            line.contains("/settings") && line.contains("show and change settings")
+        })
+    );
 }
 
 #[tokio::test]
@@ -2914,9 +2918,9 @@ async fn settings_errors_leave_the_composer_or_show_the_rpc_message_in_the_view(
             assert!(app.overlays.is_empty());
             assert!(app.overlays.get::<Settings>().is_none());
             assert!(
-                app.commit
+                committed(&app)
                     .iter()
-                    .any(|line| line.plain().contains("settings unavailable"))
+                    .any(|line| line.contains("settings unavailable"))
             );
         } else {
             app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
@@ -3031,13 +3035,9 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
     let (mut launch, _) = launch(snapshot(false)).await;
     launch.tui_config = Some(path.clone());
     let mut app = App::new(launch, 250, 36);
-    app.commit.clear();
+    assert!(app.deck.is_some(), "auto opens the deck at 250×36");
     app.command("/layout").await.unwrap();
-    assert!(
-        app.commit
-            .iter()
-            .any(|line| line.plain() == "  layout · inline (sheet, 250×36)")
-    );
+    assert!(committed(&app).contains(&"  layout · auto (sheet, 250×36)".to_owned()));
     for (name, layout, deck) in [
         ("deck", Layout::Deck, true),
         ("inline", Layout::Inline, false),
@@ -3061,7 +3061,7 @@ async fn settings_layout_cycles_and_saves_client_display() {
     let mut app = App::new(launch, 250, 36);
     app.command("/settings").await.unwrap();
     settings_down(&mut app, 3).await;
-    for layout in [Layout::Deck, Layout::Auto, Layout::Inline] {
+    for layout in [Layout::Inline, Layout::Deck, Layout::Auto] {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -3093,7 +3093,7 @@ async fn layout_config_loads_and_invalid_layout_warns_once() {
     let (mut launch, _) = launch(snapshot(false)).await;
     launch.tui_config = Some(path);
     let app = App::new(launch, 120, 36);
-    assert_eq!(app.layout, Layout::Inline);
+    assert_eq!(app.layout, Layout::Auto);
     let warnings: Vec<_> = app
         .commit
         .iter()
@@ -3153,10 +3153,8 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     };
     let (launch, _) = launch_with(attached, data).await;
     let mut app = App::new(launch, 250, 36);
-    assert!(app.deck.is_none());
-    app.set_layout(Layout::Deck).unwrap();
+    assert!(app.deck.is_some(), "auto opens the deck at 250×36");
     app.refresh_deck().await;
-    app.commit.clear();
     append(
         &mut app,
         reply(
@@ -3181,19 +3179,34 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
     for expected in [
-        "Sessions · ",
+        "ξ xi",
         "Route sandboxed bash",
-        "Other workspaces",
-        "OTHER-workspace · Fix",
+        "Sessions",
+        "1 other · alt+1",
+        "nothing else running",
         "● edit src/a.rs",
         "● read docs/policies.md",
-        "Changed · 1 file",
+        "Changes · 1 file",
         "alt+1 sessions · alt+2 log · alt+3 inspector",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
-    // alt+2 takes the log; up selects the edit, enter opens its diff.
+    // alt+1 lists every session; idle ones stay out of the live view.
     let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+    app.key(alt('1')).await.unwrap();
+    let mut out = Vec::new();
+    let mut screen = Screen::new(&mut out, false, 250);
+    app.draw(&mut screen).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    for expected in [
+        "› ● Route sandboxed bash",
+        "Other workspaces",
+        "· OTHER-workspace · Fix export",
+        "enter resumes",
+    ] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+    // alt+2 takes the log; up selects the edit, enter opens its diff.
     app.key(alt('2')).await.unwrap();
     app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
@@ -3221,4 +3234,48 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
         edit.is_some_and(|edit| note.is_some_and(|note| edit < note)),
         "{rows:?}"
     );
+}
+
+#[tokio::test]
+async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 140, 36);
+    assert!(app.deck.is_none());
+    append(
+        &mut app,
+        reply(
+            vec![Block::ToolUse {
+                id: "edit-call".into(),
+                name: "edit".into(),
+                input: json!({ "path": "src/a.rs", "old": "one\ntwo", "new": "one\nthree" }),
+                extra: Default::default(),
+            }],
+            StopReason::ToolUse,
+        ),
+    );
+    append(&mut app, result("edit-call", "replaced"));
+    app.finish_turn(None);
+    assert!(
+        committed(&app)
+            .iter()
+            .any(|row| row.starts_with("● edit src/a.rs"))
+    );
+    // The inline rows reach scrollback with the next frame.
+    app.commit.clear();
+    app.set_layout(Layout::Deck).unwrap();
+    let deck = app.deck.as_ref().unwrap();
+    let rows: Vec<_> = deck.log.rows().iter().map(Line::plain).collect();
+    assert!(
+        rows.iter().any(|row| row.starts_with("● edit src/a.rs")),
+        "{rows:?}"
+    );
+    assert_eq!(deck.log.selected().unwrap().title, "edit src/a.rs");
+    assert_eq!(deck.log.selected().unwrap().text, "  one\n- two\n+ three\n");
+    app.command("/layout inline").await.unwrap();
+    let rows: Vec<_> = app.commit.iter().map(Line::plain).collect();
+    assert!(
+        !rows.iter().any(|row| row.starts_with("● edit src/a.rs")),
+        "{rows:?}"
+    );
+    assert!(rows.contains(&"  layout → inline".to_owned()), "{rows:?}");
 }

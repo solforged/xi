@@ -62,7 +62,10 @@ impl App {
         }
         let session = info.session;
         let head = info.head;
-        self.commit_lines(header);
+        // The deck's own header names the workspace, and its panel the trust.
+        if self.deck.is_none() {
+            self.commit_lines(header);
+        }
         self.seen.clear();
         self.launch
             .attached
