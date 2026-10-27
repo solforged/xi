@@ -15,6 +15,7 @@ use crate::approvals::Approval;
 use crate::deck::{
     self, AskRow, ContextGauge, Focus, LogPane, Mark, Panel, Scene, SessionRow, SessionsPane,
 };
+use crate::icons::{Icon, Icons};
 use crate::keys::Action;
 use crate::layout::Measure;
 use crate::log::{Inspect, Log};
@@ -22,18 +23,17 @@ use crate::screen::Screen;
 use crate::sessions::age;
 use crate::style::{Line, Role};
 use crate::transcript::{Transcript, clock};
-use crate::view::home;
+use crate::view::{home, short_reasoning};
 use crate::{App, lineage};
 
 /// How long the sessions and asks lists stay fresh.
 const REFRESH: Duration = Duration::from_secs(5);
 
-/// Footer segments the deck's header carries beside the title.
+/// What the deck's header carries beside the title.
 const HEADER: [&str; 5] = ["model", "reasoning", "children", "taint", "approvals"];
 
-/// Footer segments the header adds when the side panel, which shows them,
-/// is folded.
-const STATUS: [&str; 4] = ["context", "cache", "sandbox", "sandbox-off"];
+/// What the header adds when the side panel, which shows it, is folded.
+const STATUS: [&str; 3] = ["context", "cache", "sandbox"];
 
 /// The deck's state while the client owns the screen.
 #[derive(Default)]
@@ -295,24 +295,91 @@ impl App {
     /// The log's meta row: when the session started, its head and event
     /// count.
     fn log_meta(&self) -> String {
+        let icons = self.icons;
         let info = &self.launch.attached.info;
         let started = self
             .deck
             .as_ref()
             .and_then(|deck| deck.sessions.iter().find(|e| e.session == info.session))
             .and_then(|entry| entry.started);
-        let mut meta = String::new();
+        let mut parts = Vec::new();
         if let Some(started) = started {
-            meta.push_str(&clock(started));
-            meta.push_str(" · ");
+            parts.push(icons.tag(Icon::Clock, &clock(started)));
         }
         let head = info.head.to_string();
-        meta.push_str(&format!(
-            "head #{} · {} events",
-            &head[..head.len().min(8)],
-            self.launch.attached.events.len()
-        ));
-        meta
+        parts.push(icons.tag(Icon::Head, &head[..head.len().min(8)]));
+        let events = self.launch.attached.events.len();
+        parts.push(match (icons, events) {
+            (Icons::Nerd, _) => icons.tag(Icon::Events, &events.to_string()),
+            (Icons::Unicode, 1) => "1 event".to_owned(),
+            (Icons::Unicode, _) => format!("{events} events"),
+        });
+        parts.join(" · ")
+    }
+
+    /// The deck's header segments `names` asks for, joined by ` · `.
+    fn bar(&self, names: &[&str]) -> Line {
+        let icons = self.icons;
+        let info = &self.launch.attached.info;
+        let mut line = Line::default();
+        for name in names {
+            let segment = match *name {
+                "model" => icons.label(
+                    Icon::Model,
+                    Line::default().ink(format!("{}/{}", info.model.provider, info.model.model)),
+                ),
+                "reasoning" => match &info.model_info {
+                    Some(model) if model.reasoning.is_empty() => Line::default().dim("no think"),
+                    model => {
+                        let level = model
+                            .as_ref()
+                            .map_or(info.reasoning, |model| model.resolve(info.reasoning));
+                        icons.label(Icon::Reasoning, Line::default().ink(short_reasoning(level)))
+                    }
+                },
+                "children" => match self.transcript.children().running() {
+                    0 => continue,
+                    running => icons.label(Icon::Agents, Line::default().ink(running.to_string())),
+                },
+                "taint" if self.transcript.tainted => Line::default().murex("◆ tainted"),
+                "approvals" => match self.waiting() {
+                    0 => continue,
+                    asks => Line::default()
+                        .brass(icons.tag(Icon::Waiting, &asks.to_string()))
+                        .dim(" · tab"),
+                },
+                "context" => {
+                    let window = info.model_info.as_ref().map_or(0, |m| m.context_window);
+                    let used = if window > 0 {
+                        let percent =
+                            u128::from(self.transcript.context) * 100 / u128::from(window);
+                        format!("{percent}%")
+                    } else {
+                        "–".to_owned()
+                    };
+                    icons.label(Icon::Context, Line::default().ink(used))
+                }
+                "cache" => {
+                    let session = self.transcript.session;
+                    let cache = if session.sent() > 0 {
+                        format!("{}%", session.cache_read * 100 / session.sent())
+                    } else {
+                        "–".to_owned()
+                    };
+                    icons.label(Icon::Cache, Line::default().ink(cache))
+                }
+                "sandbox" if info.sandbox_enabled => {
+                    icons.label(Icon::Sandbox, Line::default().dim("sandbox"))
+                }
+                "sandbox" => Line::default().brass(icons.tag(Icon::SandboxOff, "sandbox off")),
+                _ => continue,
+            };
+            if !line.0.is_empty() {
+                line = line.dim(" · ");
+            }
+            line = line.extend(segment);
+        }
+        line
     }
 
     /// The scene the deck draws from.
@@ -326,14 +393,18 @@ impl App {
         let info = &self.launch.attached.info;
         let now = Timestamp::now();
         let cwd = &info.cwd;
+        let icons = self.icons;
         let mut header_left = Line::default()
             .brass("ξ ")
             .strong(Role::Ink, "xi")
-            .ink(format!("  {}", home(cwd)));
+            .ink("  ")
+            .extend(icons.label(Icon::Workspace, Line::default().ink(home(cwd))));
         if let Some(branch) = self.git.label(cwd) {
-            header_left = header_left.dim(format!("  {branch}"));
+            header_left = header_left
+                .ink("  ")
+                .extend(icons.label(Icon::Branch, Line::default().dim(branch)));
         }
-        let header_right = self.joined(|name| HEADER.contains(&name));
+        let header_right = self.bar(&HEADER);
         let mark = |entry: &SessionSummary| {
             if entry.session == info.session {
                 Mark::Current
@@ -470,26 +541,26 @@ impl App {
                     .map(|setting| setting.value.clone())
             };
             if let Some(mode) = value("approvals").and_then(|v| v.as_str().map(str::to_owned)) {
-                facts.push(format!("approvals {mode}"));
+                facts.push(icons.tag(Icon::Approvals, &mode));
             }
             if let Some(count) = value("tools").and_then(|v| v.as_array().map(Vec::len)) {
-                facts.push(format!("{count} tools"));
+                facts.push(icons.tag(Icon::Tools, &count.to_string()));
             }
         }
         facts.insert(
             facts.len().min(1),
             if info.sandbox_enabled {
-                "◇ sandbox".to_owned()
+                icons.tag(Icon::Sandbox, "sandbox")
             } else {
-                "sandbox off".to_owned()
+                icons.tag(Icon::SandboxOff, "sandbox off")
             },
         );
         facts.insert(
             facts.len().min(2),
             if info.trusted {
-                "trusted".to_owned()
+                icons.tag(Icon::Trusted, "trusted")
             } else {
-                "untrusted".to_owned()
+                icons.tag(Icon::Untrusted, "untrusted")
             },
         );
         let panel = Panel {
@@ -500,11 +571,12 @@ impl App {
             sessions,
             context,
             facts: facts.join(" · "),
+            icons,
         };
         Scene {
             header_left,
             header_right,
-            status: self.joined(|name| STATUS.contains(&name)),
+            status: self.bar(&STATUS),
             log,
             panel,
             focus: deck.focus,
@@ -520,21 +592,6 @@ impl App {
             columns.log.saturating_sub(2),
             self.rows.saturating_sub(3).max(4),
         )
-    }
-
-    /// The footer segments `keep` names, in full form, joined by ` · `.
-    fn joined(&self, keep: impl Fn(&str) -> bool) -> Line {
-        let mut line = Line::default();
-        for segment in self.segments() {
-            if !keep(segment.name) {
-                continue;
-            }
-            if !line.0.is_empty() {
-                line = line.dim(" · ");
-            }
-            line = line.extend(segment.value);
-        }
-        line
     }
 }
 

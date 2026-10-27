@@ -14,7 +14,7 @@ use crate::transcript::{SPINNER, blocks_text, tokens};
 use crate::{App, lineage};
 
 /// The footer's form of a level.
-fn short_reasoning(reasoning: Reasoning) -> &'static str {
+pub(crate) fn short_reasoning(reasoning: Reasoning) -> &'static str {
     match reasoning {
         Reasoning::Minimal => "min",
         Reasoning::Medium => "med",

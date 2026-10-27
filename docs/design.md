@@ -359,6 +359,8 @@ Inline is the default. Scrollback stays append-only, and Slit, Pane and Sheet fo
 
 On the deck xi owns the alternate screen. The header names the workspace and branch at the left, and the model, reasoning level, running agents, taint and waiting asks at the right. The log keeps the sheet at the left: the session title with when it started, its head and event count, then every committed row, the live region and the composer. Entering the deck mid-session replays the head's branch into the log. A side panel takes every column beside the log once at least 36 are left. With the composer focused it lists what waits on you and what changed: asks across sessions, changed files with net counts, and other sessions that are running or waiting (sessions refresh every five seconds). Sections with nothing in them are hidden. The newest tool row fills the rows they leave, with its whole output or diff, and the context gauge, cache and traffic, and the session's approvals, sandbox, trust and tool count sit at the bottom above the keys. Below 159 columns the panel folds away and the header adds context, cache and sandbox.
 
+The deck labels its chrome with Nerd Font icons (Octicons): the workspace, branch, model and reasoning in the header, the clock, head and event count over the log, each section heading, session marks, the context gauge, cache and traffic, the session's facts and the focus keys. A built-in tool's icon replaces its name at the start of the inspected row's headline. Without a Nerd Font, `[display] icons = "unicode"` in `tui.toml` keeps the plain labels (`ctx`, `cache`, `↑ ↓`, `● ┤ ? ·`). The log's own rows keep their Unicode marks in both.
+
 `alt+1`, `alt+2` and `alt+3` give the keys to the sessions, the log or the inspector; the same key again, or `esc`, returns them to the composer, where the panel follows the newest row again. `alt+1` turns the panel into every session, this workspace first, with `up` and `down` to move and `enter` to resume. In the log `up` and `down` move a `›` gutter mark between tool rows and the panel shows the marked row's whole diff or output; `pageup` and `pagedown` scroll, and `enter` prints the row's text into the log. `alt+3` gives `up` and `down` to that text. Without room for the panel, its sessions and inspector views replace the log while they have the keys. Typing always goes to the composer. Resuming another session starts the log over. `/layout inline` leaves the deck and prints the log rows scrollback lacks, as quitting from the deck does; entering the deck keeps earlier scrollback where it is.
 
 #### Keys
@@ -397,6 +399,7 @@ kill_word = ["ctrl+w", "alt+backspace"]
 [display]
 thinking = "first"                         # full | first | hidden
 layout = "auto"                            # inline | deck | auto
+icons = "nerd"                             # nerd | unicode
 ```
 
 Action names are the snake_case names `/help` shows. A key string is `[ctrl+][alt+][shift+]KEY`, where `KEY` is one character or `enter`, `tab`, `esc`, `backspace`, `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `space` or `f1` to `f12`. A key bound to a new action leaves the action that had it by default. Unknown actions, keys and values are reported once at startup and skipped; the client always starts.

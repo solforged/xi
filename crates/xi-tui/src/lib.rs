@@ -21,6 +21,7 @@ pub mod external;
 pub mod frame;
 mod git;
 pub mod history;
+pub mod icons;
 mod input;
 pub mod keys;
 pub mod layout;
@@ -163,6 +164,8 @@ struct App {
     keymap: Keymap,
     /// The saved choice of terminal layout.
     layout: Layout,
+    /// Which glyphs the deck draws.
+    icons: icons::Icons,
     /// The deck while the client owns the alternate screen.
     deck: Option<Deck>,
     /// Terminal controls written before the next frame.
@@ -405,6 +408,7 @@ impl App {
             inbox_refresh: false,
             keymap: config.keymap,
             layout: config.layout,
+            icons: config.icons,
             deck: config.layout.deck_at(cols, rows).then(Deck::default),
             controls: Vec::new(),
             title: None,

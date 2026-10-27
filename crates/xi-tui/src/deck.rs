@@ -8,6 +8,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::icons::{Icon, Icons};
 use crate::layout::{PANEL_MIN, SHEET};
 use crate::log::Inspect;
 use crate::style::{Line, Role, lr, row, wrap};
@@ -130,6 +131,8 @@ pub struct Panel<'a> {
     pub context: ContextGauge,
     /// Approval mode, sandbox, trust and tool count.
     pub facts: String,
+    /// Which glyphs label the panel.
+    pub icons: Icons,
 }
 
 /// All input for one deck frame.
@@ -298,34 +301,47 @@ fn panel_rows(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     let Some(body) = height.checked_sub(1) else {
         return Vec::new();
     };
-    let (mut lines, keys) = match scene.focus {
-        Focus::Composer => (
-            live_view(&scene.panel, width, body),
-            "alt+1 sessions · alt+2 log · alt+3 inspector",
-        ),
-        Focus::Log => (
-            inspector_view(&scene.panel, width, body),
-            "↑↓ select · enter prints · pgup pgdn · esc back",
-        ),
-        Focus::Inspector => (
-            inspector_view(&scene.panel, width, body),
-            "↑↓ scroll · alt+2 log · esc back",
-        ),
-        Focus::Sessions => (
-            sessions_view(&scene.panel.sessions, width, body),
-            "↑↓ move · enter resumes · esc back",
-        ),
+    let icons = scene.panel.icons;
+    let keys = match (scene.focus, icons) {
+        (Focus::Composer, Icons::Nerd) => Line::default()
+            .extend(icons.label(Icon::Sessions, Line::default().dim("alt+1")))
+            .dim("  ")
+            .extend(icons.label(Icon::Log, Line::default().dim("alt+2")))
+            .dim("  ")
+            .extend(icons.label(Icon::Inspector, Line::default().dim("alt+3"))),
+        (Focus::Composer, Icons::Unicode) => {
+            Line::default().dim("alt+1 sessions · alt+2 log · alt+3 inspector")
+        }
+        (Focus::Log, _) => Line::default().dim("↑↓ select · enter prints · pgup pgdn · esc back"),
+        (Focus::Inspector, _) => Line::default().dim("↑↓ scroll · alt+2 log · esc back"),
+        (Focus::Sessions, _) => Line::default().dim("↑↓ move · enter resumes · esc back"),
     };
-    lines.push(Line::default().dim(keys));
+    let mut lines = match scene.focus {
+        Focus::Composer => live_view(&scene.panel, width, body),
+        Focus::Log | Focus::Inspector => inspector_view(&scene.panel, width, body),
+        Focus::Sessions => sessions_view(&scene.panel.sessions, icons, width, body),
+    };
+    lines.push(keys);
     lines.into_iter().map(|line| line.truncate(width)).collect()
 }
 
-fn mark(mark: Mark) -> Line {
+fn mark(mark: Mark, icons: Icons) -> Line {
     match mark {
-        Mark::Current => Line::default().brass("●"),
-        Mark::Running => Line::default().brass("┤"),
-        Mark::Waiting => Line::default().brass("?"),
-        Mark::Idle => Line::default().dim("·"),
+        Mark::Current => Line::default().brass(icons.get(Icon::Current)),
+        Mark::Running => Line::default().brass(icons.get(Icon::Running)),
+        Mark::Waiting => Line::default().brass(icons.get(Icon::Paused)),
+        Mark::Idle => Line::default().dim(icons.get(Icon::Idle)),
+    }
+}
+
+/// A section heading: its icon, then its title in bold.
+fn heading(icons: Icons, icon: Icon, title: impl AsRef<str>) -> Line {
+    let glyph = icons.get(icon);
+    let line = Line::default().strong(Role::Ink, title);
+    if icons == Icons::Nerd {
+        Line::default().dim(glyph).ink(" ").extend(line)
+    } else {
+        line
     }
 }
 
@@ -360,24 +376,29 @@ fn elide_left(text: &str, cols: usize) -> String {
 /// What waits on you and what changed, with the context gauge and the
 /// session's facts against the bottom.
 fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
+    let icons = panel.icons;
     let w = width.min(LIVE_MAX);
     let mut top: Vec<Line> = Vec::new();
-    let heading = |top: &mut Vec<Line>, title: String, right: Line| {
+    let section = |top: &mut Vec<Line>, title: Line, right: Line| {
         if !top.is_empty() {
             top.push(Line::default());
         }
-        top.push(lr(Line::default().strong(Role::Ink, title), right, w));
+        top.push(lr(title, right, w));
     };
     if !panel.asks.is_empty() {
-        heading(
-            &mut top,
+        let mut title = heading(
+            icons,
+            Icon::Waiting,
             format!("Waiting · {}", panel.asks.len()),
-            Line::default().dim("tab answers"),
         );
+        if let Some(bell) = title.0.first_mut().filter(|_| icons == Icons::Nerd) {
+            bell.role = Role::Brass;
+        }
+        section(&mut top, title, Line::default().dim("tab answers"));
         for ask in panel.asks.iter().take(ASK_ROWS) {
             top.push(
                 Line::default()
-                    .brass(format!("? {}", ask.head))
+                    .brass(format!("{} {}", icons.get(Icon::Ask), ask.head))
                     .ink(format!("  {}", ask.body))
                     .truncate(w),
             );
@@ -399,9 +420,13 @@ fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
         } else {
             "files"
         };
-        heading(
+        section(
             &mut top,
-            format!("Changes · {} {files}", panel.changed.len()),
+            heading(
+                icons,
+                Icon::Changes,
+                format!("Changes · {} {files}", panel.changed.len()),
+            ),
             counts(added, removed),
         );
         for (path, added, removed) in panel.changed.iter().take(CHANGED_ROWS) {
@@ -428,28 +453,28 @@ fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
             .iter()
             .filter(|session| matches!(session.mark, Mark::Running | Mark::Waiting))
             .collect();
-        heading(
-            &mut top,
-            "Sessions".to_owned(),
-            Line::default().dim(match others.len() {
-                1 => "1 other · alt+1".to_owned(),
-                count => format!("{count} others · alt+1"),
-            }),
-        );
-        if active.is_empty() {
-            top.push(Line::default().dim("nothing else running"));
+        let idle = others.len() - active.len();
+        let mut right = Vec::new();
+        if !active.is_empty() {
+            right.push(format!("{} active", active.len()));
         }
+        if idle > 0 {
+            right.push(format!("{idle} idle"));
+        }
+        section(
+            &mut top,
+            heading(icons, Icon::Sessions, "Sessions"),
+            Line::default().dim(right.join(" · ")),
+        );
         for session in active.iter().take(SESSION_ROWS) {
             top.push(row(
-                mark(session.mark).ink(format!(" {}", session.title)),
+                mark(session.mark, icons).ink(format!(" {}", session.title)),
                 Line::default().dim(&session.detail),
                 w,
             ));
         }
         if active.len() > SESSION_ROWS {
-            top.push(
-                Line::default().dim(format!("… {} more running", active.len() - SESSION_ROWS)),
-            );
+            top.push(Line::default().dim(format!("… {} more active", active.len() - SESSION_ROWS)));
         }
     }
     if top.is_empty() && panel.inspect.is_none() {
@@ -479,7 +504,7 @@ fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
             lines.push(Line::default());
         }
         lines.push(lr(
-            Line::default().strong(Role::Ink, headline(inspect)),
+            Line::default().strong(Role::Ink, headline(inspect, icons)),
             Line::default().dim(&inspect.meta),
             width,
         ));
@@ -500,41 +525,59 @@ fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
     lines.into_iter().map(|line| line.truncate(width)).collect()
 }
 
-/// An inspected row's headline without its live mark.
-fn headline(inspect: &Inspect) -> &str {
-    inspect
+/// An inspected row's headline without its live mark, a built-in tool's
+/// name replaced by its icon.
+fn headline(inspect: &Inspect, icons: Icons) -> String {
+    let title = inspect
         .title
         .strip_prefix("▸ ")
         .or_else(|| inspect.title.strip_prefix("● "))
-        .unwrap_or(&inspect.title)
+        .unwrap_or(&inspect.title);
+    let (name, rest) = title.split_once(' ').unwrap_or((title, ""));
+    match icons.tool(name) {
+        Some(glyph) => format!("{glyph} {rest}"),
+        None => title.to_owned(),
+    }
 }
 
 /// Context occupancy, traffic and the session's facts.
 fn gauge(panel: &Panel<'_>, w: usize) -> Vec<Line> {
+    let icons = panel.icons;
     let context = panel.context;
     let mut lines = Vec::new();
     if context.window > 0 {
         // The footer truncates; the gauge agrees with it.
         let percent = u128::from(context.used) * 100 / u128::from(context.window);
-        let label = format!("ctx {percent}%  ");
-        let of = format!("  {} of {}", tokens(context.used), tokens(context.window));
-        let bar = w.saturating_sub(label.len() + of.chars().count());
+        let label = icons.label(Icon::Context, Line::default().ink(format!("{percent}%")));
+        let of = format!("{} of {}", tokens(context.used), tokens(context.window));
+        let bar = w.saturating_sub(label.width() + 2 + 2 + of.chars().count());
         let filled = usize::try_from((percent * bar as u128 / 100).min(bar as u128)).unwrap_or(bar);
         lines.push(
-            Line::default()
-                .ink(label)
-                .brass("█".repeat(filled))
-                .dim("░".repeat(bar - filled))
-                .dim(of),
+            label
+                .ink("  ")
+                .brass("━".repeat(filled))
+                .dim("━".repeat(bar - filled))
+                .dim(format!("  {of}")),
         );
     } else {
-        lines.push(Line::default().dim(format!("ctx unknown · {} used", tokens(context.used))));
+        lines.push(
+            icons
+                .label(Icon::Context, Line::default().ink("unknown"))
+                .dim(format!(" · {} used", tokens(context.used))),
+        );
     }
-    let traffic = format!("↑ {} ↓ {}", tokens(context.sent), tokens(context.output));
-    lines.push(Line::default().dim(match context.cache_percent {
-        Some(percent) => format!("cache {percent}% · {traffic}"),
-        None => traffic,
-    }));
+    let mut traffic = Line::default();
+    if let Some(percent) = context.cache_percent {
+        traffic = icons
+            .label(Icon::Cache, Line::default().ink(format!("{percent}%")))
+            .dim(" · ");
+    }
+    lines.push(
+        traffic
+            .extend(icons.label(Icon::Sent, Line::default().ink(tokens(context.sent))))
+            .ink(" ")
+            .extend(icons.label(Icon::Received, Line::default().ink(tokens(context.output)))),
+    );
     lines.extend(
         wrap(&panel.facts, w.max(1))
             .into_iter()
@@ -553,7 +596,7 @@ fn inspector_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
         return lines;
     };
     let mut lines = vec![lr(
-        Line::default().strong(Role::Ink, headline(inspect)),
+        Line::default().strong(Role::Ink, headline(inspect, panel.icons)),
         Line::default().dim(&inspect.meta),
         width,
     )];
@@ -576,11 +619,8 @@ fn inspector_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
 }
 
 /// Every session, this workspace first, keeping the selection in view.
-fn sessions_view(pane: &SessionsPane, width: usize, height: usize) -> Vec<Line> {
-    let mut lines = vec![
-        Line::default().strong(Role::Ink, "Sessions"),
-        Line::default(),
-    ];
+fn sessions_view(pane: &SessionsPane, icons: Icons, width: usize, height: usize) -> Vec<Line> {
+    let mut lines = vec![heading(icons, Icon::Sessions, "Sessions"), Line::default()];
     let mut at = None;
     let mut push = |lines: &mut Vec<Line>, index: usize, session: &SessionRow| {
         let selected = index == pane.selected;
@@ -598,7 +638,7 @@ fn sessions_view(pane: &SessionsPane, width: usize, height: usize) -> Vec<Line> 
             Line::default().ink(format!(" {}", session.title))
         };
         lines.push(row(
-            lead.extend(mark(session.mark)).extend(title),
+            lead.extend(mark(session.mark, icons)).extend(title),
             Line::default().dim(&session.detail),
             width,
         ));
@@ -780,6 +820,7 @@ mod tests {
                         output: 5_500,
                     },
                     facts: "approvals ask · ◇ sandbox · trusted · 9 tools".into(),
+                    icons: Icons::Unicode,
                 },
                 focus: Focus::Composer,
             }
@@ -855,17 +896,16 @@ mod tests {
                     .iter()
                     .any(|line| line.contains("Settings frame hints"))
             );
-            assert!(
-                side.iter()
-                    .any(|line| line.starts_with("Sessions") && line.ends_with("4 others · alt+1"))
-            );
+            assert!(side.iter().any(
+                |line| line.starts_with("Sessions") && line.ends_with("2 active · 2 idle")
+            ));
             let latest = side
                 .iter()
                 .position(|line| line.starts_with("edit ×5 crates/xi-tools/src/bash.rs"))
                 .expect("the newest row fills the spare rows");
             assert!(side[latest].ends_with("+22 −16"));
             assert_eq!(side[latest + 1].trim_end(), "-     let mut command = spec");
-            assert!(side[31].starts_with("ctx 10%  █"));
+            assert!(side[31].starts_with("ctx 10%  ━"));
             assert!(side[31].ends_with("29.8k of 272.0k"));
             assert!(side[31].chars().count() <= LIVE_MAX);
             assert_eq!(side[32], "cache 94% · ↑ 2.3M ↓ 5.5k");
@@ -904,8 +944,53 @@ mod tests {
             detail: "now".into(),
         });
         let text = plain(&live_view(&scene.panel, 60, 20));
-        assert!(text[0].starts_with("Sessions"));
-        assert_eq!(text[1], "nothing else running");
+        assert!(text[0].starts_with("Sessions") && text[0].ends_with("1 idle"));
+        assert_eq!(text[1], "");
+    }
+
+    #[test]
+    fn nerd_icons_replace_labels_and_tool_names_but_keep_values_and_widths() {
+        let fixture = Fixture::new();
+        let mut scene = fixture.scene();
+        scene.panel.icons = Icons::Nerd;
+        let text = plain(&live_view(&scene.panel, 60, 30));
+        // Bell, diff and discussion octicons head the sections.
+        assert_eq!(text[0].chars().next(), Some('\u{f49a}'));
+        assert!(text[0].starts_with("\u{f49a} Waiting · 1"));
+        assert!(text[1].starts_with("\u{f420} bash exec"));
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("\u{f440} Changes · 2 files"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("\u{f442} Sessions"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("\u{f46a} Port footer"))
+        );
+        // The edit run's name becomes the pencil; other words stay.
+        assert!(
+            text.iter()
+                .any(|line| line.starts_with("\u{f448} ×5 crates/xi-tools"))
+        );
+        assert!(text[27].starts_with("\u{f463} 10%  ━"));
+        assert_eq!(text[28], "\u{f49b} 94% · \u{f431} 2.3M \u{f433} 5.5k");
+        assert!(
+            text.iter()
+                .all(|line| !line.contains("ctx") && !line.contains("cache"))
+        );
+        let mut inspect = fixture.inspect.clone();
+        inspect.title = "mcp_lookup docs".into();
+        assert_eq!(headline(&inspect, Icons::Nerd), "mcp_lookup docs");
+        assert_eq!(
+            headline(&fixture.inspect, Icons::Unicode),
+            "edit ×5 crates/xi-tools/src/bash.rs"
+        );
+        let (lines, _) = render(&scene, 176, 36);
+        assert!(lines.iter().all(|line| line.width() <= 176));
+        assert!(plain(&lines)[35].ends_with("\u{f442} alt+1  \u{f451} alt+2  \u{f441} alt+3"));
     }
 
     #[test]
@@ -1120,11 +1205,11 @@ mod tests {
             detail: "last week".into(),
         }));
         pane.selected = 34;
-        let text = plain(&sessions_view(&pane, 50, 10));
+        let text = plain(&sessions_view(&pane, Icons::Unicode, 50, 10));
         assert_eq!(text.len(), 10);
         assert!(text[9].starts_with("› · ledger"));
         pane.selected = 1;
-        let text = plain(&sessions_view(&pane, 50, 10));
+        let text = plain(&sessions_view(&pane, Icons::Unicode, 50, 10));
         assert!(text[3].starts_with("› ┤ Port footer"));
         assert!(text[3].ends_with("sonnet-5.5 · 2m"));
     }
