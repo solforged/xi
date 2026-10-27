@@ -151,6 +151,7 @@ impl App {
         self.steering.clear();
         self.queued.clear();
         self.editor = Editor::default();
+        self.images.clear();
         let error = if changed_workspace {
             let (history, error) =
                 History::load(self.launch.history.clone(), &self.launch.attached.info.cwd);

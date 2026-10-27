@@ -50,7 +50,9 @@ The goal is a client good enough for daily work, including developing xi with xi
 | 4. Rendering and keys | `edit` diffs, `ctrl+t` thinking display, `/copy`, `[keys]` and `[display]` in `tui.toml` | None | Done |
 | 5. Settings | `/settings` view with each value's layer, `ctrl+s` to save the session's model or reasoning as the default, the `approvals` preset | `config/settings`, `config/set` | Done |
 
-After these, in rough order of daily value: `!cmd` and `!!cmd` run in the session sandbox (needs `session/shell`), session rename and auto-naming, a large-paste menu, image paste, `alt+up` to pull queued prompts back, git branch and session cost in the footer, `/export`, and themes. Plan mode, todo, advisor, an agent hub and dashboards stay packages in the feature queue.
+Clipboard image paste is available with `ctrl+v`, including image-only prompts, steering and queued follow-ups. Images stay in the session log, not shared prompt history.
+
+After these, in rough order of daily value: `!cmd` and `!!cmd` run in the session sandbox (needs `session/shell`), session rename and auto-naming, a large-paste menu, `alt+up` to pull queued prompts back, git branch and session cost in the footer, `/export`, and themes. Plan mode, todo, advisor, an agent hub and dashboards stay packages in the feature queue.
 
 Children of a running call now get live rows under it and commit one line each when the call's result lands, with running children in the footer; a mid-call attach replays them. Opening a child in its own view, letting a child ask through the parent instead of being denied headlessly, and naming children are next.
 

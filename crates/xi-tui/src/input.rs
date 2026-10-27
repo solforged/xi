@@ -220,8 +220,9 @@ impl App {
                 self.close_overlay();
             } else if self.running() {
                 self.cancel().await;
-            } else if !self.editor.is_empty() {
+            } else if !self.editor.is_empty() || !self.images.is_empty() {
                 self.editor.clear();
+                self.images.clear();
                 self.update_completion();
             } else {
                 self.quit = true;
@@ -340,6 +341,10 @@ impl App {
                 self.external_requested = Some(ExternalRequest::Composer);
                 return Ok(());
             }
+            Some(Action::PasteImage) => {
+                self.paste_image().await;
+                return Ok(());
+            }
             Some(Action::Models) => {
                 self.open_models().await;
                 return Ok(());
@@ -369,7 +374,7 @@ impl App {
                 return Ok(());
             }
             Some(Action::DeleteOrQuit) => {
-                if self.editor.is_empty() && !self.running() {
+                if self.editor.is_empty() && self.images.is_empty() && !self.running() {
                     self.quit = true;
                     return Ok(());
                 }
@@ -382,7 +387,13 @@ impl App {
             Some(Action::KillBefore) => self.editor.kill_before(),
             Some(Action::KillAfter) => self.editor.kill_after(),
             Some(Action::KillWord) => self.editor.kill_word(),
-            Some(Action::Backspace) => self.editor.backspace(),
+            Some(Action::Backspace) => {
+                if self.editor.is_empty() {
+                    self.images.pop();
+                } else {
+                    self.editor.backspace();
+                }
+            }
             Some(Action::Delete) => self.editor.delete(),
             Some(Action::Up) => {
                 if !self.editor.text().contains('\n') {

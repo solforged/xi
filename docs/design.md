@@ -298,6 +298,7 @@ Composer keys are unique. Keys inside an overlay apply only while it has focus.
 | `tab` | Accept a completion; otherwise open pending approvals. |
 | `ctrl+r` | Search prompt history. |
 | `ctrl+g` | Edit the prompt in the external editor. |
+| `ctrl+v` | Attach an image from the local clipboard. Backspace with empty text removes the last attachment. |
 | `alt+m` | Open the model picker. |
 | `shift+tab` | Cycle reasoning through the levels the model accepts. |
 | `ctrl+o` | Expand the newest collapsed result; repeat to walk back. |
@@ -338,7 +339,8 @@ Built-in names are reserved, so an extension cannot shadow them. Model, reasonin
 
 #### Composer
 
-- History: every submitted prompt is appended to `$XDG_STATE_HOME/xi/prompts.jsonl` as `{cwd, text}`, keeping the newest 5,000. `up` walks prompts from the current workspace. `ctrl+r` searches all of them, current workspace first; `enter` puts the match in the composer and `esc` restores the draft. Line mode keeps its own history file.
+- History: the text of each submitted prompt is appended to `$XDG_STATE_HOME/xi/prompts.jsonl` as `{cwd, text}`, keeping the newest 5,000. Images are not stored in prompt history; image-only prompts add no history entry. `up` walks prompts from the current workspace. `ctrl+r` searches all of them, current workspace first; `enter` puts the match in the composer and `esc` restores the draft. Line mode keeps its own history file.
+- Image paste: copy an image or screenshot, then press `ctrl+v` in the composer (`paste_image` in `[keys]`). Repeat to attach more images, optionally add text, then send with `enter` or queue with `alt+enter`. The attachment count appears above the composer. Backspace with empty text removes the last image; clearing the composer with `ctrl+c` removes all. Images are encoded as PNG (up to 5 MiB each), sent inline through `session/prompt`, and persisted in the session log for subsequent turns and resume. Slash commands retain draft attachments; switching sessions clears them. Normal terminal text paste is unchanged. This reads the clipboard on the machine running the TUI, not the local desktop over SSH; the selected model must support image input.
 - Completion: `/` at the start of the first line opens a menu of built-in and extension commands with their descriptions. `@` at the start of a word opens a menu of workspace files from a gitignore-aware walk, fuzzy matched on the path with a preference for the file name. Accepting inserts `@relative/path` followed by a space. The mention stays plain text: the model reads the file with its tools, and nothing is inlined.
 - External editor: `ctrl+g` writes the composer text to a temporary file and runs `$VISUAL`, else `$EDITOR`, else `vi`, through `sh -c` so quoted editor commands work. A zero exit replaces the composer text without its trailing newline; any other exit leaves the composer unchanged.
 
