@@ -9,9 +9,10 @@ use crate::style::{Line, Role, lr, row, wrap};
 use crate::transcript::tokens;
 
 /// The pane receiving keyboard input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Focus {
     /// The live composer.
+    #[default]
     Composer,
     /// The session list.
     Sessions,
@@ -221,10 +222,11 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
     let rail_width = columns.rail.width();
     let log_x = rail_width + usize::from(columns.rail != Rail::None);
     let rail = session_rows(scene, columns.rail, height);
-    let (log, cursor) = log_rows(&scene.log, columns.log, height);
+    // One cell of margin after each separator.
+    let (log, cursor) = log_rows(&scene.log, columns.log.saturating_sub(1), height);
     let inspector = columns
         .inspector
-        .map(|width| inspector_rows(&scene.inspector, width, height));
+        .map(|width| inspector_rows(&scene.inspector, width.saturating_sub(1), height));
     let mut rail = rail.into_iter();
     let mut log = log.into_iter();
     let mut inspector = inspector.map(Vec::into_iter);
@@ -233,9 +235,15 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
         if columns.rail != Rail::None {
             line = row(rail.next().unwrap_or_default(), Line::default(), rail_width).dim("│");
         }
-        line = line.extend(pad(log.next().unwrap_or_default(), columns.log));
+        let log_line = Line::default()
+            .ink(" ")
+            .extend(log.next().unwrap_or_default());
+        line = line.extend(pad(log_line, columns.log));
         if let Some(inspector) = inspector.as_mut() {
-            line = line.dim("│").extend(inspector.next().unwrap_or_default());
+            line = line
+                .dim("│")
+                .ink(" ")
+                .extend(inspector.next().unwrap_or_default());
         }
         out.push(line.truncate(cols));
     }
@@ -248,7 +256,7 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
     } else {
         scene.footer.clone().truncate(cols)
     });
-    let cursor = cursor.map(|(row, col)| (row + 1, log_x + col));
+    let cursor = cursor.map(|(row, col)| (row + 1, log_x + 1 + col));
     (out, cursor)
 }
 
@@ -442,8 +450,8 @@ fn inspector_facts(pane: &InspectorPane<'_>, width: usize) -> Vec<Line> {
     let context = pane.context;
     let mut lines = vec![Line::default().strong(Role::Ink, "Context")];
     if context.window > 0 {
-        let percent = (u128::from(context.used) * 100 + u128::from(context.window) / 2)
-            / u128::from(context.window);
+        // The footer truncates; the gauge agrees with it.
+        let percent = u128::from(context.used) * 100 / u128::from(context.window);
         let filled = usize::try_from((percent * 30 / 100).min(30)).unwrap_or(30);
         lines.push(lr(
             Line::default()
@@ -766,7 +774,7 @@ mod tests {
             assert!(lines.iter().all(|line| line.width() <= cols));
             let columns = columns(cols);
             let log_x = columns.rail.width() + usize::from(columns.rail != Rail::None);
-            assert_eq!(cursor, Some((33, log_x + 4)));
+            assert_eq!(cursor, Some((33, log_x + 5)));
             let text = plain(&lines);
             assert!(text[1].contains(scene.log.title));
             assert!(text[2].contains(scene.log.meta));
@@ -831,7 +839,7 @@ mod tests {
             assert_eq!(strong.text, original.text);
         }
         let (_, cursor) = render(&scene, 250, 36);
-        assert_eq!(cursor, Some((33, 33)));
+        assert_eq!(cursor, Some((33, 34)));
     }
 
     #[test]

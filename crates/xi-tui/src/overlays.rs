@@ -611,6 +611,8 @@ impl App {
             transcript.apply(&n, self.measure());
         }
         transcript.end_turn();
+        // Replayed rows are not committed, so nothing may inspect them.
+        transcript.take_inspects();
         transcript.session = self.transcript.session;
         transcript.keep_details(&mut self.transcript);
         self.transcript = transcript;

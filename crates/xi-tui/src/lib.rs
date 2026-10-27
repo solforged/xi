@@ -27,6 +27,7 @@ pub mod layout;
 pub mod log;
 mod overlay;
 mod overlays;
+mod panes;
 pub mod picker;
 pub mod screen;
 pub mod sessions;
@@ -63,6 +64,7 @@ use crate::history::History;
 use crate::keys::Keymap;
 use crate::layout::{Layout, Measure};
 use crate::overlay::Overlays;
+use crate::panes::Deck;
 use crate::screen::{Screen, Settle};
 use crate::style::{Line, Role};
 use crate::transcript::{Transcript, duration, tokens};
@@ -139,8 +141,8 @@ struct App {
     keymap: Keymap,
     /// The saved choice of terminal layout.
     layout: Layout,
-    /// Whether the client owns the alternate screen.
-    deck: bool,
+    /// The deck while the client owns the alternate screen.
+    deck: Option<Deck>,
     /// Terminal controls written before the next frame.
     controls: Vec<String>,
     history: History,
@@ -189,6 +191,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     let mut git_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut on_deck = false;
     while !app.quit {
         if let Some(request) = app.external_requested.take() {
             let settings_file = matches!(&request, ExternalRequest::Settings(_));
@@ -229,14 +232,28 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
             app.refresh_inbox().await;
         }
         app.git.refresh(&app.launch.attached.info.cwd).await;
+        app.refresh_deck().await;
+        // The deck owns the alternate screen; entering and leaving it are
+        // the frame's first controls.
+        let deck = app.deck.is_some();
+        if deck != on_deck {
+            if deck {
+                screen.finish()?;
+                screen.enter_deck()?;
+            } else {
+                screen.leave_deck()?;
+            }
+            on_deck = deck;
+        }
         // Use one current size for layout and cursor tracking. Queued resize
         // events can describe an older size while the window is being dragged.
         // Frames wait until the width settles: a frame read after a further
-        // resize would rewind short and leave a copy of the live region.
+        // resize would rewind short and leave a copy of the live region. The
+        // deck redraws whole, so it never waits.
         if let Ok((c, r)) = crossterm::terminal::size() {
             app.cols = usize::from(c).max(20);
             app.rows = usize::from(r).max(4);
-            if settle.ready(c, Instant::now()) {
+            if settle.ready(c, Instant::now()) || deck {
                 screen.resize(usize::from(c));
                 app.draw(&mut screen)?;
             }
@@ -286,6 +303,12 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     if let Ok((c, _)) = crossterm::terminal::size() {
         screen.resize(usize::from(c));
     }
+    // Quitting from the deck leaves its log in scrollback, as /layout
+    // inline would.
+    app.leave_deck();
+    if on_deck {
+        screen.leave_deck()?;
+    }
     screen.draw(&std::mem::take(&mut app.commit), &[], None, app.rows)?;
     screen.finish()?;
     drop(raw);
@@ -329,7 +352,7 @@ impl App {
             inbox_refresh: false,
             keymap: config.keymap,
             layout: config.layout,
-            deck: config.layout.deck_at(cols, rows),
+            deck: config.layout.deck_at(cols, rows).then(Deck::default),
             controls: Vec::new(),
             history,
             commands: builtin_commands(),
@@ -703,14 +726,24 @@ impl App {
         self.started.is_some()
     }
 
-    /// The measure of the pane drawn into.
+    /// The measure of the pane drawn into: the terminal inline, the log
+    /// column on the deck.
     fn measure(&self) -> Measure {
-        Measure::new(self.cols, self.rows)
+        if self.deck.is_some() {
+            self.deck_measure()
+        } else {
+            Measure::new(self.cols, self.rows)
+        }
     }
 
-    /// Commits rows to the client's log.
+    /// Commits rows to the client's log: scrollback inline, the retained
+    /// log on the deck.
     fn commit_lines(&mut self, lines: Vec<Line>) {
-        self.commit.extend(lines);
+        let anchors = self.transcript.take_inspects();
+        match self.deck.as_mut() {
+            Some(deck) => deck.log.extend(lines, anchors),
+            None => self.commit.extend(lines),
+        }
     }
 
     fn note(&mut self, lines: Vec<Line>) {

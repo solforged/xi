@@ -8,12 +8,13 @@ use crate::{App, Error, ExternalRequest};
 impl App {
     pub(crate) async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
         let action = self.keymap.action(key);
-        if !self.deck
-            && matches!(
-                action,
-                Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector)
-            )
-        {
+        if self.overlays.is_empty() && self.deck_key(key, action).await {
+            return Ok(());
+        }
+        if matches!(
+            action,
+            Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector)
+        ) {
             return Ok(());
         }
         if matches!(action, Some(Action::Interrupt)) {

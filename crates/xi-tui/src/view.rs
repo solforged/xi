@@ -125,6 +125,11 @@ impl App {
     }
 
     pub(crate) fn footer(&self, cols: usize) -> Line {
+        fit(self.segments(), cols).line
+    }
+
+    /// The footer's segments, left ones first.
+    pub(crate) fn segments(&self) -> Vec<Segment> {
         let d = |s: String| Line::default().dim(s);
         let info = &self.launch.attached.info;
         let workspace = home(&info.cwd);
@@ -232,7 +237,7 @@ impl App {
                 .short(Line::default().brass(format!("?{asks}"))),
             );
         }
-        fit(segs, cols).line
+        segs
     }
 
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
@@ -359,7 +364,9 @@ impl App {
         }
         let top = lines.len();
         lines.extend(composer);
-        lines.push(self.footer(cols));
+        if self.deck.is_none() {
+            lines.push(self.footer(cols));
+        }
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
         let hidden = lines.len().saturating_sub(m.live_rows());
         if hidden > 0 {
@@ -375,6 +382,9 @@ impl App {
     ) -> std::io::Result<()> {
         for control in self.controls.drain(..) {
             screen.control(&control)?;
+        }
+        if self.deck.is_some() {
+            return self.draw_deck(screen);
         }
         let (live, cursor) = self.live();
         let commit = std::mem::take(&mut self.commit);
