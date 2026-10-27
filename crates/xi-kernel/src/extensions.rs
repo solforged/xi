@@ -1,4 +1,4 @@
-//! Sandboxed, full-duplex extension peers shared by a kernel's event bus.
+//! Sandboxed, full-duplex extension peers bound to their owning session.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use xi_protocol::manifest::{CommandSpec, HookPoint, PackageManifest, Registration, ToolSpec};
 use xi_protocol::methods::extension::*;
@@ -36,18 +37,15 @@ pub(crate) enum Incoming {
 struct Route {
     peers: HashSet<ExtensionId>,
     sender: mpsc::UnboundedSender<Incoming>,
-    /// Order of opening. An extension's connection goes to the newest route
-    /// that serves it, since a connection carries no session id.
-    opened: u64,
 }
 
-static ROUTES_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// One extension supervisor per kernel event bus. Packages are cached by
-/// workspace and canonical package root; session catalogs remain independent.
-#[derive(Default)]
-pub struct ExtensionHost {
-    peers: tokio::sync::Mutex<HashMap<(PathBuf, PathBuf), Arc<Peer>>>,
+/// A session's extension supervisor. No process serves another session.
+pub(crate) struct ExtensionHost {
+    session: SessionId,
+    peers: Mutex<HashMap<(SessionId, PathBuf, PathBuf), Arc<Peer>>>,
+    loading: tokio::sync::Mutex<()>,
+    closed: AtomicBool,
+    reaping: Mutex<Vec<CancellationToken>>,
     routes: Arc<Mutex<HashMap<SessionId, Route>>>,
 }
 
@@ -71,6 +69,17 @@ impl Drop for Scope {
 }
 
 impl ExtensionHost {
+    pub(crate) fn new(session: SessionId) -> Self {
+        Self {
+            session,
+            peers: Mutex::default(),
+            loading: tokio::sync::Mutex::new(()),
+            closed: AtomicBool::new(false),
+            reaping: Mutex::default(),
+            routes: Arc::default(),
+        }
+    }
+
     pub(crate) async fn load(
         &self,
         config: &Config,
@@ -102,7 +111,10 @@ impl ExtensionHost {
         builtins: &[ToolSpec],
         startup: bool,
     ) -> Result<(Extensions, bool)> {
-        let mut peers = self.peers.lock().await;
+        let _loading = self.loading.lock().await;
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Config("session extension host closed".into()));
+        }
         let mut selected = Vec::new();
         let mut complete = true;
         let mut tools: HashSet<_> = builtins.iter().map(|s| s.name.clone()).collect();
@@ -135,22 +147,45 @@ impl ExtensionHost {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let key = (config.workspace.clone(), root.clone());
+            let key = (self.session, config.workspace.clone(), root.clone());
             // A peer stops when it crashes or when a cancelled invocation
             // retires it; the next load starts a fresh process.
-            let peer = match peers.get(&key) {
-                Some(peer) if !peer.stop.is_cancelled() => peer.clone(),
+            let cached = self
+                .peers
+                .lock()
+                .expect("extension peers")
+                .get(&key)
+                .cloned();
+            let peer = match cached {
+                Some(peer) if !peer.stop.is_cancelled() => peer,
                 _ => {
-                    let peer =
-                        match Peer::start(&root, config, context, log, self.routes.clone()).await {
-                            Ok(peer) => peer,
-                            Err(error) if startup => {
-                                eprintln!("xi: extension {}: {error}", root.display());
-                                complete = false;
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
+                    let peer = match Peer::start(
+                        &root,
+                        config,
+                        context,
+                        log,
+                        self.session,
+                        self.routes.clone(),
+                    )
+                    .await
+                    {
+                        Ok(peer) => peer,
+                        Err(error) if startup => {
+                            eprintln!("xi: extension {}: {error}", root.display());
+                            complete = false;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let mut peers = self.peers.lock().expect("extension peers");
+                    if self.closed.load(Ordering::Relaxed) {
+                        peer.stop.cancel();
+                        self.reaping
+                            .lock()
+                            .expect("extension exits")
+                            .push(peer.exited.clone());
+                        return Err(Error::Config("session extension host closed".into()));
+                    }
                     peers.insert(key, peer.clone());
                     peer
                 }
@@ -186,7 +221,7 @@ impl ExtensionHost {
         Ok((Extensions(selected.into()), complete))
     }
 
-    pub(crate) fn scope(&self, session: SessionId, extensions: &Extensions) -> Scope {
+    pub(crate) fn scope(&self, extensions: &Extensions) -> Scope {
         let (sender, receiver) = mpsc::unbounded_channel();
         let route = Route {
             peers: extensions
@@ -195,22 +230,42 @@ impl ExtensionHost {
                 .map(|p| p.manifest.name.clone())
                 .collect(),
             sender,
-            opened: ROUTES_OPENED.fetch_add(1, Ordering::Relaxed),
         };
         self.routes
             .lock()
             .expect("extension routes")
-            .insert(session, route);
+            .insert(self.session, route);
         Scope {
-            session,
+            session: self.session,
             routes: self.routes.clone(),
             receiver,
         }
     }
 
+    /// Evicts the session's peers and immediately stops their process groups.
+    pub(crate) fn close(&self) {
+        let mut peers = self.peers.lock().expect("extension peers");
+        self.closed.store(true, Ordering::Relaxed);
+        let mut reaping = self.reaping.lock().expect("extension exits");
+        for (_, peer) in peers.drain() {
+            peer.wire.closing.store(true, Ordering::Relaxed);
+            peer.stop.cancel();
+            reaping.push(peer.exited.clone());
+        }
+        self.routes.lock().expect("extension routes").clear();
+    }
+
     /// Requests shutdown, then terminates each process group and reaps it.
-    pub async fn shutdown(&self) {
-        let peers: Vec<_> = self.peers.lock().await.drain().map(|(_, p)| p).collect();
+    pub(crate) async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        let _loading = self.loading.lock().await;
+        let peers: Vec<_> = self
+            .peers
+            .lock()
+            .expect("extension peers")
+            .drain()
+            .map(|(_, p)| p)
+            .collect();
         futures::future::join_all(peers.iter().map(|peer| async move {
             peer.wire.closing.store(true, Ordering::Relaxed);
             let _ = tokio::time::timeout(
@@ -222,6 +277,15 @@ impl ExtensionHost {
             peer.exited.cancelled().await;
         }))
         .await;
+        let reaping = std::mem::take(&mut *self.reaping.lock().expect("extension exits"));
+        futures::future::join_all(reaping.iter().map(CancellationToken::cancelled)).await;
+        self.routes.lock().expect("extension routes").clear();
+    }
+}
+
+impl Drop for ExtensionHost {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -374,13 +438,12 @@ struct Peer {
     wire: Wire,
     stop: CancellationToken,
     exited: CancellationToken,
-    /// The extension's own egress listener, when its manifest declares `net`.
-    _egress: Option<egress::Listener>,
 }
 
 #[derive(Clone)]
 struct Wire {
-    sender: mpsc::UnboundedSender<Message>,
+    sender: mpsc::Sender<Message>,
+    stop: CancellationToken,
     pending: Arc<Mutex<HashMap<RequestId, Reply>>>,
     next: Arc<AtomicI64>,
     failure: Arc<Mutex<Option<String>>>,
@@ -389,8 +452,13 @@ struct Wire {
 }
 
 impl Wire {
-    fn send(&self, message: Message) -> Result<()> {
-        self.sender.send(message).map_err(|_| {
+    async fn send(&self, message: Message) -> Result<()> {
+        let result = tokio::select! {
+            biased;
+            () = self.stop.cancelled() => return Err(Error::Config("extension connection closed".into())),
+            result = self.sender.send(message) => result,
+        };
+        result.map_err(|_| {
             Error::Config(
                 self.failure
                     .lock()
@@ -425,6 +493,7 @@ impl Peer {
         config: &Config,
         context: &xi_tools::Context,
         log: &Path,
+        session: SessionId,
         routes: Arc<Mutex<HashMap<SessionId, Route>>>,
     ) -> Result<Arc<Self>> {
         let path = root.join("xi-extension.toml");
@@ -455,9 +524,8 @@ impl Peer {
                 Box::new(move |connect| {
                     let routes = routes.lock().expect("extension routes");
                     let Some(route) = routes
-                        .values()
+                        .get(&session)
                         .filter(|route| route.peers.contains(&extension))
-                        .max_by_key(|route| route.opened)
                     else {
                         return Some(connect);
                     };
@@ -545,9 +613,13 @@ impl Peer {
         let stderr_copy = tokio::spawn(async move {
             let _ = tokio::io::copy(&mut stderr, &mut stderr_log).await;
         });
-        let (sender, mut outgoing) = mpsc::unbounded_channel();
+        // Bound memory when an extension stops reading. Producers wait for
+        // the pipe writer rather than accumulating an unbounded queue.
+        let (sender, mut outgoing) = mpsc::channel(256);
+        let stop = CancellationToken::new();
         let wire = Wire {
             sender,
+            stop: stop.clone(),
             pending: Arc::default(),
             next: Arc::new(AtomicI64::new(1)),
             failure: Arc::default(),
@@ -555,7 +627,6 @@ impl Peer {
             closing: Arc::default(),
         };
         let writer_wire = wire.clone();
-        let stop = CancellationToken::new();
         let writer_stop = stop.clone();
         tokio::spawn(async move {
             while let Some(message) = tokio::select! { biased; () = writer_stop.cancelled() => None, message = outgoing.recv() => message }
@@ -566,8 +637,12 @@ impl Peer {
                     stdin.write_all(&bytes).await?;
                     stdin.flush().await?;
                     Ok::<_, Error>(())
-                }
-                .await;
+                };
+                let result = tokio::select! {
+                    biased;
+                    () = writer_stop.cancelled() => break,
+                    result = result => result,
+                };
                 if let Err(error) = result {
                     writer_wire.fail(format!("extension write failed: {error}"));
                     writer_stop.cancel();
@@ -581,8 +656,15 @@ impl Peer {
         let subagents = manifest.capabilities.subagents;
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
+            let requests = Arc::new(Semaphore::new(32));
+            let mut tasks = JoinSet::new();
             loop {
-                let line = tokio::select! { biased; () = reader_stop.cancelled() => break, line = lines.next_line() => line };
+                let line = tokio::select! {
+                    biased;
+                    () = reader_stop.cancelled() => break,
+                    Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+                    line = lines.next_line() => line,
+                };
                 let message = match line {
                     Ok(Some(line)) => {
                         serde_json::from_str::<Message>(&line).map_err(|e| e.to_string())
@@ -618,13 +700,33 @@ impl Peer {
                     }
                     Message::Request(request) => {
                         let id = request.id.clone();
+                        // Reject excess requests without blocking response
+                        // routing, which active requests may still need.
+                        let Ok(permit) = requests.clone().try_acquire_owned() else {
+                            let response = rpc::Response::err(
+                                Some(id),
+                                rpc::RpcError::new(
+                                    -32000,
+                                    "too many concurrent extension requests",
+                                ),
+                            );
+                            let _ = reader_wire.send(Message::Response(response)).await;
+                            continue;
+                        };
                         // Routing before spawning keeps a session's requests,
                         // such as concurrent `agent/run`s, in the order the
                         // extension sent them, so children start in that order.
-                        let routed =
-                            route(&reader_wire, &routes, extension.clone(), subagents, request);
+                        let routed = route(
+                            &reader_wire,
+                            &routes,
+                            session,
+                            extension.clone(),
+                            subagents,
+                            request,
+                        );
                         let wire = reader_wire.clone();
-                        tokio::spawn(async move {
+                        tasks.spawn(async move {
+                            let _permit = permit;
                             let result = match routed {
                                 Ok(reply) => reply.await.unwrap_or_else(|_| {
                                     Err(Error::Config("session extension request cancelled".into()))
@@ -642,7 +744,7 @@ impl Peer {
                                     rpc::RpcError::new(-32000, error.to_string()),
                                 ),
                             };
-                            let _ = wire.send(Message::Response(response));
+                            let _ = wire.send(Message::Response(response)).await;
                         });
                     }
                 }
@@ -668,6 +770,7 @@ impl Peer {
             supervisor_stop.cancel();
             supervisor_wire.fail(format!("extension {supervisor_name} connection closed"));
             let _ = stderr_copy.await;
+            drop(egress);
             supervisor_exited.cancel();
         });
         let mut peer = Self {
@@ -676,7 +779,6 @@ impl Peer {
             wire,
             stop,
             exited,
-            _egress: egress,
         };
         let handshake = tokio::time::timeout(
             Duration::from_secs(15),
@@ -729,17 +831,19 @@ impl Peer {
             id: id.clone(),
             wire: &self.wire,
         };
-        self.wire.send(Message::Request(request))?;
         let value = tokio::select! {
             biased;
             () = cancel.cancelled() => {
-                let _ = self.wire.send(Message::Notification(rpc::Notification { jsonrpc: rpc::Version, method: "$/cancelRequest".into(), params: serde_json::json!({"id": id}) }));
+                let _ = self.wire.sender.try_send(Message::Notification(rpc::Notification { jsonrpc: rpc::Version, method: "$/cancelRequest".into(), params: serde_json::json!({"id": id}) }));
                 // A process may ignore cooperative cancellation. Retire it so
                 // no cancelled invocation continues changing the workspace.
                 self.stop.cancel();
                 return Err(Error::Config("extension invocation cancelled".into()));
             }
-            result = receiver => result.map_err(|_| Error::Config("extension response channel closed".into()))??,
+            result = async {
+                self.wire.send(Message::Request(request)).await?;
+                receiver.await.map_err(|_| Error::Config("extension response channel closed".into()))?
+            } => result?,
         };
         drop(guard);
         Ok(serde_json::from_value(value)?)
@@ -795,6 +899,7 @@ impl Drop for ProcessGroup {
 fn route(
     wire: &Wire,
     routes: &Mutex<HashMap<SessionId, Route>>,
+    bound_session: SessionId,
     extension: ExtensionId,
     subagents: bool,
     request: rpc::Request,
@@ -824,6 +929,11 @@ fn route(
             .cloned()
             .unwrap_or(Value::Null),
     )?;
+    if session != bound_session {
+        return Err(Error::Config(
+            "extension request names a different session".into(),
+        ));
+    }
     let routes = routes.lock().expect("extension routes");
     let route = routes
         .get(&session)

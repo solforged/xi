@@ -110,29 +110,23 @@ impl Notification {
 
 /// Fanout without lossy broadcast-ring overwrites.
 #[derive(Clone, Default)]
-pub struct EventBus(
-    Arc<Mutex<Vec<mpsc::UnboundedSender<Notification>>>>,
-    Arc<extensions::ExtensionHost>,
-);
+pub struct EventBus {
+    subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<Notification>>>>,
+}
 
 impl EventBus {
     /// Subscribes to future notifications.
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Notification> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.0.lock().expect("event bus lock").push(tx);
+        self.subscribers.lock().expect("event bus lock").push(tx);
         rx
     }
 
     fn send(&self, notification: Notification) {
-        self.0
+        self.subscribers
             .lock()
             .expect("event bus lock")
             .retain(|tx| tx.send(notification.clone()).is_ok());
-    }
-
-    /// Gracefully stops the process-wide extension host.
-    pub async fn shutdown_extensions(&self) {
-        self.1.shutdown().await;
     }
 }
 
@@ -316,8 +310,7 @@ struct State {
 struct EgressState {
     listener: Option<egress::Listener>,
     tx: mpsc::UnboundedSender<egress::Connect>,
-    /// Taken by [`Session::service`] while it waits, and put back after.
-    rx: Option<mpsc::UnboundedReceiver<egress::Connect>>,
+    rx: mpsc::UnboundedReceiver<egress::Connect>,
 }
 
 impl State {
@@ -339,6 +332,7 @@ struct Inner {
     /// The catalog from session start; `/skill:NAME` prompts expand from it.
     skills: Vec<context::Skill>,
     bus: EventBus,
+    extensions: extensions::ExtensionHost,
     options: TurnOptions,
     stop: CancellationToken,
     idle: Notify,
@@ -528,7 +522,7 @@ impl Session {
                 egress: EgressState {
                     listener,
                     tx: egress_tx,
-                    rx: Some(egress_rx),
+                    rx: egress_rx,
                 },
                 titles,
             }),
@@ -536,6 +530,7 @@ impl Session {
             commands: Mutex::new(Vec::new()),
             skills,
             bus,
+            extensions: extensions::ExtensionHost::new(id),
             options,
             stop: CancellationToken::new(),
             idle: Notify::new(),
@@ -695,13 +690,21 @@ impl Session {
     }
 
     /// Cancels and rejects queued prompts when the client transport closes.
+    /// Closing also evicts and stops this session's extension processes.
     pub fn close(&self) {
         let mut control = self.0.control.lock().expect("control lock");
         control.cancel.cancel();
+        self.0.stop.cancel();
+        self.0.extensions.close();
         for prompt in control.queue.drain(..) {
             let _ = prompt.reply.send(Err("client disconnected".into()));
         }
         self.0.idle.notify_waiters();
+    }
+
+    /// Stops and reaps this session's extension processes.
+    pub async fn shutdown_extensions(&self) {
+        self.0.extensions.shutdown().await;
     }
 
     /// Resolves a pending ask. Duplicate and unknown answers fail.

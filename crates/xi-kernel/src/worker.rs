@@ -456,7 +456,9 @@ where
             let _ = peer.respond(id, result);
         }
     }
-    bus.shutdown_extensions().await;
+    if let Some(active) = worker.as_ref() {
+        active.session.shutdown_extensions().await;
+    }
     peer.close();
     peer.closed().await;
     Ok(())
@@ -521,7 +523,9 @@ async fn start(
         };
         let loaded = match specs {
             Ok(specs) => {
-                bus.1
+                session
+                    .0
+                    .extensions
                     .startup(
                         &state.config,
                         &state.tools_context,

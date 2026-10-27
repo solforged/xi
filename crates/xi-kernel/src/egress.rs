@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use xi_sandbox::Egress;
 
 /// Longest request head the proxy reads before answering `431`.
@@ -138,7 +139,10 @@ impl Listener {
             return;
         };
         let deliver: std::sync::Arc<Deliver> = deliver.into();
+        // The accept task owns every relay. Aborting it drops the set and
+        // closes accepted sockets too, including tunnels already approved.
         self.task = Some(tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             match bound {
                 #[cfg(not(target_os = "linux"))]
                 Bound::Tcp(listener) => {
@@ -146,7 +150,11 @@ impl Listener {
                         return;
                     };
                     loop {
-                        let Ok((stream, _)) = listener.accept().await else {
+                        let accepted = tokio::select! {
+                            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+                            accepted = listener.accept() => accepted,
+                        };
+                        let Ok((stream, _)) = accepted else {
                             return;
                         };
                         let origin = Origin {
@@ -154,7 +162,7 @@ impl Listener {
                             hosts: hosts.clone(),
                             deliver: deliver.clone(),
                         };
-                        tokio::spawn(serve(stream, origin));
+                        connections.spawn(serve(stream, origin));
                     }
                 }
                 #[cfg(target_os = "linux")]
@@ -163,7 +171,11 @@ impl Listener {
                         return;
                     };
                     loop {
-                        let Ok((stream, _)) = listener.accept().await else {
+                        let accepted = tokio::select! {
+                            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+                            accepted = listener.accept() => accepted,
+                        };
+                        let Ok((stream, _)) = accepted else {
                             return;
                         };
                         let origin = Origin {
@@ -171,7 +183,7 @@ impl Listener {
                             hosts: hosts.clone(),
                             deliver: deliver.clone(),
                         };
-                        tokio::spawn(serve(stream, origin));
+                        connections.spawn(serve(stream, origin));
                     }
                 }
             }
@@ -431,6 +443,45 @@ fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_a_listener_closes_an_approved_tunnel() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let mut listener = Listener::bind("drop-test").unwrap();
+        listener.start(
+            None,
+            None,
+            Box::new(|connect| {
+                let _ = connect.reply.send(Verdict::Allow);
+                None
+            }),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", listener.egress().port))
+            .await
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        let mut client = tokio::net::UnixStream::connect(&listener.egress().socket)
+            .await
+            .unwrap();
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let (mut server, _) = upstream.accept().await.unwrap();
+        let mut head = [0; b"HTTP/1.1 200 Connection established\r\n\r\n".len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200 Connection established\r\n\r\n");
+        drop(listener);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut byte = [0];
+            assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        })
+        .await
+        .expect("listener left an approved tunnel running");
+    }
 
     #[test]
     fn connect_and_absolute_form_parse_and_origin_form_is_refused() {
