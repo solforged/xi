@@ -420,6 +420,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("compaction.enabled", SettingLayer::Global),
         ("compaction.trigger_tokens", SettingLayer::Project),
         ("compaction.keep_recent_tokens", SettingLayer::Local),
+        ("sandbox.enabled", SettingLayer::Default),
         ("extensions", SettingLayer::Local),
         ("sandbox.readable", SettingLayer::Global),
         (
@@ -436,7 +437,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
     for (index, (row, (key, source))) in trusted.settings.iter().zip(expected).enumerate() {
         assert_eq!(row.key, key);
         assert_eq!(row.source, source, "{key}");
-        assert_eq!(row.editable, index < 7, "{key}");
+        assert_eq!(row.editable, index < 8, "{key}");
         assert_eq!(row.held_back, None, "{key}");
     }
     assert_eq!(setting(&trusted, "approvals").value, json!("auto"));
@@ -451,6 +452,93 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
     assert_eq!(
         setting(&trusted, "extensions").value,
         json!([fixture.workspace.join(".xi/extension")])
+    );
+}
+
+#[test]
+fn sandbox_default_can_be_toggled_and_reset_without_changing_other_settings() {
+    let fixture = Fixture::new();
+    let row = setting(&fixture.report(), "sandbox.enabled").clone();
+    assert_eq!(row.value, json!(true));
+    assert_eq!(row.source, SettingLayer::Default);
+    assert!(row.editable);
+    let original = "# tool environment\n[sandbox]\nenv = ['PATH'] # keep\n";
+    write(&fixture.global(), original);
+    for enabled in [false, true] {
+        set_global(&fixture.paths, "sandbox.enabled", &json!(enabled)).unwrap();
+        let config = fixture.load();
+        assert_eq!(config.sandbox.enabled, enabled);
+        assert_eq!(config.approvals, Approvals::Ask);
+        let spec = config
+            .sandbox_spec(
+                &fixture.paths.data.join("tmp"),
+                &fixture.paths.data.join("spill"),
+                &[],
+                &fixture.paths.data.join("git"),
+            )
+            .unwrap();
+        assert_eq!(spec.enabled, enabled);
+        let report = fixture.report();
+        let row = setting(&report, "sandbox.enabled");
+        assert_eq!(row.value, json!(enabled));
+        assert_eq!(row.source, SettingLayer::Global);
+        assert!(
+            std::fs::read_to_string(fixture.global())
+                .unwrap()
+                .starts_with(original)
+        );
+    }
+    set_global(&fixture.paths, "sandbox.enabled", &Value::Null).unwrap();
+    assert!(fixture.load().sandbox.enabled);
+    assert_eq!(std::fs::read_to_string(fixture.global()).unwrap(), original);
+}
+
+#[test]
+fn sandbox_enabled_respects_explicit_layers_and_workspace_authority() {
+    let fixture = Fixture::new();
+    let explicit = fixture.paths.home.join("extra.toml");
+    write(&fixture.global(), "[sandbox]\nenabled=false\n");
+    write(&explicit, "[sandbox]\nenabled=true\n");
+    write(
+        &fixture.workspace.join(".xi/config.toml"),
+        "[sandbox]\nenabled=false\nenv=['PROJECT']\n",
+    );
+    write(
+        &fixture.workspace.join(".xi/config.local.toml"),
+        "[sandbox]\nenabled=false\n",
+    );
+    let extras = std::slice::from_ref(&explicit);
+    let config = Config::load(fixture.paths.clone(), &fixture.workspace, extras).unwrap();
+    assert!(config.sandbox.enabled);
+    let report = report(&fixture.paths, &fixture.workspace, extras).unwrap();
+    let row = setting(&report, "sandbox.enabled");
+    assert_eq!(
+        row.source,
+        SettingLayer::Explicit {
+            path: explicit.clone()
+        }
+    );
+    assert_eq!(row.held_back, Some(SettingLayer::Local));
+
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    let config = Config::load(fixture.paths.clone(), &fixture.workspace, extras).unwrap();
+    assert!(!config.sandbox.enabled);
+    assert_eq!(
+        setting(&fixture.report(), "sandbox.enabled").source,
+        SettingLayer::Local
+    );
+    std::fs::remove_file(fixture.workspace.join(".xi/config.local.toml")).unwrap();
+    let config = Config::load(fixture.paths.clone(), &fixture.workspace, extras).unwrap();
+    assert!(
+        config.sandbox.enabled,
+        "committed project config must not disable the sandbox"
+    );
+    assert_eq!(config.sandbox.env, ["PROJECT"]);
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ignoring sandbox.enabled"))
     );
 }
 
@@ -605,6 +693,8 @@ fn invalid_global_values_leave_the_file_byte_identical() {
         ("tools", json!([1])),
         ("tools", json!("read")),
         ("compaction.enabled", json!("false")),
+        ("sandbox.enabled", json!("false")),
+        ("sandbox.enabled", json!(0)),
         ("compaction.trigger_tokens", json!(0)),
         ("compaction.trigger_tokens", json!(-1)),
         ("compaction.trigger_tokens", json!(1.5)),

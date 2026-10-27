@@ -164,7 +164,7 @@ Client → daemon requests:
 | `max_turns` | Optional integer, absent means 200 | Turn limit (`--max-turns`). |
 | `approval` | `ApprovalPolicy`: `client` (default), `allow`, or `deny` | `client` waits for a client approval; `allow` and `deny` resolve asks headlessly. |
 
-The attach result is `{info, events, partial, running, pending_approvals, stream_sequence, children}` for create, open and attach. `info` is `SessionDetails`: `{session, path, head, cwd, trusted, model, reasoning, model_info?, parent_session?}`. Saved sessions without a live worker have no `head` in `session/list`. The daemon guarantees at-least-once event delivery between an attach result and subsequent `event/appended` notifications, so clients deduplicate events by id. Stream notifications can also arrive twice, because the daemon subscribes a connection before asking the worker for its snapshot; `stream_sequence` is the last stream sequence included in `partial`, and clients drop `stream/delta` and `stream/reset` notifications at or below it. A sequence of 0 means unsequenced and is always applied. The prompt result's `failed`, `cancelled` and `text` fields come from the kernel's `TurnOutcome` and default on deserialization to false, false and an empty string.
+The attach result is `{info, events, partial, running, pending_approvals, stream_sequence, children}` for create, open and attach. `info` is `SessionDetails`: `{session, path, head, cwd, trusted, model, reasoning, sandbox_enabled, model_info?, parent_session?}`. `sandbox_enabled` reports the worker's active tool sandbox setting and defaults to `true` when absent on older peers. Saved sessions without a live worker have no `head` in `session/list`. The daemon guarantees at-least-once event delivery between an attach result and subsequent `event/appended` notifications, so clients deduplicate events by id. Stream notifications can also arrive twice, because the daemon subscribes a connection before asking the worker for its snapshot; `stream_sequence` is the last stream sequence included in `partial`, and clients drop `stream/delta` and `stream/reset` notifications at or below it. A sequence of 0 means unsequenced and is always applied. The prompt result's `failed`, `cancelled` and `text` fields come from the kernel's `TurnOutcome` and default on deserialization to false, false and an empty string.
 
 Daemon → client notifications go only to connections attached to that session, except where noted:
 
@@ -388,6 +388,7 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 | Approvals | Global default | Cycles the `approvals` preset `ask`, `reads`, `auto`. |
 | One row per built-in tool, including `hashline` | Global default | Toggles the tool in `tools`, keeping the order and any other names; the last tool cannot be removed. |
 | Automatic compaction, trigger, kept tail | Global default | Toggles `enabled`, or edits a token count inline; an empty trigger means 80% of the window. |
+| Tool sandbox | Global default | Toggles `sandbox.enabled`; off gives tool commands unrestricted host filesystem and network access. |
 | Sandbox roots and environment, extensions, trust, daemon idle timeout | Read only | `e` opens the file. |
 
 Global defaults go through `config/set`, which edits the global `config.toml` with a format-preserving TOML writer, so comments and ordering survive. `tui.toml` is edited the same way by the client. A running worker keeps the config it started with; new sessions read the change. Provider sections, `[[model]]` and `[[rule]]` stay file-only.
@@ -396,7 +397,7 @@ Global defaults go through `config/set`, which edits the global `config.toml` wi
 
 The footer shows workspace and Git branch on the left; model, reasoning, context use, cache hit rate, cost when pricing is known, sandbox, running children, trust, taint and waiting approvals on the right. Labels and separators are dim; values use normal ink. Unknown context capacity and cache usage before the first request show `–`, not a fabricated percentage. Context, taint, approvals and trust never drop. As the terminal narrows, each optional segment shortens and then drops before the next changes: sandbox, cache, branch, reasoning, cost, workspace, model, children. Safety labels shorten last; if even their shortest forms cannot fit, the row visibly truncates with an ellipsis. Reasoning shows the level the model runs at, such as `think off`, `think med` or `think xhigh`, and `no think` for models without reasoning.
 
-Git state refreshes asynchronously about every three seconds, including while idle. `main*` means staged, unstaged or untracked changes; a detached head shows `@` and its short commit ID. Missing Git, non-repositories and failed or timed-out probes omit the segment. Probes do not refresh the index or run fsmonitor hooks; switching workspaces clears the old branch immediately. `◇ sandbox` (short form `◇`) names the worker's fail-closed execution policy, not a health check or a claim that the current workspace is trusted. Sandbox setup failures prevent tool execution; they do not enable an unsandboxed fallback.
+Git state refreshes asynchronously about every three seconds, including while idle. `main*` means staged, unstaged or untracked changes; a detached head shows `@` and its short commit ID. Missing Git, non-repositories and failed or timed-out probes omit the segment. Probes do not refresh the index or run fsmonitor hooks; switching workspaces clears the old branch immediately. `◇ sandbox` (short form `◇`) names the worker's fail-closed execution policy, not a health check or a claim that the current workspace is trusted. Sandbox setup failures prevent tool execution; they do not enable an unsandboxed fallback. A worker started with `sandbox.enabled = false` shows a brass `sandbox off` warning (short form `sbx off`), which stays visible with the other safety labels as the terminal narrows. This reports the worker's active setting, even after the global default changes.
 
 Tool results show an open-sided headline and at most three lines; `ctrl+o` expands the rest. A failed `bash` shows `✕` and its trailing numeric exit status in sanguine on the headline, such as `exit 1 · 1.8s`, with the duration dim. Its `[exit N]` footer is omitted from the preview and its hidden-line count. The full output keeps that footer. Expansion prints the unindented result between dim rules such as `── bash · git log … ──` and `── end · 5 lines ──`, each at most 48 cells and never wider than the terminal. Long expanded output lines use the terminal's own soft wrap so copying keeps the original line breaks. A spill path follows the end rule. A successful `edit` renders as a diff instead: the lines shared by the start and end of the old and new text are cut to one line of context on each side, then the removed and added lines, at most eight rows, with `+N −M` in the headline; `hashline` edits show their added lines. Expanded diffs keep their removal and addition colours without the preview's indent. Thinking blocks follow the thinking display setting, `first` by default: `full` shows the whole text dimmed, `first` its first line, and `hidden` nothing; streaming thinking follows the same setting in the live region. `ctrl+t` changes it for output from then on. Images show as a placeholder.
 
@@ -415,7 +416,7 @@ Threats, in order of likelihood:
 
 ### Sandbox
 
-Every tool process and extension runs sandboxed. The kernel never restricts itself; it starts each process through the `xi-sandbox-exec` helper, which enters the sandbox and then execs the target. Doing the setup in a separate single-threaded process keeps it out of the unsafe window between `fork` and `exec` in the multi-threaded kernel.
+Tool processes run sandboxed by default; extensions always run sandboxed. The kernel never restricts itself; with sandboxing enabled, it starts each process through the `xi-sandbox-exec` helper, which enters the sandbox and then execs the target. Doing the setup in a separate single-threaded process keeps it out of the unsafe window between `fork` and `exec` in the multi-threaded kernel.
 
 - Writes: the workspace and a per-session tmp directory. Linux mounts the latter at `/tmp`; workspaces under the host `/tmp` keep their paths. macOS cannot remount and instead sets `TMPDIR` to the session directory. The real `/tmp`, `/private/tmp` and `/private/var/folders` stay unwritable except for explicitly writable roots.
 - Reads: system paths, every `PATH` directory except the home directory and its ancestors, `CARGO_HOME`, `RUSTUP_HOME`, common toolchain roots (mise installs, Homebrew, Nix profiles), skills, and the session's spill and git directories. The rest of the home directory is not readable, so credential stores (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.netrc`) are covered without a denylist.
@@ -463,7 +464,18 @@ The policy is informed by [Codex's base profile](https://github.com/openai/codex
 - A repository created inside the sandbox with `git init` has unprotected hooks until a later spec sees its `.git`. Hooks planted in that window persist.
 - Platforms other than Linux and macOS fail closed. macOS paths that cannot be represented losslessly in the generated profile (non-UTF-8 or control characters) fail setup rather than widening permissions.
 
-`--yolo` disables the sandbox and refuses to start unless xi detects it is inside a container or VM.
+#### Disabling the tool sandbox
+
+Use `/settings` → **Tool sandbox**, or set the default in `$XDG_CONFIG_HOME/xi/config.toml` (normally `~/.config/xi/config.toml`):
+
+```toml
+[sandbox]
+enabled = false
+```
+
+Set `enabled = true`, or remove the key, to restore sandboxing. The built-in default is `true`. The setting is honored in global and explicit `--config` files and in trusted `.xi/config.local.toml`; committed project config cannot change it. Changes apply when a worker opens a session, not to already running workers. Child agents inherit the parent's setting.
+
+With it off, tool commands run directly without the sandbox helper, filesystem restrictions, protected paths or egress proxy. They can access host files, credentials and the network with the user's OS permissions. The tool environment allowlist, configured environment overlay, session git config, output capture, cancellation and timeouts still apply; `TMPDIR` is the session tmp directory on both platforms. Tool and command policy rules and in-process file-tool approvals remain in force, but they cannot constrain filesystem or network access inside an unsandboxed command. Extension capability sandboxes remain enforced.
 
 ### Egress
 

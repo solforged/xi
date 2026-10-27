@@ -541,6 +541,7 @@ async fn start(
         trusted: state.config.trusted,
         model: state.config.model.clone(),
         reasoning: state.config.reasoning,
+        sandbox_enabled: state.config.sandbox.enabled,
         model_info: registry.model(&state.config.model).cloned(),
         parent_session,
     };

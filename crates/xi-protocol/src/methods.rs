@@ -402,12 +402,19 @@ pub mod client {
         /// Current reasoning depth.
         #[serde(default)]
         pub reasoning: Reasoning,
+        /// Whether this worker runs tool commands in the OS sandbox.
+        #[serde(default = "default_sandbox_enabled")]
+        pub sandbox_enabled: bool,
         /// Registry metadata for the selected model, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model_info: Option<ModelInfo>,
         /// Parent session for a child session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub parent_session: Option<SessionId>,
+    }
+
+    fn default_sandbox_enabled() -> bool {
+        true
     }
 
     /// Filters for [`SessionList`].
@@ -1174,6 +1181,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(info.reasoning, crate::model::Reasoning::Medium);
+        assert!(info.sandbox_enabled);
+        let mut wire = serde_json::to_value(&info).unwrap();
+        wire["sandbox_enabled"] = json!(false);
+        let disabled: SessionDetails = serde_json::from_value(wire).unwrap();
+        assert!(!disabled.sandbox_enabled);
     }
 
     #[test]
@@ -1220,6 +1232,7 @@ mod tests {
                 trusted: true,
                 model,
                 reasoning: crate::model::Reasoning::Medium,
+                sandbox_enabled: true,
                 model_info: None,
                 parent_session: None,
             },
@@ -1255,6 +1268,7 @@ mod tests {
                 "cwd": "/work", "trusted": true,
                 "model": {"provider": "test", "model": "model"},
                 "reasoning": "medium",
+                "sandbox_enabled": true,
             },
             "events": [{
                 "id": head, "at": 7, "type": "user_message",

@@ -191,12 +191,14 @@ impl App {
                 Line::default().ink(format!("${cost:.2}")),
             ));
         }
-        // This is the worker's fail-closed execution policy, not a health
-        // check: a sandbox setup failure prevents the tool from running.
-        segs.push(
+        // Show the worker's actual launch policy, not the current default.
+        segs.push(if info.sandbox_enabled {
             Segment::new("sandbox", Line::default().dim("◇ sandbox"))
-                .short(Line::default().dim("◇")),
-        );
+                .short(Line::default().dim("◇"))
+        } else {
+            Segment::new("sandbox-off", Line::default().brass("sandbox off"))
+                .short(Line::default().brass("sbx off"))
+        });
         let running = self.transcript.children().running();
         if running > 0 {
             segs.push(

@@ -10,8 +10,9 @@
 //!   not under a protected path are inside, anything else is a
 //!   [`Crossing::Write`]. Paths are resolved through symlinks first, so a
 //!   link cannot smuggle a write out of the workspace.
-//! - `bash` runs through `xi-sandbox-exec`, and every command is a
-//!   [`Crossing::Exec`] so policy can deny specific command lines.
+//! - `bash` runs through `xi-sandbox-exec` unless the tool sandbox is disabled,
+//!   and every command is a [`Crossing::Exec`] so policy can deny specific
+//!   command lines.
 //!
 //! `edit` replaces exact text. `read` and `search` return `LINE|text` by
 //! default. With `hashline` enabled, they return `LINE:HH|text` anchors,
@@ -197,7 +198,7 @@ impl Tool for Kind {
             ),
             Self::Bash => (
                 "bash",
-                "Run a shell command in the workspace sandbox with no stdin. timeout is seconds (default 120, maximum 600). Returns merged stdout/stderr and exit status. Timeout or cancellation kills the process group. Large output is spilled to a readable file.",
+                "Run a shell command in the workspace with no stdin. OS sandboxing is enabled by default. timeout is seconds (default 120, maximum 600). Returns merged stdout/stderr and exit status. Timeout or cancellation kills the process group. Large output is spilled to a readable file.",
                 json!({"command":{"type":"string"}, "timeout":{"type":"integer","minimum":1,"maximum":600}}),
                 vec!["command"],
             ),

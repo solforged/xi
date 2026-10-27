@@ -50,6 +50,7 @@ fn snapshot(running: bool) -> AttachResult {
             trusted: true,
             model,
             reasoning: Reasoning::Medium,
+            sandbox_enabled: true,
             model_info: Some(model_info()),
             parent_session: None,
         },
@@ -85,6 +86,7 @@ fn settings_report() -> SettingsReport {
         ("compaction.enabled", json!(true)),
         ("compaction.trigger_tokens", Value::Null),
         ("compaction.keep_recent_tokens", json!(16_000)),
+        ("sandbox.enabled", json!(true)),
         ("extensions", json!(["/tmp/extensions"])),
         ("sandbox.readable", json!(["/tmp/notes"])),
         ("sandbox.writable", json!(["/tmp/output"])),
@@ -98,7 +100,7 @@ fn settings_report() -> SettingsReport {
         key: key.into(),
         value,
         source: SettingLayer::Default,
-        editable: index < 7,
+        editable: index < 8,
         held_back: None,
     })
     .collect();
@@ -555,6 +557,29 @@ async fn footer_shows_usage_sandbox_and_safety_in_color_or_monochrome() {
     for label in ["ctx 25%", "untrusted", "◆", "?1"] {
         assert!(narrow.contains(label), "{narrow}");
     }
+}
+
+#[tokio::test]
+async fn footer_warns_when_the_worker_sandbox_is_off_even_at_narrow_widths() {
+    let mut attached = snapshot(false);
+    attached.info.sandbox_enabled = false;
+    let (launch, _) = launch(attached).await;
+    let app = App::new(launch, 200, 24);
+    let footer = app.footer(200);
+    assert!(
+        footer
+            .0
+            .iter()
+            .any(|span| span.text == "sandbox off" && span.role == Role::Brass)
+    );
+    assert!(!footer.plain().contains("◇ sandbox"));
+    // The full label still fits at 22 columns; the short form is for narrower ones.
+    let narrow = app.footer(22).plain();
+    assert!(narrow.contains("sandbox off"), "{narrow}");
+    assert!(narrow.contains("ctx 0%"), "{narrow}");
+    let shorter = app.footer(18).plain();
+    assert!(shorter.contains("sbx off"), "{shorter}");
+    assert!(shorter.contains("ctx 0%"), "{shorter}");
 }
 
 #[tokio::test]
@@ -1961,6 +1986,7 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
         "held back (untrusted)",
         "Tool read",
         "Tool hashline",
+        "Tool sandbox",
         "Automatic compaction",
         "80% of window",
         "Kept tail",
@@ -2024,6 +2050,34 @@ async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
 }
 
 #[tokio::test]
+async fn settings_sandbox_toggle_saves_the_default_without_changing_the_worker() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 180, 40);
+    app.command("/settings").await.unwrap();
+    request(&mut requests, "config/settings");
+    settings_down(&mut app, 7).await;
+    for (key, enabled) in [(KeyCode::Char(' '), false), (KeyCode::Enter, true)] {
+        app.key(KeyEvent::new(key, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "sandbox.enabled");
+        assert_eq!(params["value"], enabled);
+        let report = &app.overlays.get::<Settings>().unwrap().report;
+        let row = report
+            .settings
+            .iter()
+            .find(|row| row.key == "sandbox.enabled")
+            .unwrap();
+        assert_eq!(row.value, enabled);
+        assert_eq!(row.source, SettingLayer::Global);
+        assert!(app.launch.attached.info.sandbox_enabled);
+        assert!(app.footer(180).plain().contains("◇ sandbox"));
+        assert!(live_text(&app).contains("Running sessions keep the settings they started with."));
+    }
+}
+
+#[tokio::test]
 async fn settings_saves_session_model_and_reasoning_and_returns_from_picker() {
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 180, 40);
@@ -2081,7 +2135,7 @@ async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_orde
     .await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
-    settings_down(&mut app, 7).await;
+    settings_down(&mut app, 8).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2112,7 +2166,7 @@ async fn settings_refuses_to_remove_the_last_tool() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 7).await;
+    settings_down(&mut app, 8).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();

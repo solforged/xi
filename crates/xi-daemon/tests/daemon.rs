@@ -1148,6 +1148,7 @@ async fn stubborn_workers_are_killed_and_closing_sessions_are_not_live() {
                                 model: "test".into(),
                             },
                             reasoning: Reasoning::Medium,
+                            sandbox_enabled: true,
                             model_info: None,
                             parent_session: None,
                         },
