@@ -22,6 +22,7 @@ enum Builtin {
     Reasoning,
     Compact,
     Layout,
+    Rename,
 }
 
 const COMMANDS: &[(&str, &str, Builtin)] = &[
@@ -66,6 +67,7 @@ const COMMANDS: &[(&str, &str, Builtin)] = &[
         Builtin::Reasoning,
     ),
     ("compact", "summarize older context now", Builtin::Compact),
+    ("rename", "set this session's title", Builtin::Rename),
     (
         "layout",
         "set inline, deck or auto; without an argument, show it",
@@ -252,6 +254,15 @@ impl App {
                     Err(error) => {
                         self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())])
                     }
+                }
+            }
+            Some(Builtin::Rename) if rest.is_empty() => {
+                self.note(vec![Line::default().dim("  /rename expects a title")]);
+            }
+            Some(Builtin::Rename) => {
+                // The `session_titled` event commits the scrollback line.
+                if let Err(error) = self.launch.client.rename(self.session_id(), rest).await {
+                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
                 }
             }
             None => {

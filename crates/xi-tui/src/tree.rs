@@ -117,6 +117,11 @@ impl Summary {
             EventKind::ReasoningChanged { reasoning } => {
                 self.notes.push(format!("reasoning → {reasoning}"));
             }
+            EventKind::SessionTitled {
+                title,
+                by: xi_protocol::event::TitleSource::User,
+                ..
+            } => self.notes.push(format!("renamed → {title}")),
             EventKind::TurnFailed { .. } => self.notes.push("turn failed".into()),
             _ => {}
         }

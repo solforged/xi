@@ -249,6 +249,20 @@ impl Client {
             .await
     }
 
+    /// Sets a session's title, at once when idle or at the running turn's
+    /// next model boundary.
+    pub async fn rename(
+        &self,
+        session: SessionId,
+        title: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.request::<SessionRename>(&RenameParams {
+            session,
+            title: title.into(),
+        })
+        .await
+    }
+
     /// Lists registry models and credential availability without exposing credentials.
     pub async fn models(&self, session: SessionId) -> Result<ModelsResult, ClientError> {
         self.request::<SessionModels>(&SessionRef { session }).await

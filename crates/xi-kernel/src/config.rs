@@ -214,6 +214,21 @@ impl Default for SandboxConfig {
     }
 }
 
+/// `[title]`: automatic session naming.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TitleConfig {
+    /// Name sessions with the `tiny` model. On by default; it applies only
+    /// to sessions whose client asks for titles.
+    pub auto: bool,
+}
+
+impl Default for TitleConfig {
+    fn default() -> Self {
+        Self { auto: true }
+    }
+}
+
 /// Built-in approval policy applied before user rules.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -239,6 +254,7 @@ struct FileConfig {
     extensions: Option<Vec<PathBuf>>,
     sandbox: Option<SandboxLayer>,
     compaction: Option<crate::compaction::Layer>,
+    title: Option<TitleConfig>,
     #[serde(default)]
     provider: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -297,6 +313,8 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     /// Automatic context compaction and retained history budget.
     pub compaction: crate::compaction::Config,
+    /// Automatic session naming.
+    pub title: TitleConfig,
     /// Daemon settings from the global user config file only.
     pub daemon: DaemonSettings,
     /// Ordered registry layers, resolved lazily at the first model request.
@@ -335,6 +353,7 @@ impl Config {
                 .collect(),
             sandbox: SandboxConfig::default(),
             compaction: crate::compaction::Config::default(),
+            title: TitleConfig::default(),
             daemon: DaemonSettings::default(),
             extensions: Vec::new(),
             registries: Vec::new(),
@@ -495,6 +514,9 @@ impl Config {
             }
             if let Some(compaction) = layer.compaction {
                 compaction.apply(&mut config.compaction);
+            }
+            if let Some(title) = layer.title {
+                config.title = title;
             }
             if let Some(extensions) = layer.extensions {
                 let base = path.parent().expect("config file has a parent");

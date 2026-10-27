@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 use xi_client::client::ClientNotification;
-use xi_protocol::event::{Decision, ModelRef, Remember, StopReason, Usage};
+use xi_protocol::event::{Decision, ModelRef, Remember, StopReason, TitleSource, Usage};
 use xi_protocol::methods::client::{Delta, EventParams};
 use xi_protocol::model::Pricing;
 use xi_protocol::{Block, EventKind, OutputBlock, SessionId, Timestamp, ToolCallId, ToolOutput};
@@ -1245,6 +1245,15 @@ impl Transcript {
             }
             // Reasoning changes are reflected in the footer, not the transcript.
             EventKind::ReasoningChanged { .. } => {}
+            // Automatic titles show only where sessions are listed.
+            EventKind::SessionTitled { title, by, .. } => {
+                if *by == TitleSource::User {
+                    self.push(
+                        &mut out,
+                        [Line::default().dim(format!("  renamed · {title}"))],
+                    );
+                }
+            }
             EventKind::UserMessage { content } => {
                 self.children.clear();
                 self.gap(&mut out);

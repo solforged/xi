@@ -22,6 +22,7 @@ enum Row {
     Trigger,
     Tail,
     Sandbox,
+    Titles,
     ReadOnly(&'static str, &'static str),
     Trust,
 }
@@ -36,6 +37,7 @@ const ROWS: &[Row] = &[
     Row::Trigger,
     Row::Tail,
     Row::Sandbox,
+    Row::Titles,
     Row::Tool("read"),
     Row::Tool("edit"),
     Row::Tool("write"),
@@ -368,6 +370,10 @@ impl Settings {
                             !self.value("sandbox.enabled").as_bool().unwrap_or(true),
                         ),
                     },
+                    Row::Titles => Action::Set {
+                        key: "title.auto",
+                        value: Value::Bool(!self.value("title.auto").as_bool().unwrap_or(true)),
+                    },
                     Row::Compaction => Action::Set {
                         key: "compaction.enabled",
                         value: Value::Bool(
@@ -443,6 +449,7 @@ impl Settings {
                 );
             }
             Row::Sandbox => ("Tool sandbox".into(), "sandbox.enabled"),
+            Row::Titles => ("Session titles".into(), "title.auto"),
             Row::Compaction => ("Automatic compaction".into(), "compaction.enabled"),
             Row::Trigger => ("Compaction trigger".into(), "compaction.trigger"),
             Row::Tail => ("Kept tail".into(), "compaction.keep_recent_tokens"),

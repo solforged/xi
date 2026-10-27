@@ -2476,7 +2476,7 @@ async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_orde
     .await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
-    settings_down(&mut app, 9).await;
+    settings_down(&mut app, 10).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2507,7 +2507,7 @@ async fn settings_refuses_to_remove_the_last_tool() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 9).await;
+    settings_down(&mut app, 10).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();

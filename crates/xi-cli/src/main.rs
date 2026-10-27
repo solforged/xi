@@ -226,6 +226,8 @@ async fn run(cli: Cli) -> Result<u8> {
             } else {
                 ApprovalPolicy::Client
             },
+            // Only the interactive clients list sessions for a person.
+            auto_title: cli.prompt.is_none(),
         },
     };
     let resume = cli.resume.flatten().as_deref().map(absolute);

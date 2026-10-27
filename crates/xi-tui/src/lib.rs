@@ -588,6 +588,12 @@ impl App {
                 xi_protocol::EventKind::ReasoningChanged { reasoning } => {
                     self.launch.attached.info.reasoning = *reasoning;
                 }
+                // The deck lists titles from `session/list`; fetch it now.
+                xi_protocol::EventKind::SessionTitled { .. } => {
+                    if let Some(deck) = self.deck.as_mut() {
+                        deck.refreshed = None;
+                    }
+                }
                 _ => {}
             },
             ClientNotification::Exited(_) => {

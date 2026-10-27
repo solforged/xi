@@ -15,7 +15,7 @@ use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
     ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, ChildEvents, Delta, EventAppended,
     EventParams, ModelEntry, ModelsResult, PendingApproval, PromptParams, PromptResult,
-    ResolveParams, SessionCommandParams, SessionDetails, SessionOptions, SessionRef,
+    RenameParams, ResolveParams, SessionCommandParams, SessionDetails, SessionOptions, SessionRef,
     SetModelParams, SetReasoningParams, StreamDelta, StreamReset,
 };
 use xi_protocol::methods::worker::{LeaseParams, ModelLease, ModelRelease, WorkerStartParams};
@@ -490,6 +490,7 @@ async fn start(
             ApprovalPolicy::Deny => ApprovalMode::Headless(false),
         },
         leaser: Some(Arc::new(PeerLeaser(peer.clone()))),
+        auto_title: options.auto_title,
     };
     let session = match log {
         Some(log) => Session::from_log(log, config, bus.clone(), turn, setup.backend.take()),
@@ -677,6 +678,12 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
                 .set_reasoning(params.reasoning)
                 .await
                 .map_err(kernel_error)?;
+            Value::Null
+        }
+        "session/rename" => {
+            let params: RenameParams = decode(params)?;
+            check_session(&session, params.session)?;
+            session.rename(&params.title).await.map_err(kernel_error)?;
             Value::Null
         }
         "session/command" => {

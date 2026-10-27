@@ -1,7 +1,7 @@
 //! Client routing, worker supervision and the daemon's session index.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -61,6 +61,7 @@ impl Daemon {
             shutdown: None,
             exe_changed: false,
             config_edits: Arc::new(Mutex::new(())),
+            logs: LogCache::default(),
         };
         tokio::spawn(actor.run(incoming, finished));
         Daemon {
@@ -265,6 +266,7 @@ struct Router {
     shutdown: Option<ShutdownWhen>,
     exe_changed: bool,
     config_edits: Arc<Mutex<()>>,
+    logs: LogCache,
 }
 
 impl Router {
@@ -473,6 +475,7 @@ impl Router {
                     })
                     .collect();
                 let root = sessions_root(&self.options.paths);
+                let logs = self.logs.clone();
                 let Some(peer) = self
                     .clients
                     .get(&client)
@@ -495,10 +498,12 @@ impl Router {
                                 summary.running = *running;
                             }
                         }
-                        tokio::task::spawn_blocking(move || list_sessions(&root, live, filters))
-                            .await
-                            .map_err(internal)?
-                            .and_then(encode)
+                        tokio::task::spawn_blocking(move || {
+                            list_sessions(&root, live, filters, &logs)
+                        })
+                        .await
+                        .map_err(internal)?
+                        .and_then(encode)
                     }
                     .await;
                     let _ = peer.respond(id, result);
@@ -603,6 +608,7 @@ impl Router {
             | "session/compact"
             | "session/set_model"
             | "session/set_reasoning"
+            | "session/rename"
             | "session/models"
             | "session/commands"
             | "session/command"
@@ -1293,7 +1299,7 @@ impl Router {
             .values()
             .filter_map(|worker| {
                 let info = worker.info.as_ref()?;
-                let metadata = log_metadata(&info.path);
+                let metadata = self.logs.metadata(&info.path);
                 Some(SessionSummary {
                     session: info.session,
                     path: info.path.clone(),
@@ -1352,6 +1358,7 @@ fn list_sessions(
     root: &Path,
     mut live: Vec<SessionSummary>,
     filters: ListParams,
+    logs: &LogCache,
 ) -> Result<Vec<SessionSummary>, RpcError> {
     let live_ids: HashSet<_> = live.iter().map(|session| session.session).collect();
     let workspaces = match std::fs::read_dir(root) {
@@ -1374,7 +1381,7 @@ fn list_sessions(
                 {
                     continue;
                 }
-                let metadata = log_metadata(&path);
+                let metadata = logs.metadata(&path);
                 if metadata.unprompted {
                     continue;
                 }
@@ -1431,68 +1438,139 @@ struct LogMetadata {
     unprompted: bool,
 }
 
-const METADATA_SCAN: u64 = 64 * 1024;
+/// What `session/list` reads from each log, kept between calls. Logs are
+/// append-only, so a call reads only the complete lines appended since the
+/// last; a changed root line or a shorter file starts over.
+#[derive(Clone, Default)]
+struct LogCache(Arc<Mutex<HashMap<PathBuf, LogIndex>>>);
 
-fn log_metadata(path: &Path) -> LogMetadata {
-    let mut metadata = LogMetadata::default();
-    let Ok(file) = std::fs::File::open(path) else {
-        return metadata;
-    };
-    let stat = file.metadata().ok();
-    let whole = stat
-        .as_ref()
-        .is_some_and(|stat| stat.len() <= METADATA_SCAN);
-    metadata.updated = stat
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-        .map(Timestamp);
-    let mut reader = BufReader::new(file.take(METADATA_SCAN));
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() || !line.ends_with('\n') {
-        return metadata;
-    }
-    let Ok(root) = serde_json::from_str::<Event>(&line) else {
-        return metadata;
-    };
-    if !matches!(root.kind, EventKind::SessionStarted { .. }) {
-        return metadata;
-    }
-    metadata.root = Some(root);
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                metadata.unprompted = whole;
-                break;
-            }
-            Ok(_) if line.ends_with('\n') => {}
-            _ => break,
-        }
-        let Ok(event) = serde_json::from_str::<Event>(&line) else {
-            break;
+#[derive(Clone, Default)]
+struct LogIndex {
+    /// The root line as read, to notice a replaced file.
+    root_line: String,
+    root: Option<Event>,
+    /// Bytes read so far, always at a line boundary.
+    offset: u64,
+    /// A malformed line ended the scan for good.
+    stopped: bool,
+    /// The first non-blank line of the first user message, cut to 80
+    /// characters.
+    prompt: Option<String>,
+    prompted: bool,
+    /// The latest `session_titled` title.
+    title: Option<String>,
+}
+
+/// Lines that may hold a `session_titled` event; others need no parse once
+/// the first prompt is known.
+const TITLED: &str = "\"type\":\"session_titled\"";
+
+impl LogCache {
+    fn metadata(&self, path: &Path) -> LogMetadata {
+        let mut metadata = LogMetadata::default();
+        let Ok(file) = std::fs::File::open(path) else {
+            return metadata;
         };
-        if let EventKind::UserMessage { content } = event.kind {
-            let text: String = content
-                .into_iter()
-                .filter_map(|block| match block {
-                    Block::Text { text } => Some(text),
-                    _ => None,
-                })
-                .collect();
-            if let Some(first) = text.lines().find(|line| !line.trim().is_empty()) {
-                let first = first.trim();
-                let mut chars = first.chars();
-                let mut title: String = chars.by_ref().take(80).collect();
-                if chars.next().is_some() {
-                    title.push('…');
+        let Ok(stat) = file.metadata() else {
+            return metadata;
+        };
+        metadata.updated = stat
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .map(Timestamp);
+        let mut reader = BufReader::new(file);
+        let mut root_line = String::new();
+        if reader.read_line(&mut root_line).is_err() || !root_line.ends_with('\n') {
+            return metadata;
+        }
+        // Scan without the lock, so a cold scan never stalls other lists.
+        let cached = self.0.lock().expect("log cache lock").get(path).cloned();
+        let mut index = cached
+            .filter(|index| index.root_line == root_line && index.offset <= stat.len())
+            .unwrap_or_default();
+        index.scan(reader, root_line);
+        metadata.root.clone_from(&index.root);
+        metadata.title = index.title.clone().or_else(|| index.prompt.clone());
+        metadata.unprompted =
+            index.root.is_some() && !index.prompted && !index.stopped && index.offset == stat.len();
+        self.0
+            .lock()
+            .expect("log cache lock")
+            .insert(path.to_owned(), index);
+        metadata
+    }
+}
+
+impl LogIndex {
+    /// Reads the complete lines after `offset`. `reader` stands after the
+    /// root line.
+    fn scan(&mut self, mut reader: BufReader<std::fs::File>, root_line: String) {
+        if self.offset == 0 {
+            self.offset = root_line.len() as u64;
+            match serde_json::from_str::<Event>(&root_line) {
+                Ok(root) if matches!(root.kind, EventKind::SessionStarted { .. }) => {
+                    self.root = Some(root);
                 }
-                metadata.title = Some(title);
+                _ => self.stopped = true,
             }
-            break;
+            self.root_line = root_line;
+        } else if reader.seek(std::io::SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut line = String::new();
+        while !self.stopped {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(read) if read > 0 && line.ends_with('\n') => {
+                    self.stopped = !self.accept(&line);
+                    if !self.stopped {
+                        self.offset += read as u64;
+                    }
+                }
+                // End of file, an append in progress or a read error: the
+                // next call resumes here.
+                _ => break,
+            }
         }
     }
-    metadata
+
+    /// Records one complete line; false when it is malformed.
+    fn accept(&mut self, line: &str) -> bool {
+        if self.prompted && !line.contains(TITLED) {
+            return true;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(line) else {
+            return false;
+        };
+        match event.kind {
+            EventKind::UserMessage { content } if !self.prompted => {
+                self.prompted = true;
+                let text: String = content
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        Block::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                self.prompt = text
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(|first| {
+                        let mut chars = first.trim().chars();
+                        let mut title: String = chars.by_ref().take(80).collect();
+                        if chars.next().is_some() {
+                            title.push('…');
+                        }
+                        title
+                    });
+            }
+            EventKind::SessionTitled { title, .. } => self.title = Some(title),
+            _ => {}
+        }
+        true
+    }
 }
 
 fn grant(replies: Vec<Reply>) {
@@ -1603,6 +1681,7 @@ mod tests {
             shutdown: None,
             exe_changed: false,
             config_edits: Arc::new(Mutex::new(())),
+            logs: LogCache::default(),
         };
         let session = SessionId::generate();
         let root = root(session);
@@ -1681,24 +1760,45 @@ mod tests {
         assert!(router.inbox.contains_key(&(session, "net2".into())));
     }
 
+    fn line(event: &Event) -> String {
+        format!("{}\n", serde_json::to_string(event).unwrap())
+    }
+
+    fn titled(root: &Event, title: &str, by: xi_protocol::event::TitleSource) -> Event {
+        Event {
+            id: EventId::generate(),
+            parent: Some(root.id),
+            at: Timestamp(13),
+            kind: EventKind::SessionTitled {
+                title: title.into(),
+                by,
+                model: None,
+                usage: None,
+            },
+        }
+    }
+
     #[test]
-    fn metadata_scans_are_bounded_and_malformed_lines_are_not_fatal() {
+    fn log_index_reads_appends_once_and_starts_over_on_rewrites() {
+        use std::io::Write;
+        use xi_protocol::event::TitleSource;
+
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.jsonl");
         let root = root(SessionId::generate());
-        let first = format!("{}\n", serde_json::to_string(&root).unwrap());
+        let first = line(&root);
         let prompt = Event {
             id: EventId::generate(),
             parent: Some(root.id),
             at: Timestamp(12),
             kind: EventKind::UserMessage {
                 content: vec![Block::Text {
-                    text: "title".into(),
+                    text: "\n  first prompt line  \nsecond".into(),
                 }],
             },
         };
-        let last = format!("{}\n", serde_json::to_string(&prompt).unwrap());
-        let padding = Event {
+        let last = line(&prompt);
+        let padding = line(&Event {
             id: EventId::generate(),
             parent: Some(root.id),
             at: Timestamp(12),
@@ -1707,46 +1807,60 @@ mod tests {
                 kind: "large".into(),
                 data: json!("x".repeat(64 * 1024)),
             },
+        });
+        let logs = LogCache::default();
+        let append = |text: &str| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
         };
-        std::fs::write(
-            &path,
-            format!(
-                "{first}{}\n{last}",
-                serde_json::to_string(&padding).unwrap()
-            ),
-        )
-        .unwrap();
-        let metadata = log_metadata(&path);
-        assert_eq!(
-            metadata.root.as_ref().map(|event| event.at),
-            Some(Timestamp(11))
-        );
+
+        // A prompt past the first 64 KiB still names the session.
+        std::fs::write(&path, format!("{first}{padding}{last}")).unwrap();
+        let metadata = logs.metadata(&path);
+        assert_eq!(metadata.root.map(|event| event.at), Some(Timestamp(11)));
         assert!(metadata.updated.is_some());
-        assert_eq!(metadata.title, None);
+        assert_eq!(metadata.title.as_deref(), Some("first prompt line"));
+        assert!(!metadata.unprompted);
+
+        // The latest title wins; an unfinished line waits for its newline.
+        append(&line(&titled(&root, "Automatic", TitleSource::FirstPrompt)));
+        assert_eq!(logs.metadata(&path).title.as_deref(), Some("Automatic"));
+        append(&padding);
+        append(&line(&titled(&root, "Mine", TitleSource::User)));
+        let later = line(&titled(&root, "Later", TitleSource::User));
+        let (head, tail) = later.split_at(later.len() / 2);
+        append(head);
+        assert_eq!(logs.metadata(&path).title.as_deref(), Some("Mine"));
+        append(tail);
+        assert_eq!(logs.metadata(&path).title.as_deref(), Some("Later"));
+
+        // A shorter or replaced file is read again from its root.
         std::fs::write(&path, format!("{first}not json\n{last}")).unwrap();
-        let metadata = log_metadata(&path);
-        assert_eq!(
-            metadata.root.as_ref().map(|event| event.at),
-            Some(Timestamp(11))
-        );
+        let metadata = logs.metadata(&path);
+        assert_eq!(metadata.root.map(|event| event.at), Some(Timestamp(11)));
         assert_eq!(metadata.title, None);
+        assert!(!metadata.unprompted);
         std::fs::write(&path, "not json\n").unwrap();
-        assert!(log_metadata(&path).root.is_none());
-        let missing = log_metadata(&directory.path().join("missing"));
+        assert!(logs.metadata(&path).root.is_none());
+        let missing = logs.metadata(&directory.path().join("missing"));
         assert!(missing.root.is_none());
         assert!(missing.updated.is_none());
         assert!(missing.title.is_none());
         assert!(!missing.unprompted);
-        std::fs::write(
-            &path,
-            format!("{first}{}\n", serde_json::to_string(&padding).unwrap()),
-        )
-        .unwrap();
-        assert!(!log_metadata(&path).unprompted);
+
+        // Only a whole log without a user message is unprompted.
+        std::fs::write(&path, format!("{first}{padding}")).unwrap();
+        assert!(logs.metadata(&path).unprompted);
         std::fs::write(&path, &first).unwrap();
-        assert!(log_metadata(&path).unprompted);
-        std::fs::write(&path, format!("{first}{last}")).unwrap();
-        assert!(!log_metadata(&path).unprompted);
+        assert!(logs.metadata(&path).unprompted);
+        append(&last[..last.len() - 1]);
+        assert!(!logs.metadata(&path).unprompted);
+        append("\n");
+        assert!(!logs.metadata(&path).unprompted);
     }
 
     fn saved(path: &Path, session: SessionId, prompted: bool) {
@@ -1775,7 +1889,13 @@ mod tests {
         let empty = SessionId::generate();
         saved(&workspace.join("prompted.jsonl"), prompted, true);
         saved(&workspace.join("empty.jsonl"), empty, false);
-        let listed = list_sessions(directory.path(), Vec::new(), ListParams::default()).unwrap();
+        let listed = list_sessions(
+            directory.path(),
+            Vec::new(),
+            ListParams::default(),
+            &LogCache::default(),
+        )
+        .unwrap();
         assert_eq!(
             listed
                 .iter()
@@ -1800,7 +1920,13 @@ mod tests {
                 .set_modified(UNIX_EPOCH + Duration::from_secs(100))
                 .unwrap();
         }
-        let listed = list_sessions(directory.path(), Vec::new(), ListParams::default()).unwrap();
+        let listed = list_sessions(
+            directory.path(),
+            Vec::new(),
+            ListParams::default(),
+            &LogCache::default(),
+        )
+        .unwrap();
         assert_eq!(
             listed
                 .iter()

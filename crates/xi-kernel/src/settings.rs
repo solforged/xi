@@ -11,7 +11,7 @@ use xi_protocol::model::{ModelRole, Reasoning};
 use crate::config::{Approvals, Config, Paths, parse_model, validate_global};
 use crate::{Error, Result};
 
-pub(crate) const KEYS: [&str; 19] = [
+pub(crate) const KEYS: [&str; 20] = [
     "default_model",
     "reasoning",
     "approvals",
@@ -20,6 +20,7 @@ pub(crate) const KEYS: [&str; 19] = [
     "compaction.trigger",
     "compaction.keep_recent_tokens",
     "sandbox.enabled",
+    "title.auto",
     "extensions",
     "sandbox.readable",
     "sandbox.writable",
@@ -32,6 +33,9 @@ pub(crate) const KEYS: [&str; 19] = [
     "roles.tiny",
     "sandbox.ssh_agent",
 ];
+
+/// The leading `KEYS` that `config/set` may change.
+const EDITABLE: usize = 9;
 
 /// Effective settings and their layers for a workspace, without running
 /// `sandbox.env_command` or starting anything.
@@ -50,6 +54,7 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
         json!(config.compaction.trigger),
         json!(config.compaction.keep_recent_tokens),
         json!(config.sandbox.enabled),
+        json!(config.title.auto),
         json!(config.extensions),
         json!(config.sandbox.readable),
         json!(config.sandbox.writable),
@@ -74,7 +79,7 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
                 .get(key)
                 .cloned()
                 .unwrap_or(SettingLayer::Default),
-            editable: index < 8,
+            editable: index < EDITABLE,
             held_back: config.held_back.get(key).cloned(),
         })
         .collect();
@@ -156,7 +161,7 @@ fn replace(table: &mut dyn TableLike, key: &str, replacement: Option<toml_edit::
 }
 
 fn validate_value(key: &str, value: &Value) -> Result<Option<toml_edit::Value>> {
-    if !KEYS[..8].contains(&key) {
+    if !KEYS[..EDITABLE].contains(&key) {
         return Err(Error::Config(format!(
             "{key}: unknown or read-only setting"
         )));
@@ -191,7 +196,7 @@ fn validate_value(key: &str, value: &Value) -> Result<Option<toml_edit::Value>> 
             }
             toml_edit::Value::from(array)
         }
-        "compaction.enabled" | "sandbox.enabled" => {
+        "compaction.enabled" | "sandbox.enabled" | "title.auto" => {
             toml_edit::Value::from(value.as_bool().ok_or_else(invalid)?)
         }
         "compaction.trigger" => {
