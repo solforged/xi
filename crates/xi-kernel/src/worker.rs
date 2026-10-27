@@ -255,6 +255,9 @@ impl Mirror {
                         Auth::Login(LoginService::Anthropic) => {
                             xi_provider::anthropic_file(&self.credentials).exists()
                         }
+                        Auth::Login(LoginService::Grok) => {
+                            xi_provider::grok_file(&self.credentials).exists()
+                        }
                     }),
                 info: info.clone(),
             })

@@ -259,10 +259,10 @@ impl Picker {
                 meta.push("think".into());
             }
             if !entry.available {
-                meta = vec![if entry.model.provider == "chatgpt" {
-                    "no credentials · xi login chatgpt".into()
-                } else {
-                    "no credentials".into()
+                meta = vec![match entry.model.provider.as_str() {
+                    "chatgpt" => "no credentials · xi login chatgpt".into(),
+                    "grok" => "no credentials · xi login grok".into(),
+                    _ => "no credentials".into(),
                 }];
             } else if let Some(pricing) = entry.info.pricing {
                 meta.push(format!("${}/${}", pricing.input, pricing.output));
@@ -400,6 +400,22 @@ mod tests {
         assert!(
             rows.iter()
                 .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= 116)
+        );
+    }
+
+    #[test]
+    fn grok_models_explain_how_to_sign_in() {
+        let grok = entry("grok", "grok-4.6", false);
+        let picker = Picker::new(ModelsResult {
+            current: grok.model.clone(),
+            reasoning: Reasoning::Medium,
+            roles: BTreeMap::new(),
+            models: vec![grok],
+        });
+        assert!(
+            picker.body(116).list[1]
+                .plain()
+                .ends_with("no credentials · xi login grok")
         );
     }
 

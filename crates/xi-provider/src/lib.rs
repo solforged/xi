@@ -6,9 +6,10 @@
 //! round-trips in encrypted form; Chat Completions reasoning is exposed as
 //! [`Block::Thinking`] but is not replayed.
 //!
-//! `auth = { login = "chatgpt" }` or `{ login = "anthropic" }` signs
-//! requests with stored subscription tokens instead of an API key.
-//! [`Login`] and [`AnthropicLogin`] obtain them; requests refresh them.
+//! `auth = { login = "chatgpt" }`, `{ login = "anthropic" }` or
+//! `{ login = "grok" }` signs requests with stored OAuth tokens instead of an
+//! API key. [`Login`], [`AnthropicLogin`] and [`GrokLogin`] obtain them;
+//! requests refresh them.
 //! Providers that speak the same [`Api`] differently say so in [`Compat`].
 //!
 //! The [`Registry`] knows which providers and models exist. It starts from a
@@ -31,6 +32,7 @@ mod anthropic;
 mod anthropic_login;
 mod chatgpt;
 mod claude_code;
+mod grok;
 mod oauth;
 mod openai;
 mod registry;
@@ -46,6 +48,7 @@ use std::time::Duration;
 
 pub use anthropic_login::{Login as AnthropicLogin, anthropic_file};
 pub use chatgpt::{Account, Login, chatgpt_file};
+pub use grok::{Login as GrokLogin, grok_file};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -217,6 +220,8 @@ pub enum LoginService {
     Chatgpt,
     /// A Claude subscription through Claude Code's OAuth client.
     Anthropic,
+    /// A Grok account through Grok Build's OAuth client.
+    Grok,
 }
 
 /// Wire differences between providers that speak the same [`Api`]. Set

@@ -305,6 +305,64 @@ fn jwt(payload: Value) -> String {
 }
 
 #[tokio::test]
+async fn grok_account_requests_use_responses_and_token_routing() {
+    let server = MockServer::start().await;
+    mock(&server, Api::OpenaiResponses, transcript()).await;
+    let credentials = tempfile::tempdir().unwrap();
+    let file = xi_provider::grok_file(credentials.path());
+    std::fs::write(
+        &file,
+        json!({
+            "access_token": "grok-access", "refresh_token": "grok-refresh",
+            "expires_at": 4_102_444_800_u64,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut registry = Registry::builtin();
+    let mut config = registry.provider("grok").unwrap().clone();
+    config.base_url = server.uri();
+    registry.extend(RegistryConfig {
+        provider: std::collections::BTreeMap::from([("grok".into(), config)]),
+        ..Default::default()
+    });
+    registry.set_credentials(credentials.path().into());
+    let mut request = request();
+    request.model = "grok-4.7".into();
+    let response = registry
+        .connect(&ModelRef {
+            provider: "grok".into(),
+            model: request.model.clone(),
+        })
+        .unwrap()
+        .stream(&request, &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(response.stop, StopReason::ToolUse);
+    assert!(
+        response
+            .content
+            .iter()
+            .any(|block| matches!(block, Block::ToolUse { name, .. } if name == "read"))
+    );
+    let received = &server.received_requests().await.unwrap()[0];
+    assert_eq!(received.headers["authorization"], "Bearer grok-access");
+    assert_eq!(received.headers["x-xai-token-auth"], "xai-grok-cli");
+    assert!(!received.headers.contains_key("chatgpt-account-id"));
+    let body: Value = received.body_json().unwrap();
+    assert_eq!(body["model"], "grok-4.7");
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    assert_eq!(body["max_output_tokens"], request.max_tokens);
+    assert_eq!(body["tools"][0]["name"], "read");
+    assert_eq!(body["store"], false);
+}
+
+#[tokio::test]
 async fn chatgpt_requests_are_signed_and_model_compat_overrides_the_provider() {
     let server = MockServer::start().await;
     mock(&server, Api::OpenaiResponses, sse(vec![completed(1, 0, 1)])).await;
