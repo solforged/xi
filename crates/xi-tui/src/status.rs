@@ -61,7 +61,7 @@ impl Segment {
 #[must_use]
 pub fn priority(name: &str) -> u8 {
     match name {
-        "context" | "taint" | "approvals" | "trust" => 0,
+        "context" | "taint" | "approvals" | "trust" | "sandbox-off" => 0,
         "children" => 1,
         "model" => 2,
         "workspace" => 3,

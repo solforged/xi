@@ -680,6 +680,80 @@ mod shell {
     }
 
     #[tokio::test]
+    async fn bash_without_sandbox_uses_host_access_and_does_not_need_a_helper() {
+        let mut f = Fixture::new();
+        f.ctx.sandbox.enabled = false;
+        f.ctx.helper = f.outside.join("missing-helper");
+        fs::write(f.outside.join("note"), "outside").unwrap();
+        let ran = f
+            .run(
+                "bash",
+                json!({"command": format!(
+                    "cat '{}'; printf stderr >&2; pwd; if read line; then exit 9; fi",
+                    f.outside.join("note").display()
+                )}),
+            )
+            .await;
+        assert!(!ran.output.is_error, "{}", text(&ran));
+        assert_eq!(
+            text(&ran),
+            format!("outsidestderr{}\n\n[exit 0]", f.ctx.workspace.display())
+        );
+        assert_eq!(
+            f.crossings("read", json!({"path": f.outside.join("note")}))
+                .unwrap(),
+            [Crossing::Read(f.outside.join("note"))],
+            "disabling the OS sandbox must not change file approval policy"
+        );
+        let ran = f.run("bash", json!({"command": "exit 125"})).await;
+        assert!(ran.output.is_error);
+        assert_eq!(text(&ran), "\n[exit 125]");
+    }
+
+    #[tokio::test]
+    async fn bash_without_sandbox_still_kills_background_processes() {
+        for stop in ["timeout", "cancel", "drop"] {
+            let mut f = Fixture::new();
+            f.ctx.sandbox.enabled = false;
+            let ctx = f.ctx.clone();
+            let task = tokio::spawn(async move {
+                toolset(&["bash"]).unwrap()[0]
+                    .run(
+                        &ToolCallId::from("direct"),
+                        json!({"command": "(sleep 2; echo survived > survived) & echo started > child; wait", "timeout": if stop == "timeout" { 1 } else { 60 }}),
+                        &ctx,
+                    ).await
+            });
+            wait_for_file(&f.ctx.workspace.join("child")).await;
+            match stop {
+                "cancel" => f.ctx.cancel.cancel(),
+                "drop" => task.abort(),
+                _ => {}
+            }
+            let result = task.await;
+            if stop == "drop" {
+                assert!(result.unwrap_err().is_cancelled());
+            } else {
+                let ran = result.unwrap();
+                assert!(ran.output.is_error, "{}", text(&ran));
+                assert!(
+                    text(&ran).ends_with(if stop == "timeout" {
+                        "[timed out after 1s]"
+                    } else {
+                        "[cancelled]"
+                    }),
+                    "{}",
+                    text(&ran)
+                );
+            }
+            // A surviving descendant would write after two seconds. This
+            // checks group cleanup without relying on platform process probes.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(!f.ctx.workspace.join("survived").exists(), "{stop}");
+        }
+    }
+
+    #[tokio::test]
     async fn bash_timeout_kills_background_process_group() {
         let f = Fixture::new();
         let ran = f

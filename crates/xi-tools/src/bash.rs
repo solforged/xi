@@ -73,20 +73,26 @@ pub(crate) async fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Resu
     };
     let mut spec = ctx.sandbox.clone();
     spec.cwd.clone_from(&ctx.workspace);
+    let launch_error = if spec.enabled {
+        "Sandbox could not start"
+    } else {
+        "Shell could not start"
+    };
     let mut command = spec
         .command(&ctx.helper, shell, ["-c", &input.command])
-        .map_err(|error| format!("Sandbox could not start: {error}"))?;
+        .map_err(|error| format!("{launch_error}: {error}"))?;
     let (reader, writer) = std::io::pipe().map_err(|error| error.to_string())?;
     command
         .stdin(Stdio::null())
         .stdout(writer.try_clone().map_err(|error| error.to_string())?)
         .stderr(writer);
-    // Do not set process_group(0): that would make the helper's setsid fail.
+    // Sandboxed commands need setsid in the helper; direct commands already
+    // have their own process group from Spec::command.
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(true);
     let mut child = command
         .spawn()
-        .map_err(|error| format!("Sandbox could not start: {error}"))?;
+        .map_err(|error| format!("{launch_error}: {error}"))?;
     drop(command); // Close the parent's write handles so EOF can be observed.
     let mut group = ProcessGroup {
         pid: nix::unistd::Pid::from_raw(child.id().expect("spawned child") as i32),
@@ -128,7 +134,7 @@ pub(crate) async fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Resu
     let is_error = stopped.is_some() || !status.success();
     let footer = stopped.unwrap_or_else(|| {
         use std::os::unix::process::ExitStatusExt;
-        if status.code() == Some(xi_sandbox::EXIT_SETUP_FAILED) {
+        if ctx.sandbox.enabled && status.code() == Some(xi_sandbox::EXIT_SETUP_FAILED) {
             "[Sandbox could not start: helper exited 125]\n[exit 125]".to_owned()
         } else if let Some(code) = status.code() {
             format!("[exit {code}]")

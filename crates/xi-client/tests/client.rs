@@ -89,6 +89,7 @@ fn snapshot() -> AttachResult {
                 model: "model".into(),
             },
             reasoning: Reasoning::Medium,
+            sandbox_enabled: true,
             model_info: None,
             parent_session: None,
         },

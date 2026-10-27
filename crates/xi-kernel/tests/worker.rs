@@ -295,6 +295,28 @@ fn reply(value: &str) -> Step {
 }
 
 #[tokio::test]
+async fn worker_reports_the_sandbox_setting_it_started_with() {
+    let fixture = Fixture::new();
+    xi_kernel::settings::set_global(&fixture.paths, "sandbox.enabled", &json!(false)).unwrap();
+    let harness = fixture.worker(Script::new(vec![]));
+    let attached = harness.start(&fixture).await;
+    assert!(!attached.info.sandbox_enabled);
+    // A saved default does not alter an already-open worker.
+    xi_kernel::settings::set_global(&fixture.paths, "sandbox.enabled", &json!(true)).unwrap();
+    let refreshed = request::<SessionAttach>(
+        &harness.peer,
+        &AttachParams {
+            session: attached.info.session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!refreshed.info.sandbox_enabled);
+    harness.close(attached.info.session).await;
+}
+
+#[tokio::test]
 async fn requires_start_and_create_returns_root_and_config_details() {
     let fixture = Fixture::new();
     let harness = fixture.worker(Script::new(vec![]));
@@ -325,6 +347,7 @@ async fn requires_start_and_create_returns_root_and_config_details() {
     );
     assert_eq!(attached.info.model_info, Some(model()));
     assert_eq!(attached.info.reasoning, Reasoning::Medium);
+    assert!(attached.info.sandbox_enabled);
     assert!(!attached.info.trusted);
     assert!(attached.info.parent_session.is_none());
     assert!(attached.info.path.is_absolute());

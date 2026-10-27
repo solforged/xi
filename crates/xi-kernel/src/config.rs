@@ -175,10 +175,12 @@ pub fn sessions_root(paths: &Paths) -> PathBuf {
     paths.data.join("sessions")
 }
 
-/// Extra sandbox roots and environment variable names.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Tool sandbox settings, extra roots and environment variable names.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SandboxConfig {
+    /// Whether tool processes run in the OS sandbox. Enabled by default.
+    pub enabled: bool,
     /// Readable roots.
     #[serde(default)]
     pub readable: Vec<PathBuf>,
@@ -195,6 +197,18 @@ pub struct SandboxConfig {
     /// variables already passed through.
     #[serde(default)]
     pub env_command: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            readable: Vec::new(),
+            writable: Vec::new(),
+            env: Vec::new(),
+            env_command: Vec::new(),
+        }
+    }
 }
 
 /// Built-in approval policy applied before user rules.
@@ -231,6 +245,7 @@ struct FileConfig {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SandboxLayer {
+    enabled: Option<bool>,
     readable: Option<Vec<PathBuf>>,
     writable: Option<Vec<PathBuf>>,
     env: Option<Vec<String>>,
@@ -359,6 +374,20 @@ impl Config {
                 eprintln!("xi: {warning}");
                 config.warnings.push(warning);
             }
+            if source == SettingLayer::Project
+                && table
+                    .get_mut("sandbox")
+                    .and_then(toml::Value::as_table_mut)
+                    .and_then(|sandbox| sandbox.remove("enabled"))
+                    .is_some()
+            {
+                let warning = format!(
+                    "{}: ignoring sandbox.enabled outside user and local config",
+                    path.display()
+                );
+                eprintln!("xi: {warning}");
+                config.warnings.push(warning);
+            }
             if !settings {
                 record_sources(table, &source, &mut config.held_back);
             } else {
@@ -417,6 +446,9 @@ impl Config {
                     .collect();
             }
             if let Some(sandbox) = layer.sandbox {
+                if let Some(enabled) = sandbox.enabled {
+                    config.sandbox.enabled = enabled;
+                }
                 if let Some(paths) = sandbox.readable {
                     config.sandbox.readable = paths;
                 }
@@ -493,6 +525,7 @@ impl Config {
         git: &Path,
     ) -> Result<xi_sandbox::Spec> {
         let mut spec = xi_sandbox::Spec::new(&self.workspace, tmp);
+        spec.enabled = self.sandbox.enabled;
         spec.readable
             .extend(self.sandbox.readable.iter().map(|p| self.paths.expand(p)));
         spec.writable
@@ -594,7 +627,9 @@ impl Config {
             git.join("config").to_string_lossy().into_owned(),
         );
         spec.validate().map_err(|e| Error::Config(e.to_string()))?;
-        if let Ok(dir) = xi_protocol::runtime::dir() {
+        if spec.enabled
+            && let Ok(dir) = xi_protocol::runtime::dir()
+        {
             let runtime = comparison_path(&dir);
             for root in spec.readable.iter().chain(&spec.writable) {
                 if runtime.starts_with(comparison_path(root)) {

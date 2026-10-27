@@ -25,6 +25,7 @@ enum Row {
     Compaction,
     Trigger,
     Tail,
+    Sandbox,
     ReadOnly(&'static str, &'static str),
     Trust,
 }
@@ -37,6 +38,7 @@ const ROWS: &[Row] = &[
     Row::Compaction,
     Row::Trigger,
     Row::Tail,
+    Row::Sandbox,
     Row::Tool("read"),
     Row::Tool("edit"),
     Row::Tool("write"),
@@ -263,6 +265,12 @@ impl Settings {
                             value: Value::Array(tools),
                         }
                     }
+                    Row::Sandbox => Action::Set {
+                        key: "sandbox.enabled",
+                        value: Value::Bool(
+                            !self.value("sandbox.enabled").as_bool().unwrap_or(true),
+                        ),
+                    },
                     Row::Compaction => Action::Set {
                         key: "compaction.enabled",
                         value: Value::Bool(
@@ -332,6 +340,7 @@ impl Settings {
                     self.source("tools"),
                 );
             }
+            Row::Sandbox => ("Tool sandbox".into(), "sandbox.enabled"),
             Row::Compaction => ("Automatic compaction".into(), "compaction.enabled"),
             Row::Trigger => ("Compaction trigger".into(), "compaction.trigger_tokens"),
             Row::Tail => ("Kept tail".into(), "compaction.keep_recent_tokens"),
@@ -458,7 +467,11 @@ impl Settings {
             list.push(line);
         }
         let note = self.note.clone().or_else(|| {
-            (!self.report.warnings.is_empty()).then(|| self.report.warnings.join(" · "))
+            if ROWS[self.selected] == Row::Sandbox {
+                Some("Off gives tool commands unrestricted host file and network access. Extensions stay sandboxed.".into())
+            } else {
+                (!self.report.warnings.is_empty()).then(|| self.report.warnings.join(" · "))
+            }
         });
         Body {
             list,

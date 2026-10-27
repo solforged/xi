@@ -4,7 +4,8 @@
 //! `xi-sandbox-exec` helper, which enters the sandbox described by a [`Spec`]
 //! and then execs the target program. Restricting a separate single-threaded
 //! helper keeps non-async-signal-safe setup out of the window between `fork`
-//! and `exec` in the multi-threaded kernel.
+//! and `exec` in the multi-threaded kernel. With [`Spec::enabled`] false,
+//! [`Spec::command`] launches directly without the helper or OS restrictions.
 //!
 //! On Linux the helper uses a user namespace, a mount namespace, optionally a
 //! network namespace, and Landlock:
@@ -186,6 +187,9 @@ pub enum Network {
 /// What a sandboxed process may access.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
+    /// Whether [`Self::command`] uses the OS sandbox helper. Enabled by default.
+    #[serde(default = "enabled")]
+    pub enabled: bool,
     /// Roots that are readable, writable and executable.
     pub writable: Vec<PathBuf>,
     /// Roots that are readable and executable. Missing paths are skipped.
@@ -211,6 +215,10 @@ pub struct Spec {
     pub allow_partial: bool,
 }
 
+fn enabled() -> bool {
+    true
+}
+
 impl Spec {
     /// The default sandbox for a workspace: the workspace and `tmp` are
     /// writable, system paths are readable, git hooks, git config and `.xi`
@@ -229,6 +237,7 @@ impl Spec {
         }
         protected.push(workspace.join(".xi"));
         Self {
+            enabled: true,
             writable: vec![workspace.clone(), tmp.clone()],
             readable: SYSTEM_READABLE
                 .iter()
@@ -268,11 +277,12 @@ impl Spec {
         Ok(())
     }
 
-    /// Builds a command that runs `program` inside this sandbox through the
-    /// helper binary at `helper`. The environment is cleared except for
-    /// [`Self::env`], then [`Self::vars`] are set. `TMPDIR` is `/tmp` on
-    /// Linux and [`Self::tmp`] on macOS. Variables added to the returned
-    /// command afterwards pass through too.
+    /// Builds a command that runs `program` through the helper binary at
+    /// `helper`, or directly when [`Self::enabled`] is false. Direct commands
+    /// get their own process group on Unix. The environment is cleared except
+    /// for [`Self::env`], then [`Self::vars`] are set. `TMPDIR` is `/tmp` on
+    /// sandboxed Linux and [`Self::tmp`] otherwise. Variables added to the
+    /// returned command afterwards pass through too.
     ///
     /// # Errors
     /// Fails if a path is relative or the spec cannot be encoded.
@@ -287,14 +297,21 @@ impl Spec {
         S: AsRef<OsStr>,
     {
         self.validate()?;
-        let spec = serde_json::to_string(self).map_err(Error::Encode)?;
-        let mut command = Command::new(helper);
-        command
-            .arg(spec)
-            .arg(program)
-            .args(args)
-            .current_dir(&self.cwd)
-            .env_clear();
+        let mut command = if self.enabled {
+            let spec = serde_json::to_string(self).map_err(Error::Encode)?;
+            let mut command = Command::new(helper);
+            command.arg(spec).arg(program);
+            command
+        } else {
+            let mut command = Command::new(program);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            command
+        };
+        command.args(args).current_dir(&self.cwd).env_clear();
         for (name, value) in std::env::vars_os() {
             if self.env.iter().any(|allowed| name == OsStr::new(allowed)) {
                 command.env(name, value);
@@ -304,7 +321,14 @@ impl Spec {
         #[cfg(target_os = "macos")]
         command.env("TMPDIR", &self.tmp);
         #[cfg(not(target_os = "macos"))]
-        command.env("TMPDIR", "/tmp");
+        command.env(
+            "TMPDIR",
+            if self.enabled {
+                Path::new("/tmp")
+            } else {
+                &self.tmp
+            },
+        );
         Ok(command)
     }
 }
@@ -329,5 +353,43 @@ pub fn enter_and_exec(
     {
         let _ = (program, args);
         Err(Error::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_is_enabled_for_new_and_legacy_specs() {
+        let spec = Spec::new("/workspace", "/tmp/xi-sandbox-test");
+        assert!(spec.enabled);
+        let mut wire = serde_json::to_value(&spec).unwrap();
+        wire.as_object_mut().unwrap().remove("enabled");
+        assert!(serde_json::from_value::<Spec>(wire).unwrap().enabled);
+        let command = spec
+            .command(Path::new("/helper"), "/bin/true", ["arg"])
+            .unwrap();
+        assert_eq!(command.get_program(), "/helper");
+    }
+
+    #[test]
+    fn disabled_sandbox_launches_directly_without_injecting_a_proxy() {
+        let mut spec = Spec::new("/workspace", "/tmp/xi-sandbox-test");
+        spec.enabled = false;
+        spec.env.clear();
+        spec.vars.insert("EXTRA".into(), "value".into());
+        let command = spec
+            .command(Path::new("/missing-helper"), "/bin/echo", ["hello"])
+            .unwrap();
+        assert_eq!(command.get_program(), "/bin/echo");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["hello"]);
+        assert_eq!(command.get_current_dir(), Some(Path::new("/workspace")));
+        let environment = command.get_envs().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment[OsStr::new("TMPDIR")],
+            Some(spec.tmp.as_os_str())
+        );
+        assert_eq!(environment[OsStr::new("EXTRA")], Some(OsStr::new("value")));
     }
 }
