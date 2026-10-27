@@ -50,7 +50,7 @@ Paths in the manifest resolve against the package directory. They are literal ex
 
 Tool and command handlers receive `{ session, signal, agentRun, appendCustom, log }`. Tools also receive `call`. `text(value, is_error?, untrusted?)` builds a tool output. Set `untrusted` when output includes third-party content. Post-tool hooks cannot clear an existing taint flag.
 
-`ctx.agentRun({ prompt, tools?, model? })` requires `subagents = true`. It returns `{ session, path, text, failed, usage }`. The kernel creates a linked child log, uses only requested built-in tools from the parent's catalog, and denies approval asks with a recorded headless decision. Omitting `tools` selects every parent built-in. Children share the workspace, inherit config and sandbox settings, and cannot load extensions or delegate. Use `Promise.all` for independent children; assign disjoint files. Cancelling the parent cancels the children.
+`ctx.agentRun({ prompt, tools?, model? })` requires `subagents = true`. It returns `{ session, path, text, failed, usage }`. The kernel creates a linked child log, uses only requested built-in tools from the parent's catalog, and denies approval asks with a recorded headless decision. Omitting `tools` selects every parent built-in. `model` is a `ModelRef` such as `{ provider: "claude", model: "claude-haiku-5-5" }` or a role such as `{ role: "smol" }`, resolved against the parent's config; omitting it keeps the parent's model. Children share the workspace, inherit config and sandbox settings, and cannot load extensions or delegate. Use `Promise.all` for independent children; assign disjoint files. Cancelling the parent cancels the children.
 
 Hooks use the Rust protocol's snake-case tagged unions:
 

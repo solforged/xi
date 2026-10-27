@@ -9,6 +9,7 @@ use xi_kernel::settings::{report, set_global};
 use xi_policy::{Action, Taint};
 use xi_protocol::Decision;
 use xi_protocol::methods::client::{Setting, SettingLayer, SettingsReport};
+use xi_protocol::model::ModelRole;
 
 struct Fixture {
     _directory: TempDir,
@@ -432,6 +433,10 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("sandbox.env", SettingLayer::Project),
         ("sandbox.env_command", SettingLayer::Local),
         ("daemon.idle_exit", SettingLayer::Global),
+        ("preset", SettingLayer::Default),
+        ("roles.slow", SettingLayer::Default),
+        ("roles.smol", SettingLayer::Default),
+        ("roles.tiny", SettingLayer::Default),
     ];
     assert_eq!(trusted.settings.len(), expected.len());
     for (index, (row, (key, source))) in trusted.settings.iter().zip(expected).enumerate() {
@@ -453,6 +458,116 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         setting(&trusted, "extensions").value,
         json!([fixture.workspace.join(".xi/extension")])
     );
+}
+
+#[test]
+fn presets_fill_roles_that_later_layers_override_one_at_a_time() {
+    let fixture = Fixture::new();
+    let model = |config: &Config, role| {
+        let model = config.role(role);
+        format!("{}/{}", model.provider, model.model)
+    };
+    let config = fixture.load();
+    assert_eq!(config.preset, None);
+    for role in ModelRole::ALL {
+        assert_eq!(model(&config, role), "chatgpt/gpt-6.1-sol", "{role}");
+    }
+
+    write(&fixture.global(), "preset = 'claude'\n");
+    let config = fixture.load();
+    assert_eq!(config.preset.as_deref(), Some("claude"));
+    assert_eq!(model(&config, ModelRole::Slow), "claude/claude-fable-5-1");
+    assert_eq!(model(&config, ModelRole::Default), "claude/claude-opus-5-5");
+    assert_eq!(model(&config, ModelRole::Smol), "claude/claude-sonnet-5-5");
+    assert_eq!(model(&config, ModelRole::Tiny), "claude/claude-haiku-5-5");
+    assert_eq!(config.model, *config.role(ModelRole::Default));
+    assert_eq!(
+        config.resolve(&"@tiny".parse().unwrap()),
+        *config.role(ModelRole::Tiny)
+    );
+    assert_eq!(
+        config.resolve(&"local/x".parse().unwrap()).provider,
+        "local"
+    );
+
+    // `default_model` and `[roles]` in the preset's own layer win over it.
+    write(
+        &fixture.global(),
+        "preset = 'claude'\ndefault_model = 'claude/claude-sonnet-4-6'\n[roles]\nsmol = 'local/small'\n",
+    );
+    let config = fixture.load();
+    assert_eq!(config.model.model, "claude-sonnet-4-6");
+    assert_eq!(model(&config, ModelRole::Smol), "local/small");
+    assert_eq!(model(&config, ModelRole::Tiny), "claude/claude-haiku-5-5");
+    let report = fixture.report();
+    assert_eq!(setting(&report, "preset").value, json!("claude"));
+    assert_eq!(setting(&report, "roles.smol").value, json!("local/small"));
+    for key in [
+        "preset",
+        "default_model",
+        "roles.slow",
+        "roles.smol",
+        "roles.tiny",
+    ] {
+        assert_eq!(setting(&report, key).source, SettingLayer::Global, "{key}");
+        assert_eq!(
+            setting(&report, key).editable,
+            key == "default_model",
+            "{key}"
+        );
+    }
+
+    // A later layer's preset replaces every role, including `default`.
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    write(
+        &fixture.workspace.join(".xi/config.local.toml"),
+        "preset = 'chatgpt'\n",
+    );
+    let config = fixture.load();
+    assert_eq!(model(&config, ModelRole::Slow), "chatgpt/gpt-6-astra");
+    assert_eq!(model(&config, ModelRole::Default), "chatgpt/gpt-6.1-sol");
+    assert_eq!(model(&config, ModelRole::Smol), "chatgpt/gpt-6.1-terra");
+    assert_eq!(model(&config, ModelRole::Tiny), "chatgpt/gpt-6-luna");
+    assert_eq!(
+        setting(&fixture.report(), "roles.tiny").source,
+        SettingLayer::Local
+    );
+
+    // Unassigned roles fall back up the tiers: tiny to smol, smol and slow
+    // to default.
+    std::fs::remove_file(fixture.workspace.join(".xi/config.local.toml")).unwrap();
+    write(
+        &fixture.global(),
+        "default_model = 'local/big'\n[roles]\nsmol = 'local/small'\n",
+    );
+    let config = fixture.load();
+    assert_eq!(model(&config, ModelRole::Slow), "local/big");
+    assert_eq!(model(&config, ModelRole::Tiny), "local/small");
+    assert_eq!(config.resolved_roles().len(), 4);
+}
+
+#[test]
+fn unknown_presets_and_roles_and_role_selectors_in_config_fail_to_load() {
+    let fixture = Fixture::new();
+    for (text, message) in [
+        (
+            "preset = 'openai'\n",
+            "unknown preset \"openai\"; expected one of anthropic, chatgpt, claude",
+        ),
+        ("[roles]\ndefault = 'a/b'\n", "unknown field `default`"),
+        ("[roles]\nhuge = 'a/b'\n", "unknown field `huge`"),
+        (
+            "[roles]\nsmol = '@tiny'\n",
+            "roles.smol: invalid model \"@tiny\"",
+        ),
+        ("default_model = '@slow'\n", "invalid model \"@slow\""),
+    ] {
+        write(&fixture.global(), text);
+        let error = Config::load(fixture.paths.clone(), &fixture.workspace, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(message), "{text}: {error}");
+    }
 }
 
 #[test]

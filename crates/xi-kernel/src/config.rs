@@ -11,7 +11,7 @@ use xi_policy::{ActionKind, Authority, Condition, Policy, RuleSpec};
 use xi_protocol::Decision;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::SettingLayer;
-use xi_protocol::model::Reasoning;
+use xi_protocol::model::{ModelRole, ModelSelector, Reasoning};
 use xi_provider::{ModelEntry, ProviderConfig, Registry, RegistryConfig};
 
 use crate::{Error, Result};
@@ -228,6 +228,8 @@ pub enum Approvals {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     default_model: Option<String>,
+    preset: Option<String>,
+    roles: Option<RolesLayer>,
     reasoning: Option<Reasoning>,
     approvals: Option<Approvals>,
     tools: Option<Vec<String>>,
@@ -240,6 +242,15 @@ struct FileConfig {
     model: Vec<ModelEntry>,
     #[serde(default)]
     rule: Vec<RuleSpec>,
+}
+
+/// `[roles]`: one `PROVIDER/MODEL` per role. `default_model` sets `default`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RolesLayer {
+    slow: Option<String>,
+    smol: Option<String>,
+    tiny: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -263,6 +274,11 @@ pub struct Config {
     pub trusted: bool,
     /// Selected provider and model.
     pub model: ModelRef,
+    /// Models assigned to roles by `preset`, `[roles]` and `default_model`.
+    /// `default` is always present; see [`Config::role`] for the rest.
+    pub roles: BTreeMap<ModelRole, ModelRef>,
+    /// The last preset applied, which later layers may have partly overridden.
+    pub preset: Option<String>,
     /// Reasoning setting.
     pub reasoning: Reasoning,
     /// Explicit per-invocation override, which takes precedence over a saved level.
@@ -298,11 +314,14 @@ impl Config {
         }
         let trusted = paths.trust_store()?.roots.contains(&workspace);
         let mut rule_layers = Vec::new();
+        let default = parse_model("chatgpt/gpt-6.1-sol")?;
         let mut config = Self {
             workspace,
             paths,
             trusted,
-            model: parse_model("chatgpt/gpt-6.1-sol")?,
+            roles: BTreeMap::from([(ModelRole::Default, default.clone())]),
+            preset: None,
+            model: default,
             reasoning: Reasoning::Medium,
             reasoning_override: None,
             approvals: Approvals::default(),
@@ -423,8 +442,41 @@ impl Config {
             }
             let layer = parse_file(value, &path)?;
             rule_layers.push((path.display().to_string(), authority, layer.rule));
+            // A preset replaces every role; `[roles]` and `default_model`
+            // in the same or a later layer then override single roles.
+            if let Some(name) = layer.preset {
+                let registry = Registry::builtin();
+                let preset = registry.preset(&name).ok_or_else(|| {
+                    let known: Vec<_> = registry.presets().collect();
+                    Error::Config(format!(
+                        "{}: unknown preset {name:?}; expected one of {}",
+                        path.display(),
+                        known.join(", ")
+                    ))
+                })?;
+                for role in ModelRole::ALL {
+                    config.roles.insert(role, parse_model(preset.get(role))?);
+                }
+                config.preset = Some(name);
+            }
+            if let Some(roles) = layer.roles {
+                for (role, model) in [
+                    (ModelRole::Slow, roles.slow),
+                    (ModelRole::Smol, roles.smol),
+                    (ModelRole::Tiny, roles.tiny),
+                ] {
+                    if let Some(model) = model {
+                        let model = parse_model(&model).map_err(|error| {
+                            Error::Config(format!("{}: roles.{role}: {error}", path.display()))
+                        })?;
+                        config.roles.insert(role, model);
+                    }
+                }
+            }
             if let Some(model) = layer.default_model {
-                config.model = parse_model(&model)?;
+                config
+                    .roles
+                    .insert(ModelRole::Default, parse_model(&model)?);
             }
             if let Some(reasoning) = layer.reasoning {
                 config.reasoning = reasoning;
@@ -465,6 +517,7 @@ impl Config {
             config.registries.push(RegistryConfig {
                 provider: layer.provider,
                 model: layer.model,
+                ..Default::default()
             });
         }
         let mut policy = Policy::new();
@@ -491,7 +544,39 @@ impl Config {
             policy.add_layer(name, authority, &rules)?;
         }
         config.policy = Arc::new(policy);
+        config.model = config.role(ModelRole::Default).clone();
         Ok(config)
+    }
+
+    /// The model for `role`, or for the nearest role up its fallback chain
+    /// when none is assigned: `tiny` falls back to `smol`, and `smol` and
+    /// `slow` to `default`.
+    pub fn role(&self, role: ModelRole) -> &ModelRef {
+        let mut role = role;
+        loop {
+            if let Some(model) = self.roles.get(&role) {
+                return model;
+            }
+            role = role
+                .fallback()
+                .expect("the default role is always assigned");
+        }
+    }
+
+    /// Every role's model after fallbacks.
+    pub fn resolved_roles(&self) -> BTreeMap<ModelRole, ModelRef> {
+        ModelRole::ALL
+            .into_iter()
+            .map(|role| (role, self.role(role).clone()))
+            .collect()
+    }
+
+    /// The concrete model a selector names.
+    pub fn resolve(&self, selector: &ModelSelector) -> ModelRef {
+        match selector {
+            ModelSelector::Model(model) => model.clone(),
+            ModelSelector::Role { role } => self.role(*role).clone(),
+        }
     }
 
     /// Builds the registry after all authoritative config layers are known.
@@ -680,13 +765,18 @@ fn record_sources(
         if key == "daemon.idle_exit" && *source != SettingLayer::Global {
             continue;
         }
-        let present = match key.split_once('.') {
-            Some((parent, field)) => table
-                .get(parent)
-                .and_then(toml::Value::as_table)
-                .is_some_and(|table| table.contains_key(field)),
-            None => table.contains_key(key),
-        };
+        // A preset assigns every role, so it is the source of each one
+        // until a later `[roles]` entry or `default_model` replaces it.
+        let preset =
+            (key == "default_model" || key.starts_with("roles.")) && table.contains_key("preset");
+        let present = preset
+            || match key.split_once('.') {
+                Some((parent, field)) => table
+                    .get(parent)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|table| table.contains_key(field)),
+                None => table.contains_key(key),
+            };
         if present {
             sources.insert(key, source.clone());
         }
@@ -929,13 +1019,7 @@ fn host_git_config(key: &str, path: bool) -> Option<String> {
 
 /// Parses a provider/model selector, retaining slashes inside the model id.
 pub fn parse_model(value: &str) -> Result<ModelRef> {
-    match value.split_once('/') {
-        Some((provider, model)) if !provider.is_empty() && !model.is_empty() => Ok(ModelRef {
-            provider: provider.into(),
-            model: model.into(),
-        }),
-        _ => Err(Error::Config(format!(
-            "invalid model {value:?}; expected PROVIDER/MODEL"
-        ))),
-    }
+    value
+        .parse()
+        .map_err(|_| Error::Config(format!("invalid model {value:?}; expected PROVIDER/MODEL")))
 }

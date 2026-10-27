@@ -216,6 +216,10 @@ async fn launch_with(
                     "session/models" => Ok(json!({
                         "current": response.info.model,
                         "reasoning": response.info.reasoning,
+                        "roles": {
+                            "default": response.info.model,
+                            "smol": { "provider": "demo", "model": "second" },
+                        },
                         "models": [
                             { "model": response.info.model, "info": model_info(), "available": true },
                             {
@@ -225,6 +229,11 @@ async fn launch_with(
                             },
                         ],
                     })),
+                    "session/set_model" => Ok(match params["model"]["role"].as_str() {
+                        Some("smol") => json!({ "provider": "demo", "model": "second" }),
+                        Some(_) => json!(response.info.model),
+                        None => params["model"].clone(),
+                    }),
                     "session/commands" => {
                         Ok(json!([{ "name": "known", "description": "an extension command" }]))
                     }
@@ -278,7 +287,7 @@ async fn launch_with(
     let (client, notifications) = Client::over(reader, writer, "test-tui").await.unwrap();
     let template = CreateParams {
         cwd: attached.info.cwd.clone(),
-        model: Some(attached.info.model.clone()),
+        model: Some(attached.info.model.clone().into()),
         options: Default::default(),
     };
     (
@@ -730,6 +739,25 @@ async fn model_command_opens_the_picker_and_enter_selects_a_model() {
     );
     assert_eq!(app.launch.attached.info.model.model, "second");
     assert!(app.overlays.is_empty());
+}
+
+#[tokio::test]
+async fn model_command_selects_a_role_and_shows_the_model_it_resolved_to() {
+    let (launch, mut requests) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 120, 24);
+    app.command("/model @smol").await.unwrap();
+    assert_eq!(
+        request(&mut requests, "session/set_model")["model"],
+        json!({ "role": "smol" })
+    );
+    assert_eq!(app.launch.attached.info.model.model, "second");
+    app.commit.clear();
+    app.command("/model @huge").await.unwrap();
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("PROVIDER/MODEL or @slow"))
+    );
 }
 
 #[tokio::test]

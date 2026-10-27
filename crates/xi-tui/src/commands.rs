@@ -1,4 +1,3 @@
-use xi_protocol::event::ModelRef;
 use xi_protocol::manifest::CommandSpec;
 use xi_protocol::model::Reasoning;
 
@@ -178,15 +177,14 @@ impl App {
                 self.completion = None;
             }
             Some(Builtin::Model) if rest.is_empty() => self.open_models().await,
-            Some(Builtin::Model) => match rest.split_once('/') {
-                Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
-                    self.set_model(ModelRef {
-                        provider: provider.into(),
-                        model: model.into(),
-                    })
-                    .await;
+            Some(Builtin::Model) => match rest.parse() {
+                Ok(model) => {
+                    self.set_model(model).await;
                 }
-                _ => self.note(vec![Line::default().dim("  /model expects PROVIDER/MODEL")]),
+                Err(_) => self
+                    .note(vec![Line::default().dim(
+                        "  /model expects PROVIDER/MODEL or @slow, @default, @smol, @tiny",
+                    )]),
             },
             Some(Builtin::Reasoning) if rest.is_empty() => {
                 let info = &self.launch.attached.info;

@@ -14,7 +14,7 @@ use xi_policy::{Action, Taint};
 use xi_protocol::event::{Approver, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
-use xi_protocol::model::{ModelInfo, Reasoning};
+use xi_protocol::model::{ModelInfo, ModelRole, Reasoning};
 use xi_protocol::{Block, Decision, EventKind, OutputBlock, ToolCallId, ToolOutput};
 use xi_provider::{BoxFuture, Error, ErrorKind, Message, Provider, Request, Response};
 use xi_tools::{Context, Crossing, Ran, Tool};
@@ -1295,6 +1295,39 @@ async fn selecting_the_current_model_records_nothing() {
     let events = session.info().await.events;
     assert_eq!(events.len(), before + 1);
     assert!(matches!(&events[before].kind, EventKind::ModelChanged { model } if *model == other));
+}
+
+#[tokio::test]
+async fn role_selection_records_the_concrete_model_it_resolves_to() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.paths.config.join("config.toml"),
+        "default_model = 'local/m'\n[roles]\ntiny = 'local/n'\n[provider.local]\napi = 'openai-chat'\nbase_url = 'http://127.0.0.1:9/v1'\nauth = 'none'\n[[model]]\nprovider = 'local'\nid = 'm'\ncontext_window = 1000\nmax_output = 100\n[[model]]\nprovider = 'local'\nid = 'n'\ncontext_window = 1000\nmax_output = 100\n",
+    );
+    let (session, _) = fixture.session(Script::new(vec![]), FakeTool { gate: None }, opts());
+    let before = session.info().await.events.len();
+    let model = |id: &str| ModelRef {
+        provider: "local".into(),
+        model: id.into(),
+    };
+    assert_eq!(
+        session.set_model(ModelRole::Tiny).await.unwrap(),
+        model("n")
+    );
+    // `smol` is unassigned and falls back to `default`.
+    assert_eq!(
+        session.set_model(ModelRole::Smol).await.unwrap(),
+        model("m")
+    );
+    let events = session.info().await.events;
+    let changes: Vec<_> = events[before..]
+        .iter()
+        .map(|event| match &event.kind {
+            EventKind::ModelChanged { model } => model.model.as_str(),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(changes, ["n", "m"]);
 }
 
 #[tokio::test]

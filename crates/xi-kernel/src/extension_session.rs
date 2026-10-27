@@ -367,7 +367,7 @@ impl Session {
                 model: parent.model.clone(),
                 tools,
             };
-            if let Some(model) = params.model
+            if let Some(model) = params.model.map(|model| config.resolve(&model))
                 && model != config.model
             {
                 config.model = model;

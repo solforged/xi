@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use xi_policy::{Action, ActionKind, Taint};
 use xi_protocol::event::{Approver, ModelRef, Remember, StopReason, Usage};
 use xi_protocol::methods::client::{Delta, DeltaParams, EventParams, ResetParams};
-use xi_protocol::model::{ModelInfo, Reasoning};
+use xi_protocol::model::{ModelInfo, ModelSelector, Reasoning};
 use xi_protocol::{
     Block, Decision, EventId, EventKind, OutputBlock, SessionId, ToolCallId, ToolOutput,
 };
@@ -700,23 +700,30 @@ impl Session {
         Ok(())
     }
 
-    /// Switches model at an idle prompt and records the selection. Selecting
-    /// the model already in use connects it but records nothing.
-    pub async fn set_model(&self, model: ModelRef) -> Result<()> {
+    /// Switches model at an idle prompt and records the selection, returning
+    /// the concrete model a role resolved to. Selecting the model already in
+    /// use connects it but records nothing.
+    pub async fn set_model(&self, model: impl Into<ModelSelector>) -> Result<ModelRef> {
         let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
         let control = self.0.control.lock().expect("control lock");
         if control.running {
             return Err(Error::Running);
         }
+        let model = state.config.resolve(&model.into());
         let mut next = state.config.clone();
         next.model = model.clone();
         let backend = Backend::connect(&next)?;
         if model != state.config.model {
-            self.append(&mut state, EventKind::ModelChanged { model })?;
+            self.append(
+                &mut state,
+                EventKind::ModelChanged {
+                    model: model.clone(),
+                },
+            )?;
         }
         state.config = next;
         state.backend = Some(backend.into());
-        Ok(())
+        Ok(model)
     }
 
     /// Changes reasoning depth at an idle prompt, recording only changed

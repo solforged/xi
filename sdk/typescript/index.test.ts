@@ -53,3 +53,13 @@ test("cancellation reaches the pending handler", async () => {
   kernel.close(); extension.close();
   toExtension.destroy(); toKernel.destroy();
 });
+
+test("agent/run accepts a model or a role and rejects unknown roles", async () => {
+  const { decode } = await import("./validation.ts");
+  for (const model of [undefined, { provider: "claude", model: "claude-haiku-5-5" }, { role: "smol" }, { role: "slow" }]) {
+    assert.deepEqual(decode("agent/run", 0, { session: "s", prompt: "p", model }), { session: "s", prompt: "p", model });
+  }
+  for (const model of [{ role: "huge" }, { provider: "claude" }, "@smol"]) {
+    assert.throws(() => decode("agent/run", 0, { session: "s", prompt: "p", model }));
+  }
+});

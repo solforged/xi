@@ -4,6 +4,9 @@ export type SessionId = string;
 export type EventId = string;
 export type ToolCallId = string;
 export interface ModelRef { provider: string; model: string }
+export type ModelRole = "slow" | "default" | "smol" | "tiny";
+/** A concrete model, or a role the kernel resolves against its config. */
+export type ModelSelector = ModelRef | { role: ModelRole };
 export interface Usage { input: number; output: number; cache_read: number; cache_write: number }
 export type OutputBlock = { type: "text"; text: string } | { type: "image"; media_type: string; data: string };
 export interface ToolOutput { content: OutputBlock[]; is_error?: boolean; untrusted?: boolean }
@@ -28,7 +31,7 @@ export type HookOutcome =
 export interface CommandParams { session: SessionId; name: string; args: string }
 export interface CommandResult { message?: string }
 export interface AppendCustomParams { session: SessionId; kind: string; data: Json }
-export interface AgentRunParams { session: SessionId; prompt: string; tools?: string[]; model?: ModelRef }
+export interface AgentRunParams { session: SessionId; prompt: string; tools?: string[]; model?: ModelSelector }
 export interface AgentRunResult { session: SessionId; path: string; text: string; failed: boolean; usage: Usage }
 export type LogLevel = "debug" | "info" | "warn" | "error";
 export interface LogParams { level: LogLevel; message: string }

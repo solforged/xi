@@ -12,7 +12,8 @@
 //! Providers that speak the same [`Api`] differently say so in [`Compat`].
 //!
 //! The [`Registry`] knows which providers and models exist. It starts from a
-//! built-in table and is extended from config ([`RegistryConfig`]).
+//! built-in table and is extended from config ([`RegistryConfig`]). The
+//! built-in table also names [`Preset`]s, one model per role for each lab.
 //!
 //! Clients share a connection pool per provider, use a 30-second connection
 //! timeout and a 120-second read/idle timeout, and have no total timeout.
@@ -51,7 +52,7 @@ use serde_json::Value;
 use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
-use xi_protocol::model::{ModelInfo, Reasoning};
+use xi_protocol::model::{ModelInfo, ModelRole, Reasoning};
 use xi_protocol::{Block, ToolCallId, ToolOutput};
 
 /// One message of history in provider-neutral form.
@@ -315,6 +316,36 @@ pub struct RegistryConfig {
     /// Models.
     #[serde(default)]
     pub model: Vec<ModelEntry>,
+    /// Role presets by name, as `[preset.<name>]` tables.
+    #[serde(default)]
+    pub preset: BTreeMap<String, Preset>,
+}
+
+/// One `PROVIDER/MODEL` for every [`ModelRole`], selected with `preset`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preset {
+    /// The most capable model.
+    pub slow: String,
+    /// The model new sessions start with.
+    pub default: String,
+    /// A faster, cheaper model.
+    pub smol: String,
+    /// The fastest, cheapest model.
+    pub tiny: String,
+}
+
+impl Preset {
+    /// The `PROVIDER/MODEL` for `role`.
+    #[must_use]
+    pub fn get(&self, role: ModelRole) -> &str {
+        match role {
+            ModelRole::Slow => &self.slow,
+            ModelRole::Default => &self.default,
+            ModelRole::Smol => &self.smol,
+            ModelRole::Tiny => &self.tiny,
+        }
+    }
 }
 
 /// Known providers and models.
@@ -322,6 +353,7 @@ pub struct RegistryConfig {
 pub struct Registry {
     providers: BTreeMap<String, ProviderConfig>,
     models: Vec<ModelEntry>,
+    presets: BTreeMap<String, Preset>,
     clients: Arc<Mutex<BTreeMap<String, reqwest::Client>>>,
     credentials: Option<PathBuf>,
 }

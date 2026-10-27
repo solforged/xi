@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             .into(),
         ],
+        ..Default::default()
     });
     let provider = registry.connect(&ModelRef {
         provider: "live".into(),

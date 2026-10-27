@@ -1,7 +1,10 @@
 //! A filterable model registry, grouped by provider.
 
+use std::collections::BTreeMap;
+
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{ModelEntry, ModelsResult};
+use xi_protocol::model::ModelRole;
 
 use crossterm::event::KeyEvent;
 
@@ -13,6 +16,7 @@ use crate::style::{Line, Role, row};
 /// The model-selection overlay.
 pub struct Picker {
     models: Vec<ModelEntry>,
+    roles: BTreeMap<ModelRole, ModelRef>,
     current: ModelRef,
     query: String,
     matches: Vec<usize>,
@@ -34,11 +38,23 @@ impl Picker {
         let matches = (0..models.len()).collect();
         Self {
             models,
+            roles: result.roles,
             current: result.current,
             query: String::new(),
             matches,
             selected,
         }
+    }
+
+    /// The roles that resolve to `model`, as `@smol @tiny`.
+    fn tags(&self, model: &ModelRef) -> String {
+        let tags: Vec<_> = self
+            .roles
+            .iter()
+            .filter(|(_, assigned)| *assigned == model)
+            .map(|(role, _)| format!("@{role}"))
+            .collect();
+        tags.join(" ")
     }
 
     fn filter(&mut self) {
@@ -48,9 +64,8 @@ impl Picker {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                format!("{}/{}", entry.model.provider, entry.model.model)
-                    .to_lowercase()
-                    .contains(&query)
+                let model = format!("{}/{}", entry.model.provider, entry.model.model);
+                (model.to_lowercase().contains(&query) || self.tags(&entry.model).contains(&query))
                     .then_some(index)
             })
             .collect();
@@ -175,6 +190,10 @@ impl Picker {
             } else if let Some(pricing) = entry.info.pricing {
                 meta.push(format!("${}/${}", pricing.input, pricing.output));
             }
+            let tags = self.tags(&entry.model);
+            if !tags.is_empty() {
+                meta.insert(0, tags);
+            }
             list.push(row(left, Line::default().dim(meta.join(" · ")), inner));
         }
         Body {
@@ -263,6 +282,7 @@ mod tests {
         let mut picker = Picker::new(ModelsResult {
             current: current.model.clone(),
             reasoning: Reasoning::Medium,
+            roles: BTreeMap::new(),
             models: vec![current, entry("chatgpt", "large", false)],
         });
         for c in "chatgpt".chars() {
@@ -294,6 +314,36 @@ mod tests {
     }
 
     #[test]
+    fn rows_name_their_roles_and_filter_on_them() {
+        let big = entry("lab", "big", true);
+        let small = entry("lab", "small", false);
+        let roles = BTreeMap::from([
+            (ModelRole::Slow, big.model.clone()),
+            (ModelRole::Default, big.model.clone()),
+            (ModelRole::Smol, small.model.clone()),
+            (ModelRole::Tiny, small.model.clone()),
+        ]);
+        let mut picker = Picker::new(ModelsResult {
+            current: big.model.clone(),
+            reasoning: Reasoning::Medium,
+            roles,
+            models: vec![big, small, entry("lab", "other", true)],
+        });
+        let rows: Vec<String> = picker.body(116).list.iter().map(Line::plain).collect();
+        assert!(rows[1].ends_with("@slow @default · 1M · think"), "{rows:?}");
+        assert!(
+            rows[3].ends_with("@smol @tiny · no credentials"),
+            "{rows:?}"
+        );
+        assert!(rows[2].ends_with("  1M · think"), "{rows:?}");
+        for c in "@tiny".chars() {
+            picker.input(c);
+        }
+        assert_eq!(picker.selected().unwrap().model.model, "small");
+        assert_eq!(picker.matches.len(), 1);
+    }
+
+    #[test]
     fn short_frames_keep_the_selection_under_its_provider() {
         let models: Vec<_> = (0..20)
             .map(|index| entry(&format!("provider-{index:02}"), "model", true))
@@ -301,6 +351,7 @@ mod tests {
         let mut picker = Picker::new(ModelsResult {
             current: models[0].model.clone(),
             reasoning: Reasoning::Medium,
+            roles: BTreeMap::new(),
             models,
         });
         for _ in 0..15 {

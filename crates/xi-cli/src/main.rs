@@ -9,7 +9,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use xi_client::client::{Client, ClientError};
 use xi_daemon::ProcessSpawner;
-use xi_kernel::config::{Paths, parse_model};
+use xi_kernel::config::Paths;
 use xi_protocol::SessionId;
 use xi_protocol::methods::client::{
     ApprovalPolicy, AttachResult, CreateParams, OpenParams, SessionOptions, ShutdownWhen,
@@ -27,7 +27,7 @@ struct Cli {
     /// Run one prompt and exit.
     #[arg(short = 'p')]
     prompt: Option<String>,
-    /// Provider/model selector.
+    /// Model as PROVIDER/MODEL, or a role: @slow, @default, @smol or @tiny.
     #[arg(short, long, global = true)]
     model: Option<String>,
     /// Reasoning depth; models run the nearest level they accept.
@@ -210,7 +210,7 @@ async fn run(cli: Cli) -> Result<u8> {
     let absolute = |path: &Path| base.join(paths.expand(path));
     let template = CreateParams {
         cwd: cli.cwd.as_deref().map_or_else(|| base.clone(), absolute),
-        model: cli.model.as_deref().map(parse_model).transpose()?,
+        model: cli.model.as_deref().map(str::parse).transpose()?,
         options: SessionOptions {
             configs: cli.config.iter().map(|path| absolute(path)).collect(),
             session_dir: cli.session_dir.as_deref().map(absolute),

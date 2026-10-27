@@ -12,7 +12,7 @@ use xi_protocol::ids::{EventId, SessionId, ToolCallId};
 use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::*;
 use xi_protocol::methods::extension::CommandResult;
-use xi_protocol::model::Reasoning;
+use xi_protocol::model::{ModelSelector, Reasoning};
 use xi_protocol::rpc::{NotificationMethod, RequestMethod, RpcError};
 
 use crate::connect;
@@ -226,10 +226,17 @@ impl Client {
             .await
     }
 
-    /// Selects a session's model.
-    pub async fn set_model(&self, session: SessionId, model: ModelRef) -> Result<(), ClientError> {
-        self.request::<SessionSetModel>(&SetModelParams { session, model })
-            .await
+    /// Selects a session's model or role, returning the concrete model.
+    pub async fn set_model(
+        &self,
+        session: SessionId,
+        model: impl Into<ModelSelector>,
+    ) -> Result<ModelRef, ClientError> {
+        self.request::<SessionSetModel>(&SetModelParams {
+            session,
+            model: model.into(),
+        })
+        .await
     }
 
     /// Selects a session's reasoning depth while idle.
