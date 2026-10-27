@@ -1,7 +1,5 @@
-//! Session-side servicing while a turn owns the log: extension callbacks and
-//! egress proxy decisions. Custom appends and connection decisions need the
-//! log, so they are serviced here rather than trying to reacquire the
-//! session mutex.
+//! Turn-side servicing of extension callbacks and egress decisions while the
+//! actor remains available for approvals, cancellation and steering.
 
 use std::time::Duration;
 
@@ -9,7 +7,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use xi_policy::{Action, ActionKind, Taint};
+use xi_policy::{Action, Taint};
 use xi_protocol::BoxFuture;
 use xi_protocol::event::{Approver, Remember, Usage};
 use xi_protocol::methods::extension::{
@@ -17,6 +15,7 @@ use xi_protocol::methods::extension::{
 };
 use xi_protocol::{Block, Decision, EventKind, ToolCallId};
 
+use super::approvals::ActionKey;
 use crate::egress::{Connect, Verdict};
 use crate::extensions::Incoming;
 use crate::{ApprovalMode, Backend, Error, PendingAsk, Result, Session, State, TurnOptions};
@@ -36,14 +35,20 @@ struct Waiting {
     approved: bool,
     by: Approver,
     remember: Remember,
-    grant: Option<(String, String)>,
+    grant: Option<(String, ActionKey)>,
     reply: oneshot::Sender<Verdict>,
 }
 
 impl Session {
     pub(crate) async fn prepare_extensions(&self, state: &mut State) -> Result<()> {
         if state.backend.is_none() {
-            state.backend = Some(Backend::connect(&state.config)?.into());
+            let config = state.config.clone();
+            state.backend = Some(
+                tokio::task::spawn_blocking(move || Backend::connect(&config))
+                    .await
+                    .map_err(|_| Error::Stopped)??
+                    .into(),
+            );
         }
         if !state.extensions.as_ref().is_some_and(|e| e.running()) {
             state.extensions = Some(
@@ -57,13 +62,15 @@ impl Session {
                     )
                     .await?,
             );
-            *self.0.commands.lock().expect("command catalog") = state
-                .extensions
-                .as_ref()
-                .expect("loaded extensions")
-                .commands()
-                .cloned()
-                .collect();
+            self.0.commands.send_replace(
+                state
+                    .extensions
+                    .as_ref()
+                    .expect("loaded extensions")
+                    .commands()
+                    .cloned()
+                    .collect(),
+            );
         }
         Ok(())
     }
@@ -90,7 +97,7 @@ impl Session {
             let decided = tokio::select! {
                 biased;
                 incoming = scope.receiver.recv() => {
-                    let Some(incoming) = incoming else { break Err(Error::Config("extension scope closed".into())); };
+                    let Some(incoming) = incoming else { break Err(Error::Extension("extension scope closed".into())); };
                     match incoming {
                         Incoming::Request { extension, request, reply } => {
                             if request.method == "session/append_custom" {
@@ -164,7 +171,10 @@ impl Session {
         } else {
             Taint::Clean
         };
-        let action = format!("net {host}:{port}");
+        let action = ActionKey::Net {
+            host: host.clone(),
+            port,
+        };
         let tool = current
             .map(|current| current.tool.to_owned())
             .or_else(|| extension.clone())
@@ -184,7 +194,10 @@ impl Session {
         };
         if decision == Decision::Ask
             && taint == Taint::Clean
-            && state.grants.contains(&(tool.clone(), action.clone()))
+            && state
+                .grants
+                .get(&tool)
+                .is_some_and(|grants| grants.contains(&action))
         {
             decision = Decision::Allow;
             rule = Some("session".into());
@@ -195,23 +208,17 @@ impl Session {
             && matches!(self.0.options.approval, ApprovalMode::Client)
         {
             let (tx, rx) = oneshot::channel();
-            self.0
-                .control
-                .lock()
-                .expect("control lock")
-                .approvals
-                .insert(
-                    id.clone(),
-                    PendingAsk {
-                        answer: tx,
-                        taint: taint_ask,
-                        kind: ActionKind::Net,
-                        subject: host.clone(),
-                        grant: (tool, action.clone()),
-                        workspace: state.config.workspace.clone(),
-                        trusted: state.config.trusted,
-                    },
-                );
+            self.register_ask(
+                id.clone(),
+                PendingAsk {
+                    answer: tx,
+                    taint: taint_ask,
+                    grant: (tool, action.clone()),
+                    workspace: state.config.workspace.clone(),
+                    trusted: state.config.trusted,
+                    resolving: false,
+                },
+            );
             Some(rx)
         } else {
             None
@@ -220,7 +227,7 @@ impl Session {
             state,
             EventKind::ToolDecision {
                 call: id.clone(),
-                action,
+                action: action.to_string(),
                 decision,
                 rule: rule.clone(),
                 taint: taint_ask,
@@ -295,12 +302,7 @@ impl Session {
 
     /// Records an egress ask's answer and releases the connection.
     fn finish_egress(&self, state: &mut State, done: Waiting) -> Result<()> {
-        self.0
-            .control
-            .lock()
-            .expect("control lock")
-            .approvals
-            .remove(&done.id);
+        self.remove_ask(done.id.clone());
         let verdict = if done.approved {
             Verdict::Allow
         } else {
@@ -320,7 +322,7 @@ impl Session {
             },
         )?;
         if let Some(grant) = done.grant {
-            state.grants.insert(grant);
+            state.grants.entry(grant.0).or_default().insert(grant.1);
         }
         let _ = done.reply.send(verdict);
         Ok(())
@@ -350,12 +352,24 @@ impl Session {
         params: AgentRunParams,
         cancel: &CancellationToken,
     ) -> BoxFuture<'static, Result<(AgentRunResult, bool)>> {
-        let prepared = (|| -> Result<_> {
-            let mut config = state.config.clone();
-            let parent = state.backend.as_ref().expect("connected backend");
+        let mut config = state.config.clone();
+        let parent = state.backend.as_ref().expect("connected backend");
+        let parent_provider = parent.provider.clone();
+        let parent_model = parent.model.clone();
+        let parent_specs = parent.specs.clone();
+        let parent_tools = parent.tools.clone();
+        let directory = state
+            .log
+            .file_path()
+            .parent()
+            .map(std::path::Path::to_owned);
+        let bus = self.0.bus.clone();
+        let options = self.0.options.clone();
+        let parent_id = self.id();
+        let parent_snapshot = self.0.snapshot.clone();
+        let prepared = move || -> Result<_> {
             let names = params.tools.unwrap_or_else(|| {
-                parent
-                    .specs
+                parent_specs
                     .iter()
                     .filter(|s| xi_tools::is_builtin(&s.name))
                     .map(|s| s.name.clone())
@@ -364,7 +378,7 @@ impl Session {
             let mut tools = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for name in &names {
-                if !xi_tools::is_builtin(name) || !parent.tools.contains_key(name) {
+                if !xi_tools::is_builtin(name) || !parent_tools.contains_key(name) {
                     return Err(Error::Config(format!(
                         "child tool {name} is not one of the parent's built-in tools"
                     )));
@@ -372,12 +386,12 @@ impl Session {
                 if !seen.insert(name) {
                     return Err(Error::Config(format!("duplicate child tool {name}")));
                 }
-                tools.push(parent.tools[name].clone());
+                tools.push(parent_tools[name].clone());
             }
             config.tools = names;
             let mut backend = Backend {
-                provider: parent.provider.clone(),
-                model: parent.model.clone(),
+                provider: parent_provider,
+                model: parent_model,
                 tools,
             };
             if let Some(model) = params.model.map(|model| config.resolve(&model))
@@ -390,23 +404,42 @@ impl Session {
             }
             let child = Self::create_linked(
                 config,
-                state.log.file_path().parent(),
-                self.0.bus.clone(),
+                directory.as_deref(),
+                bus,
                 TurnOptions {
-                    max_turns: self.0.options.max_turns,
+                    max_turns: options.max_turns,
                     approval: ApprovalMode::Headless(false),
-                    leaser: self.0.options.leaser.clone(),
+                    leaser: options.leaser,
                     auto_title: false,
                 },
                 Some(backend),
-                Some(self.id()),
+                Some((parent_id, parent_snapshot)),
             )?;
             Ok((child, params.prompt))
-        })();
+        };
+        // Reserve order before spawning: scheduler order must not renumber children.
+        let ticket = self
+            .0
+            .child_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let order = self.0.child_ready.clone();
+        let mut ready = order.subscribe();
+        let prepared = tokio::spawn(async move {
+            ready
+                .wait_for(|next| *next == ticket)
+                .await
+                .map_err(|_| Error::Stopped)?;
+            let result = tokio::task::spawn_blocking(prepared)
+                .await
+                .map_err(|_| Error::Stopped)
+                .and_then(|result| result);
+            order.send_replace(ticket + 1);
+            result
+        });
         let cancel = cancel.clone();
         let stop = self.0.stop.clone();
         Box::pin(async move {
-            let (child, prompt) = prepared?;
+            let (child, prompt) = prepared.await.map_err(|_| Error::Stopped)??;
             let mut reply = child.submit(vec![Block::Text { text: prompt }]);
             let outcome = tokio::select! {
                 biased;
@@ -414,14 +447,10 @@ impl Session {
                 () = cancel.cancelled() => { child.cancel(); reply.await }
                 result = &mut reply => result,
             }
-            .map_err(|_| Error::Config("child turn stopped".into()))?
-            .map_err(Error::Config)?;
+            .map_err(|_| Error::Stopped)??;
             child.shutdown_extensions().await;
             let info = child.info().await;
-            let tainted = {
-                let state = child.0.state.lock().await;
-                state.log.is_tainted(state.head) == Some(true)
-            };
+            let tainted = info.tainted;
             let mut usage = Usage::default();
             for event in &info.events {
                 let tokens = match event.kind {
@@ -443,31 +472,38 @@ impl Session {
                 failed: outcome.failed || outcome.cancelled,
                 usage,
             };
+            child.close();
+            child.wait_idle().await;
             Ok((result, tainted))
         })
     }
 
     /// Routes a slash command without its leading slash. `None` means unknown.
     pub async fn command(&self, name: &str, args: &str) -> Result<Option<CommandResult>> {
-        let mut state = self.0.state.try_lock().map_err(|_| Error::Running)?;
-        if self.is_running() {
-            return Err(Error::Running);
-        }
-        self.prepare_extensions(&mut state).await?;
+        let (reply, rx) = oneshot::channel();
+        self.idle_operation(
+            super::actor::IdleCommand::ExtensionCommand(name.into(), args.into(), reply),
+            rx,
+        )
+        .await
+    }
+
+    pub(crate) async fn command_state(
+        &self,
+        state: &mut State,
+        name: &str,
+        args: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<CommandResult>> {
+        self.prepare_extensions(state).await?;
         let extensions = state.extensions.clone().unwrap_or_default();
         let params = CommandParams {
             session: self.id(),
             name: name.into(),
             args: args.into(),
         };
-        let cancel = CancellationToken::new();
-        self.service(
-            &mut state,
-            extensions.command(&params, &cancel),
-            &cancel,
-            None,
-        )
-        .await
+        self.service(state, extensions.command(&params, cancel), cancel, None)
+            .await
     }
 
     /// Runs `compact` hooks, serving full-duplex custom appends and child

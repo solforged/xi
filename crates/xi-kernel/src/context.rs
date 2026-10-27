@@ -233,7 +233,10 @@ pub(crate) fn expand_skill(
     let text = std::fs::read_to_string(&skill.path)
         .map_err(|e| format!("{}: {e}", skill.path.display()))?;
     let body = frontmatter(&text).map_or(text.as_str(), |(_, body)| body);
-    let directory = skill.path.parent().expect("SKILL.md has a directory");
+    let directory = skill
+        .path
+        .parent()
+        .ok_or_else(|| format!("{}: skill path has no directory", skill.path.display()))?;
     let mut expanded = Vec::with_capacity(content.len() + 1);
     expanded.push(xi_protocol::skill::instructions(
         &skill.name,

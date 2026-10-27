@@ -1,6 +1,11 @@
 //! The worker side of the daemon pipe: one session per worker process.
+//!
+//! Attach responses come from the kernel's published snapshot. The worker
+//! forwards typed event and stream notifications without replaying the log or
+//! changing stream sequence numbers. Session construction runs on a blocking
+//! thread before async extension startup.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,18 +17,17 @@ use tokio::task::JoinSet;
 use xi_protocol::BoxFuture;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
-    ApprovalPolicy, ApprovalResolve, AttachResult, ChildEvents, Delta, EventAppended, EventParams,
-    ModelEntry, ModelsResult, PendingApproval, PromptResult, SessionAttach, SessionCancel,
-    SessionCheckout, SessionClose, SessionCommand, SessionCommands, SessionCompact, SessionDetails,
-    SessionModels, SessionOptions, SessionPrompt, SessionRename, SessionSetModel,
-    SessionSetReasoning, SessionSetSandbox, StreamDelta, StreamReset,
+    ApprovalPolicy, ApprovalResolve, AttachResult, EventAppended, ModelEntry, ModelsResult,
+    PromptResult, SessionAttach, SessionCancel, SessionCheckout, SessionClose, SessionCommand,
+    SessionCommands, SessionCompact, SessionModels, SessionOptions, SessionPrompt, SessionRename,
+    SessionSetModel, SessionSetReasoning, SessionSetSandbox, StreamDelta, StreamReset,
 };
 use xi_protocol::methods::worker::{
     LeaseParams, ModelLease, ModelRelease, WorkerStart, WorkerStartParams,
 };
-use xi_protocol::model::{ModelRole, Reasoning};
+use xi_protocol::model::ModelRole;
 use xi_protocol::rpc::{RequestId, RequestMethod, RpcError};
-use xi_protocol::{Block, Decision, Event, EventId, EventKind, SessionId, ToolCallId};
+use xi_protocol::{Event, EventId, EventKind, SessionId};
 use xi_provider::{Auth, LoginService, Registry};
 use xi_rpc::{Incoming, Peer, decode_request, encode_result};
 use xi_session::SessionLog;
@@ -58,13 +62,11 @@ impl Leaser for PeerLeaser {
                 let result = peer
                     .request::<ModelLease>(&params)
                     .await
-                    .map_err(|error| Error::Config(error.to_string()))
+                    .map_err(|error| Error::Operation(error.to_string()))
                     .map(|()| Box::new(LeaseGuard { peer, params }) as Box<dyn Send>);
                 let _ = reply.send(result);
             });
-            granted
-                .await
-                .map_err(|_| Error::Config("lease task stopped".into()))?
+            granted.await.map_err(|_| Error::Stopped)?
         })
     }
 }
@@ -82,158 +84,15 @@ impl Drop for LeaseGuard {
 
 struct Worker {
     session: Session,
-    mirror: Mirror,
-}
-
-struct Mirror {
-    info: SessionDetails,
     registry: Registry,
     credentials: PathBuf,
-    /// Each role's model; config does not change while the worker runs.
+    /// Each role's model; the role configuration is fixed for this worker.
     roles: BTreeMap<ModelRole, ModelRef>,
-    initial_reasoning: Reasoning,
-    events: Vec<Event>,
-    index: HashMap<EventId, usize>,
-    partial: Vec<Block>,
-    stream_sequence: u64,
-    tools: HashMap<ToolCallId, String>,
-    pending: Vec<PendingApproval>,
-    /// Children started since the last tool result, kept for attach.
-    children: Vec<ChildEvents>,
 }
 
-impl Mirror {
-    fn event(&mut self, event: &Event) {
-        if self.index.contains_key(&event.id) {
-            return;
-        }
-        self.info.head = event.id;
-        match &event.kind {
-            EventKind::AssistantMessage { content, .. } => {
-                self.partial.clear();
-                for block in content {
-                    if let Block::ToolUse { id, name, .. } = block {
-                        self.tools.insert(id.clone(), name.clone());
-                    }
-                }
-            }
-            EventKind::UserMessage { .. } => {
-                self.partial.clear();
-                self.children.clear();
-            }
-            EventKind::TurnFailed { .. } => {
-                self.partial.clear();
-            }
-            EventKind::Compaction { .. } => self.children.clear(),
-            EventKind::ModelChanged { model } => {
-                self.info.model = model.clone();
-                self.info.model_info = self.registry.model(model).cloned();
-            }
-            EventKind::ReasoningChanged { reasoning } => {
-                self.info.reasoning = *reasoning;
-            }
-            EventKind::SandboxChanged { enabled } => {
-                self.info.sandbox_enabled = *enabled;
-            }
-            EventKind::ToolDecision {
-                call,
-                action,
-                decision: Decision::Ask,
-                rule,
-                taint,
-                during,
-                extension,
-            } => {
-                if !self.pending.iter().any(|pending| pending.call == *call) {
-                    self.pending.push(PendingApproval {
-                        session: self.info.session,
-                        call: call.clone(),
-                        tool: self
-                            .tools
-                            .get(during.as_ref().unwrap_or(call))
-                            .cloned()
-                            .or_else(|| extension.clone())
-                            .unwrap_or_default(),
-                        action: action.clone(),
-                        rule: rule.clone(),
-                        taint: *taint,
-                        trusted: self.info.trusted,
-                    });
-                }
-            }
-            EventKind::ApprovalResolved { call, .. } => {
-                self.pending.retain(|pending| pending.call != *call);
-            }
-            EventKind::ToolResult { call, .. } => {
-                self.pending.retain(|pending| pending.call != *call);
-                self.tools.remove(call);
-                // The call these children ran under has its result.
-                self.children.clear();
-            }
-            _ => {}
-        }
-        self.index.insert(event.id, self.events.len());
-        self.events.push(event.clone());
-    }
-
-    /// Records an event from another session on this worker's bus. Returns
-    /// whether it belongs to a child of this session.
-    fn child(&mut self, params: &EventParams) -> bool {
-        if let Some(child) = self
-            .children
-            .iter_mut()
-            .find(|c| c.session == params.session)
-        {
-            child.events.push(params.event.clone());
-            return true;
-        }
-        match &params.event.kind {
-            EventKind::SessionStarted {
-                parent_session: Some(parent),
-                ..
-            } if *parent == self.info.session => {
-                self.children.push(ChildEvents {
-                    session: params.session,
-                    events: vec![params.event.clone()],
-                });
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn checkout(&mut self, head: EventId) {
-        self.info.head = head;
-        self.info.reasoning = self.initial_reasoning;
-        let mut model_found = false;
-        let mut reasoning_found = false;
-        let mut next = Some(head);
-        while let Some(id) = next {
-            let Some(event) = self.index.get(&id).map(|index| &self.events[*index]) else {
-                break;
-            };
-            match &event.kind {
-                EventKind::SessionStarted { model, .. } | EventKind::ModelChanged { model }
-                    if !model_found =>
-                {
-                    self.info.model = model.clone();
-                    self.info.model_info = self.registry.model(model).cloned();
-                    model_found = true;
-                }
-                EventKind::ReasoningChanged { reasoning } if !reasoning_found => {
-                    self.info.reasoning = *reasoning;
-                    reasoning_found = true;
-                }
-                _ => {}
-            }
-            if model_found && reasoning_found {
-                break;
-            }
-            next = event.parent;
-        }
-    }
-
+impl Worker {
     fn models(&self) -> ModelsResult {
+        let details = self.session.details();
         let mut models: Vec<_> = self
             .registry
             .models()
@@ -269,36 +128,33 @@ impl Mirror {
                 .cmp(&(&right.model.provider, &right.model.model))
         });
         ModelsResult {
-            current: self.info.model.clone(),
-            reasoning: self.info.reasoning,
+            current: details.model,
+            reasoning: details.reasoning,
             models,
             roles: self.roles.clone(),
         }
     }
 
-    fn attach(&self, since: Option<EventId>, running: bool) -> RpcResult<AttachResult> {
-        let start =
-            match since {
-                Some(id) => self.index.get(&id).map(|index| index + 1).ok_or_else(|| {
-                    RpcError::new(RpcError::INVALID_PARAMS, "unknown replay event")
-                })?,
-                None => 0,
-            };
+    fn attach(&self, since: Option<EventId>) -> RpcResult<AttachResult> {
+        let mut snapshot = self.session.snapshot();
+        if let Some(id) = since {
+            let index = snapshot
+                .events
+                .iter()
+                .position(|event| event.id == id)
+                .ok_or_else(|| kernel_error(Error::UnknownEvent(id)))?;
+            drop(snapshot.events.drain(..=index));
+        }
         Ok(AttachResult {
-            info: self.info.clone(),
-            events: self.events[start..].to_vec(),
-            partial: self.partial.clone(),
-            stream_sequence: self.stream_sequence,
-            running,
-            pending_approvals: self.pending.clone(),
-            children: self.children.clone(),
+            info: snapshot.details,
+            events: snapshot.events,
+            partial: snapshot.partial,
+            stream_sequence: snapshot.stream_sequence,
+            running: self.session.is_running(),
+            pending_approvals: snapshot.pending_approvals,
+            children: snapshot.children,
         })
     }
-}
-
-enum Completion {
-    Value(Value),
-    Checkout { head: EventId, value: Value },
 }
 
 /// Serves one session over a daemon pipe until the session closes or the pipe ends.
@@ -311,13 +167,13 @@ where
     let bus = EventBus::default();
     let mut notifications = bus.subscribe();
     let mut worker: Option<Worker> = None;
-    let mut requests: JoinSet<(RequestId, RpcResult<Completion>)> = JoinSet::new();
+    let mut requests: JoinSet<(RequestId, RpcResult<Value>)> = JoinSet::new();
     let graceful = loop {
         tokio::select! {
             _ = peer.closed() => break false,
             notification = notifications.recv() => {
                 if let Some(notification) = notification {
-                    mirror(&mut worker, &peer, notification);
+                    forward(&worker, &peer, notification);
                 }
             }
             call = incoming.recv() => {
@@ -327,8 +183,8 @@ where
                 let Incoming::Request { id, method, params } = call else {
                     continue;
                 };
-                drain(&mut notifications, &mut worker, &peer);
-                let Some(active) = worker.as_mut() else {
+                drain(&mut notifications, &worker, &peer);
+                let Some(active) = worker.as_ref() else {
                     if method != WorkerStart::METHOD {
                         let _ = peer.respond(id, Err(RpcError::new(
                             RpcError::NOT_INITIALIZED, "worker/start is required",
@@ -342,9 +198,9 @@ where
                     let result = match result {
                         Ok(active) => {
                             worker = Some(active);
-                            drain(&mut notifications, &mut worker, &peer);
+                            drain(&mut notifications, &worker, &peer);
                             worker.as_ref().expect("worker was just started")
-                                .mirror.attach(None, false).and_then(encode_result::<WorkerStart>)
+                                .attach(None).and_then(encode_result::<WorkerStart>)
                         }
                         Err(error) => Err(error),
                     };
@@ -355,7 +211,7 @@ where
                     SessionModels::METHOD => {
                         let result = decode_request::<SessionModels>(params).and_then(|params| {
                             check_session(&active.session, params.session)?;
-                            encode_result::<SessionModels>(active.mirror.models())
+                            encode_result::<SessionModels>(active.models())
                         });
                         let _ = peer.respond(id, result);
                     }
@@ -369,7 +225,7 @@ where
                     SessionAttach::METHOD => {
                         let result = decode_request::<SessionAttach>(params).and_then(|params| {
                             check_session(&active.session, params.session)?;
-                            active.mirror.attach(params.since, active.session.is_running())
+                            active.attach(params.since)
                                 .and_then(encode_result::<SessionAttach>)
                         });
                         let _ = peer.respond(id, result);
@@ -398,16 +254,14 @@ where
                                 requests.spawn(async move {
                                     let result = async {
                                         let outcome = prompt.await
-                                            .map_err(|_| kernel_error(Error::Config(
-                                                "turn task stopped".into(),
-                                            )))?
-                                            .map_err(|error| kernel_error(Error::Config(error)))?;
-                                        Ok(Completion::Value(encode_result::<SessionPrompt>(PromptResult {
+                                            .map_err(|_| kernel_error(Error::Stopped))?
+                                            .map_err(kernel_error)?;
+                                        encode_result::<SessionPrompt>(PromptResult {
                                             head: outcome.head,
                                             failed: outcome.failed,
                                             cancelled: outcome.cancelled,
                                             text: outcome.text,
-                                        })?))
+                                        })
                                     }.await;
                                     (id, result)
                                 });
@@ -427,16 +281,7 @@ where
             }
             completed = requests.join_next(), if !requests.is_empty() => {
                 if let Some(Ok((id, result))) = completed {
-                    drain(&mut notifications, &mut worker, &peer);
-                    let result = result.map(|completion| match completion {
-                        Completion::Value(value) => value,
-                        Completion::Checkout { head, value } => {
-                            if let Some(active) = worker.as_mut() {
-                                active.mirror.checkout(head);
-                            }
-                            value
-                        }
-                    });
+                    drain(&mut notifications, &worker, &peer);
                     let _ = peer.respond(id, result);
                 }
             }
@@ -454,16 +299,14 @@ where
     // get their replies before the pipe closes.
     while let Some(completed) = requests.join_next().await {
         if let Ok((id, result)) = completed {
-            drain(&mut notifications, &mut worker, &peer);
-            let result = result.map(|completion| match completion {
-                Completion::Value(value) => value,
-                Completion::Checkout { value, .. } => value,
-            });
+            drain(&mut notifications, &worker, &peer);
             let _ = peer.respond(id, result);
         }
     }
     if let Some(active) = worker.as_ref() {
         active.session.shutdown_extensions().await;
+        active.session.close();
+        active.session.wait_idle().await;
     }
     peer.close();
     peer.closed().await;
@@ -476,125 +319,60 @@ async fn start(
     peer: &Peer,
     bus: &EventBus,
 ) -> RpcResult<Worker> {
-    let (options, cwd, log, model) = match params {
-        WorkerStartParams::Create(params) => {
-            validate_absolute(&params.cwd, "cwd")?;
-            (params.options, params.cwd, None, params.model)
-        }
-        WorkerStartParams::Open(params) => {
-            validate_absolute(&params.path, "session log path")?;
-            validate_options(&params.options)?;
-            let log = SessionLog::open(params.path).map_err(|error| kernel_error(error.into()))?;
-            let EventKind::SessionStarted { cwd, .. } = &log.root().kind else {
-                unreachable!("validated session root")
-            };
-            (params.options, cwd.clone(), Some(log), None)
-        }
-    };
-    validate_options(&options)?;
-    let mut config = session_config(&setup.paths, &cwd, &options).map_err(kernel_error)?;
-    if let Some(model) = model {
-        config.model = config.resolve(&model);
-    }
-    let turn = TurnOptions {
-        max_turns: options.max_turns.unwrap_or(200),
-        approval: match options.approval {
-            ApprovalPolicy::Client => ApprovalMode::Client,
-            ApprovalPolicy::Allow => ApprovalMode::Headless(true),
-            ApprovalPolicy::Deny => ApprovalMode::Headless(false),
-        },
-        leaser: Some(Arc::new(PeerLeaser(peer.clone()))),
-        auto_title: options.auto_title,
-    };
-    let session = match log {
-        Some(log) => Session::from_log(log, config, bus.clone(), turn, setup.backend.take()),
-        None => Session::create(
-            config,
-            options.session_dir.as_deref(),
-            bus.clone(),
-            turn,
-            setup.backend.take(),
-        ),
-    }
-    .map_err(kernel_error)?;
-    let mut state = session.0.state.lock().await;
-    let mut commands = Vec::new();
-    if !state.config.extensions.is_empty() {
-        // Registration needs tool schemas, not a model connection or credential.
-        let specs = match &state.backend {
-            Some(backend) => Ok(std::borrow::Cow::Borrowed(backend.specs.as_slice())),
-            None => crate::toolset(&state.config).map(|tools| {
-                std::borrow::Cow::Owned(tools.iter().map(|tool| tool.spec()).collect())
-            }),
-        };
-        let loaded = match specs {
-            Ok(specs) => {
-                session
-                    .0
-                    .extensions
-                    .startup(
-                        &state.config,
-                        &state.tools_context,
-                        state.log.file_path(),
-                        &specs,
-                    )
-                    .await
+    let paths = setup.paths.clone();
+    let backend = setup.backend.take();
+    let peer = peer.clone();
+    let bus = bus.clone();
+    // Loading the log and constructing the session can probe the host and
+    // access the filesystem, so neither runs on an async executor thread.
+    let session = tokio::task::spawn_blocking(move || {
+        let (options, cwd, log, model) = match params {
+            WorkerStartParams::Create(params) => {
+                validate_absolute(&params.cwd, "cwd")?;
+                (params.options, params.cwd, None, params.model)
             }
-            Err(error) => Err(error),
-        };
-        match loaded {
-            Ok((extensions, complete)) => {
-                commands = extensions.commands().cloned().collect();
-                // Incomplete startup catalogs retry through the normal use path.
-                if complete {
-                    state.extensions = Some(extensions);
-                }
+            WorkerStartParams::Open(params) => {
+                validate_absolute(&params.path, "session log path")?;
+                validate_options(&params.options)?;
+                let log =
+                    SessionLog::open(params.path).map_err(|error| kernel_error(error.into()))?;
+                let EventKind::SessionStarted { cwd, .. } = &log.root().kind else {
+                    unreachable!("validated session root")
+                };
+                (params.options, cwd.clone(), Some(log), None)
             }
-            Err(error) => eprintln!("xi: extension startup: {error}"),
+        };
+        validate_options(&options)?;
+        let mut config = session_config(&paths, &cwd, &options).map_err(kernel_error)?;
+        if let Some(model) = model {
+            config.model = config.resolve(&model);
         }
-    }
-    *session.0.commands.lock().expect("command catalog") = commands;
-    let registry = state.config.registry();
-    let parent_session = match &state.log.root().kind {
-        EventKind::SessionStarted { parent_session, .. } => *parent_session,
-        _ => unreachable!("validated session root"),
-    };
-    let info = SessionDetails {
-        session: session.id(),
-        path: state.log.file_path().to_owned(),
-        head: state.head,
-        cwd: state.config.workspace.clone(),
-        trusted: state.config.trusted,
-        model: state.config.model.clone(),
-        reasoning: state.config.reasoning,
-        sandbox_enabled: state.config.sandbox.enabled,
-        model_info: registry.model(&state.config.model).cloned(),
-        parent_session,
-    };
-    let mut mirror = Mirror {
-        info,
-        registry,
-        credentials: state.config.paths.credentials(),
-        roles: state.config.resolved_roles(),
-        initial_reasoning: state.initial_reasoning,
-        events: Vec::with_capacity(state.log.events().len()),
-        index: HashMap::new(),
-        partial: Vec::new(),
-        stream_sequence: 0,
-        tools: HashMap::new(),
-        pending: Vec::new(),
-        children: Vec::new(),
-    };
-    for event in state.log.events() {
-        mirror.event(event);
-    }
-    mirror.checkout(state.head);
-    // Replaying the log must not overwrite an explicit open-time override.
-    mirror.info.reasoning = state.config.reasoning;
-    // Sandbox events audit prior workers; they never restore an override.
-    mirror.info.sandbox_enabled = state.config.sandbox.enabled;
-    drop(state);
-    Ok(Worker { session, mirror })
+        let turn = TurnOptions {
+            max_turns: options.max_turns.unwrap_or(200),
+            approval: match options.approval {
+                ApprovalPolicy::Client => ApprovalMode::Client,
+                ApprovalPolicy::Allow => ApprovalMode::Headless(true),
+                ApprovalPolicy::Deny => ApprovalMode::Headless(false),
+            },
+            leaser: Some(Arc::new(PeerLeaser(peer))),
+            auto_title: options.auto_title,
+        };
+        match log {
+            Some(log) => Session::from_log(log, config, bus, turn, backend),
+            None => Session::create(config, options.session_dir.as_deref(), bus, turn, backend),
+        }
+        .map_err(kernel_error)
+    })
+    .await
+    .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))??;
+    session.startup_extensions().await.map_err(kernel_error)?;
+    let config = session.config();
+    Ok(Worker {
+        session,
+        registry: config.registry(),
+        credentials: config.paths.credentials(),
+        roles: config.resolved_roles(),
+    })
 }
 
 fn validate_options(options: &SessionOptions) -> RpcResult<()> {
@@ -660,7 +438,7 @@ fn session_config(paths: &Paths, cwd: &Path, options: &SessionOptions) -> Result
     Ok(config)
 }
 
-async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Completion> {
+async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Value> {
     let value = match method {
         SessionCancel::METHOD => {
             let params = decode_request::<SessionCancel>(params)?;
@@ -672,10 +450,7 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
             let params = decode_request::<SessionCheckout>(params)?;
             check_session(&session, params.session)?;
             session.checkout(params.event).await.map_err(kernel_error)?;
-            return Ok(Completion::Checkout {
-                head: params.event,
-                value: encode_result::<SessionCheckout>(())?,
-            });
+            encode_result::<SessionCheckout>(())?
         }
         SessionCompact::METHOD => {
             let params = decode_request::<SessionCompact>(params)?;
@@ -731,6 +506,7 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
             check_session(&session, params.session)?;
             session
                 .approve(&params.call, params.approved, params.remember)
+                .await
                 .map_err(kernel_error)?;
             encode_result::<ApprovalResolve>(())?
         }
@@ -741,42 +517,24 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
             ));
         }
     };
-    Ok(Completion::Value(value))
+    Ok(value)
 }
 
-fn mirror(worker: &mut Option<Worker>, peer: &Peer, notification: Notification) {
-    let Some(active) = worker.as_mut() else {
+fn forward(worker: &Option<Worker>, peer: &Peer, notification: Notification) {
+    let Some(active) = worker.as_ref() else {
         return;
     };
     match notification {
-        Notification::Event(params) if params.session == active.session.id() => {
-            active.mirror.event(&params.event);
+        // The worker-local bus contains this session and its children. Child
+        // stream output stays local; clients draw children from durable events.
+        Notification::Event(params) => {
             let _ = peer.notify::<EventAppended>(&params);
         }
-        Notification::Delta(mut params) if params.session == active.session.id() => {
-            active.mirror.stream_sequence += 1;
-            params.sequence = active.mirror.stream_sequence;
-            match &params.delta {
-                Delta::Text { text } => {
-                    crate::push_partial(&mut active.mirror.partial, text, false)
-                }
-                Delta::Thinking { text } => {
-                    crate::push_partial(&mut active.mirror.partial, text, true)
-                }
-                Delta::ToolInput { .. } => {}
-            }
+        Notification::Delta(params) if params.session == active.session.id() => {
             let _ = peer.notify::<StreamDelta>(&params);
         }
-        Notification::Reset(mut params) if params.session == active.session.id() => {
-            active.mirror.stream_sequence += 1;
-            params.sequence = active.mirror.stream_sequence;
-            active.mirror.partial.clear();
+        Notification::Reset(params) if params.session == active.session.id() => {
             let _ = peer.notify::<StreamReset>(&params);
-        }
-        // Only the session's children share its bus. Their stream deltas
-        // stay in the worker; clients draw children from events.
-        Notification::Event(params) if active.mirror.child(&params) => {
-            let _ = peer.notify::<EventAppended>(&params);
         }
         _ => {}
     }
@@ -784,11 +542,11 @@ fn mirror(worker: &mut Option<Worker>, peer: &Peer, notification: Notification) 
 
 fn drain(
     notifications: &mut mpsc::UnboundedReceiver<Notification>,
-    worker: &mut Option<Worker>,
+    worker: &Option<Worker>,
     peer: &Peer,
 ) {
     while let Ok(notification) = notifications.try_recv() {
-        mirror(worker, peer, notification);
+        forward(worker, peer, notification);
     }
 }
 
@@ -803,8 +561,14 @@ fn kernel_error(error: Error) -> RpcError {
     let code = match &error {
         Error::Running => RpcError::SESSION_RUNNING,
         Error::NotPending => RpcError::APPROVAL_NOT_PENDING,
-        Error::InvalidRemember(_) => RpcError::INVALID_PARAMS,
-        Error::Session(xi_session::Error::Locked(_)) => RpcError::SESSION_HELD,
+        Error::Config(_)
+        | Error::Model { .. }
+        | Error::UnknownEvent(_)
+        | Error::InvalidRemember(_) => RpcError::INVALID_PARAMS,
+        Error::Session(error) if matches!(error.as_ref(), xi_session::Error::Locked(_)) => {
+            RpcError::SESSION_HELD
+        }
+        Error::Extension(_) | Error::Stopped | Error::Tool(_) => RpcError::INTERNAL_ERROR,
         _ => RpcError::INTERNAL_ERROR,
     };
     RpcError::new(code, error.to_string())

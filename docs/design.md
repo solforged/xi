@@ -68,12 +68,23 @@ Line mode and the TUI connect through `xi-client`, which autostarts the per-user
 
 Each worker runs the kernel with these responsibilities:
 
-1. Run the agent loop: build context, call the model, dispatch tool calls, append results.
-2. Own the session log and broadcast every appended event.
-3. Evaluate policy for every boundary crossing and run tools inside the sandbox.
-4. Spawn, supervise and route to extensions.
+1. Own mutable session state in one actor: the log, head, configuration, approvals and active turn.
+2. Run the agent loop: build context, call the model, dispatch tool calls, append results and broadcast typed notifications.
+3. Publish an incremental snapshot so session information and attachment do not wait for a running model request, tool or approval.
+4. Evaluate policy for every boundary crossing and run tools inside the sandbox.
+5. Spawn, supervise and route to extensions.
 
 Other agent behavior belongs in an extension or a client.
+
+The `Session` handle sends state-changing requests to the actor and reads published state without locking the running turn. The actor continues servicing approvals while a turn waits for a decision. Cancellation and request shutdown remain synchronous handle operations; new or queued prompts rejected after shutdown return the typed `Stopped` error.
+
+Synchronous session constructors require an entered Tokio runtime to start the actor. A running turn owns the log by value and returns it before its prompt replies are delivered. Accepted submissions retain the handle until delivery, while an idle actor holds only a weak reference. Call `close` and await `wait_idle` before reopening a session file synchronously; this releases the actor-owned log lock.
+
+Snapshots carry session details, the current head, durable events, partial assistant blocks, the stream sequence, pending approvals, child events and taint. A watch channel publishes an incrementally updated event vector. Each append copies only the new event, with amortized constant-time insertion; publishing a delta or approval does not copy the full history. The public event vector is copied only for `info` or attachment.
+
+Linked children update their parent's child snapshot before broadcasting each durable event. Child construction is sequenced off-thread in request order, while child turns run concurrently. Parent batch-clearing appends therefore cannot race with delayed child notifications.
+
+The kernel's session implementation is split by responsibility: `session/mod.rs` owns the handle, `actor.rs` owns state and request dispatch, `turn.rs` drives model turns, `invoke.rs` runs tool calls, `approvals.rs` resolves asks and remembers grants, and `restore.rs` rebuilds state from the selected log lineage.
 
 #### Lifecycle
 
@@ -580,7 +591,7 @@ Tool processes run sandboxed by default; extensions always run sandboxed. The ke
 - Network: Linux uses a private network namespace with only loopback. macOS denies all IP networking, including connections to host localhost servers and binding in-sandbox loopback servers. The one exception on both platforms is the session's egress proxy ([Egress](#egress)), reached through `HTTP_PROXY`. `Network::Host` allows host IP networking on either platform. The only additional macOS Unix socket access is the system DNS resolver described below.
 - Terminal: the helper starts a new session, so there's no controlling terminal to push input into with `TIOCSTI`.
 
-The kernel's `config` module owns layered loading and trust. Its `schema` submodule defines file settings and defaults, and `approvals` builds preset rules and persists workspace allow rules. The separate `sandbox` module materializes git settings and builds the sandbox specification. Its blocking `probe_host` function gathers host git and developer-tool settings. `Config` caches that snapshot for git materialization and sandbox construction. Session constructors are synchronous, so their first probe still blocks the caller.
+The kernel's `config` module owns layered loading and trust. Its `schema` submodule defines file settings and defaults, and `approvals` builds preset rules and persists workspace allow rules. The separate `sandbox` module materializes git settings and builds the sandbox specification. Its blocking `probe_host` function gathers host git and developer-tool settings. `Config` caches that snapshot for git materialization and sandbox construction. Worker and child-session startup run synchronous construction on blocking threads, so the first probe never runs on an async runtime thread.
 
 Setup failures exit 125, an unrunnable program 126 and a missing program 127. The macOS helper resolves the program on `PATH` before sandboxing, then execs `sandbox-exec`, which execs a second helper stage that execs the target. Every exec preserves the helper's pid and process group. The internal stage requires a launcher marker, removes it from the target environment, and maps target exec failures to 126/127. Failures within Apple's profile installation itself retain `sandbox-exec`'s native status rather than 125.
 
@@ -772,7 +783,7 @@ The subscription profile stays inside the Anthropic Messages adapter. It uses Cl
 | `xi-auth` | ChatGPT, Grok and opt-in Anthropic OAuth sign-in, loopback callbacks, token refresh, private token storage and authentication headers, without model wire types. | Implemented (login and token-store regression tests) |
 | `xi-provider` | Anthropic Messages, OpenAI-compatible Chat and OpenAI Responses adapters, Claude Code request shaping, model registry and request-time credential adapters. Responses replays encrypted reasoning statelessly and speaks Responses Lite for the GPT-6 models. | Implemented (Anthropic subscription CLI verified against a local server; Anthropic live path untested; ChatGPT `gpt-6.1-sol` verified live; hosted search verified live on `chatgpt` and `claude`) |
 | `xi-tools` | In-process `read`, exact-string `edit`, atomic `write`, `bash`, `search`, plus opt-in atomic `hashline` edits and `fetch`. File mutations preserve existing mode bits. | Implemented |
-| `xi-kernel` | Agent loop, context builder, layered config schema and loading, workspace trust, approval synthesis, sandbox materialization, sandboxed extension host, hosted-search result interpretation, Exa client and worker entry point over the daemon pipe. | Implemented (Exa verified against a mock and a live key rejection) |
+| `xi-kernel` | Session actor and incremental snapshots; split session handle, actor, turn, invocation, approval and restore modules; context builder; layered configuration and workspace trust; sandbox materialization; extension host; hosted-search result interpretation; Exa client; worker entry point over the daemon pipe. | Implemented (Exa verified against a mock and a live key rejection) |
 | `xi-daemon` | Socket listener, handshake, session index, worker supervision, routing, approvals inbox, scheduler, socket activation, unit installation and private-instance mode. | Implemented |
 | `xi-cli` | The `xi` binary: daemon-backed line mode and TUI launch, private-instance headless `-p`, client-protocol `serve`, `trust`, `daemon`, `daemon install`/`uninstall` and internal `worker`. | Implemented |
 | `xi-bench` | Runs xi, omp and pi arms on a task suite and reports metrics. | Implemented |

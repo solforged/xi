@@ -11,7 +11,9 @@
 //! on a tainted branch. [`WebSearch`] resolves the service when the
 //! toolset is built; the session runs the call, as it does for `task`.
 
+#[path = "web_search/exa.rs"]
 mod exa;
+#[path = "web_search/results.rs"]
 mod results;
 
 use exa::ExaResult;
@@ -65,14 +67,14 @@ pub(crate) struct WebSearch {
 impl WebSearch {
     pub(crate) fn new(config: &Config) -> Self {
         Self {
-            service: service(config),
+            service: search_service(config),
         }
     }
 }
 
 /// Picks the service `[web_search]` names. `auto` uses the search model's
 /// hosted search when its provider speaks an API that has one.
-fn service(config: &Config) -> Result<Service, String> {
+fn search_service(config: &Config) -> Result<Service, String> {
     let settings = &config.web_search;
     if settings.backend == SearchBackend::Exa {
         return Ok(Service::Exa);
@@ -166,7 +168,7 @@ impl Session {
         input: Value,
         cancel: &CancellationToken,
     ) -> ToolOutput {
-        let (query, service) = match (query(&input), service(&state.config)) {
+        let (query, service) = match (query(&input), search_service(&state.config)) {
             (Ok(query), Ok(service)) => (query, service),
             (Err(error), _) | (_, Err(error)) => return error_output(error),
         };
@@ -329,24 +331,24 @@ mod tests {
             })
         };
         assert_eq!(
-            service(&configured("preset = \"chatgpt\"")),
+            search_service(&configured("preset = \"chatgpt\"")),
             hosted("chatgpt", "chatgpt.com", "gpt-6-luna")
         );
         assert_eq!(
-            service(&configured(
+            search_service(&configured(
                 "preset = \"chatgpt\"\n[web_search]\nmodel = \"anthropic/claude-haiku-5-5\""
             )),
             hosted("anthropic", "api.anthropic.com", "claude-haiku-5-5")
         );
         let local = "default_model = \"openai/gpt-5\"\n[web_search]\n";
-        assert_eq!(service(&configured(local)), Ok(Service::Exa));
+        assert_eq!(search_service(&configured(local)), Ok(Service::Exa));
         assert!(
-            service(&configured(&format!("{local}backend = \"model\"")))
+            search_service(&configured(&format!("{local}backend = \"model\"")))
                 .unwrap_err()
                 .contains("has no hosted web search")
         );
         assert_eq!(
-            service(&configured(
+            search_service(&configured(
                 "preset = \"claude\"\n[web_search]\nbackend = \"exa\""
             )),
             Ok(Service::Exa)

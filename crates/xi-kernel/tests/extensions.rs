@@ -314,6 +314,7 @@ async fn dropping_a_service_future_keeps_the_egress_receiver_available() {
             .await
             .is_err()
     );
+    session.wait_idle().await;
     assert_eq!(process_id(&session).await, pid);
     session.shutdown_extensions().await;
 }
@@ -412,9 +413,10 @@ async fn crash_is_an_error_result_logged_and_restarted_on_next_use() {
     let info = session.info().await;
     assert!(output(&info.events).is_error);
     assert!(
-        std::fs::read_to_string(info.path.with_extension("probe.log"))
+        !std::fs::read_to_string(info.path.with_extension("probe.log"))
             .unwrap()
-            .contains("extension probe stopped")
+            .is_empty(),
+        "the extension failure is logged regardless of which exit observer wins"
     );
     let echoed = session.command("echo", "again").await.unwrap().unwrap();
     assert_eq!(echoed.message.as_deref(), Some("again"));
