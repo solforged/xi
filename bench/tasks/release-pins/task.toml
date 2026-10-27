@@ -1,0 +1,5 @@
+prompt = "Update pins.toml so each tool pins its latest stable release as of 2026-10-27, with the SHA-256 of the listed artifact for that version, taken from the project's official release metadata. Run python3 -m unittest discover -s tests. Do not modify tests or .gitignore."
+check = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+timeout_seconds = 600
+protected_paths = ["tests", ".gitignore"]
+tags = ["lookup", "web"]

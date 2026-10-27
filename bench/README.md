@@ -17,6 +17,7 @@ Each directory under `bench/tasks` contains:
 - `task.toml`: `prompt`, `check` (an argv array, not a shell string), positive `timeout_seconds` for the agent, `protected_paths` (literal relative paths), and optional `tags`.
 - `repo/`: the initial repository, without `.git`, symlinks, or external dependencies.
 - `reference.patch`: a patch applied by `git apply` from the copied repository root.
+- `hidden/` (optional): files the agent never sees. After the agent exits, the runner copies them into the workspace at the same relative paths, runs the check, then removes them before the diff and the protected-path check. A hidden file may not shadow a file in `repo/`.
 
 `verify` requires a normal nonzero check exit on the initial repository and a zero exit after the reference patch, with protected paths unchanged. Checks have a separate ten-second limit, including compilation. A timeout or spawn error is not accepted as proof of an initially failing test. The five starter tasks cover a multi-bug Python library, Rust interval union, a public-function rename, searching a policy registry, and case-sensitive URL normalization regressions. Reference fixes change one or two production files.
 
@@ -31,17 +32,29 @@ The harder tasks add these workloads:
 
 The long-context count comes from the configured Qwen server's tokenizer, without special tokens. The prose is 547,203 characters; every charter and memorandum supplies tested facts. It fits a 262k-token window before the conversation and generated catalog. Test digests do not repeat the source facts, and the checker loads the resulting module and catalog in a standalone directory. There are no network, package-install, clock, or random-seed dependencies in the checks. Rust checks use `cargo test --offline`; generated histories use fixed seeds. Every task protects its tests, specifications and source material where applicable. An all-task `verify` run checks old and new tasks together on both macOS and Linux.
 
+Two web tasks need facts released after the models' training. Their checks stay offline. A first round with every test visible was not usable: with its network denied, the `xi` arm brute-forced the salted hashes in the protected test and passed `zig-017-port` in two of three runs. Hashes of short identifiers fall to a few guesses, so the visible tests now check only that old forms are gone and that values are well formed, and the comparisons with the ground truth live in `hidden/`:
+
+| Task | Workload | Ground truth |
+|---|---|---|
+| `zig-017-port` | Port four small Zig 0.16 files to Zig 0.17.0, released 2026-10-01: twelve renames and syntax removals from the release notes, such as `BufferFirstAllocator`, `@divCeil` and struct-of-arrays `@typeInfo`. Zig is not installed, so the visible check looks for old forms by regex, and the hidden check for the identifiers each 0.17.0 replacement needs, by hash. | The original tree passes a behavioral `zig test` under Zig 0.16.0 and fails to compile under 0.17.0; the reference port passes the same test under 0.17.0. |
+| `release-pins` | Pin the latest stable Zig, Go, Rust and Python as of 2026-10-27 with the SHA-256 of one artifact each. Checksums cannot be recalled, so the task fails without the network. | Zig 0.17.0, Go 1.27.3 and Python 3.15.2 checksums match the downloaded files; Rust 1.99.1 comes from `channel-rust-stable.toml`. |
+
+Both tasks age: a newer release changes the right answer for `release-pins`, and later training data may teach Zig 0.17. Rebuild their ground truth before comparing runs from different months.
+
 ## Arms
 
 `bench/arms.toml` has one `[[arm]]` entry per variant: unique `name`, `kind` (`xi`, `omp` or `pi`), `argv`, and optional `[arm.env]`. Argument and environment-value templates support `{prompt}`, `{workspace}`, `{session_dir}`, `{model}`, and `{arms_dir}`. The last is the absolute directory containing the arms file, not the temporary workspace. Expansion happens once, without a shell; placeholders inside the prompt remain literal. The environment otherwise inherits the invoking shell. Each command receives `PYTHONDONTWRITEBYTECODE=1` and a workspace-local `CARGO_TARGET_DIR`.
 
 The xi arms run `xi -p`, which uses a private daemon instance with worker processes so arms stay isolated. Benchmark argv is unchanged.
 
-The `xi` arm uses the default exact-string `edit` tool. The `xi-hashline` arm selects `read,hashline,write,bash,search` for hash-anchored edits. Read and search output uses `LINE|text` by default and `LINE:HH|text` with `hashline`. The `omp` and `pi` arms are unchanged. Three additional arms opt into features:
+The `xi` arm uses the default exact-string `edit` tool. The `xi-hashline` arm selects `read,hashline,write,bash,search` for hash-anchored edits. Read and search output uses `LINE|text` by default and `LINE:HH|text` with `hashline`. The `omp` and `pi` arms are unchanged. The other arms opt into features:
 
 - `xi-compact` adds `--config {arms_dir}/configs/compact.toml`. That file enables automatic compaction with `trigger = { tokens = 24000 }` and `keep_recent_tokens = 8000`. Automatic compaction is off by default. The kernel's default recent retention is 20,000 tokens, clamped to at most half the effective trigger; this arm explicitly uses 8,000. Compare pass rate, total usage, and compaction count on the long-context workload.
 - `xi-subagents` adds the built-in `task` tool with `--tools read,edit,write,bash,search,task`. It accepts `{"tasks":[{"prompt":"...","tools":["read","edit"],"model":"@smol"}]}` with 1 to 8 items. `tools` is optional; without it a child gets the parent's built-in tools. `model` is optional, `@ROLE` or `PROVIDER/MODEL`; without it a child uses the parent's model. Runs before the move from `extensions/subagents` used the same schema without `model`. Use self-contained prompts and disjoint file scopes. Children run concurrently, cannot delegate again, and log `parent_session` in the parent's session directory. Compare against `xi` on `parallel-kernels`.
 - `xi-delegate` is `xi-subagents` with one sentence appended to the prompt asking the model to use the `task` tool for independent parts. It measures delegation when it happens, since models may not choose it unprompted.
+- `xi-net` answers every ask with `--on-ask allow`, so tools reach the web, but only through `bash` (`curl`, `git`). The default arms deny every ask, which leaves them with no network.
+- `xi-web` is `xi-net` with the opt-in `web_search` and `fetch` tools. Searches use the global config's `[web_search]` settings, by default the `@tiny` model's hosted search.
+- `xi-web-exa` is `xi-web` with `--config {arms_dir}/configs/web-exa.toml`, which sends searches to Exa with the key in `XI_BENCH_EXA_API_KEY`. The arm reads a variable of its own because omp also reads `EXA_API_KEY` for its web search, and the `omp` arm's backend should stay unchanged.
 
 The runner writes `{session_dir}/omp.yml` with `memory.backend: off` for omp arms. The shipped omp arm disables extensions, skills, rules, title generation, and approval prompts, but retains the user's configured model/provider registry. `omp --help` v18.12.6 names the approval option `--approval-mode yolo`; this is the current equivalent of older `--yolo` invocations.
 

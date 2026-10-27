@@ -1,0 +1,5 @@
+prompt = "Port this Zig 0.16 library in src/ to Zig 0.17.0, released on 2026-10-01. Replace every API and syntax form that 0.17.0 removed or deprecated with its 0.17.0 replacement, keeping behavior the same. Zig is not installed here; the tests check the 0.17.0 forms statically. Run python3 -m unittest discover -s tests. Do not modify tests or .gitignore."
+check = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+timeout_seconds = 900
+protected_paths = ["tests", ".gitignore"]
+tags = ["zig", "docs", "web"]

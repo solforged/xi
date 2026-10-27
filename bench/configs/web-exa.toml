@@ -1,0 +1,3 @@
+[web_search]
+backend = "exa"
+exa = { env = "XI_BENCH_EXA_API_KEY" }

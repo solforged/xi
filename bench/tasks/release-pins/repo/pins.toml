@@ -1,0 +1,23 @@
+# Toolchain pins for the release builder. `version` is a bare version number
+# such as 1.2.3, and `sha256` is the lowercase hex SHA-256 of `artifact` with
+# `{version}` filled in.
+
+[zig]
+artifact = "zig-x86_64-linux-{version}.tar.xz"
+version = "0.16.0"
+sha256 = ""
+
+[go]
+artifact = "go{version}.linux-amd64.tar.gz"
+version = "1.26.4"
+sha256 = ""
+
+[rust]
+artifact = "rust-{version}-x86_64-unknown-linux-gnu.tar.xz"
+version = "1.96.0"
+sha256 = ""
+
+[python]
+artifact = "Python-{version}.tar.xz"
+version = "3.14.2"
+sha256 = ""

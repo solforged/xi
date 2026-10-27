@@ -1,0 +1,172 @@
+diff --git a/src/config.zig b/src/config.zig
+index 0e4b241..1274c56 100644
+--- a/src/config.zig
++++ b/src/config.zig
+@@ -8,13 +8,13 @@ pub const Config = struct {
+ 
+ /// Number of fields in struct type `T`.
+ pub fn fieldCount(comptime T: type) usize {
+-    return @typeInfo(T).@"struct".fields.len;
++    return @typeInfo(T).@"struct".field_names.len;
+ }
+ 
+ /// Writes `name: type` for each field of `value`'s struct type.
+ pub fn describe(w: *std.Io.Writer, value: anytype) !void {
+-    const T = @TypeOf(value);
+-    inline for (@typeInfo(T).@"struct".fields) |field| {
+-        try w.print("{s}: {s}\n", .{ field.name, @typeName(field.type) });
++    const info = @typeInfo(@TypeOf(value)).@"struct";
++    inline for (info.field_names, info.field_types) |field_name, field_type| {
++        try w.print("{s}: {s}\n", .{ field_name, @typeName(field_type) });
+     }
+ }
+diff --git a/src/flags.zig b/src/flags.zig
+index 4356371..0380cf2 100644
+--- a/src/flags.zig
++++ b/src/flags.zig
+@@ -3,25 +3,25 @@ const std = @import("std");
+ pub const Feature = enum { color, unicode, mouse, paste };
+ 
+ /// Open ports among the first sixteen.
+-pub const Ports = std.bit_set.IntegerBitSet(16);
++pub const Ports = std.bit_set.Integer(16);
+ 
+ /// Busy lanes in a 256-lane scheduler.
+-pub const Lanes = std.bit_set.ArrayBitSet(usize, 256);
++pub const Lanes = std.bit_set.Array(usize, 256);
+ 
+ pub fn allFeatures() std.EnumSet(Feature) {
+-    return std.EnumSet(Feature).initFull();
++    return .full;
+ }
+ 
+ pub fn noFeatures() std.EnumSet(Feature) {
+-    return std.EnumSet(Feature).initEmpty();
++    return .empty;
+ }
+ 
+ pub fn closedPorts() Ports {
+-    return Ports.initEmpty();
++    return .empty;
+ }
+ 
+ pub fn busyLanes() Lanes {
+-    return Lanes.initFull();
++    return .full;
+ }
+ 
+ /// Marks each id as seen in a set of `len` bits. The caller frees it.
+@@ -29,8 +29,8 @@ pub fn markSeen(
+     allocator: std.mem.Allocator,
+     ids: []const usize,
+     len: usize,
+-) !std.DynamicBitSetUnmanaged {
+-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(allocator, len);
++) !std.bit_set.Dynamic {
++    var seen = try std.bit_set.Dynamic.initEmpty(allocator, len);
+     for (ids) |id| seen.set(id);
+     return seen;
+ }
+diff --git a/src/mode.zig b/src/mode.zig
+index e9d9ed7..56249ad 100644
+--- a/src/mode.zig
++++ b/src/mode.zig
+@@ -2,26 +2,26 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ 
+ /// Short label for an optimization mode, used in build banners.
+-pub fn modeLabel(mode: std.builtin.OptimizeMode) []const u8 {
++pub fn modeLabel(mode: std.lang.Optimize) []const u8 {
+     return switch (mode) {
+-        .Debug => "dev",
+-        .ReleaseSafe => "checked",
+-        .ReleaseFast => "speed",
+-        .ReleaseSmall => "size",
++        .debug => "dev",
++        .safe => "checked",
++        .fast => "speed",
++        .small => "size",
+     };
+ }
+ 
+ /// Whether this binary was built for speed or size rather than safety.
+ pub fn isOptimized() bool {
+-    return builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall;
++    return builtin.mode == .fast or builtin.mode == .small;
+ }
+ 
+ /// `arch-os-abi (format)` for the compilation target.
+ pub fn targetSummary(buf: []u8) ![]const u8 {
+     return std.fmt.bufPrint(buf, "{s}-{s}-{s} ({s})", .{
+-        @tagName(builtin.cpu.arch),
+-        @tagName(builtin.os.tag),
+-        @tagName(builtin.abi),
+-        @tagName(builtin.object_format),
++        @tagName(builtin.target.cpu.arch),
++        @tagName(builtin.target.os.tag),
++        @tagName(builtin.target.abi),
++        @tagName(builtin.target.ofmt),
+     });
+ }
+diff --git a/src/report.zig b/src/report.zig
+index 2deae2c..bfa2be6 100644
+--- a/src/report.zig
++++ b/src/report.zig
+@@ -7,28 +7,29 @@ pub const Entry = struct {
+ 
+ /// `key=value` for one entry, allocated in `arena`.
+ pub fn line(arena: std.mem.Allocator, entry: Entry) ![]u8 {
+-    return std.fmt.allocPrint(arena, "{s}={d}", .{ entry.key, entry.value });
++    return arena.print("{s}={d}", .{ entry.key, entry.value });
+ }
+ 
+ /// Pages needed for `total` rows at `per_page` rows per page.
+ pub fn pages(total: usize, per_page: usize) usize {
+-    return std.math.divCeil(usize, total, per_page) catch unreachable;
++    return @divCeil(total, per_page);
+ }
+ 
+ /// A row of 32 spaces.
+ pub fn blankRow() [32]u8 {
+-    return [1]u8{' '} ** 32;
++    return @splat(' ');
+ }
+ 
+ /// Whether `key` appears in `text`, ignoring ASCII case.
+ pub fn hasKey(text: []const u8, key: []const u8) bool {
+-    return std.ascii.indexOfIgnoreCase(text, key) != null;
++    return std.ascii.findIgnoreCase(text, key) != null;
+ }
+ 
+ /// Appends one line per entry. Short lines are built on the stack.
+ pub fn render(gpa: std.mem.Allocator, entries: []const Entry, out: *std.ArrayList(u8)) !void {
+-    var fallback = std.heap.stackFallback(512, gpa);
+-    const scratch = fallback.get();
++    var stack_buf: [512]u8 = undefined;
++    var fallback: std.heap.BufferFirstAllocator = .init(&stack_buf, gpa);
++    const scratch = fallback.allocator();
+     for (entries) |entry| {
+         const text = try line(scratch, entry);
+         defer scratch.free(text);
+@@ -39,7 +40,13 @@ pub fn render(gpa: std.mem.Allocator, entries: []const Entry, out: *std.ArrayLis
+ 
+ /// Renders every entry and logs the error when rendering fails.
+ pub fn writeAll(gpa: std.mem.Allocator, entries: []const Entry, out: *std.ArrayList(u8)) !void {
+-    errdefer |err| std.log.err("report failed: {s}", .{@errorName(err)});
++    writeAllInner(gpa, entries, out) catch |err| {
++        std.log.err("report failed: {s}", .{@errorName(err)});
++        return err;
++    };
++}
++
++fn writeAllInner(gpa: std.mem.Allocator, entries: []const Entry, out: *std.ArrayList(u8)) !void {
+     try render(gpa, entries, out);
+     try out.appendSlice(gpa, "--\n");
+ }
+@@ -47,5 +54,5 @@ pub fn writeAll(gpa: std.mem.Allocator, entries: []const Entry, out: *std.ArrayL
+ /// Entries without a value are skipped.
+ pub fn skip(entry: Entry) void {
+     _ = entry;
+-    return void{};
++    return {};
+ }

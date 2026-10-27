@@ -1,0 +1,33 @@
+diff --git a/pins.toml b/pins.toml
+index ebefb1e..dbf3f3d 100644
+--- a/pins.toml
++++ b/pins.toml
+@@ -4,20 +4,20 @@
+ 
+ [zig]
+ artifact = "zig-x86_64-linux-{version}.tar.xz"
+-version = "0.16.0"
+-sha256 = ""
++version = "0.17.0"
++sha256 = "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+ 
+ [go]
+ artifact = "go{version}.linux-amd64.tar.gz"
+-version = "1.26.4"
+-sha256 = ""
++version = "1.27.3"
++sha256 = "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
+ 
+ [rust]
+ artifact = "rust-{version}-x86_64-unknown-linux-gnu.tar.xz"
+-version = "1.96.0"
+-sha256 = ""
++version = "1.99.1"
++sha256 = "231fcae47ee950621374725b5fc3b5441d2fbda2955ac45dd7dc816d8876cfe7"
+ 
+ [python]
+ artifact = "Python-{version}.tar.xz"
+-version = "3.14.2"
+-sha256 = ""
++version = "3.15.2"
++sha256 = "8b5536d280142ecf6cdfe15d12a21ba1c65e300bbf7b28a8d0cdb849575797de"
