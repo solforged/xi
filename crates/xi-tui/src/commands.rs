@@ -93,10 +93,15 @@ fn reasoning_levels(model: &xi_protocol::model::ModelInfo, separator: &str) -> S
 }
 
 impl App {
-    /// Changes and saves the client's layout choice.
+    /// Changes and saves the client's layout choice, entering or leaving
+    /// the deck as it says.
     pub(crate) fn set_layout(&mut self, layout: Layout) -> std::io::Result<()> {
         self.layout = layout;
-        self.deck = layout.deck_at(self.cols, self.rows);
+        if layout.deck_at(self.cols, self.rows) {
+            self.enter_deck();
+        } else {
+            self.leave_deck();
+        }
         self.launch
             .tui_config
             .as_deref()

@@ -262,7 +262,7 @@ impl Overlay for Sessions {
     }
 }
 
-fn age(updated: Option<Timestamp>, now: Timestamp) -> String {
+pub(crate) fn age(updated: Option<Timestamp>, now: Timestamp) -> String {
     let Some(updated) = updated else {
         return "?".into();
     };

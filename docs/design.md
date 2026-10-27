@@ -311,6 +311,10 @@ Inline is the default. Scrollback stays append-only, and Slit, Pane and Sheet fo
 
 `[display] layout` in `tui.toml` accepts `inline`, `deck` or `auto`. Inline never enters the alternate screen by itself. Deck owns the alternate screen with sessions, the log and an inspector. Auto chooses Deck when xi starts at 180×30 or larger, otherwise Inline. `/layout` reports the choice, width tier and pane size; `/layout inline`, `/layout deck` and `/layout auto` change and save it.
 
+On the deck xi owns the alternate screen. The header names the workspace, branch, model and reasoning level. Three columns follow: sessions at the left (this workspace, other workspaces, then every ask waiting across sessions, refreshed every five seconds), the log in the middle at the sheet's measure (the session title, when it started, its head and event count, then every committed row, the live region and the composer), and an inspector at the right (the selected log row's diff or output, the context gauge, changed files with net counts, queued prompts and the session's approvals, sandbox, trust and tool count). The footer keeps context, cache, sandbox, taint and waiting asks. Columns fold as the pane narrows: below 200 columns the inspector folds into the inline footer, below 150 sessions fold to a mark rail (`●` this session, `┤` running, `?` waiting, `·` idle), and below 100 the rail goes away; the header then names the keys that bring a folded pane back.
+
+`alt+1`, `alt+2` and `alt+3` give the keys to the sessions, the log or the inspector; the same key again, or `esc`, returns them to the composer. In the sessions pane `up` and `down` move and `enter` resumes. In the log `up` and `down` select a tool row for the inspector, `pageup` and `pagedown` scroll, and `enter` prints the row's whole diff or output into the log. In the inspector `up` and `down` scroll. Typing always goes to the composer. `/layout inline` leaves the deck and prints its log to scrollback, as quitting from the deck does; entering the deck keeps earlier scrollback where it is.
+
 #### Keys
 
 Composer keys are unique. Keys inside an overlay apply only while it has focus.

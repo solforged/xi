@@ -2669,6 +2669,12 @@ async fn short_live_region_keeps_the_frame_title_five_rows_and_hints() {
     assert!(lines.iter().all(|line| line.width() <= 120));
 }
 
+/// Rows committed so far: scrollback inline, the retained log on the deck.
+fn committed(app: &App) -> Vec<String> {
+    let deck = app.deck.as_ref().map(|deck| deck.log.rows()).unwrap_or(&[]);
+    app.commit.iter().chain(deck).map(Line::plain).collect()
+}
+
 #[tokio::test]
 async fn layout_command_reports_changes_and_persists_the_choice() {
     let temp = tempfile::tempdir().unwrap();
@@ -2689,12 +2695,8 @@ async fn layout_command_reports_changes_and_persists_the_choice() {
     ] {
         app.command(&format!("/layout {name}")).await.unwrap();
         assert_eq!(app.layout, layout);
-        assert_eq!(app.deck, deck);
-        assert!(
-            app.commit
-                .iter()
-                .any(|line| line.plain() == format!("  layout → {name}"))
-        );
+        assert_eq!(app.deck.is_some(), deck);
+        assert!(committed(&app).contains(&format!("  layout → {name}")));
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains(&format!("layout = \"{name}\"")), "{saved}");
         assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
@@ -2715,7 +2717,7 @@ async fn settings_layout_cycles_and_saves_client_display() {
             .await
             .unwrap();
         assert_eq!(app.layout, layout);
-        assert_eq!(app.deck, layout != Layout::Inline);
+        assert_eq!(app.deck.is_some(), layout != Layout::Inline);
         assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
         assert!(live_text(&app).contains("saved · layout"));
     }
@@ -2736,7 +2738,7 @@ async fn layout_config_loads_and_invalid_layout_warns_once() {
         launch.tui_config = Some(path.clone());
         let app = App::new(launch, size.0, size.1);
         assert_eq!(app.layout.name(), value);
-        assert_eq!(app.deck, deck);
+        assert_eq!(app.deck.is_some(), deck);
     }
     std::fs::write(&path, "[display]\nlayout = \"wide\"\n").unwrap();
     let (mut launch, _) = launch(snapshot(false)).await;
@@ -2785,4 +2787,89 @@ async fn deck_focus_keys_are_in_help_and_noop_inline() {
     for key in ["alt+1", "alt+2", "alt+3"] {
         assert!(help.contains(key), "{help}");
     }
+}
+
+#[tokio::test]
+async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
+    let attached = snapshot(false);
+    let mut other = snapshot(false);
+    other.info.session = SessionId::generate();
+    other.info.cwd = "/tmp/OTHER-workspace".into();
+    let data = FakeData {
+        summaries: vec![
+            summary(&attached, true, "Route sandboxed bash", 5),
+            summary(&other, true, "Fix export", 3),
+        ],
+        ..Default::default()
+    };
+    let (launch, _) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 250, 36);
+    assert!(app.deck.is_none());
+    app.set_layout(Layout::Deck).unwrap();
+    app.refresh_deck().await;
+    app.commit.clear();
+    append(
+        &mut app,
+        reply(
+            vec![Block::ToolUse {
+                id: "edit-call".into(),
+                name: "edit".into(),
+                input: json!({ "path": "src/a.rs", "old": "one\ntwo", "new": "one\nthree" }),
+                extra: Default::default(),
+            }],
+            StopReason::ToolUse,
+        ),
+    );
+    append(&mut app, result("edit-call", "replaced"));
+    append(&mut app, read_call());
+    append(&mut app, result("read-call", "1|x\n2|y"));
+    assert!(
+        app.commit.is_empty(),
+        "the deck keeps committed rows itself"
+    );
+    let mut out = Vec::new();
+    let mut screen = Screen::new(&mut out, false, 250);
+    app.draw(&mut screen).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    for expected in [
+        "Sessions · ",
+        "Route sandboxed bash",
+        "Other workspaces",
+        "OTHER-workspace · Fix",
+        "● edit src/a.rs",
+        "● read docs/policies.md",
+        "Changed · 1 file",
+        "alt+1 sessions · alt+2 log · alt+3 inspector",
+    ] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+    // alt+2 takes the log; up selects the edit, enter opens its diff.
+    let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+    app.key(alt('2')).await.unwrap();
+    app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let selected = app.deck.as_ref().unwrap().log.selected().unwrap();
+    assert_eq!(selected.title, "edit src/a.rs");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        committed(&app)
+            .iter()
+            .any(|row| row.starts_with("── edit src/a.rs ──"))
+    );
+    assert!(app.editor.is_empty());
+    // Leaving the deck prints its log ahead of later rows.
+    app.command("/layout inline").await.unwrap();
+    assert!(app.deck.is_none());
+    let rows: Vec<_> = app.commit.iter().map(Line::plain).collect();
+    let edit = rows
+        .iter()
+        .position(|row| row.starts_with("● edit src/a.rs"));
+    let note = rows.iter().position(|row| row == "  layout → inline");
+    assert!(
+        edit.is_some_and(|edit| note.is_some_and(|note| edit < note)),
+        "{rows:?}"
+    );
 }

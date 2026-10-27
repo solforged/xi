@@ -97,7 +97,15 @@ impl Thinking {
         if self == Self::Hidden || text.trim().is_empty() {
             return Vec::new();
         }
-        let mut rows = prose(text.trim(), m.prose, Role::Dim).into_iter();
+        // A title row and its paragraph gap are the headline; blank rows
+        // between paragraphs stay, so Full keeps its shape.
+        let mut rows = prose(text.trim(), m.prose, Role::Dim)
+            .into_iter()
+            .enumerate()
+            .filter(|(index, row)| *index != 1 || !row.plain().trim().is_empty())
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>()
+            .into_iter();
         let Some(first) = rows.next() else {
             return Vec::new();
         };
