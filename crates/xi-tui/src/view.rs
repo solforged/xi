@@ -134,6 +134,9 @@ impl App {
                 .short(Line::default().ink(base))
                 .left(),
         ];
+        if let Some(branch) = self.git.label(&info.cwd) {
+            segs.push(Segment::new("branch", Line::default().dim(branch)).left());
+        }
         let model = &info.model;
         segs.push(
             Segment::new(
@@ -143,34 +146,58 @@ impl App {
             .short(Line::default().ink(&model.model)),
         );
         let reasoning = match &info.model_info {
-            Some(model) if model.reasoning.is_empty() => "no think".to_owned(),
-            Some(model) => format!("think {}", short_reasoning(model.resolve(info.reasoning))),
-            None => format!("think {}", short_reasoning(info.reasoning)),
+            Some(model) if model.reasoning.is_empty() => Line::default().dim("no think"),
+            Some(model) => Line::default()
+                .dim("think ")
+                .ink(short_reasoning(model.resolve(info.reasoning))),
+            None => Line::default()
+                .dim("think ")
+                .ink(short_reasoning(info.reasoning)),
         };
-        segs.push(Segment::new("reasoning", d(reasoning)));
-        if let Some(model) = &info.model_info {
-            let window = model.context_window.max(1);
-            segs.push(Segment::new(
-                "context",
-                d(format!("ctx {}%", self.transcript.context * 100 / window)),
-            ));
-        }
+        segs.push(Segment::new("reasoning", reasoning));
+        let context = info
+            .model_info
+            .as_ref()
+            .filter(|model| model.context_window > 0)
+            .map_or_else(
+                || "–".into(),
+                |model| {
+                    format!(
+                        "{}%",
+                        u128::from(self.transcript.context) * 100
+                            / u128::from(model.context_window)
+                    )
+                },
+            );
+        segs.push(Segment::new(
+            "context",
+            Line::default().dim("ctx ").ink(context),
+        ));
         let session = self.transcript.session;
-        if session.sent() > 0 {
-            segs.push(Segment::new(
-                "cache",
-                d(format!(
-                    "cache {}%",
-                    session.cache_read * 100 / session.sent()
-                )),
-            ));
-        }
+        let cache = if session.sent() > 0 {
+            format!(
+                "{}%",
+                u128::from(session.cache_read) * 100 / u128::from(session.sent())
+            )
+        } else {
+            "–".into()
+        };
+        segs.push(Segment::new(
+            "cache",
+            Line::default().dim("cache ").ink(cache),
+        ));
         if let Some(cost) = session.cost(info.model_info.as_ref().and_then(|m| m.pricing)) {
             segs.push(Segment::new(
                 "cost",
                 Line::default().ink(format!("${cost:.2}")),
             ));
         }
+        // This is the worker's fail-closed execution policy, not a health
+        // check: a sandbox setup failure prevents the tool from running.
+        segs.push(
+            Segment::new("sandbox", Line::default().dim("◇ sandbox"))
+                .short(Line::default().dim("◇")),
+        );
         let running = self.transcript.children().running();
         if running > 0 {
             segs.push(

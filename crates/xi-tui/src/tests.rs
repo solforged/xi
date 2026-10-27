@@ -467,6 +467,131 @@ fn request(requests: &mut mpsc::UnboundedReceiver<(String, Value)>, wanted: &str
 }
 
 #[tokio::test]
+async fn footer_sets_labels_apart_from_values_and_handles_unknown_usage() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 200, 24);
+    let footer = app.footer(200);
+    for (text, role) in [
+        ("think ", Role::Dim),
+        ("med", Role::Ink),
+        ("ctx ", Role::Dim),
+        ("0%", Role::Ink),
+        ("cache ", Role::Dim),
+        ("–", Role::Ink),
+        ("◇ sandbox", Role::Dim),
+    ] {
+        assert!(
+            footer
+                .0
+                .iter()
+                .any(|span| span.text == text && span.role == role),
+            "{text}"
+        );
+    }
+    assert!(!footer.plain().contains('$')); // No pricing, not a fabricated zero.
+    app.launch
+        .attached
+        .info
+        .model_info
+        .as_mut()
+        .unwrap()
+        .context_window = 0;
+    assert!(app.footer(200).plain().contains("ctx –"));
+    app.launch.attached.info.model_info = None;
+    assert!(app.footer(200).plain().contains("ctx –"));
+}
+
+#[tokio::test]
+async fn footer_shows_usage_sandbox_and_safety_in_color_or_monochrome() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 200, 24);
+    app.transcript.context = 64_000;
+    app.transcript.session = crate::transcript::Totals {
+        input: 100_000,
+        cache_read: 900_000,
+        ..Default::default()
+    };
+    app.launch
+        .attached
+        .info
+        .model_info
+        .as_mut()
+        .unwrap()
+        .pricing = Some(xi_protocol::model::Pricing {
+        input: 2.0,
+        output: 10.0,
+        cache_read: 0.1,
+        cache_write: 2.0,
+    });
+    app.launch.attached.info.trusted = false;
+    app.transcript.tainted = true;
+    app.notify(&ClientNotification::ApprovalPending(pending(
+        app.session_id(),
+    )));
+    let footer = app.footer(200);
+    let text = footer.plain();
+    for label in [
+        "ctx 25%",
+        "cache 90%",
+        "$0.29",
+        "◇ sandbox",
+        "untrusted",
+        "◆ tainted",
+        "? 1 waiting",
+    ] {
+        assert!(text.contains(label), "{text}");
+    }
+    let mut mono = String::new();
+    footer.write_ansi(&mut mono, false);
+    assert_eq!(mono, text);
+    let narrow = app.footer(36).plain();
+    assert!(!narrow.contains('◇'));
+    for label in ["ctx 25%", "untrusted", "◆", "?1"] {
+        assert!(narrow.contains(label), "{narrow}");
+    }
+}
+
+#[tokio::test]
+async fn footer_git_state_is_collected_asynchronously_and_scoped_to_the_workspace() {
+    let repo = tempfile::tempdir().unwrap();
+    assert!(
+        tokio::process::Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=footer-test"])
+            .arg(repo.path())
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    std::fs::write(repo.path().join("new.txt"), "new").unwrap();
+    let mut attached = snapshot(false);
+    attached.info.cwd = repo.path().into();
+    let (launch, _) = launch(attached).await;
+    let mut app = App::new(launch, 200, 24);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            app.git.refresh(&app.launch.attached.info.cwd).await;
+            if app.git.label(repo.path()).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let footer = app.footer(200).plain();
+    assert!(
+        footer.starts_with(&format!(
+            " {}  footer-test*",
+            crate::view::home(repo.path())
+        )),
+        "{footer}"
+    );
+    app.launch.attached.info.cwd = "/different-workspace".into();
+    assert!(!app.footer(200).plain().contains("footer-test"));
+}
+
+#[tokio::test]
 async fn shift_tab_cycles_the_models_levels_and_updates_the_footer() {
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 160, 24);

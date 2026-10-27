@@ -5,7 +5,7 @@
 //! approvals and trust stay to the end. The desktop status line and phone
 //! chips use the same order.
 
-use crate::style::{Line, lr};
+use crate::style::Line;
 
 /// Which end of the status line a segment sits at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,8 +56,8 @@ impl Segment {
     }
 }
 
-/// Drop order: higher numbers shorten and drop first; 0 never drops. Every
-/// short form is used before any segment drops.
+/// Drop order: higher numbers shorten and then drop before lower numbers
+/// change. Priority 0 only shortens, after all optional segments have dropped.
 #[must_use]
 pub fn priority(name: &str) -> u8 {
     match name {
@@ -108,7 +108,8 @@ fn join(slots: &[Slot], side: Side, sep: &str) -> Line {
     line
 }
 
-/// Fits segments into `cols` cells.
+/// Fits segments into `cols` cells. If even the shortest safety state cannot
+/// fit, it is visibly truncated rather than replaced with an empty row.
 #[must_use]
 pub fn fit(segments: Vec<Segment>, cols: usize) -> Fitted {
     let mut slots: Vec<Slot> = segments
@@ -120,37 +121,41 @@ pub fn fit(segments: Vec<Segment>, cols: usize) -> Fitted {
         .collect();
     let mut dropped = Vec::new();
     let width = |slots: &[Slot]| {
-        2 + join(slots, Side::Left, "  ").width() + 2 + join(slots, Side::Right, " · ").width()
+        let left = join(slots, Side::Left, "  ").width();
+        let right = join(slots, Side::Right, " · ").width();
+        2 + left + right + if left > 0 && right > 0 { 2 } else { 0 }
     };
     while width(&slots) > cols {
         let rank = |(i, s): &(usize, &Slot)| (priority(s.segment.name), std::cmp::Reverse(*i));
-        let shorten = slots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.segment.short.is_some() && !s.short)
-            .max_by_key(rank)
-            .map(|(i, _)| i);
-        if let Some(i) = shorten {
-            slots[i].short = true;
-            continue;
-        }
-        let drop = slots
+        let optional = slots
             .iter()
             .enumerate()
             .filter(|(_, s)| priority(s.segment.name) > 0)
             .max_by_key(rank)
             .map(|(i, _)| i);
-        match drop {
-            Some(i) => dropped.push(slots.remove(i).segment.name),
-            None => break,
+        if let Some(i) = optional {
+            if slots[i].segment.short.is_some() && !slots[i].short {
+                slots[i].short = true;
+            } else {
+                dropped.push(slots.remove(i).segment.name);
+            }
+            continue;
+        }
+        // Safety labels keep their full wording until only safety remains.
+        if let Some(slot) = slots
+            .iter_mut()
+            .find(|s| s.segment.short.is_some() && !s.short)
+        {
+            slot.short = true;
+        } else {
+            break;
         }
     }
     let inner = cols.saturating_sub(2);
-    let row = lr(
-        join(&slots, Side::Left, "  "),
-        join(&slots, Side::Right, " · "),
-        inner,
-    );
+    let left = join(&slots, Side::Left, "  ");
+    let right = join(&slots, Side::Right, " · ");
+    let gap = inner.saturating_sub(left.width() + right.width());
+    let row = left.ink(" ".repeat(gap)).extend(right).truncate(inner);
     Fitted {
         line: Line::default().ink(" ").extend(row).ink(" ").truncate(cols),
         dropped,
@@ -190,17 +195,84 @@ mod tests {
     }
 
     #[test]
-    fn short_forms_are_used_before_segments_drop_in_priority_order() {
+    fn lower_priority_segments_drop_before_important_labels_shorten() {
         let fitted = fit(segments(), 60);
-        assert_eq!(fitted.dropped, ["sandbox", "cache", "branch"]);
+        assert_eq!(
+            fitted.dropped,
+            ["sandbox", "cache", "branch", "reasoning", "cost"]
+        );
         let text = fitted.line.plain();
         assert!(text.starts_with(" ledger"), "{text}");
-        assert!(
-            text.contains("think med") && text.contains("$0.29"),
-            "{text}"
-        );
-        assert!(text.contains("◆ · ?1"), "{text}");
+        assert!(text.contains("sonnet-5.5"), "{text}");
+        assert!(text.contains("◆ tainted · ? 1 waiting"), "{text}");
         assert_eq!(fitted.line.width(), 60);
+    }
+
+    #[test]
+    fn a_segment_shortens_before_it_drops() {
+        let segments = || {
+            vec![
+                Segment::new("sandbox", Line::default().dim("◇ sandbox"))
+                    .short(Line::default().dim("◇")),
+                Segment::new("context", Line::default().dim("ctx 24%")),
+            ]
+        };
+        let fitted = fit(segments(), 13);
+        assert_eq!(fitted.line.plain(), " ◇ · ctx 24% ");
+        assert!(fitted.dropped.is_empty());
+        let fitted = fit(segments(), 12);
+        assert_eq!(fitted.line.plain(), "    ctx 24% ");
+        assert_eq!(fitted.dropped, ["sandbox"]);
+    }
+
+    #[test]
+    fn an_exact_fit_does_not_reserve_a_gap_for_an_absent_left_side() {
+        let fitted = fit(
+            vec![Segment::new("context", Line::default().dim("ctx 24%"))],
+            9,
+        );
+        assert_eq!(fitted.line.plain(), " ctx 24% ");
+        assert!(fitted.dropped.is_empty());
+    }
+
+    #[test]
+    fn safety_overflow_is_visible_and_every_width_is_bounded() {
+        for cols in 0..=120 {
+            let mut segs = segments();
+            segs.push(Segment::new("trust", Line::default().brass("untrusted")));
+            let fitted = fit(segs, cols);
+            assert_eq!(fitted.line.width(), cols, "width {cols}");
+            assert!(fitted.dropped.iter().all(|name| priority(name) > 0));
+            let text = fitted.line.plain();
+            if cols >= 3 {
+                assert!(!text.trim().is_empty(), "width {cols}");
+            }
+            if cols >= 30 {
+                for label in ["ctx 24%", "◆", "?", "untrusted"] {
+                    assert!(text.contains(label), "width {cols}: {text}");
+                }
+            } else if cols >= 3 {
+                assert!(text.contains('…'), "width {cols}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_labels_and_monochrome_output_preserve_safety_marks() {
+        let fitted = fit(
+            vec![
+                Segment::new("workspace", Line::default().ink("~/src/帳簿")).left(),
+                Segment::new("taint", Line::default().murex("◆ tainted")),
+                Segment::new("approvals", Line::default().brass("? 1 waiting")),
+            ],
+            36,
+        );
+        let mut plain = String::new();
+        fitted.line.write_ansi(&mut plain, false);
+        assert_eq!(plain, fitted.line.plain());
+        assert!(plain.contains("◆ tainted · ? 1 waiting"));
+        assert_eq!(fitted.line.width(), 36);
+        assert!(!plain.contains('\x1b'));
     }
 
     #[test]
