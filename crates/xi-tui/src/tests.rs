@@ -3470,19 +3470,18 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
         "Changes",
         "+1 −1",
         "Sessions",
-        "1 idle",
+        "1 more",
         "● edit src/a.rs",
         "● read docs/policies.md",
         "/tmp/xi-tui-demo",
-        "approvals ask · sandboxed · trusted",
+        "\u{f45e} approvals ask · \u{f49c} sandboxed · \u{f4a1} trusted",
         "ξ xi",
-        "enter sends",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
     assert!(
-        !text.contains("alt+2"),
-        "the composer's panel has no keys row"
+        !text.contains("alt+2") && !text.contains("enter sends"),
+        "the composer's panel has no keys row and an idle dock no hint"
     );
     app.launch.attached.info.sandbox_enabled = false;
     app.launch.attached.info.trusted = false;
@@ -3491,7 +3490,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains("approvals ask · sandbox off · untrusted"),
+        text.contains("approvals ask · \u{f513} sandbox off · \u{f4a3} untrusted"),
         "{text}"
     );
     // alt+1 lists every session; idle ones stay out of the live view.

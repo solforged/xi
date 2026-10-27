@@ -391,9 +391,9 @@ impl App {
         line
     }
 
-    /// The approval mode, sandbox and trust in words, with what differs
-    /// from the usual in brass: approvals other than `ask`, the sandbox
-    /// off, an untrusted workspace.
+    /// The approval mode, sandbox and trust in words after their icons,
+    /// with what differs from the usual in brass: approvals other than
+    /// `ask`, the sandbox off, an untrusted workspace.
     fn facts(&self) -> Line {
         let info = &self.launch.attached.info;
         let mode = self
@@ -402,25 +402,40 @@ impl App {
             .and_then(|deck| deck.settings.as_ref())
             .and_then(|report| report.settings.iter().find(|s| s.key == "approvals"))
             .and_then(|setting| setting.value.as_str().map(str::to_owned));
-        let approvals = match mode.as_deref() {
-            None | Some("ask") => Line::default().dim("approvals ask"),
-            Some(mode) => Line::default().brass(format!("approvals {mode}")),
-        };
-        let sandbox = if info.sandbox_enabled {
-            Line::default().dim("sandboxed")
-        } else {
-            Line::default().brass("sandbox off")
-        };
-        let trust = if info.trusted {
-            Line::default().dim("trusted")
-        } else {
-            Line::default().brass("untrusted")
-        };
-        approvals
-            .dim(" · ")
-            .extend(sandbox)
-            .dim(" · ")
-            .extend(trust)
+        let facts = [
+            match mode.as_deref() {
+                None | Some("ask") => (Icon::Approvals, "approvals ask".to_owned(), false),
+                Some(mode) => (Icon::Approvals, format!("approvals {mode}"), true),
+            },
+            if info.sandbox_enabled {
+                (Icon::Sandbox, "sandboxed".to_owned(), false)
+            } else {
+                (Icon::SandboxOff, "sandbox off".to_owned(), true)
+            },
+            if info.trusted {
+                (Icon::Trusted, "trusted".to_owned(), false)
+            } else {
+                (Icon::Untrusted, "untrusted".to_owned(), true)
+            },
+        ];
+        let mut line = Line::default();
+        for (icon, words, unusual) in facts {
+            if !line.0.is_empty() {
+                line = line.dim(" · ");
+            }
+            let glyph = self.icons.get(icon);
+            let text = if glyph.is_empty() {
+                words
+            } else {
+                format!("{glyph} {words}")
+            };
+            line = if unusual {
+                line.brass(text)
+            } else {
+                line.dim(text)
+            };
+        }
+        line
     }
 
     /// The workspace with its last component and the branch set apart.

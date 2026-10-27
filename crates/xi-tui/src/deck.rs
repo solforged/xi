@@ -22,8 +22,11 @@ const LIVE_MAX: usize = 72;
 const ASK_ROWS: usize = 3;
 /// Changed files the overview lists before counting the rest.
 const CHANGED_ROWS: usize = 8;
-/// Running or waiting sessions the overview lists.
+/// Sessions the overview lists: running or waiting ones first, then this
+/// workspace's latest.
 const SESSION_ROWS: usize = 5;
+/// Of those, the most that are this workspace's idle sessions.
+const RECENT_ROWS: usize = 3;
 /// Blank columns on either side of the panel's text.
 const PANEL_PAD: usize = 2;
 
@@ -517,28 +520,29 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
         .filter(|session| session.mark != Mark::Current)
         .collect();
     if !others.is_empty() {
-        let active: Vec<&&SessionRow> = others
+        let active = others
             .iter()
             .filter(|session| matches!(session.mark, Mark::Running | Mark::Waiting))
-            .collect();
+            .take(SESSION_ROWS);
+        let room = SESSION_ROWS
+            .saturating_sub(active.clone().count())
+            .min(RECENT_ROWS);
+        let recent = sessions
+            .here
+            .iter()
+            .filter(|session| session.mark == Mark::Idle)
+            .take(room);
+        let shown: Vec<&SessionRow> = active.copied().chain(recent).collect();
         section(&mut top, heading("Sessions"), Line::default().dim("alt+1"));
-        for session in active.iter().take(SESSION_ROWS) {
+        for session in &shown {
             top.push(lr(
                 mark(session.mark, icons).ink(format!(" {}", session.title)),
                 Line::default().dim(&session.detail),
                 w,
             ));
         }
-        let mut rest = Vec::new();
-        if active.len() > SESSION_ROWS {
-            rest.push(format!("{} more active", active.len() - SESSION_ROWS));
-        }
-        let idle = others.len() - active.len();
-        if idle > 0 {
-            rest.push(format!("{idle} idle"));
-        }
-        if !rest.is_empty() {
-            top.push(Line::default().dim(rest.join(" · ")));
+        if others.len() > shown.len() {
+            top.push(Line::default().dim(format!("{} more", others.len() - shown.len())));
         }
     }
     let foot: Vec<Line> = [
@@ -931,12 +935,12 @@ mod tests {
             assert!(side[sessions].trim_end().ends_with("alt+1"));
             assert!(side[sessions + 1].starts_with("┤ Port footer fit to deck"));
             assert!(side[sessions + 2].starts_with("? Bump tokio to 1.48"));
-            assert_eq!(side[sessions + 3].trim_end(), "2 idle");
-            assert!(
-                !side
-                    .iter()
-                    .any(|line| line.contains("Settings frame hints"))
-            );
+            // This workspace's idle sessions follow; other workspaces' are
+            // counted.
+            assert!(side[sessions + 3].starts_with("· Settings frame hints"));
+            assert!(side[sessions + 3].trim_end().ends_with("yesterday"));
+            assert_eq!(side[sessions + 4].trim_end(), "1 more");
+            assert!(!side.iter().any(|line| line.contains("Fix export offsets")));
             // The newest tool row stays in the log and the inspector.
             assert!(!side.iter().any(|line| line.contains("edit ×5")));
             assert_eq!(side[36].trim_end(), "~/src/xi:main*");
