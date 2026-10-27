@@ -3,7 +3,9 @@
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{ModelEntry, ModelsResult};
 
-use crate::style::{Line, Role};
+use crate::frame::{Body, Cursor, Frame, Hint, Tone};
+use crate::keys::{Action, Keymap};
+use crate::style::{Line, Role, lr};
 
 /// The model-selection overlay.
 pub struct Picker {
@@ -82,94 +84,103 @@ impl Picker {
             .map(|index| &self.models[*index])
     }
 
-    /// Overlay rows with the selection kept visible within `rows`.
+    /// The border, the count and the keys. `back` names the overlay `esc`
+    /// returns to, when the picker was opened from one.
     #[must_use]
-    pub fn render(&self, cols: usize, rows: usize) -> Vec<Line> {
-        if rows == 0 {
-            return Vec::new();
+    pub fn frame(&self, keys: &Keymap, back: Option<&str>) -> Frame {
+        let info = if self.query.is_empty() {
+            format!("{} models", self.models.len())
+        } else {
+            format!("{} of {}", self.matches.len(), self.models.len())
+        };
+        let mut hints: Vec<Hint> = Hint::key(keys, Action::Send, "selects", 0)
+            .into_iter()
+            .collect();
+        hints.push(Hint::new("type to filter", 2).short("type"));
+        hints.extend(match back {
+            Some(back) => keys.key(Action::Escape).map(|key| {
+                Hint::new(format!("{key} back to {back}"), 0).short(format!("{key} back"))
+            }),
+            None => Hint::key(keys, Action::Escape, "closes", 0),
+        });
+        Frame {
+            tone: Tone::Focus,
+            title: Line::default().ink("models"),
+            info: Some(Line::default().dim(info)),
+            hints,
         }
-        let mut lines = vec![
-            Line::default()
-                .brass("models")
-                .dim(format!(
-                    " · {} · type to filter · enter selects · esc closes",
-                    self.query
-                ))
-                .truncate(cols),
-        ];
-        if rows == 1 {
-            return lines;
-        }
+    }
+
+    /// The filter row, then models under their provider headings, `inner`
+    /// wide. Headings scroll with their models and are never selected.
+    #[must_use]
+    pub fn body(&self, inner: usize) -> Body {
+        let head = vec![Line::default().dim("filter ").ink(&self.query)];
+        let cursor = Some(Cursor::Head(
+            0,
+            unicode_width::UnicodeWidthStr::width(format!("filter {}", self.query).as_str()),
+        ));
         if self.matches.is_empty() {
-            lines.push(Line::default().dim("  no matching models").truncate(cols));
-            return lines;
+            return Body {
+                head,
+                list: vec![Line::default().dim("no matching models")],
+                cursor,
+                ..Body::default()
+            };
         }
-        let capacity = rows - 1;
-        let start = self.selected.saturating_sub(capacity.saturating_sub(2) / 2);
+        let mut list = Vec::new();
+        let mut selected = 0;
         let mut provider = None;
-        for (position, index) in self.matches.iter().enumerate().skip(start) {
-            if lines.len() == rows {
-                break;
-            }
+        for (position, index) in self.matches.iter().enumerate() {
             let entry = &self.models[*index];
             if provider != Some(entry.model.provider.as_str()) {
                 provider = Some(entry.model.provider.as_str());
-                if lines.len() + 1 >= rows && capacity > 1 {
-                    break;
-                }
-                if lines.len() + 1 < rows {
-                    lines.push(
-                        Line::default()
-                            .strong(Role::Ink, &entry.model.provider)
-                            .truncate(cols),
-                    );
-                }
+                list.push(Line::default().strong(Role::Ink, &entry.model.provider));
             }
-            let cursor = if position == self.selected {
-                "›"
+            let here = position == self.selected;
+            if here {
+                selected = list.len();
+            }
+            let mark = if entry.model == self.current {
+                Line::default().brass("●")
             } else {
-                " "
+                Line::default().ink(" ")
             };
-            let current = if entry.model == self.current {
-                "●"
+            let left = if here {
+                Line::default()
+                    .brass("› ")
+                    .extend(mark)
+                    .brass(format!(" {}", entry.model.model))
             } else {
-                " "
-            };
-            let mut label = format!(
-                "{cursor} {current} {} · {}",
-                entry.model.model,
-                window(entry.info.context_window)
-            );
-            if !entry.info.reasoning.is_empty() {
-                label.push_str(" · think");
-            }
-            if let Some(pricing) = entry.info.pricing {
-                label.push_str(&format!(
-                    " · ${}/${} /M in/out",
-                    pricing.input, pricing.output
-                ));
-            }
-            let line = if entry.available {
-                Line::default().span(
-                    if position == self.selected {
-                        Role::Brass
-                    } else {
-                        Role::Ink
-                    },
-                    false,
-                    label,
-                )
-            } else {
-                label.push_str(if entry.model.provider == "chatgpt" {
-                    " · no credentials · xi login chatgpt"
+                let id = if entry.available {
+                    Line::default().ink(&entry.model.model)
                 } else {
-                    " · no credentials"
-                });
-                Line::default().dim(label)
+                    Line::default().dim(&entry.model.model)
+                };
+                Line::default().ink("  ").extend(mark).ink(" ").extend(id)
             };
-            lines.push(line.truncate(cols));
+            let mut meta = vec![window(entry.info.context_window)];
+            if !entry.info.reasoning.is_empty() {
+                meta.push("think".into());
+            }
+            if !entry.available {
+                meta = vec![if entry.model.provider == "chatgpt" {
+                    "no credentials · xi login chatgpt".into()
+                } else {
+                    "no credentials".into()
+                }];
+            } else if let Some(pricing) = entry.info.pricing {
+                meta.push(format!("${}/${}", pricing.input, pricing.output));
+            }
+            list.push(lr(left, Line::default().dim(meta.join(" · ")), inner));
         }
-        lines
+        Body {
+            head,
+            list,
+            selected: Some(selected),
+            cursor,
+            ..Body::default()
+        }
     }
 }
 
@@ -224,21 +235,32 @@ mod tests {
             picker.input(c);
         }
         assert_eq!(picker.selected().unwrap().model.model, "large");
-        let lines = picker.render(120, 10);
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.plain().contains("xi login chatgpt"))
+        let body = picker.body(116);
+        let rows: Vec<String> = body.list.iter().map(Line::plain).collect();
+        assert_eq!(rows[0], "chatgpt");
+        assert!(rows[1].starts_with("›   large"), "{rows:?}");
+        assert!(rows[1].ends_with("no credentials · xi login chatgpt"));
+        assert_eq!(body.head[0].plain(), "filter chatgpt");
+        assert_eq!(body.cursor, Some(Cursor::Head(0, 14)));
+        assert_eq!(
+            picker.frame(&Keymap::default(), None).info.unwrap().plain(),
+            "1 of 2"
         );
-        assert!(lines.iter().any(|line| line.plain().contains("1M")));
-        assert!(lines.iter().all(|line| line.width() <= 120));
-        picker.backspace();
-        picker.up();
+        for _ in 0..7 {
+            picker.backspace();
+        }
         picker.down();
+        let rows: Vec<String> = picker.body(116).list.iter().map(Line::plain).collect();
+        assert!(rows[3].starts_with("› ● small"), "{rows:?}");
+        assert!(rows[3].ends_with("1M · think"), "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= 116)
+        );
     }
 
     #[test]
-    fn short_overlays_keep_the_selection_and_provider_visible() {
+    fn short_frames_keep_the_selection_under_its_provider() {
         let models: Vec<_> = (0..20)
             .map(|index| entry(&format!("provider-{index:02}"), "model", true))
             .collect();
@@ -250,13 +272,26 @@ mod tests {
         for _ in 0..15 {
             picker.down();
         }
-        for rows in 2..9 {
-            let lines = picker.render(80, rows);
+        for rows in 5..12 {
+            let (lines, _) = crate::frame::draw(
+                &picker.frame(&Keymap::default(), Some("settings")),
+                picker.body(76),
+                80,
+                rows,
+            );
+            let text: Vec<String> = lines.iter().map(Line::plain).collect();
             assert!(lines.len() <= rows);
-            assert!(lines.iter().any(|line| line.plain().starts_with("›")));
-            if rows >= 3 {
-                assert!(lines.iter().any(|line| line.plain() == "provider-15"));
+            let at = text
+                .iter()
+                .position(|line| line.starts_with("│ › ● model") || line.starts_with("│ ›   model"))
+                .unwrap_or_else(|| panic!("selection hidden at {rows} rows: {text:#?}"));
+            if rows >= 7 {
+                assert!(text[at - 1].starts_with("│ provider-15"), "{text:#?}");
             }
+            assert!(
+                text.last().unwrap().contains("esc back to settings"),
+                "{text:#?}"
+            );
         }
     }
 }
