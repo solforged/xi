@@ -398,15 +398,15 @@ impl Session {
         decision: Decision,
         cancel: &CancellationToken,
     ) -> Result<Approval> {
-        let (event, ask, denied, waiter) = match decision {
+        let (event, waiter, denied) = match decision {
             Decision::Ask(pending, event, waiter) => {
                 if matches!(self.0.options.approval, ApprovalMode::Client) {
                     self.register_ask(call.clone(), pending);
                 }
-                (event, true, None, Some(waiter))
+                (event, Some(waiter), None)
             }
-            Decision::Deny(reason, event) => (event, false, Some(reason), None),
-            Decision::Run(event) => (event, false, None, None),
+            Decision::Deny(reason, event) => (event, None, Some(reason)),
+            Decision::Run(event) => (event, None, None),
         };
         self.append(
             state,
@@ -423,9 +423,9 @@ impl Session {
         if let Some(reason) = denied {
             return Ok(Approval::Denied(reason));
         }
-        if !ask {
+        let Some(waiter) = waiter else {
             return Ok(Approval::Granted);
-        }
+        };
         let (approved, by, remember, grant) = match self.0.options.approval {
             ApprovalMode::Headless(approved) => {
                 (approved, Approver::Headless, Remember::Once, None)
@@ -441,7 +441,7 @@ impl Session {
                     biased;
                     () = cancel.cancelled() => (false, Approver::Cancelled, Remember::Once, None),
                     () = self.0.stop.cancelled() => (false, Approver::Cancelled, Remember::Once, None),
-                    result = waiter.expect("client waiter") => match result {
+                    result = waiter => match result {
                         Ok(answer) => (answer.approved, Approver::User, answer.remember, answer.grant),
                         Err(_) => (false, Approver::Cancelled, Remember::Once, None),
                     },
