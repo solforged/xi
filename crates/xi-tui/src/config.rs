@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::keys::{Action, Binding, Keymap};
+use crate::layout::Layout;
 use crate::transcript::Thinking;
 
 /// Effective client settings.
@@ -13,6 +14,8 @@ pub struct TuiConfig {
     pub keymap: Keymap,
     /// How reasoning text is displayed.
     pub thinking: Thinking,
+    /// How the client owns the terminal.
+    pub layout: Layout,
 }
 
 impl TuiConfig {
@@ -101,19 +104,19 @@ impl TuiConfig {
             return;
         };
         for (name, value) in table {
-            if name != "thinking" {
-                warnings.push(format!("unknown setting display.{name}"));
-                continue;
+            match name.as_str() {
+                "thinking" => match value.as_str() {
+                    Some("full") => self.thinking = Thinking::Full,
+                    Some("first") => self.thinking = Thinking::First,
+                    Some("hidden") => self.thinking = Thinking::Hidden,
+                    _ => warnings.push("display.thinking must be full, first or hidden".into()),
+                },
+                "layout" => match value.as_str().and_then(Layout::parse) {
+                    Some(layout) => self.layout = layout,
+                    None => warnings.push("display.layout must be inline, deck or auto".into()),
+                },
+                _ => warnings.push(format!("unknown setting display.{name}")),
             }
-            self.thinking = match value.as_str() {
-                Some("full") => Thinking::Full,
-                Some("first") => Thinking::First,
-                Some("hidden") => Thinking::Hidden,
-                _ => {
-                    warnings.push("display.thinking must be full, first or hidden".into());
-                    continue;
-                }
-            };
         }
     }
 }
@@ -123,6 +126,18 @@ impl TuiConfig {
 /// Missing parent directories and files are created. Invalid TOML or a
 /// non-table `display` setting leaves the existing file untouched.
 pub fn save_thinking(path: &Path, thinking: Thinking) -> io::Result<()> {
+    save_display(path, "thinking", thinking.name())
+}
+
+/// Saves the layout while preserving other client settings.
+///
+/// Missing parent directories and files are created. Invalid TOML or a
+/// non-table `display` setting leaves the existing file untouched.
+pub fn save_layout(path: &Path, layout: Layout) -> io::Result<()> {
+    save_display(path, "layout", layout.name())
+}
+
+fn save_display(path: &Path, key: &str, value: &str) -> io::Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -137,14 +152,9 @@ pub fn save_thinking(path: &Path, thinking: Thinking) -> io::Result<()> {
     let display = document["display"]
         .as_table_like_mut()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "display must be a table"))?;
-    let value = match thinking {
-        Thinking::Full => "full",
-        Thinking::First => "first",
-        Thinking::Hidden => "hidden",
-    };
     let mut value = toml_edit::Value::from(value);
     // Replace in place so the key keeps its leading comments.
-    match display.get_mut("thinking") {
+    match display.get_mut(key) {
         Some(item) => {
             if let Some(old) = item.as_value() {
                 *value.decor_mut() = old.decor().clone();
@@ -152,7 +162,7 @@ pub fn save_thinking(path: &Path, thinking: Thinking) -> io::Result<()> {
             *item = toml_edit::Item::Value(value);
         }
         None => {
-            display.insert("thinking", toml_edit::Item::Value(value));
+            display.insert(key, toml_edit::Item::Value(value));
         }
     }
     let parent = path
@@ -267,6 +277,7 @@ mod tests {
             let (config, warnings) = TuiConfig::load(path);
             assert!(warnings.is_empty());
             assert_eq!(config.thinking, Thinking::First);
+            assert_eq!(config.layout, Layout::Inline);
             assert_eq!(config.keymap.help(), Keymap::default().help());
         }
     }
@@ -308,6 +319,50 @@ mod tests {
         for invalid in ["[display", "display = false"] {
             std::fs::write(&path, invalid).unwrap();
             assert!(save_thinking(&path, Thinking::Full).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+    }
+
+    #[test]
+    fn saving_layout_and_thinking_preserves_both_modes_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        std::fs::write(
+            &path,
+            "# client\n[keys]\nsearch = 'ctrl+y'\n[display]\n# layout choice\nlayout = 'inline' # keep layout\nthinking = 'full' # keep thinking\n",
+        )
+        .unwrap();
+        save_layout(&path, Layout::Deck).unwrap();
+        save_thinking(&path, Thinking::Hidden).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        for preserved in [
+            "# client",
+            "# layout choice",
+            "# keep layout",
+            "# keep thinking",
+            "search = 'ctrl+y'",
+        ] {
+            assert!(saved.contains(preserved), "{saved}");
+        }
+        let (config, warnings) = TuiConfig::load(Some(&path));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.layout, Layout::Deck);
+        assert_eq!(config.thinking, Thinking::Hidden);
+        for layout in [Layout::Inline, Layout::Deck, Layout::Auto] {
+            save_layout(&path, layout).unwrap();
+            assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
+        }
+    }
+
+    #[test]
+    fn saving_layout_creates_parents_and_leaves_invalid_config_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new/config/tui.toml");
+        save_layout(&path, Layout::Auto).unwrap();
+        assert_eq!(TuiConfig::load(Some(&path)).0.layout, Layout::Auto);
+        for invalid in ["[display", "display = false"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(save_layout(&path, Layout::Deck).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
         }
     }

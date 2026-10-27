@@ -17,6 +17,7 @@ use crate::approvals::{Approvals, Choice};
 use crate::frame::{self, Body, Frame, Hint};
 use crate::history::History;
 use crate::keys::{Action, Keymap};
+use crate::layout::Layout;
 use crate::settings;
 use crate::style::Line;
 use crate::transcript::Thinking;
@@ -28,6 +29,7 @@ pub(crate) struct Ctx<'a> {
     pub history: &'a History,
     pub info: &'a SessionDetails,
     pub thinking: Thinking,
+    pub layout: Layout,
     pub tui_path: Option<&'a Path>,
     pub now: Timestamp,
     /// Terminal rows, for paging.

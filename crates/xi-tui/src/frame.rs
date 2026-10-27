@@ -683,4 +683,27 @@ mod tests {
         keys.bind(Action::Escape, Vec::new());
         assert_eq!(Hint::key(&keys, Action::Escape, "closes", 0), None);
     }
+
+    #[test]
+    fn seven_rows_keep_the_title_five_body_rows_and_hints() {
+        let frame = Frame {
+            tone: Tone::Focus,
+            title: Line::default().ink("settings"),
+            info: None,
+            hints: vec![Hint::new("enter changes", 0), Hint::new("esc closes", 0)],
+        };
+        let body = Body {
+            list: (0..10)
+                .map(|i| Line::default().ink(format!("row {i}")))
+                .collect(),
+            selected: Some(4),
+            ..Body::default()
+        };
+        let (lines, _) = draw(&frame, body, 120, 7);
+        assert_eq!(lines.len(), 7);
+        assert!(lines[0].plain().contains("settings"));
+        assert!(lines[1..6].iter().all(|line| line.plain().contains("row ")));
+        assert!(lines[6].plain().contains("enter changes"));
+        assert!(lines[6].plain().contains("esc closes"));
+    }
 }

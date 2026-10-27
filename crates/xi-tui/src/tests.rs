@@ -2198,6 +2198,7 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
         "settings",
         "/tmp/xi-test-config/config.toml",
         "this session",
+        "client",
         "defaults",
         "tools",
         "read only",
@@ -2207,6 +2208,7 @@ async fn settings_opens_with_report_rows_and_session_model_and_reasoning() {
         "medium",
         "session",
         "Thinking display",
+        "Layout",
         "Approvals",
         "--config extra.toml",
         "held back (untrusted)",
@@ -2253,7 +2255,7 @@ async fn settings_compaction_toggle_sends_set_and_replaces_the_report() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 4).await;
+    settings_down(&mut app, 5).await;
     app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2281,7 +2283,7 @@ async fn settings_sandbox_toggle_saves_the_default_without_changing_the_worker()
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 7).await;
+    settings_down(&mut app, 8).await;
     for (key, enabled) in [(KeyCode::Char(' '), false), (KeyCode::Enter, true)] {
         app.key(KeyEvent::new(key, KeyModifiers::NONE))
             .await
@@ -2363,7 +2365,7 @@ async fn settings_tool_toggle_sends_full_array_preserving_unknown_names_and_orde
     .await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
-    settings_down(&mut app, 8).await;
+    settings_down(&mut app, 9).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2394,7 +2396,7 @@ async fn settings_refuses_to_remove_the_last_tool() {
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
     request(&mut requests, "config/settings");
-    settings_down(&mut app, 8).await;
+    settings_down(&mut app, 9).await;
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -2407,7 +2409,7 @@ async fn settings_cycles_approvals_and_edits_nullable_and_positive_token_counts(
     let (launch, mut requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 180, 40);
     app.command("/settings").await.unwrap();
-    settings_down(&mut app, 3).await;
+    settings_down(&mut app, 4).await;
     for approval in ["reads", "auto", "ask"] {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
@@ -2585,4 +2587,202 @@ async fn startup_resume_uses_the_attached_workspace_for_new_sessions() {
     launch.template.cwd = "/tmp/original-workspace".into();
     let app = App::new(launch, 120, 32);
     assert_eq!(app.launch.template.cwd, app.launch.attached.info.cwd);
+}
+
+#[tokio::test]
+async fn slit_composer_is_a_rule_and_bare_prompt() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let app = App::new(launch, 60, 36);
+    let (lines, cursor) = app.live();
+    assert_eq!(lines[0].plain(), "─".repeat(60));
+    assert_eq!(
+        composer_line(&app),
+        "ξ enter sends · ctrl+j new line · /help"
+    );
+    assert_eq!(cursor, Some((1, 2)));
+    assert!(!live_text(&app).contains('╭'));
+    assert!(lines.iter().all(|line| line.width() <= 60));
+}
+
+#[tokio::test]
+async fn sheet_chrome_stays_on_the_output_measure() {
+    let (launch, _) = launch(snapshot(true)).await;
+    let app = App::new(launch, 250, 36);
+    let (lines, _) = app.live();
+    let activity = lines
+        .iter()
+        .find(|line| line.plain().contains("working"))
+        .unwrap();
+    assert!(activity.width() <= 120);
+    assert_eq!(lines.last().unwrap().width(), 120);
+    for line in lines.iter().filter(|line| {
+        let text = line.plain();
+        text.starts_with('╭') || text.starts_with('│') || text.starts_with('╰')
+    }) {
+        assert_eq!(line.width(), 120);
+    }
+    assert!(lines.iter().all(|line| line.width() <= 120));
+}
+
+#[tokio::test]
+async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
+    let (launch, _) = launch(snapshot(true)).await;
+    let mut app = App::new(launch, 60, 36);
+    append(&mut app, reply(Vec::new(), StopReason::ToolUse));
+    let (lines, _) = app.live();
+    let activity = lines
+        .iter()
+        .find(|line| line.plain().contains("working"))
+        .unwrap()
+        .plain();
+    assert!(activity.contains("working · "));
+    assert!(activity.ends_with("esc stop"));
+    assert!(!activity.contains('↑'));
+    assert!(!activity.contains('↓'));
+    app.cols = 250;
+    let (lines, _) = app.live();
+    let activity = lines
+        .iter()
+        .find(|line| line.plain().contains("working"))
+        .unwrap()
+        .plain();
+    assert!(
+        activity.contains(&format!("↑ {} ↓ {}", tokens(1_000), tokens(10))),
+        "{activity}"
+    );
+}
+
+#[tokio::test]
+async fn short_live_region_keeps_the_frame_title_five_rows_and_hints() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 124, 17);
+    app.editor.set_text(&"draft\n".repeat(20));
+    assert!(app.live().0.len() <= 8);
+    app.command("/settings").await.unwrap();
+    let (lines, _) = app.live();
+    assert_eq!(lines.len(), 8);
+    assert!(lines[0].plain().contains("settings"));
+    assert!(lines[6].plain().contains("enter changes"));
+    assert!(lines[6].plain().contains("esc closes"));
+    assert!(lines[7].plain().contains("ctx"));
+    assert!(!live_text(&app).contains("esc returns here"));
+    assert!(lines.iter().all(|line| line.width() <= 120));
+}
+
+#[tokio::test]
+async fn layout_command_reports_changes_and_persists_the_choice() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tui.toml");
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.tui_config = Some(path.clone());
+    let mut app = App::new(launch, 250, 36);
+    app.commit.clear();
+    app.command("/layout").await.unwrap();
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain() == "  layout · inline (sheet, 250×36)")
+    );
+    for (name, layout, deck) in [
+        ("deck", Layout::Deck, true),
+        ("inline", Layout::Inline, false),
+    ] {
+        app.command(&format!("/layout {name}")).await.unwrap();
+        assert_eq!(app.layout, layout);
+        assert_eq!(app.deck, deck);
+        assert!(
+            app.commit
+                .iter()
+                .any(|line| line.plain() == format!("  layout → {name}"))
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(&format!("layout = \"{name}\"")), "{saved}");
+        assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
+    }
+}
+
+#[tokio::test]
+async fn settings_layout_cycles_and_saves_client_display() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tui.toml");
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.tui_config = Some(path.clone());
+    let mut app = App::new(launch, 250, 36);
+    app.command("/settings").await.unwrap();
+    settings_down(&mut app, 3).await;
+    for layout in [Layout::Deck, Layout::Auto, Layout::Inline] {
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.layout, layout);
+        assert_eq!(app.deck, layout != Layout::Inline);
+        assert_eq!(TuiConfig::load(Some(&path)).0.layout, layout);
+        assert!(live_text(&app).contains("saved · layout"));
+    }
+}
+
+#[tokio::test]
+async fn layout_config_loads_and_invalid_layout_warns_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tui.toml");
+    for (value, size, deck) in [
+        ("inline", (250, 36), false),
+        ("deck", (60, 17), true),
+        ("auto", (250, 36), true),
+        ("auto", (124, 36), false),
+    ] {
+        std::fs::write(&path, format!("[display]\nlayout = \"{value}\"\n")).unwrap();
+        let (mut launch, _) = launch(snapshot(false)).await;
+        launch.tui_config = Some(path.clone());
+        let app = App::new(launch, size.0, size.1);
+        assert_eq!(app.layout.name(), value);
+        assert_eq!(app.deck, deck);
+    }
+    std::fs::write(&path, "[display]\nlayout = \"wide\"\n").unwrap();
+    let (mut launch, _) = launch(snapshot(false)).await;
+    launch.tui_config = Some(path);
+    let app = App::new(launch, 120, 36);
+    assert_eq!(app.layout, Layout::Inline);
+    let warnings: Vec<_> = app
+        .commit
+        .iter()
+        .filter(|line| line.plain().contains("display.layout"))
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0].plain(),
+        "  tui.toml: display.layout must be inline, deck or auto"
+    );
+    assert!(warnings[0].0.iter().all(|span| span.role == Role::Dim));
+}
+
+#[tokio::test]
+async fn deck_focus_keys_are_in_help_and_noop_inline() {
+    let (launch, _) = launch(snapshot(false)).await;
+    let mut app = App::new(launch, 120, 36);
+    app.editor.set_text("keep draft");
+    app.commit.clear();
+    for (key, action, name) in [
+        ('1', Action::FocusSessions, "focus_sessions"),
+        ('2', Action::FocusLog, "focus_log"),
+        ('3', Action::FocusInspector, "focus_inspector"),
+    ] {
+        let key = KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT);
+        assert_eq!(app.keymap.action(key), Some(action));
+        assert_eq!(action.name(), name);
+        app.key(key).await.unwrap();
+        assert_eq!(app.editor.text(), "keep draft");
+        assert!(app.overlays.is_empty());
+        assert!(app.commit.is_empty());
+    }
+    app.command("/help").await.unwrap();
+    let help = app
+        .commit
+        .iter()
+        .map(Line::plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for key in ["alt+1", "alt+2", "alt+3"] {
+        assert!(help.contains(key), "{help}");
+    }
 }

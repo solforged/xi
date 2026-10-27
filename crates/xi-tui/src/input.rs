@@ -8,6 +8,14 @@ use crate::{App, Error, ExternalRequest};
 impl App {
     pub(crate) async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
         let action = self.keymap.action(key);
+        if !self.deck
+            && matches!(
+                action,
+                Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector)
+            )
+        {
+            return Ok(());
+        }
         if matches!(action, Some(Action::Interrupt)) {
             if !self.overlays.is_empty() || self.completion.is_some() {
                 self.close_overlay();
@@ -106,7 +114,7 @@ impl App {
                     };
                     self.transcript.note(vec![Line::default().dim(why)])
                 });
-                self.commit.extend(lines);
+                self.commit_lines(lines);
                 return Ok(());
             }
             Some(Action::Thinking) => {
@@ -161,7 +169,12 @@ impl App {
                     return Ok(());
                 }
             }
-            Some(Action::Interrupt) => return Ok(()),
+            Some(
+                Action::Interrupt
+                | Action::FocusSessions
+                | Action::FocusLog
+                | Action::FocusInspector,
+            ) => return Ok(()),
         }
         self.update_completion();
         Ok(())

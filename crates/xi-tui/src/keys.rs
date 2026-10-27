@@ -37,6 +37,12 @@ pub enum Action {
     Expand,
     /// Cycle the thinking display.
     Thinking,
+    /// Focus the deck's sessions pane.
+    FocusSessions,
+    /// Focus the deck's log.
+    FocusLog,
+    /// Focus the deck's inspector.
+    FocusInspector,
     /// Move to the line start.
     Home,
     /// Move to the line end.
@@ -76,6 +82,9 @@ impl Action {
         Self::Reasoning,
         Self::Expand,
         Self::Thinking,
+        Self::FocusSessions,
+        Self::FocusLog,
+        Self::FocusInspector,
         Self::Home,
         Self::End,
         Self::Left,
@@ -107,6 +116,9 @@ impl Action {
             Self::Reasoning => "reasoning",
             Self::Expand => "expand",
             Self::Thinking => "thinking",
+            Self::FocusSessions => "focus_sessions",
+            Self::FocusLog => "focus_log",
+            Self::FocusInspector => "focus_inspector",
             Self::Home => "home",
             Self::End => "end",
             Self::Left => "left",
@@ -139,6 +151,9 @@ impl Action {
             Self::Reasoning => "cycle reasoning through the model's levels",
             Self::Expand => "expand the newest collapsed result; repeat for older",
             Self::Thinking => "cycle thinking display: full, first line, hidden",
+            Self::FocusSessions => "focus sessions (deck)",
+            Self::FocusLog => "focus log (deck)",
+            Self::FocusInspector => "focus inspector (deck)",
             Self::Home => "line start",
             Self::End => "line end",
             Self::Left => "previous character",
@@ -315,6 +330,9 @@ impl Default for Keymap {
             (BackTab, M::NONE, Action::Reasoning),
             (Char('o'), M::CONTROL, Action::Expand),
             (Char('t'), M::CONTROL, Action::Thinking),
+            (Char('1'), M::ALT, Action::FocusSessions),
+            (Char('2'), M::ALT, Action::FocusLog),
+            (Char('3'), M::ALT, Action::FocusInspector),
             (Char('a'), M::CONTROL, Action::Home),
             (Char('e'), M::CONTROL, Action::End),
             (Char('b'), M::CONTROL, Action::Left),
@@ -531,7 +549,9 @@ mod tests {
             assert_eq!(row.1, action.description());
         }
         assert_eq!(rows[2].0, "shift+enter, ctrl+j");
-        assert_eq!(rows[16].0, "ctrl+a, home");
+        assert!(rows.iter().any(|(keys, description)| {
+            keys == "ctrl+a, home" && *description == Action::Home.description()
+        }));
         map.bind(Action::Send, Vec::new());
         assert_eq!(map.help()[0].0, "alt+enter");
     }

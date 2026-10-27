@@ -1,7 +1,5 @@
 //! Effective settings, their sources and the settings editor overlay.
 
-use std::path::Path;
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 use xi_protocol::event::ModelRef;
@@ -13,13 +11,13 @@ use crate::frame::{Body, Cursor, Frame, Hint, Note, Tone};
 use crate::keys::{Action as Key, Keymap};
 use crate::overlay::{Command, Ctx, Outcome, Overlay};
 use crate::style::{self, Line, Role};
-use crate::transcript::Thinking;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Row {
     Model,
     Reasoning,
     Thinking,
+    Layout,
     Approvals,
     Tool(&'static str),
     Compaction,
@@ -34,6 +32,7 @@ const ROWS: &[Row] = &[
     Row::Model,
     Row::Reasoning,
     Row::Thinking,
+    Row::Layout,
     Row::Approvals,
     Row::Compaction,
     Row::Trigger,
@@ -58,7 +57,8 @@ const ROWS: &[Row] = &[
 fn heading(index: usize) -> Option<&'static str> {
     match ROWS[index] {
         Row::Model => Some("this session"),
-        Row::Thinking => Some("defaults"),
+        Row::Thinking => Some("client"),
+        Row::Approvals => Some("defaults"),
         Row::Tool("read") => Some("tools"),
         Row::ReadOnly(_, "sandbox.readable") => Some("read only"),
         _ => None,
@@ -80,6 +80,8 @@ pub(crate) enum Action {
     Reasoning,
     /// Cycle and persist the client thinking display.
     Thinking,
+    /// Cycle and persist the client layout.
+    Layout,
     /// Change an editable global setting.
     Set {
         /// Dotted setting key.
@@ -235,6 +237,7 @@ impl Settings {
                     Row::Model if enter => Action::Models,
                     Row::Reasoning => Action::Reasoning,
                     Row::Thinking => Action::Thinking,
+                    Row::Layout => Action::Layout,
                     Row::Approvals => Action::Set {
                         key: "approvals",
                         value: Value::String(
@@ -293,34 +296,39 @@ impl Settings {
         Action::None
     }
 
-    fn row(
-        &self,
-        row: Row,
-        model: &ModelRef,
-        reasoning: Reasoning,
-        thinking: Thinking,
-        tui_path: Option<&Path>,
-    ) -> (String, String, String) {
+    fn row(&self, row: Row, ctx: &Ctx) -> (String, String, String) {
         let (label, key) = match row {
             Row::Model => {
                 return (
                     "Model".into(),
-                    format!("{}/{}", model.provider, model.model),
+                    format!("{}/{}", ctx.info.model.provider, ctx.info.model.model),
                     "session".into(),
                 );
             }
             Row::Reasoning => {
                 return (
                     "Reasoning".into(),
-                    reasoning.name().into(),
+                    ctx.info.reasoning.name().into(),
                     "session".into(),
                 );
             }
             Row::Thinking => {
                 return (
                     "Thinking display".into(),
-                    thinking.name().into(),
-                    if tui_path.is_some() {
+                    ctx.thinking.name().into(),
+                    if ctx.tui_path.is_some() {
+                        "tui.toml"
+                    } else {
+                        "session"
+                    }
+                    .into(),
+                );
+            }
+            Row::Layout => {
+                return (
+                    "Layout".into(),
+                    ctx.layout.name().into(),
+                    if ctx.tui_path.is_some() {
                         "tui.toml"
                     } else {
                         "session"
@@ -417,14 +425,7 @@ impl Settings {
     /// right where they truncate before labels and values. An inline
     /// number field holds the cursor.
     #[must_use]
-    pub fn body(
-        &self,
-        inner: usize,
-        model: &ModelRef,
-        reasoning: Reasoning,
-        thinking: Thinking,
-        tui_path: Option<&Path>,
-    ) -> Body {
+    fn body(&self, inner: usize, ctx: &Ctx) -> Body {
         let mut list = Vec::new();
         let mut selected = 0;
         let mut cursor = None;
@@ -432,7 +433,7 @@ impl Settings {
             if let Some(heading) = heading(index) {
                 list.push(Line::default().strong(Role::Ink, heading));
             }
-            let (label, value, source) = self.row(*row, model, reasoning, thinking, tui_path);
+            let (label, value, source) = self.row(*row, ctx);
             let here = index == self.selected;
             let role = if here { Role::Brass } else { Role::Ink };
             let prefix = Line::default().span(
@@ -493,14 +494,7 @@ impl Overlay for Settings {
     }
 
     fn body(&self, inner: usize, ctx: &Ctx) -> Body {
-        Self::body(
-            self,
-            inner,
-            &ctx.info.model,
-            ctx.info.reasoning,
-            ctx.thinking,
-            ctx.tui_path,
-        )
+        Self::body(self, inner, ctx)
     }
 
     fn key(&mut self, key: KeyEvent, action: Option<Key>, ctx: &Ctx) -> Outcome {

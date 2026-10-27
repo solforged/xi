@@ -32,6 +32,7 @@ macro_rules! ctx {
             history: &$app.history,
             info: &$app.launch.attached.info,
             thinking: $app.transcript.thinking_display(),
+            layout: $app.layout,
             tui_path: $app.launch.tui_config.as_deref(),
             now: ::xi_protocol::Timestamp::now(),
             rows: $app.rows,
@@ -124,6 +125,20 @@ impl App {
                     Some(Ok(())) => self.settings_note("saved · thinking display"),
                     Some(Err(error)) => self.settings_note(error.to_string()),
                     None => self.settings_note("not saved: no config path"),
+                }
+            }
+            settings::Action::Layout => {
+                let layout = match self.layout {
+                    crate::layout::Layout::Inline => crate::layout::Layout::Deck,
+                    crate::layout::Layout::Deck => crate::layout::Layout::Auto,
+                    crate::layout::Layout::Auto => crate::layout::Layout::Inline,
+                };
+                match self.set_layout(layout) {
+                    Ok(()) if self.launch.tui_config.is_some() => {
+                        self.settings_note("saved · layout")
+                    }
+                    Ok(()) => self.settings_note("not saved: no config path"),
+                    Err(error) => self.settings_note(error.to_string()),
                 }
             }
             settings::Action::Set { key, value } => match self.save_setting(key, value).await {

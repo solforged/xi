@@ -2,9 +2,9 @@
 //!
 //! [`Transcript::apply`] returns the lines a notification commits to
 //! scrollback. Everything not yet committed (streaming text and calls still
-//! waiting for their result) is drawn by [`Transcript::live`]. A block
-//! commits when its last event lands, and calls commit in the order the model
-//! made them, so scrollback reads in call order.
+//! waiting for their result) is drawn by [`Transcript::live`]. Calls commit
+//! in model order. A trailing run of edits stays live until a different
+//! block or [`Transcript::flush`] closes it.
 
 use std::time::Instant;
 
@@ -17,6 +17,7 @@ use xi_protocol::{Block, EventKind, OutputBlock, SessionId, Timestamp, ToolCallI
 
 use crate::children::Children;
 use crate::layout::Measure;
+use crate::log::Inspect;
 use crate::style::{Line, Role, inline, lr, prose, wrap};
 
 /// Terminal spinner frames, one every 125 ms.
@@ -24,8 +25,6 @@ pub const SPINNER: [&str; 8] = ["┤", "┘", "┴", "└", "├", "┌", "┬",
 
 /// Result lines shown under a call before the rest is counted.
 pub(crate) const RESULT_LINES: usize = 3;
-/// Streaming rows kept in the live region.
-const STREAM_ROWS: usize = 6;
 /// Diff rows shown before the rest is kept for ctrl+o.
 const DIFF_ROWS: usize = 8;
 
@@ -34,7 +33,7 @@ const DIFF_ROWS: usize = 8;
 pub enum Thinking {
     /// Show all reasoning text.
     Full,
-    /// Show the first committed line or newest live line.
+    /// Show a committed headline and two body rows, or the newest live line.
     #[default]
     First,
     /// Hide reasoning text without hiding the activity indicator.
@@ -62,47 +61,73 @@ impl Thinking {
         }
     }
 
-    fn rows(self, text: &str, cols: usize, live: bool) -> Vec<Line> {
+    fn live_rows(self, text: &str, m: Measure) -> Vec<Line> {
         if text.trim().is_empty() {
             return Vec::new();
         }
         match self {
             Self::Hidden => Vec::new(),
             Self::Full => {
-                let rows = prose(text, cols.saturating_sub(4), Role::Dim);
-                let skip = if live {
-                    rows.len().saturating_sub(STREAM_ROWS)
-                } else {
-                    0
-                };
+                let rows = prose(text, m.prose, Role::Dim);
+                let skip = rows.len().saturating_sub(m.stream_rows());
                 rows.into_iter()
                     .skip(skip)
                     .enumerate()
                     .map(|(i, row)| {
                         let lead = if i == 0 { "  ∴ " } else { "    " };
-                        Line::default().dim(lead).extend(row).truncate(cols)
+                        Line::default().dim(lead).extend(row).truncate(m.out)
                     })
                     .collect()
             }
-            Self::First => {
-                let mut rows = text.lines();
-                let row = if live {
-                    rows.rfind(|line| !line.trim().is_empty())
-                } else {
-                    rows.find(|line| !line.trim().is_empty())
-                };
-                let Some(row) = row else { return Vec::new() };
-                let more = !live && rows.next().is_some();
-                let line = Line::default().dim("  ∴ ").extend(inline(row, Role::Dim));
-                vec![if more {
-                    line.truncate(cols.saturating_sub(9))
-                        .dim(" · ctrl+t")
-                        .truncate(cols)
-                } else {
-                    line.truncate(cols)
-                }]
-            }
+            Self::First => text
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .map(|row| {
+                    Line::default()
+                        .dim("  ∴ ")
+                        .extend(inline(row, Role::Dim))
+                        .truncate(m.out)
+                })
+                .into_iter()
+                .collect(),
         }
+    }
+
+    fn committed_rows(self, text: &str, m: Measure, elapsed: u64, output: u64) -> Vec<Line> {
+        if self == Self::Hidden || text.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut rows = prose(text.trim(), m.prose, Role::Dim).into_iter();
+        let Some(first) = rows.next() else {
+            return Vec::new();
+        };
+        let meta = if m.durations() {
+            format!("{} · {}", duration(elapsed), tokens(output))
+        } else {
+            duration(elapsed)
+        };
+        let mut lines = vec![lr(
+            Line::default().dim("  ∴ ").strong(Role::Ink, first.plain()),
+            Line::default().dim(meta),
+            m.out,
+        )];
+        let count = rows.len();
+        let shown = if self == Self::First {
+            count.min(2)
+        } else {
+            count
+        };
+        for (index, row) in rows.take(shown).enumerate() {
+            let line = Line::default().dim("    ").extend(row);
+            lines.push(if index + 1 == shown && shown < count {
+                line.truncate(m.out.saturating_sub(9))
+                    .dim(" · ctrl+t")
+                    .truncate(m.out)
+            } else {
+                line.truncate(m.out)
+            });
+        }
+        lines
     }
 }
 
@@ -129,6 +154,7 @@ struct Call {
     arg: String,
     input: Value,
     since: Option<Instant>,
+    started_at: Timestamp,
     decided_at: Option<Timestamp>,
     decision: Option<Decision>,
     rule: Option<String>,
@@ -185,6 +211,17 @@ pub(crate) struct Detail {
     pub(crate) spill: Option<std::path::PathBuf>,
 }
 
+/// A file changed by successful edits, in first-touch order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Changed {
+    /// The call's workspace-relative path.
+    pub path: String,
+    /// Lines added by the edits.
+    pub added: usize,
+    /// Lines removed by the edits.
+    pub removed: usize,
+}
+
 /// Token totals.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Totals {
@@ -232,6 +269,11 @@ impl Totals {
 pub struct Transcript {
     calls: Vec<Call>,
     stream: String,
+    /// Successful edits held until a different block closes their run.
+    edits: Vec<Call>,
+    changed: Vec<Changed>,
+    inspects: Vec<(usize, Inspect)>,
+    previous_at: Option<Timestamp>,
     thinking: bool,
     asks: Vec<Ask>,
     stream_thinking: String,
@@ -471,6 +513,33 @@ fn diff_line(role: Role, text: &str, cols: usize) -> Line {
         .truncate(cols)
 }
 
+fn diff_text(diff: &Diff<'_>) -> String {
+    let mut text = String::new();
+    for (role, row) in &diff.rows {
+        text.push_str(match role {
+            Role::Sanguine => "- ",
+            Role::Verdigris => "+ ",
+            _ => "  ",
+        });
+        text.push_str(row);
+        text.push('\n');
+    }
+    text
+}
+
+fn edit_head(edits: &[Call], m: Measure) -> Line {
+    let first = &edits[0];
+    if edits.len() == 1 {
+        first.head(first.mark(), m)
+    } else {
+        Line::default()
+            .dim("▸ ")
+            .strong(Role::Ink, format!("edit ×{}", edits.len()))
+            .ink(" ")
+            .ink(first.headline_arg(m))
+    }
+}
+
 impl Call {
     fn mark(&self) -> Line {
         let Some((output, ..)) = &self.result else {
@@ -486,13 +555,29 @@ impl Call {
         }
     }
 
-    fn head(&self, mark: Line) -> Line {
+    fn headline_arg(&self, m: Measure) -> &str {
+        if !m.durations() && matches!(self.name.as_str(), "read" | "edit" | "write" | "hashline") {
+            self.arg.rsplit('/').next().unwrap_or(&self.arg)
+        } else {
+            &self.arg
+        }
+    }
+
+    fn head(&self, mark: Line, m: Measure) -> Line {
         let line = mark.ink(" ").strong(Role::Ink, &self.name);
         if self.arg.is_empty() {
             line
         } else {
-            line.ink(" ").ink(&self.arg)
+            line.ink(" ").ink(self.headline_arg(m))
         }
+    }
+
+    fn successful_edit(&self) -> bool {
+        matches!(self.name.as_str(), "edit" | "hashline")
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|(output, ..)| !output.is_error)
     }
 
     fn detail_title(&self) -> String {
@@ -559,11 +644,11 @@ impl Call {
 
     /// The block the call commits, and its whole result when the block cut
     /// lines from it.
-    fn committed(&self, cols: usize) -> (Vec<Line>, Vec<Detail>) {
+    fn committed(&self, m: Measure, diff: Option<Diff<'_>>) -> (Vec<Line>, Vec<Detail>, Inspect) {
+        let cols = m.out;
         let Some((output, spill, at)) = &self.result else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Inspect::default());
         };
-        let diff = if output.is_error { None } else { self.diff() };
         let text = if diff.is_some() {
             String::new()
         } else {
@@ -612,7 +697,9 @@ impl Call {
                 counted(count, "hit", "hits")
             });
         }
-        if let Some(from) = self.decided_at {
+        if m.durations()
+            && let Some(from) = self.decided_at
+        {
             meta.push(duration(at.0.saturating_sub(from.0)));
         }
         let role = if self.mark().plain() == "↺" {
@@ -630,11 +717,25 @@ impl Call {
             }
         }
         right = right.span(role, false, meta.join(" · "));
-        let mut lines = vec![lr(self.head(self.mark()), right, cols)];
+        let mut inspect = Inspect {
+            title: self
+                .head(Line::default(), m)
+                .plain()
+                .trim_start()
+                .to_owned(),
+            meta: right.plain(),
+            diff: diff.is_some(),
+            ..Inspect::default()
+        };
+        let mut lines = vec![lr(self.head(self.mark(), m), right, cols)];
         lines.extend(self.egress.iter().map(|row| row.line(cols, true, None)));
         if !self.children.is_empty() {
-            let (slips, mut details) = self.children.committed(cols);
+            let (slips, mut details) = self.children.committed(m);
             lines.extend(slips);
+            if !text.is_empty() {
+                inspect.note = format!("{count} lines");
+                inspect.text.clone_from(&text);
+            }
             if !text.trim().is_empty() {
                 details.insert(
                     0,
@@ -647,7 +748,7 @@ impl Call {
                     },
                 );
             }
-            return (lines, details);
+            return (lines, details, inspect);
         }
         if let Some(diff) = diff {
             lines.extend(
@@ -663,16 +764,9 @@ impl Call {
                         .dim(format!("    {}", more_lines(hidden)))
                         .truncate(cols),
                 );
-                let mut text = String::new();
-                for (role, row) in diff.rows {
-                    text.push_str(match role {
-                        Role::Sanguine => "- ",
-                        Role::Verdigris => "+ ",
-                        _ => "  ",
-                    });
-                    text.push_str(row);
-                    text.push('\n');
-                }
+                let text = diff_text(&diff);
+                inspect.note = format!("{} lines", diff.rows.len());
+                inspect.text.clone_from(&text);
                 return (
                     lines,
                     vec![Detail {
@@ -682,12 +776,25 @@ impl Call {
                         error: false,
                         spill: spill.clone(),
                     }],
+                    inspect,
                 );
             }
-            return (lines, Vec::new());
+            if diff
+                .rows
+                .iter()
+                .any(|(_, row)| Line::default().ink(row).width() + 4 > cols)
+            {
+                inspect.note = format!("{} lines", diff.rows.len());
+                inspect.text = diff_text(&diff);
+            }
+            return (lines, Vec::new(), inspect);
         }
         if quiet {
-            return (lines, Vec::new());
+            if !text.is_empty() {
+                inspect.note = format!("{count} lines");
+                inspect.text = text;
+            }
+            return (lines, Vec::new(), inspect);
         }
         let red = if output.is_error && exit.is_none() {
             alarm(&rows)
@@ -728,6 +835,15 @@ impl Call {
             let more = format!("    {}", more.join(" · "));
             lines.push(Line::default().dim(more).truncate(cols));
         }
+        if hidden > 0
+            || exit.is_some()
+            || rows
+                .iter()
+                .any(|(_, row)| inline(row, Role::Ink).width() + 4 > cols)
+        {
+            inspect.note = format!("{count} lines");
+            inspect.text.clone_from(&text);
+        }
         let details = if hidden > 0 || exit.is_some() {
             vec![Detail {
                 title: self.detail_title(),
@@ -739,7 +855,7 @@ impl Call {
         } else {
             Vec::new()
         };
-        (lines, details)
+        (lines, details, inspect)
     }
 }
 
@@ -795,6 +911,143 @@ impl Transcript {
         &self.children
     }
 
+    /// Files changed by committed successful edits, in first-touch order.
+    #[must_use]
+    pub fn changed(&self) -> &[Changed] {
+        &self.changed
+    }
+
+    /// Takes inspector anchors for the most recent apply or flush.
+    pub fn take_inspects(&mut self) -> Vec<(usize, Inspect)> {
+        std::mem::take(&mut self.inspects)
+    }
+
+    /// Commits the trailing edit run before a turn or stream boundary.
+    pub fn flush(&mut self, m: Measure) -> Vec<Line> {
+        self.inspects.clear();
+        let mut out = Vec::new();
+        self.flush_edits(&mut out, m);
+        out
+    }
+
+    fn record_changed(&mut self, call: &Call, diff: &Diff<'_>) {
+        if let Some(changed) = self.changed.iter_mut().find(|entry| entry.path == call.arg) {
+            changed.added += diff.added;
+            changed.removed += diff.removed.unwrap_or(0);
+        } else {
+            self.changed.push(Changed {
+                path: call.arg.clone(),
+                added: diff.added,
+                removed: diff.removed.unwrap_or(0),
+            });
+        }
+    }
+
+    fn commit_call(&mut self, call: &Call, out: &mut Vec<Line>, m: Measure) {
+        let diff = call
+            .result
+            .as_ref()
+            .filter(|(output, ..)| !output.is_error)
+            .and_then(|_| call.diff());
+        if let Some(diff) = &diff {
+            self.record_changed(call, diff);
+        }
+        let (lines, details, inspect) = call.committed(m, diff);
+        if !lines.is_empty() {
+            self.inspects.push((out.len(), inspect));
+        }
+        if !details.is_empty() {
+            self.details.extend(details);
+            self.expanded = 0;
+        }
+        self.push(out, lines);
+    }
+
+    fn flush_edits(&mut self, out: &mut Vec<Line>, m: Measure) {
+        let edits = std::mem::take(&mut self.edits);
+        let Some(first) = edits.first() else {
+            return;
+        };
+        if edits.len() == 1 {
+            self.commit_call(first, out, m);
+            return;
+        }
+        let diffs: Vec<_> = edits.iter().map(Call::diff).collect();
+        let added: usize = diffs.iter().flatten().map(|diff| diff.added).sum();
+        let removed: usize = diffs
+            .iter()
+            .flatten()
+            .map(|diff| diff.removed.unwrap_or(0))
+            .sum();
+        let count: usize = diffs.iter().flatten().map(|diff| diff.rows.len()).sum();
+        let mut meta = format!("+{added} −{removed}");
+        if m.durations()
+            && let Some((_, _, at)) = &edits[edits.len() - 1].result
+        {
+            let elapsed =
+                at.0.saturating_sub(first.decided_at.unwrap_or(first.started_at).0);
+            meta.push_str(&format!(" · {}", duration(elapsed)));
+        }
+        let text: String = diffs.iter().flatten().map(diff_text).collect();
+        let head = edit_head(&edits, m);
+        self.inspects.push((
+            out.len(),
+            Inspect {
+                title: head.plain().trim_start_matches("▸ ").to_owned(),
+                meta: meta.clone(),
+                note: format!("net diff · {} edits", edits.len()),
+                diff: true,
+                text,
+            },
+        ));
+        let mut lines = vec![lr(head, Line::default().dim(meta), m.out)];
+        lines.extend(
+            diffs
+                .iter()
+                .flatten()
+                .flat_map(|diff| &diff.rows)
+                .take(DIFF_ROWS)
+                .map(|(role, row)| diff_line(*role, row, m.out)),
+        );
+        let hidden = count.saturating_sub(DIFF_ROWS);
+        if hidden > 0 {
+            lines.push(
+                Line::default()
+                    .dim(format!(
+                        "    … {hidden} more lines in {} edits · ctrl+o",
+                        edits.len()
+                    ))
+                    .truncate(m.out),
+            );
+        }
+        for (index, call) in edits.iter().enumerate() {
+            let diff = diffs[index].as_ref();
+            if let Some(diff) = diff {
+                self.record_changed(call, diff);
+            }
+            self.details.push(Detail {
+                title: format!("edit · {} · {} of {}", call.arg, index + 1, edits.len()),
+                diff: diff.is_some(),
+                text: diff.map_or_else(
+                    || {
+                        call.result
+                            .as_ref()
+                            .map_or_else(String::new, |(output, ..)| text_of(output))
+                    },
+                    diff_text,
+                ),
+                error: false,
+                spill: call.result.as_ref().and_then(|(_, spill, _)| spill.clone()),
+            });
+            lines.extend(call.egress.iter().map(|row| row.line(m.out, true, None)));
+            let (slips, details) = call.children.committed(m);
+            lines.extend(slips);
+            self.details.extend(details);
+        }
+        self.expanded = 0;
+        self.push(out, lines);
+    }
+
     fn gap(&mut self, out: &mut Vec<Line>) {
         if !self.blank {
             out.push(Line::default());
@@ -832,6 +1085,8 @@ impl Transcript {
             if let Some(index) = self.sent.iter().position(|sent| sent == content) {
                 self.sent.remove(index);
             } else {
+                let mut out = self.flush(m);
+                self.previous_at = Some(params.event.at);
                 self.children.clear();
                 let mut lines = vec![
                     Line::default()
@@ -840,11 +1095,12 @@ impl Transcript {
                         .truncate(cols),
                 ];
                 lines.extend(
-                    wrap(&blocks_text(content), cols.saturating_sub(2))
+                    wrap(&blocks_text(content), m.prose)
                         .into_iter()
                         .map(|row| Line::default().ink("  ").ink(row).truncate(cols)),
                 );
-                return self.note(lines);
+                out.extend(self.note(lines));
+                return out;
             }
         }
         self.apply(notification, m)
@@ -853,6 +1109,7 @@ impl Transcript {
     /// Applies a notification and returns the lines it commits.
     pub fn apply(&mut self, notification: &ClientNotification, m: Measure) -> Vec<Line> {
         let cols = m.out;
+        self.inspects.clear();
         match notification {
             ClientNotification::Reset(_) => {
                 self.stream.clear();
@@ -890,6 +1147,8 @@ impl Transcript {
                 Vec::new()
             }
             ClientNotification::Exited(params) => {
+                let mut out = Vec::new();
+                self.flush_edits(&mut out, m);
                 self.end_turn();
                 self.calls.clear();
                 self.children.clear();
@@ -900,7 +1159,8 @@ impl Transcript {
                 if let Some(detail) = &params.message {
                     message.push_str(&format!(" · {detail}"));
                 }
-                self.note(vec![Line::default().dim(message).truncate(cols)])
+                out.extend(self.note(vec![Line::default().dim(message).truncate(cols)]));
+                out
             }
         }
     }
@@ -933,6 +1193,33 @@ impl Transcript {
     fn event(&mut self, kind: &EventKind, at: Timestamp, m: Measure) -> Vec<Line> {
         let cols = m.out;
         let mut out = Vec::new();
+        let elapsed = self
+            .previous_at
+            .map_or(0, |previous| at.0.saturating_sub(previous.0));
+        self.previous_at = Some(at);
+        let breaks_run = match kind {
+            EventKind::AssistantMessage { content, .. } => {
+                self.edits.first().is_some_and(|first| {
+                    content.iter().any(|block| match block {
+                        Block::ToolUse { name, input, .. } => {
+                            !matches!(name.as_str(), "edit" | "hashline")
+                                || headline_arg(name, input, self.workspace.as_deref()) != first.arg
+                        }
+                        Block::Thinking { .. } | Block::RedactedThinking { .. } => {
+                            self.thinking_display != Thinking::Hidden
+                        }
+                        _ => true,
+                    })
+                })
+            }
+            EventKind::UserMessage { .. }
+            | EventKind::Compaction { .. }
+            | EventKind::TurnFailed { .. } => true,
+            _ => false,
+        };
+        if breaks_run {
+            self.flush_edits(&mut out, m);
+        }
         match kind {
             EventKind::SessionStarted { model, cwd, .. } => {
                 self.model = Some(model.clone());
@@ -954,7 +1241,7 @@ impl Transcript {
                 self.children.clear();
                 self.gap(&mut out);
                 let text = blocks_text(content);
-                let rows = wrap(&text, cols.saturating_sub(2));
+                let rows = wrap(&text, m.prose);
                 let lines = rows.iter().enumerate().map(|(i, row)| {
                     let lead = if i == 0 {
                         Line::default().brass("ξ ")
@@ -998,7 +1285,8 @@ impl Transcript {
                 for block in content {
                     let lines = match block {
                         Block::Thinking { text, .. } => {
-                            self.thinking_display.rows(text, cols, false)
+                            self.thinking_display
+                                .committed_rows(text, m, elapsed, usage.output)
                         }
                         Block::RedactedThinking { .. }
                             if self.thinking_display != Thinking::Hidden =>
@@ -1018,11 +1306,10 @@ impl Transcript {
                     match block {
                         Block::Text { text } if !text.trim().is_empty() => {
                             self.gap(&mut out);
-                            let lines: Vec<_> =
-                                prose(text.trim(), cols.saturating_sub(2), Role::Ink)
-                                    .into_iter()
-                                    .map(|row| Line::default().ink("  ").extend(row))
-                                    .collect();
+                            let lines: Vec<_> = prose(text.trim(), m.prose, Role::Ink)
+                                .into_iter()
+                                .map(|row| Line::default().ink("  ").extend(row))
+                                .collect();
                             self.push(&mut out, lines);
                             self.blank = false;
                             self.gap(&mut out);
@@ -1035,6 +1322,7 @@ impl Transcript {
                             arg: headline_arg(name, input, self.workspace.as_deref()),
                             input: input.clone(),
                             since: Some(Instant::now()),
+                            started_at: at,
                             decided_at: None,
                             decision: None,
                             rule: None,
@@ -1142,16 +1430,33 @@ impl Transcript {
                     c.children = std::mem::take(&mut self.children);
                 }
                 let done = self.calls.iter().take_while(|c| c.result.is_some()).count();
-                let mut lines = Vec::new();
-                for call in self.calls.drain(..done) {
-                    let (block, details) = call.committed(cols);
-                    lines.extend(block);
-                    if !details.is_empty() {
-                        self.details.extend(details);
-                        self.expanded = 0;
+                let pending = self.calls.split_off(done);
+                let finished = std::mem::replace(&mut self.calls, pending);
+                for call in finished {
+                    if !call.successful_edit()
+                        || self
+                            .edits
+                            .first()
+                            .is_some_and(|first| first.arg != call.arg)
+                    {
+                        self.flush_edits(&mut out, m);
+                    }
+                    if call.successful_edit() {
+                        self.edits.push(call);
+                    } else {
+                        self.commit_call(&call, &mut out, m);
                     }
                 }
-                self.push(&mut out, lines);
+                if self
+                    .calls
+                    .first()
+                    .zip(self.edits.first())
+                    .is_some_and(|(next, first)| {
+                        !matches!(next.name.as_str(), "edit" | "hashline") || next.arg != first.arg
+                    })
+                {
+                    self.flush_edits(&mut out, m);
+                }
             }
             EventKind::Tainted { reason, .. } => {
                 self.tainted = true;
@@ -1220,7 +1525,7 @@ impl Transcript {
             }
             EventKind::Custom { .. } => {}
         }
-        out
+        out.into_iter().map(|line| line.truncate(cols)).collect()
     }
 
     fn call(&mut self, id: &ToolCallId) -> Option<&mut Call> {
@@ -1240,8 +1545,6 @@ impl Transcript {
         let detail = &self.details[at];
         let count = detail.text.lines().count();
         let mut lines = vec![detail_rule(&detail.title, cols)];
-        // Screen only rewinds live rows. Committed rows can soft-wrap safely,
-        // keeping the original output lines intact when copied.
         let rows: Vec<&str> = detail.text.lines().collect();
         let red = if detail.error { alarm(&rows) } else { 0..0 };
         for (index, row) in rows.iter().enumerate() {
@@ -1254,7 +1557,7 @@ impl Transcript {
             } else {
                 Role::Ink
             };
-            lines.push(Line::default().span(role, false, row));
+            lines.push(Line::default().span(role, false, row).truncate(cols));
         }
         lines.push(detail_rule(
             &format!("end · {}", counted(count, "line", "lines")),
@@ -1309,7 +1612,7 @@ impl Transcript {
         let cols = m.out;
         let mut lines = Vec::new();
         if !self.stream.trim().is_empty() {
-            let rows = prose(self.stream.trim(), cols.saturating_sub(2), Role::Ink);
+            let rows = prose(self.stream.trim(), m.prose, Role::Ink);
             if collapse {
                 let noun = if rows.len() == 1 { "line" } else { "lines" };
                 lines.push(
@@ -1319,9 +1622,9 @@ impl Transcript {
                         .truncate(cols),
                 );
             } else {
-                let skip = rows.len().saturating_sub(STREAM_ROWS);
+                let skip = rows.len().saturating_sub(m.stream_rows());
                 for row in rows.into_iter().skip(skip) {
-                    lines.push(Line::default().ink("  ").extend(row));
+                    lines.push(Line::default().ink("  ").extend(row).truncate(cols));
                 }
                 lines.push(Line::default());
             }
@@ -1331,10 +1634,17 @@ impl Transcript {
                 Thinking::Full if collapse => Thinking::First,
                 display => display,
             };
-            lines.extend(display.rows(&self.stream_thinking, cols, true));
+            lines.extend(display.live_rows(&self.stream_thinking, m));
             if self.redacted_thinking && display != Thinking::Hidden {
                 lines.push(Line::default().dim("  ∴ redacted thinking").truncate(cols));
             }
+        }
+        if !self.edits.is_empty() {
+            lines.push(lr(
+                edit_head(&self.edits, m),
+                Line::default().dim("done"),
+                cols,
+            ));
         }
         let mut roster = (!self.children.is_empty()).then_some(&self.children);
         for call in &self.calls {
@@ -1357,7 +1667,9 @@ impl Transcript {
                     Some(rule) => format!("{rule} · {}", duration(elapsed)),
                     None => duration(elapsed),
                 };
-                if let Some(children) = roster {
+                if m.durations()
+                    && let Some(children) = roster
+                {
                     meta = format!("↑ {} · {meta}", tokens(children.sent()));
                 }
                 (
@@ -1365,7 +1677,7 @@ impl Transcript {
                     Line::default().dim(meta),
                 )
             };
-            lines.push(lr(call.head(mark), meta, cols));
+            lines.push(lr(call.head(mark, m), meta, cols));
             lines.extend(call.egress.iter().map(|row| row.line(cols, true, None)));
             if call.result.is_none()
                 && !waiting
@@ -1706,11 +2018,11 @@ mod tests {
         );
         let rows = plain(&rows);
         assert!(rows[0].starts_with("✕ bash pytest -x"), "{rows:?}");
-        assert!(rows[0].ends_with("user#1 · 1.8s"), "{rows:?}");
+        assert!(rows[0].ends_with("user#1"), "{rows:?}");
         assert_eq!(rows[1], "  └ FAILED test_x");
         assert_eq!(rows[4], "    … 1 more line · ctrl+o");
-        assert!(rows[5].starts_with("● read policies/archive.py"));
-        assert!(rows[5].ends_with("2 lines · 0.1s"));
+        assert!(rows[5].starts_with("● read archive.py"));
+        assert!(rows[5].ends_with("2 lines"));
         assert!(t.live(m(60), 0).is_empty());
         assert_eq!(t.context, 15_280);
     }
@@ -1789,10 +2101,7 @@ mod tests {
             &ev(result("a", "denied by policy (user#2)", true), 0),
             m(60),
         ));
-        assert!(
-            rows[0].ends_with("denied by you · user#2 · 0.0s"),
-            "{rows:?}"
-        );
+        assert!(rows[0].ends_with("denied by you · user#2"), "{rows:?}");
     }
 
     #[test]
@@ -1971,23 +2280,21 @@ mod tests {
             let text = plain(&rows);
             let answer = text.iter().position(|line| line == "  answer").unwrap();
             match mode {
-                Thinking::Full => {
+                Thinking::Full | Thinking::First => {
                     let first = text
                         .iter()
-                        .position(|line| line == "  ∴ first thought")
+                        .position(|line| line.starts_with("  ∴ first thought"))
                         .unwrap();
                     assert!(first < answer);
+                    assert!(text[first].ends_with("0.0s"));
                     assert_eq!(text[first + 1], "    second thought");
-                    assert!(rows[first].0.iter().all(|span| span.role == Role::Dim));
+                    assert!(
+                        rows[first]
+                            .0
+                            .iter()
+                            .any(|span| span.role == Role::Ink && span.bold)
+                    );
                     assert!(rows[first + 1].0.iter().all(|span| span.role == Role::Dim));
-                }
-                Thinking::First => {
-                    let first = text
-                        .iter()
-                        .position(|line| line == "  ∴ first thought · ctrl+t")
-                        .unwrap();
-                    assert!(first < answer);
-                    assert!(text.iter().all(|line| !line.contains("second thought")));
                 }
                 Thinking::Hidden => assert!(text.iter().all(|line| !line.contains("thought"))),
             }
@@ -2029,8 +2336,8 @@ mod tests {
             m(24),
         );
         assert!(rows.iter().all(|line| line.width() <= 24));
-        assert!(plain(&rows).iter().any(|line| line.ends_with(" · ctrl+t")));
-        assert!(plain(&rows).iter().all(|line| !line.contains("second")));
+        assert!(plain(&rows).iter().all(|line| !line.ends_with(" · ctrl+t")));
+        assert!(plain(&rows).iter().any(|line| line.contains("second")));
         for mode in [Thinking::Full, Thinking::First, Thinking::Hidden] {
             t.set_thinking(mode);
             let rows = t.apply(
@@ -2076,7 +2383,7 @@ mod tests {
         assert_eq!(plain(&t.live_under_frame(m(60), 0)), ["  ∴ three"]);
         let text: String = (1..=12).map(|n| format!("line {n}\n\n")).collect();
         t.apply(&delta(Delta::Text { text }), m(60));
-        assert_eq!(t.live(m(60), 0).len(), STREAM_ROWS + 1);
+        assert_eq!(t.live(m(60), 0).len(), m(60).stream_rows() + 1);
         assert_eq!(
             plain(&t.live_under_frame(m(60), 0)),
             ["┤ streaming · 23 lines"]
@@ -2104,7 +2411,7 @@ mod tests {
         assert_eq!(plain(&t.live(m(60), 0)), ["  ∴ eight"]);
         t.set_thinking(Thinking::Full);
         let full = t.live(m(60), 0);
-        assert_eq!(full.len(), STREAM_ROWS);
+        assert_eq!(full.len(), m(60).stream_rows());
         assert!(
             full.iter()
                 .all(|line| line.0.iter().all(|span| span.role == Role::Dim))
@@ -2178,7 +2485,11 @@ mod tests {
             &ev(decide("edit", Decision::Allow, Some("user#1")), 0),
             m(100),
         );
-        let rows = t.apply(&ev(result("edit", "replaced text", false), 100), m(100));
+        assert!(
+            t.apply(&ev(result("edit", "replaced text", false), 100), m(100))
+                .is_empty()
+        );
+        let rows = t.flush(m(100));
         let text = plain(&rows);
         assert!(text[0].starts_with("● edit source.rs"));
         assert!(text[0].ends_with("+1 −2 · user#1 · 0.1s"), "{text:?}");
@@ -2222,7 +2533,11 @@ mod tests {
             ),
             m(80),
         );
-        let rows = plain(&t.apply(&ev(result("edit", "replaced", false), 0), m(80)));
+        assert!(
+            t.apply(&ev(result("edit", "replaced", false), 0), m(80))
+                .is_empty()
+        );
+        let rows = plain(&t.flush(m(80)));
         assert_eq!(rows.len(), 10);
         assert!(rows[0].ends_with("+6 −6"));
         assert_eq!(rows[8], "  + new 1");
@@ -2263,7 +2578,11 @@ mod tests {
             ),
             m(12),
         );
-        let rows = t.apply(&ev(result("edit", "replaced", false), 0), m(12));
+        assert!(
+            t.apply(&ev(result("edit", "replaced", false), 0), m(12))
+                .is_empty()
+        );
+        let rows = t.flush(m(12));
         assert!(rows.iter().all(|line| line.width() <= 12));
         assert!(rows[1].plain().ends_with('…'));
         t.apply(
@@ -2308,7 +2627,11 @@ mod tests {
             ),
             m(80),
         );
-        let rows = t.apply(&ev(result("hash", "updated", false), 0), m(80));
+        assert!(
+            t.apply(&ev(result("hash", "updated", false), 0), m(80))
+                .is_empty()
+        );
+        let rows = t.flush(m(80));
         let text = plain(&rows);
         assert!(text[0].ends_with("+3"));
         assert_eq!(text[1..], ["  + one", "  + two", "  + three"]);
@@ -2596,7 +2919,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_rules_fit_small_widths_and_output_keeps_its_line_breaks() {
+    fn expansion_rules_and_output_rows_fit_small_widths() {
         let output = "a very long original output line that must remain one line when copied\nsecond\nthird\nfourth";
         assert_eq!(detail_rule("bash · anything", 0).width(), 0);
         for cols in 1..=80 {
@@ -2617,8 +2940,15 @@ mod tests {
             assert!(lines[1].width() <= cols.min(48), "cols {cols}");
             assert!(lines.last().unwrap().width() <= cols.min(48), "cols {cols}");
             assert!(lines[1].0.iter().all(|span| span.role == Role::Dim));
-            assert_eq!(lines[2].plain(), output.lines().next().unwrap());
-            assert_eq!(lines[3].plain(), "second");
+            assert!(
+                lines.iter().all(|line| line.width() <= m(cols).out),
+                "cols {cols}"
+            );
+            assert_eq!(
+                lines[3].plain(),
+                Line::default().ink("second").truncate(cols).plain()
+            );
+            assert_eq!(t.details[0].text, output);
         }
     }
 
@@ -2754,6 +3084,445 @@ mod tests {
         let full = plain(&t.expand(m(96)).unwrap());
         assert!(full.iter().any(|line| line == "parent result"));
         assert!(t.expand(m(96)).is_none());
+    }
+
+    fn hold_edits(t: &mut Transcript, measure: Measure) {
+        assert!(
+            t.apply(
+                &ev(
+                    assistant(vec![
+                        use_(
+                            "a",
+                            "edit",
+                            json!({
+                                "path": "crates/src/lib.rs", "old": "old", "new": "new"
+                            })
+                        ),
+                        use_(
+                            "b",
+                            "hashline",
+                            json!({
+                                "path": "crates/src/lib.rs",
+                                "edits": [{"start": "1:aa", "lines": ["one", "two"]}]
+                            })
+                        ),
+                    ]),
+                    100
+                ),
+                measure
+            )
+            .is_empty()
+        );
+        t.apply(&ev(decide("a", Decision::Allow, None), 100), measure);
+        t.apply(&ev(decide("b", Decision::Allow, None), 200), measure);
+        assert!(
+            t.apply(&ev(result("a", "updated", false), 150), measure)
+                .is_empty()
+        );
+        assert!(
+            t.apply(&ev(result("b", "updated", false), 300), measure)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sheet_outcomes_align_at_120_and_prose_uses_88_cells() {
+        let mut t = Transcript::default();
+        let text = "words that should stay on the sheet ".repeat(20);
+        let user = t.apply(
+            &ev(
+                EventKind::UserMessage {
+                    content: vec![Block::Text { text: text.clone() }],
+                },
+                0,
+            ),
+            m(250),
+        );
+        assert!(user.iter().all(|line| line.width() <= 90));
+        let answer = t.apply(
+            &ev(assistant(vec![Block::Text { text: text.clone() }]), 1),
+            m(250),
+        );
+        assert!(answer.iter().all(|line| line.width() <= 90));
+        t.partial(&[Block::Text { text }]);
+        let live = t.live(m(250), 0);
+        assert!(live.iter().all(|line| line.width() <= 90));
+        assert_eq!(live.len(), m(250).stream_rows() + 1);
+        t.apply(
+            &ev(
+                assistant(vec![use_(
+                    "read",
+                    "read",
+                    json!({
+                        "path": "crates/xi-tui/src/transcript.rs:1-180"
+                    }),
+                )]),
+                10,
+            ),
+            m(250),
+        );
+        t.apply(&ev(decide("read", Decision::Allow, None), 10), m(250));
+        let rows = t.apply(&ev(result("read", "1|first\n2|second", false), 110), m(250));
+        assert!(rows.iter().all(|line| line.width() <= 120));
+        assert_eq!(rows[0].width(), 120);
+        assert!(rows[0].plain().ends_with("2 lines · 0.1s"));
+    }
+
+    #[test]
+    fn slit_headlines_shorten_file_arguments_and_drop_only_committed_durations() {
+        for name in ["read", "edit", "write", "hashline", "bash"] {
+            let mut t = Transcript::default();
+            let input = match name {
+                "edit" => json!({"path": "crates/src/lib.rs", "old": "old", "new": "new"}),
+                "hashline" => json!({"path": "crates/src/lib.rs", "edits": [
+                    {"start": "1:aa", "lines": ["new"]}
+                ]}),
+                "bash" => json!({"command": "cat crates/src/lib.rs"}),
+                _ => json!({"path": "crates/src/lib.rs:1-180"}),
+            };
+            t.apply(&ev(assistant(vec![use_("a", name, input)]), 0), m(60));
+            t.apply(&ev(decide("a", Decision::Allow, None), 0), m(60));
+            let live = plain(&t.live(m(60), 0));
+            assert!(live[0].ends_with('s'));
+            assert!(!live[0].contains('↑'));
+            if name == "bash" {
+                assert!(live[0].starts_with("┤ bash cat crates/src/lib.rs"));
+            } else {
+                assert!(!live[0].contains("crates/"));
+                if matches!(name, "read" | "write") {
+                    assert!(live[0].contains("lib.rs:1-180"));
+                }
+            }
+            let mut rows = t.apply(&ev(result("a", "1|new", false), 100), m(60));
+            rows.extend(t.flush(m(60)));
+            assert!(rows.iter().all(|line| line.width() <= 60));
+            assert!(!rows[0].plain().contains("0.1s"));
+            if name != "bash" {
+                assert!(!rows[0].plain().contains("crates/"));
+            }
+        }
+    }
+
+    #[test]
+    fn committed_thinking_has_a_strong_headline_meta_and_two_body_rows() {
+        for cols in [250, 60] {
+            let mut t = Transcript::default();
+            let prior = t.apply(
+                &ev(
+                    EventKind::UserMessage {
+                        content: vec![Block::Text {
+                            text: "begin".into(),
+                        }],
+                    },
+                    1_000,
+                ),
+                m(cols),
+            );
+            let mut message = assistant(vec![Block::Thinking {
+                text:
+                    "Planning the spawn path\nFirst body row.\nSecond body row.\nHidden body row."
+                        .into(),
+                signature: None,
+            }]);
+            if let EventKind::AssistantMessage { usage, .. } = &mut message {
+                usage.output = 2_100;
+            }
+            let rows = t.apply(&ev(message, 15_000), m(cols));
+            let head = rows
+                .iter()
+                .position(|row| row.plain().starts_with("  ∴ "))
+                .unwrap();
+            assert_eq!(rows[head].width(), m(cols).out);
+            assert!(rows[head].0.iter().any(|span| {
+                span.text == "Planning the spawn path" && span.role == Role::Ink && span.bold
+            }));
+            assert!(rows[head].plain().ends_with(if cols == 60 {
+                "14.0s"
+            } else {
+                "14.0s · 2.1k"
+            }));
+            assert_eq!(rows[head + 1].plain(), "    First body row.");
+            assert_eq!(rows[head + 2].plain(), "    Second body row. · ctrl+t");
+            assert!(!plain(&rows).iter().any(|row| row.contains("Hidden")));
+            assert_eq!(prior.last().unwrap().plain(), "");
+            assert_eq!(head, 0);
+            assert_eq!(rows[head + 3].plain(), "");
+        }
+    }
+
+    #[test]
+    fn short_streams_keep_one_prose_or_full_thinking_row() {
+        let mut t = Transcript::default();
+        let short = Measure::new(250, 17);
+        t.partial(&[Block::Text {
+            text: "one\ntwo\nthree".into(),
+        }]);
+        assert_eq!(plain(&t.live(short, 0)), ["  three", ""]);
+        t.set_thinking(Thinking::Full);
+        t.partial(&[Block::Thinking {
+            text: "one\ntwo\nthree".into(),
+            signature: None,
+        }]);
+        assert_eq!(plain(&t.live(short, 0)), ["  ∴ three"]);
+    }
+
+    #[test]
+    fn edit_runs_sum_counts_cap_the_combined_diff_and_keep_each_detail() {
+        for cols in [250, 60] {
+            let mut t = Transcript::default();
+            t.apply(&ev(assistant(vec![
+                use_("a", "edit", json!({
+                    "path": "crates/src/lib.rs", "old": "a\nb\nc\nd", "new": "e\nf\ng\nh"
+                })),
+                use_("b", "edit", json!({
+                    "path": "crates/src/lib.rs", "old": "i\nj", "new": "k\nl\nm"
+                })),
+            ]), 100), m(cols));
+            t.apply(&ev(decide("a", Decision::Allow, None), 100), m(cols));
+            t.apply(&ev(decide("b", Decision::Allow, None), 200), m(cols));
+            assert!(
+                t.apply(&ev(result("a", "updated", false), 150), m(cols))
+                    .is_empty()
+            );
+            assert!(
+                t.apply(&ev(result("b", "updated", false), 300), m(cols))
+                    .is_empty()
+            );
+            assert!(t.changed().is_empty());
+            let live = t.live(m(cols), 0);
+            assert_eq!(live.len(), 1);
+            assert!(live[0].plain().starts_with("▸ edit ×2 "));
+            assert!(live[0].plain().ends_with("done"));
+            let rows = t.flush(m(cols));
+            assert_eq!(rows.len(), DIFF_ROWS + 2);
+            assert_eq!(rows[0].width(), m(cols).out);
+            assert!(rows[0].plain().starts_with(if cols == 60 {
+                "▸ edit ×2 lib.rs"
+            } else {
+                "▸ edit ×2 crates/src/lib.rs"
+            }));
+            assert!(rows[0].plain().ends_with(if cols == 60 {
+                "+7 −6"
+            } else {
+                "+7 −6 · 0.2s"
+            }));
+            assert_eq!(rows[1].plain(), "  - a");
+            assert_eq!(rows[8].plain(), "  + h");
+            assert_eq!(rows[9].plain(), "    … 5 more lines in 2 edits · ctrl+o");
+            assert_eq!(t.details.len(), 2);
+            assert_eq!(t.details[0].title, "edit · crates/src/lib.rs · 1 of 2");
+            assert_eq!(t.details[1].title, "edit · crates/src/lib.rs · 2 of 2");
+            let anchors = t.take_inspects();
+            assert_eq!(anchors.len(), 1);
+            assert_eq!(anchors[0].0, 0);
+            assert_eq!(anchors[0].1.note, "net diff · 2 edits");
+            assert!(anchors[0].1.diff);
+            assert_eq!(anchors[0].1.text.lines().count(), 13);
+            let newest = plain(&t.expand(m(cols)).unwrap());
+            assert!(newest.iter().any(|row| row == "+ m"));
+            let older = plain(&t.expand(m(cols)).unwrap());
+            assert!(older.iter().any(|row| row == "- a"));
+            assert!(t.expand(m(cols)).is_none());
+            assert!(t.flush(m(cols)).is_empty());
+            assert!(t.take_inspects().is_empty());
+        }
+    }
+
+    #[test]
+    fn edit_runs_extend_across_messages_and_flush_before_breaking_events() {
+        let boundaries = [
+            assistant(vec![Block::Text {
+                text: "answer".into(),
+            }]),
+            assistant(vec![Block::Thinking {
+                text: "reason".into(),
+                signature: None,
+            }]),
+            assistant(vec![use_(
+                "c",
+                "edit",
+                json!({"path": "another.rs", "old": "a", "new": "b"}),
+            )]),
+            assistant(vec![use_(
+                "c",
+                "read",
+                json!({"path": "crates/src/lib.rs"}),
+            )]),
+            EventKind::UserMessage {
+                content: vec![Block::Text {
+                    text: "next".into(),
+                }],
+            },
+            EventKind::Compaction {
+                summary: "summary".into(),
+                tokens_before: 10,
+                kept: None,
+                usage: None,
+            },
+            EventKind::TurnFailed {
+                message: "failed".into(),
+            },
+        ];
+        for boundary in boundaries {
+            let mut t = Transcript::default();
+            hold_edits(&mut t, m(250));
+            let rows = t.apply(&ev(boundary, 400), m(250));
+            assert!(rows[0].plain().starts_with("▸ edit ×2 crates/src/lib.rs"));
+            assert_eq!(t.take_inspects()[0].0, 0);
+            assert!(t.edits.is_empty());
+        }
+        let mut t = Transcript::default();
+        hold_edits(&mut t, m(250));
+        assert!(
+            t.apply(
+                &ev(
+                    assistant(vec![use_(
+                        "c",
+                        "edit",
+                        json!({
+                            "path": "crates/src/lib.rs", "old": "x", "new": "y"
+                        })
+                    )]),
+                    400
+                ),
+                m(250)
+            )
+            .is_empty()
+        );
+        assert!(
+            t.apply(&ev(result("c", "updated", false), 500), m(250))
+                .is_empty()
+        );
+        assert!(t.flush(m(250))[0].plain().starts_with("▸ edit ×3"));
+        assert_eq!(t.details.len(), 3);
+
+        let mut t = Transcript::default();
+        hold_edits(&mut t, m(250));
+        let rows = t.apply(
+            &ClientNotification::Exited(xi_protocol::methods::client::ExitedParams {
+                session: SessionId::generate(),
+                status: None,
+                message: None,
+            }),
+            m(250),
+        );
+        assert!(rows[0].plain().starts_with("▸ edit ×2"));
+        assert!(rows.last().unwrap().plain().contains("session exited"));
+    }
+
+    #[test]
+    fn inspector_offsets_follow_call_blocks_and_gaps_and_clear_per_apply() {
+        let mut t = Transcript::default();
+        t.apply(
+            &ev(
+                assistant(vec![
+                    use_("a", "bash", json!({"command": "cargo test"})),
+                    use_("b", "read", json!({"path": "crates/src/lib.rs"})),
+                ]),
+                0,
+            ),
+            m(250),
+        );
+        assert!(
+            t.apply(&ev(result("b", "1|first\n2|second", false), 10), m(250))
+                .is_empty()
+        );
+        let rows = t.apply(
+            &ev(result("a", "one\ntwo\nthree\nfour\n[exit 101]", true), 20),
+            m(250),
+        );
+        let anchors = t.take_inspects();
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].0, 0);
+        assert_eq!(anchors[1].0, 5);
+        assert!(rows[anchors[1].0].plain().starts_with("● read "));
+        assert_eq!(anchors[0].1.title, "bash cargo test");
+        assert_eq!(anchors[0].1.meta, "exit 101");
+        assert_eq!(anchors[0].1.note, "5 lines");
+        assert!(anchors[0].1.text.ends_with("[exit 101]"));
+        assert_eq!(anchors[1].1.text, "1|first\n2|second");
+        assert!(t.take_inspects().is_empty());
+        t.apply(&ev(assistant(Vec::new()), 21), m(250));
+        assert!(t.take_inspects().is_empty());
+
+        hold_edits(&mut t, m(250));
+        let rows = t.apply_live(
+            &ev(
+                EventKind::UserMessage {
+                    content: vec![Block::Text {
+                        text: "from elsewhere".into(),
+                    }],
+                },
+                400,
+            ),
+            m(250),
+        );
+        let anchors = t.take_inspects();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].0, 0);
+        let next = rows
+            .iter()
+            .position(|row| row.plain().starts_with("» "))
+            .unwrap();
+        assert!(next > 0);
+        assert_eq!(rows[next - 1].plain(), "");
+        assert!(rows[anchors[0].0].plain().starts_with("▸ edit ×2"));
+    }
+
+    #[test]
+    fn changed_files_sum_committed_edits_in_first_touch_order() {
+        let mut t = Transcript::default();
+        hold_edits(&mut t, m(250));
+        t.flush(m(250));
+        for (id, path, old, new) in [
+            ("c", "other.rs", "one\ntwo", "three"),
+            ("d", "crates/src/lib.rs", "one", "two\nthree"),
+        ] {
+            t.apply(
+                &ev(
+                    assistant(vec![use_(
+                        id,
+                        "edit",
+                        json!({
+                            "path": path, "old": old, "new": new
+                        }),
+                    )]),
+                    400,
+                ),
+                m(250),
+            );
+            t.apply(&ev(result(id, "updated", false), 500), m(250));
+            t.flush(m(250));
+        }
+        t.apply(
+            &ev(
+                assistant(vec![use_(
+                    "failed",
+                    "edit",
+                    json!({
+                        "path": "untouched.rs", "old": "old", "new": "new"
+                    }),
+                )]),
+                600,
+            ),
+            m(250),
+        );
+        t.apply(&ev(result("failed", "not found", true), 700), m(250));
+        assert_eq!(
+            t.changed(),
+            [
+                Changed {
+                    path: "crates/src/lib.rs".into(),
+                    added: 5,
+                    removed: 2
+                },
+                Changed {
+                    path: "other.rs".into(),
+                    added: 1,
+                    removed: 2
+                },
+            ]
+        );
     }
 
     #[test]
