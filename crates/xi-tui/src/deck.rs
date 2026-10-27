@@ -1,12 +1,26 @@
 //! The desktop deck, composed without terminal I/O.
 //!
-//! Sessions fold to a mark rail and the inspector folds into the inline footer.
-//! The log keeps its live rows against the bottom of the screen.
+//! The log keeps the sheet at the left with its live rows against the bottom
+//! of the screen. A side panel takes every column beside it: what waits on
+//! you and what changed while nothing has the keys, the selected log row
+//! while you walk the log, every session while you pick one. Without room
+//! for the panel, its views replace the log while they have the keys.
 
-use crate::layout::SHEET;
+use unicode_width::UnicodeWidthChar;
+
+use crate::layout::{PANEL_MIN, SHEET};
 use crate::log::Inspect;
 use crate::style::{Line, Role, lr, row, wrap};
 use crate::transcript::tokens;
+
+/// The widest the live view sets its rows, so counts stay near their names.
+const LIVE_MAX: usize = 72;
+/// Asks the live view lists before counting the rest.
+const ASK_ROWS: usize = 3;
+/// Changed files the live view lists before counting the rest.
+const CHANGED_ROWS: usize = 8;
+/// Running or waiting sessions the live view lists.
+const SESSION_ROWS: usize = 5;
 
 /// The pane receiving keyboard input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,7 +49,7 @@ pub enum Mark {
     Idle,
 }
 
-/// A session in the rail or the full sessions pane.
+/// A session in the panel.
 pub struct SessionRow {
     /// The session's activity.
     pub mark: Mark,
@@ -45,7 +59,7 @@ pub struct SessionRow {
     pub detail: String,
 }
 
-/// An unanswered approval in the sessions pane.
+/// An unanswered approval.
 pub struct AskRow {
     /// Tool and action, such as `bash exec`.
     pub head: String,
@@ -55,30 +69,28 @@ pub struct AskRow {
     pub origin: String,
 }
 
-/// Sessions and approvals across workspaces.
+/// Every top-level session the daemon lists.
 pub struct SessionsPane {
-    /// The current workspace, home-relative when possible.
-    pub cwd: String,
     /// Sessions in the current workspace.
     pub here: Vec<SessionRow>,
     /// Sessions in other workspaces.
     pub elsewhere: Vec<SessionRow>,
-    /// Unanswered approvals.
-    pub asks: Vec<AskRow>,
     /// The selected index into `here` followed by `elsewhere`.
-    pub selected: Option<usize>,
+    pub selected: usize,
 }
 
 /// Retained output and the live dock.
 pub struct LogPane<'a> {
     /// The attached session's title.
     pub title: &'a str,
-    /// Clock, model, head and event count.
+    /// When it started, its head and event count.
     pub meta: &'a str,
     /// Retained rows, oldest first.
     pub rows: &'a [Line],
-    /// The retained row emphasized for inspection.
+    /// The retained row marked for inspection.
     pub selected: Option<usize>,
+    /// Whether the rows shown move to keep `selected` in view.
+    pub reveal: bool,
     /// Rows scrolled back from the newest retained row.
     pub scrolled: usize,
     /// The live region, including the composer.
@@ -102,94 +114,65 @@ pub struct ContextGauge {
     pub output: u64,
 }
 
-/// Selected output and the session's supporting facts.
-pub struct InspectorPane<'a> {
+/// What the side panel can show.
+pub struct Panel<'a> {
     /// The selected call or edit run.
     pub inspect: Option<&'a Inspect>,
-    /// Context occupancy and traffic.
-    pub context: ContextGauge,
+    /// Rows scrolled down in the inspected text.
+    pub scrolled: usize,
+    /// Unanswered approvals across sessions.
+    pub asks: Vec<AskRow>,
     /// Changed paths and their added and removed line counts.
     pub changed: Vec<(String, usize, usize)>,
-    /// Queued steering messages.
-    pub queued: Vec<String>,
+    /// Every session, for the live view's active ones and the full list.
+    pub sessions: SessionsPane,
+    /// Context occupancy and traffic.
+    pub context: ContextGauge,
     /// Approval mode, sandbox, trust and tool count.
-    pub session: String,
-    /// Rows scrolled down from the top of the inspector.
-    pub scrolled: usize,
+    pub facts: String,
 }
 
 /// All input for one deck frame.
 pub struct Scene<'a> {
     /// Application, workspace and branch.
     pub header_left: Line,
-    /// Provider, model and thinking level.
+    /// Model, thinking level, running agents, taint and waiting asks.
     pub header_right: Line,
-    /// Sessions and approvals, when available.
-    pub sessions: Option<SessionsPane>,
+    /// Context, cache and sandbox, which the header carries when the panel
+    /// is folded.
+    pub status: Line,
     /// The attached session's output and composer.
     pub log: LogPane<'a>,
-    /// The selected output and supporting facts.
-    pub inspector: InspectorPane<'a>,
-    /// Context, cache, sandbox and waiting approvals.
-    pub status: Line,
-    /// The inline footer used when the inspector is folded.
-    pub footer: Line,
+    /// The side panel.
+    pub panel: Panel<'a>,
     /// The pane receiving keyboard input.
     pub focus: Focus,
 }
 
-/// The widths of the deck's visible columns, excluding separators.
+/// The widths of the deck's columns, excluding the separator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Columns {
-    /// The sessions pane or folded mark rail.
-    pub rail: Rail,
-    /// The log's width.
+    /// The log's width: a gutter cell, its rows and one cell of margin.
     pub log: usize,
-    /// The inspector's width when visible.
-    pub inspector: Option<usize>,
+    /// The side panel's width when it fits.
+    pub panel: Option<usize>,
 }
 
-/// How the sessions column folds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rail {
-    /// A full sessions pane of this width.
-    Full(usize),
-    /// Three cells containing activity marks.
-    Marks,
-    /// No sessions column.
-    None,
-}
-
-impl Rail {
-    fn width(self) -> usize {
-        match self {
-            Self::Full(width) => width,
-            Self::Marks => 3,
-            Self::None => 0,
-        }
-    }
-}
-
-/// Measures the columns, including one cell per visible separator.
+/// Measures the columns: the sheet and the panel beside it when at least
+/// [`PANEL_MIN`] columns are left, else the log alone.
 #[must_use]
 pub fn columns(cols: usize) -> Columns {
-    let rail = match cols {
-        150.. => Rail::Full(28),
-        100..150 => Rail::Marks,
-        _ => Rail::None,
-    };
-    let remaining = cols - rail.width() - usize::from(rail != Rail::None);
-    let (log, inspector) = if cols >= 200 {
-        let available = remaining - 1;
-        let log = (SHEET + 2).min(available - 40);
-        (log, Some(available - log))
+    let log = SHEET + 2;
+    if cols > log + PANEL_MIN {
+        Columns {
+            log,
+            panel: Some(cols - log - 1),
+        }
     } else {
-        (remaining, None)
-    };
-    Columns {
-        rail,
-        log,
-        inspector,
+        Columns {
+            log: cols,
+            panel: None,
+        }
     }
 }
 
@@ -200,70 +183,141 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
         return (Vec::new(), None);
     }
     let columns = columns(cols);
-    let sessions_folded = !matches!(columns.rail, Rail::Full(_)) || scene.sessions.is_none();
-    let mut hints = Vec::new();
-    if sessions_folded {
-        hints.push("alt+1 sessions");
+    let mut right = scene.header_right.clone();
+    if columns.panel.is_none() && !scene.status.0.is_empty() {
+        if !right.0.is_empty() {
+            right = right.dim(" · ");
+        }
+        right = right.extend(scene.status.clone());
     }
-    if columns.inspector.is_none() {
-        hints.push("alt+3 inspector");
-    }
-    let right = if hints.is_empty() {
-        scene.header_right.clone()
-    } else {
-        Line::default().dim(hints.join(" · "))
-    };
     let mut out = Vec::with_capacity(rows);
     out.push(lr(scene.header_left.clone(), right, cols));
-    if rows == 1 {
-        return (out, None);
-    }
-    let height = rows - 2;
-    let rail_width = columns.rail.width();
-    let log_x = rail_width + usize::from(columns.rail != Rail::None);
-    let rail = session_rows(scene, columns.rail, height);
-    // One cell of margin after each separator.
-    let (log, cursor) = log_rows(&scene.log, columns.log.saturating_sub(1), height);
-    let inspector = columns
-        .inspector
-        .map(|width| inspector_rows(&scene.inspector, width.saturating_sub(1), height));
-    let mut rail = rail.into_iter();
-    let mut log = log.into_iter();
-    let mut inspector = inspector.map(Vec::into_iter);
-    for _ in 0..height {
-        let mut line = Line::default();
-        if columns.rail != Rail::None {
-            line = row(rail.next().unwrap_or_default(), Line::default(), rail_width).dim("│");
+    let height = rows - 1;
+    let Some(panel) = columns.panel else {
+        let inner = cols.saturating_sub(2);
+        if matches!(scene.focus, Focus::Sessions | Focus::Inspector) {
+            out.extend(
+                panel_rows(scene, inner, height)
+                    .into_iter()
+                    .map(|line| Line::default().ink(" ").extend(line).truncate(cols)),
+            );
+            return (out, None);
         }
-        let log_line = Line::default()
-            .ink(" ")
-            .extend(log.next().unwrap_or_default());
-        line = line.extend(pad(log_line, columns.log));
-        if let Some(inspector) = inspector.as_mut() {
-            line = line
+        let (log, cursor) = log_rows(&scene.log, inner, height);
+        out.extend(log.into_iter().map(|line| line.truncate(cols)));
+        return (out, cursor.map(|(row, col)| (row + 1, col + 1)));
+    };
+    let (log, cursor) = log_rows(&scene.log, columns.log - 2, height);
+    let side = panel_rows(scene, panel.saturating_sub(2), height);
+    for (log, side) in log.into_iter().zip(side) {
+        out.push(
+            pad(log, columns.log)
                 .dim("│")
                 .ink(" ")
-                .extend(inspector.next().unwrap_or_default());
-        }
-        out.push(line.truncate(cols));
+                .extend(side)
+                .truncate(cols),
+        );
     }
-    out.push(if columns.inspector.is_some() {
-        lr(
-            scene.status.clone(),
-            Line::default().dim("alt+1 sessions · alt+2 log · alt+3 inspector"),
-            cols,
-        )
-    } else {
-        scene.footer.clone().truncate(cols)
-    });
-    let cursor = cursor.map(|(row, col)| (row + 1, log_x + 1 + col));
-    (out, cursor)
+    (out, cursor.map(|(row, col)| (row + 1, col + 1)))
 }
 
 fn pad(line: Line, width: usize) -> Line {
     let line = line.truncate(width);
     let gap = width - line.width();
     line.ink(" ".repeat(gap))
+}
+
+fn blank(height: usize) -> Vec<Line> {
+    vec![Line::default(); height]
+}
+
+/// The log's rows, each behind a gutter cell that marks the selected row.
+/// `width` excludes the gutter; the cursor is relative to `width`.
+fn log_rows(
+    pane: &LogPane<'_>,
+    width: usize,
+    height: usize,
+) -> (Vec<Line>, Option<(usize, usize)>) {
+    let mut lines = blank(height);
+    if let Some(line) = lines.first_mut() {
+        *line = lr(
+            Line::default().strong(Role::Ink, pane.title),
+            Line::default().dim(pane.meta),
+            width,
+        );
+    }
+    let top = height.min(2);
+    let live_skip = pane.live.len().saturating_sub(height - top);
+    let live = &pane.live[live_skip..];
+    let live_top = height - live.len();
+    let room = live_top - top;
+    let len = pane.rows.len();
+    let mut end = len.saturating_sub(pane.scrolled);
+    if pane.reveal
+        && let Some(selected) = pane.selected.filter(|&row| row < len)
+    {
+        if selected >= end {
+            end = selected + 1;
+        } else if selected < end.saturating_sub(room) {
+            end = (selected + room).min(len);
+        }
+    }
+    let start = end.saturating_sub(room);
+    let retained_top = live_top - (end - start);
+    for (index, line) in pane.rows[start..end].iter().enumerate() {
+        lines[retained_top + index] = line.clone().truncate(width);
+    }
+    for (index, line) in live.iter().enumerate() {
+        lines[live_top + index] = line.clone().truncate(width);
+    }
+    let marked = pane
+        .selected
+        .filter(|row| (start..end).contains(row))
+        .map(|row| retained_top + row - start);
+    let lines = lines
+        .into_iter()
+        .enumerate()
+        .map(|(y, line)| {
+            let gutter = if marked == Some(y) {
+                Line::default().brass("›")
+            } else {
+                Line::default().ink(" ")
+            };
+            gutter.extend(line)
+        })
+        .collect();
+    let cursor = pane.cursor.and_then(|(row, col)| {
+        let row = row.checked_sub(live_skip)?;
+        (row < live.len() && width > 0).then(|| (live_top + row, col.min(width - 1)))
+    });
+    (lines, cursor)
+}
+
+/// Exactly `height` panel rows: the focused view, then its keys.
+fn panel_rows(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
+    let Some(body) = height.checked_sub(1) else {
+        return Vec::new();
+    };
+    let (mut lines, keys) = match scene.focus {
+        Focus::Composer => (
+            live_view(&scene.panel, width, body),
+            "alt+1 sessions · alt+2 log · alt+3 inspector",
+        ),
+        Focus::Log => (
+            inspector_view(&scene.panel, width, body),
+            "↑↓ select · enter prints · pgup pgdn · esc back",
+        ),
+        Focus::Inspector => (
+            inspector_view(&scene.panel, width, body),
+            "↑↓ scroll · alt+2 log · esc back",
+        ),
+        Focus::Sessions => (
+            sessions_view(&scene.panel.sessions, width, body),
+            "↑↓ move · enter resumes · esc back",
+        ),
+    };
+    lines.push(Line::default().dim(keys));
+    lines.into_iter().map(|line| line.truncate(width)).collect()
 }
 
 fn mark(mark: Mark) -> Line {
@@ -275,196 +329,204 @@ fn mark(mark: Mark) -> Line {
     }
 }
 
-fn session_rows(scene: &Scene<'_>, rail: Rail, height: usize) -> Vec<Line> {
-    let Some(pane) = &scene.sessions else {
-        return Vec::new();
-    };
-    if height == 0 || rail == Rail::None {
-        return Vec::new();
+fn counts(added: usize, removed: usize) -> Line {
+    Line::default()
+        .verdigris(format!("+{added}"))
+        .dim(" ")
+        .sanguine(format!("−{removed}"))
+}
+
+/// `text` cut from the left to `cols` cells, so a path keeps its file name.
+fn elide_left(text: &str, cols: usize) -> String {
+    let width: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if width <= cols {
+        return text.to_owned();
     }
-    let selected = (scene.focus == Focus::Sessions)
-        .then_some(pane.selected)
-        .flatten();
-    let mut lines = Vec::new();
-    if rail == Rail::Marks {
-        for (index, session) in pane.here.iter().enumerate() {
-            lines.push(session_mark(session, selected == Some(index)));
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w + 1 > cols {
+            break;
         }
-        if !pane.elsewhere.is_empty() {
-            lines.push(Line::default());
-            for (index, session) in pane.elsewhere.iter().enumerate() {
-                lines.push(session_mark(
-                    session,
-                    selected == Some(pane.here.len() + index),
-                ));
-            }
+        used += w;
+        kept.push(c);
+    }
+    let mut out = String::from(if cols > 0 { "…" } else { "" });
+    out.extend(kept.into_iter().rev());
+    out
+}
+
+/// What waits on you and what changed, with the context gauge and the
+/// session's facts against the bottom.
+fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
+    let w = width.min(LIVE_MAX);
+    let mut top: Vec<Line> = Vec::new();
+    let heading = |top: &mut Vec<Line>, title: String, right: Line| {
+        if !top.is_empty() {
+            top.push(Line::default());
         }
-    } else {
-        lines.push(Line::default().dim(format!("Sessions · {}", pane.cwd)));
-        lines.push(Line::default());
-        for (index, session) in pane.here.iter().enumerate() {
-            full_session(&mut lines, session, selected == Some(index));
+        top.push(lr(Line::default().strong(Role::Ink, title), right, w));
+    };
+    if !panel.asks.is_empty() {
+        heading(
+            &mut top,
+            format!("Waiting · {}", panel.asks.len()),
+            Line::default().dim("tab answers"),
+        );
+        for ask in panel.asks.iter().take(ASK_ROWS) {
+            top.push(
+                Line::default()
+                    .brass(format!("? {}", ask.head))
+                    .ink(format!("  {}", ask.body))
+                    .truncate(w),
+            );
+            top.push(Line::default().dim(format!("  {}", ask.origin)).truncate(w));
         }
-        lines.push(Line::default());
-        lines.push(Line::default().dim("Other workspaces"));
-        for (index, session) in pane.elsewhere.iter().enumerate() {
-            full_session(
-                &mut lines,
-                session,
-                selected == Some(pane.here.len() + index),
+        if panel.asks.len() > ASK_ROWS {
+            top.push(Line::default().dim(format!("  … {} more", panel.asks.len() - ASK_ROWS)));
+        }
+    }
+    if !panel.changed.is_empty() {
+        let (added, removed) = panel
+            .changed
+            .iter()
+            .fold((0usize, 0usize), |(added, removed), (_, a, r)| {
+                (added.saturating_add(*a), removed.saturating_add(*r))
+            });
+        let files = if panel.changed.len() == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        heading(
+            &mut top,
+            format!("Changes · {} {files}", panel.changed.len()),
+            counts(added, removed),
+        );
+        for (path, added, removed) in panel.changed.iter().take(CHANGED_ROWS) {
+            let counts = counts(*added, *removed);
+            let room = w.saturating_sub(counts.width() + 2);
+            top.push(lr(Line::default().ink(elide_left(path, room)), counts, w));
+        }
+        if panel.changed.len() > CHANGED_ROWS {
+            top.push(Line::default().dim(format!(
+                "… {} more files",
+                panel.changed.len() - CHANGED_ROWS
+            )));
+        }
+    }
+    let sessions = &panel.sessions;
+    let others: Vec<&SessionRow> = sessions
+        .here
+        .iter()
+        .chain(&sessions.elsewhere)
+        .filter(|session| session.mark != Mark::Current)
+        .collect();
+    if !others.is_empty() {
+        let active: Vec<&&SessionRow> = others
+            .iter()
+            .filter(|session| matches!(session.mark, Mark::Running | Mark::Waiting))
+            .collect();
+        heading(
+            &mut top,
+            "Sessions".to_owned(),
+            Line::default().dim(match others.len() {
+                1 => "1 other · alt+1".to_owned(),
+                count => format!("{count} others · alt+1"),
+            }),
+        );
+        if active.is_empty() {
+            top.push(Line::default().dim("nothing else running"));
+        }
+        for session in active.iter().take(SESSION_ROWS) {
+            top.push(row(
+                mark(session.mark).ink(format!(" {}", session.title)),
+                Line::default().dim(&session.detail),
+                w,
+            ));
+        }
+        if active.len() > SESSION_ROWS {
+            top.push(
+                Line::default().dim(format!("… {} more running", active.len() - SESSION_ROWS)),
             );
         }
-        lines.push(Line::default());
-        lines.push(Line::default().dim(format!("Waiting · {}", pane.asks.len())));
-        for ask in &pane.asks {
-            lines.push(Line::default().brass(format!("? {}", ask.head)));
-            lines.push(Line::default().ink(format!("  {}", ask.body)));
-            lines.push(Line::default().dim(format!("  {}", ask.origin)));
-            lines.push(Line::default().dim("  tab answers"));
+    }
+    if top.is_empty() && panel.inspect.is_none() {
+        top.push(
+            Line::default()
+                .dim("Nothing waits on you and nothing has changed yet.")
+                .truncate(w),
+        );
+    }
+    let bottom = gauge(panel, w);
+    let room = height.saturating_sub(bottom.len() + 1);
+    if top.len() > room {
+        top.truncate(room.saturating_sub(1));
+        if room > 0 {
+            top.push(Line::default().dim("…"));
         }
-        lines.truncate(height - 1);
-        lines.resize(height - 1, Line::default());
-        lines.push(Line::default().dim("/new · /resume · /tree"));
     }
-    lines.truncate(height);
-    lines
-}
-
-fn session_mark(session: &SessionRow, selected: bool) -> Line {
-    if selected {
-        Line::default().brass("› ").extend(mark(session.mark))
-    } else {
-        mark(session.mark)
-    }
-}
-
-fn full_session(lines: &mut Vec<Line>, session: &SessionRow, selected: bool) {
-    let activity = if session.mark == Mark::Idle {
-        Line::default().ink(" ")
-    } else {
-        mark(session.mark)
-    };
-    let title = if selected {
-        Line::default()
-            .brass("› ")
-            .extend(activity)
-            .brass(format!(" {}", session.title))
-    } else {
-        activity.ink(format!(" {}", session.title))
-    };
-    lines.push(title);
-    lines.push(Line::default().dim(format!("  {}", session.detail)));
-}
-
-fn log_rows(
-    pane: &LogPane<'_>,
-    width: usize,
-    height: usize,
-) -> (Vec<Line>, Option<(usize, usize)>) {
-    let mut lines = vec![Line::default(); height];
-    if let Some(line) = lines.first_mut() {
-        *line = Line::default()
-            .strong(Role::Ink, pane.title)
-            .truncate(width);
-    }
-    if let Some(line) = lines.get_mut(1) {
-        *line = Line::default().dim(pane.meta).truncate(width);
-    }
-    let top = height.min(3);
-    let live_skip = pane.live.len().saturating_sub(height - top);
-    let live = &pane.live[live_skip..];
-    let live_top = height - live.len();
-    let end = pane.rows.len().saturating_sub(pane.scrolled);
-    let start = end.saturating_sub(live_top - top);
-    let retained_top = live_top - (end - start);
-    for (index, line) in pane.rows[start..end].iter().enumerate() {
-        let mut line = line.clone().truncate(width);
-        if pane.selected == Some(start + index) {
-            for span in &mut line.0 {
-                span.bold = true;
-            }
+    let mut lines = top;
+    // The newest tool row fills what the sections leave, at the panel's
+    // whole width: its output past the log's few rows, or its whole diff.
+    let gap = usize::from(!lines.is_empty());
+    let spare = room.saturating_sub(lines.len() + gap);
+    if let Some(inspect) = panel.inspect
+        && spare >= 3
+    {
+        if gap > 0 {
+            lines.push(Line::default());
         }
-        lines[retained_top + index] = line;
-    }
-    for (index, line) in live.iter().enumerate() {
-        lines[live_top + index] = line.clone().truncate(width);
-    }
-    let cursor = pane.cursor.and_then(|(row, col)| {
-        let row = row.checked_sub(live_skip)?;
-        (row < live.len() && width > 0).then(|| (live_top + row, col.min(width - 1)))
-    });
-    (lines, cursor)
-}
-
-fn inspector_rows(pane: &InspectorPane<'_>, width: usize, height: usize) -> Vec<Line> {
-    let tail = inspector_facts(pane, width);
-    let mut lines = Vec::new();
-    if let Some(inspect) = pane.inspect {
-        let title = inspect
-            .title
-            .strip_prefix("▸ ")
-            .or_else(|| inspect.title.strip_prefix("● "))
-            .unwrap_or(&inspect.title);
         lines.push(lr(
-            Line::default().strong(Role::Ink, title),
+            Line::default().strong(Role::Ink, headline(inspect)),
             Line::default().dim(&inspect.meta),
             width,
         ));
-        lines.push(Line::default().dim(&inspect.note));
-        lines.push(Line::default());
-        let budget = height.saturating_sub(tail.len() + 5);
-        let count = inspect.text.lines().count();
-        let shown = if count > budget {
-            budget.saturating_sub(1)
+        let body = inspected(inspect, width);
+        let shown = spare - 1;
+        if body.len() > shown {
+            lines.extend(body.iter().take(shown - 1).cloned());
+            lines.push(
+                Line::default().dim(format!("… {} more lines · alt+3", body.len() - (shown - 1))),
+            );
         } else {
-            count
-        };
-        for text in inspect.text.lines().take(shown) {
-            let role = if inspect.diff && text.starts_with("- ") {
-                Role::Sanguine
-            } else if inspect.diff && text.starts_with("+ ") {
-                Role::Verdigris
-            } else if inspect.diff {
-                Role::Dim
-            } else {
-                Role::Ink
-            };
-            lines.push(Line::default().span(role, false, text));
+            lines.extend(body);
         }
-        if count > shown && budget > 0 {
-            lines.push(Line::default().dim(format!("… {} more lines", count - shown)));
-        }
-        lines.push(Line::default().dim("enter opens the whole diff · up and down move in the log"));
-        lines.push(Line::default());
     }
-    lines.extend(tail);
-    lines
-        .into_iter()
-        .skip(pane.scrolled)
-        .take(height)
-        .map(|line| line.truncate(width))
-        .collect()
+    lines.resize(height.saturating_sub(bottom.len()), Line::default());
+    lines.extend(bottom);
+    lines.truncate(height);
+    lines.into_iter().map(|line| line.truncate(width)).collect()
 }
 
-fn inspector_facts(pane: &InspectorPane<'_>, width: usize) -> Vec<Line> {
-    let context = pane.context;
-    let mut lines = vec![Line::default().strong(Role::Ink, "Context")];
+/// An inspected row's headline without its live mark.
+fn headline(inspect: &Inspect) -> &str {
+    inspect
+        .title
+        .strip_prefix("▸ ")
+        .or_else(|| inspect.title.strip_prefix("● "))
+        .unwrap_or(&inspect.title)
+}
+
+/// Context occupancy, traffic and the session's facts.
+fn gauge(panel: &Panel<'_>, w: usize) -> Vec<Line> {
+    let context = panel.context;
+    let mut lines = Vec::new();
     if context.window > 0 {
         // The footer truncates; the gauge agrees with it.
         let percent = u128::from(context.used) * 100 / u128::from(context.window);
-        let filled = usize::try_from((percent * 30 / 100).min(30)).unwrap_or(30);
-        lines.push(lr(
+        let label = format!("ctx {percent}%  ");
+        let of = format!("  {} of {}", tokens(context.used), tokens(context.window));
+        let bar = w.saturating_sub(label.len() + of.chars().count());
+        let filled = usize::try_from((percent * bar as u128 / 100).min(bar as u128)).unwrap_or(bar);
+        lines.push(
             Line::default()
-                .ink(format!("ctx {percent}%  "))
+                .ink(label)
                 .brass("█".repeat(filled))
-                .dim("░".repeat(30 - filled)),
-            Line::default().dim(format!(
-                "{} of {}",
-                tokens(context.used),
-                tokens(context.window)
-            )),
-            width,
-        ));
+                .dim("░".repeat(bar - filled))
+                .dim(of),
+        );
     } else {
         lines.push(Line::default().dim(format!("ctx unknown · {} used", tokens(context.used))));
     }
@@ -473,64 +535,122 @@ fn inspector_facts(pane: &InspectorPane<'_>, width: usize) -> Vec<Line> {
         Some(percent) => format!("cache {percent}% · {traffic}"),
         None => traffic,
     }));
-    lines.push(Line::default());
-    let (added, removed) = pane
-        .changed
-        .iter()
-        .fold((0usize, 0usize), |(added, removed), (_, a, r)| {
-            (added.saturating_add(*a), removed.saturating_add(*r))
-        });
-    let files = if pane.changed.len() == 1 {
-        "file"
-    } else {
-        "files"
-    };
-    lines.push(lr(
-        Line::default().strong(
-            Role::Ink,
-            format!("Changed · {} {files}", pane.changed.len()),
-        ),
-        counts(added, removed),
-        width,
-    ));
-    for (path, added, removed) in &pane.changed {
-        lines.push(lr(
-            Line::default().ink(path),
-            counts(*added, *removed),
-            width,
-        ));
-    }
-    lines.push(Line::default());
-    if !pane.queued.is_empty() {
-        lines.push(Line::default().strong(Role::Ink, "Queued"));
-        for text in &pane.queued {
-            for (index, text) in wrap(text, width.saturating_sub(2).max(1))
-                .into_iter()
-                .enumerate()
-            {
-                lines.push(
-                    Line::default()
-                        .brass(if index == 0 { "» " } else { "  " })
-                        .ink(text),
-                );
-            }
-        }
-        lines.push(Line::default());
-    }
-    lines.push(Line::default().strong(Role::Ink, "Session"));
     lines.extend(
-        wrap(&pane.session, width.max(1))
+        wrap(&panel.facts, w.max(1))
             .into_iter()
             .map(|text| Line::default().dim(text)),
     );
     lines
 }
 
-fn counts(added: usize, removed: usize) -> Line {
-    Line::default()
-        .verdigris(format!("+{added}"))
-        .dim(" ")
-        .sanguine(format!("−{removed}"))
+/// The selected row: its headline fixed at the top, its whole text below,
+/// wrapped and scrolled.
+fn inspector_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
+    let Some(inspect) = panel.inspect else {
+        let mut lines = vec![Line::default().dim("No tool rows yet.")];
+        lines.resize(height, Line::default());
+        lines.truncate(height);
+        return lines;
+    };
+    let mut lines = vec![lr(
+        Line::default().strong(Role::Ink, headline(inspect)),
+        Line::default().dim(&inspect.meta),
+        width,
+    )];
+    if !inspect.note.is_empty() {
+        lines.push(Line::default().dim(&inspect.note));
+    }
+    lines.push(Line::default());
+    let body = inspected(inspect, width);
+    let room = height.saturating_sub(lines.len());
+    let skip = panel.scrolled.min(body.len().saturating_sub(1));
+    let rest = body.len() - skip;
+    if rest > room && room > 0 {
+        lines.extend(body.into_iter().skip(skip).take(room - 1));
+        lines.push(Line::default().dim(format!("… {} more lines", rest - (room - 1))));
+    } else {
+        lines.extend(body.into_iter().skip(skip));
+    }
+    lines.resize(height, Line::default());
+    lines
+}
+
+/// Every session, this workspace first, keeping the selection in view.
+fn sessions_view(pane: &SessionsPane, width: usize, height: usize) -> Vec<Line> {
+    let mut lines = vec![
+        Line::default().strong(Role::Ink, "Sessions"),
+        Line::default(),
+    ];
+    let mut at = None;
+    let mut push = |lines: &mut Vec<Line>, index: usize, session: &SessionRow| {
+        let selected = index == pane.selected;
+        if selected {
+            at = Some(lines.len());
+        }
+        let lead = if selected {
+            Line::default().brass("› ")
+        } else {
+            Line::default().ink("  ")
+        };
+        let title = if selected {
+            Line::default().brass(format!(" {}", session.title))
+        } else {
+            Line::default().ink(format!(" {}", session.title))
+        };
+        lines.push(row(
+            lead.extend(mark(session.mark)).extend(title),
+            Line::default().dim(&session.detail),
+            width,
+        ));
+    };
+    for (index, session) in pane.here.iter().enumerate() {
+        push(&mut lines, index, session);
+    }
+    if !pane.elsewhere.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::default().dim("Other workspaces"));
+        for (index, session) in pane.elsewhere.iter().enumerate() {
+            push(&mut lines, pane.here.len() + index, session);
+        }
+    }
+    if let Some(at) = at
+        && at >= height
+    {
+        lines.drain(..=at - height);
+    }
+    lines.resize(height, Line::default());
+    lines
+}
+
+/// The inspected text, wrapped to `width`, with diff rows in their roles.
+fn inspected(inspect: &Inspect, width: usize) -> Vec<Line> {
+    let mut body = Vec::new();
+    for text in inspect.text.lines() {
+        let role = if inspect.diff && text.starts_with("- ") {
+            Role::Sanguine
+        } else if inspect.diff && text.starts_with("+ ") {
+            Role::Verdigris
+        } else if inspect.diff {
+            Role::Dim
+        } else {
+            Role::Ink
+        };
+        for part in wrap(text, width.max(1)) {
+            body.push(Line::default().span(role, false, part));
+        }
+    }
+    if body.is_empty() {
+        body.push(Line::default().dim("no output"));
+    }
+    body
+}
+
+/// How many rows the inspector sets `inspect`'s text in on a `cols`-wide
+/// deck, which bounds how far it scrolls.
+#[must_use]
+pub fn inspector_rows(inspect: &Inspect, cols: usize) -> usize {
+    let width = columns(cols).panel.unwrap_or(cols).saturating_sub(2);
+    inspected(inspect, width).len()
 }
 
 #[cfg(test)]
@@ -544,32 +664,32 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(cols: usize) -> Self {
-            let width = columns(cols).log.min(SHEET);
+        fn new() -> Self {
+            let width = SHEET;
             Self {
                 retained: vec![
-                    Line::default().brass("ξ ").ink("route sandboxed bash through the egress proxy on Linux, and keep direct commands"),
-                    Line::default().ink("  unsandboxed with their own process group"),
+                    Line::default()
+                        .brass("ξ ")
+                        .ink("route sandboxed bash through the egress proxy on Linux"),
                     Line::default(),
                     lr(
-                        Line::default().dim("  ∴ ").strong(Role::Ink, "Planning the spawn path"),
-                        Line::default().dim("14s · 2.1k"),
-                        width,
-                    ),
-                    Line::default().dim("    Spec::command builds the helper invocation before setsid. · ctrl+t"),
-                    Line::default(),
-                    lr(
-                        Line::default().verdigris("● ").ink("read crates/xi-sandbox/src/lib.rs:1-180"),
+                        Line::default()
+                            .verdigris("● ")
+                            .ink("read crates/xi-sandbox/src/lib.rs:1-180"),
                         Line::default().dim("180 lines · 0.0s"),
                         width,
                     ),
                     lr(
-                        Line::default().dim("▸ ").ink("edit ×5 crates/xi-tools/src/bash.rs"),
+                        Line::default()
+                            .dim("▸ ")
+                            .ink("edit ×5 crates/xi-tools/src/bash.rs"),
                         counts(22, 16).dim(" · 0.1s"),
                         width,
                     ),
                     lr(
-                        Line::default().sanguine("✕ ").ink("bash cargo test -p xi-sandbox egress"),
+                        Line::default()
+                            .sanguine("✕ ")
+                            .ink("bash cargo test -p xi-sandbox egress"),
                         Line::default().sanguine("exit 101").dim(" · 6.8s"),
                         width,
                     ),
@@ -577,34 +697,28 @@ mod tests {
                     Line::default(),
                 ],
                 live: vec![
-                    lr(
-                        Line::default().dim("┤ ").ink("bash cargo test -p xi-sandbox egress"),
-                        Line::default().dim("sandbox · 3.1s"),
-                        width,
-                    ),
-                    Line::default().dim("└ working · 5m13s · ↑ 2.3M ↓ 5.5k · esc stop"),
+                    Line::default().dim("└ working · 5m13s · esc stop"),
                     Line::default().brass(format!("╭{}╮", "─".repeat(width - 2))),
                     pad(
-                        Line::default().brass("│ ").ink("ξ enter steers · alt+enter queues · esc stops"),
+                        Line::default()
+                            .brass("│ ")
+                            .ink("ξ enter steers · alt+enter queues · esc stops"),
                         width - 1,
-                    ).brass("│"),
+                    )
+                    .brass("│"),
                     Line::default().brass(format!("╰{}╯", "─".repeat(width - 2))),
                 ],
                 inspect: Inspect {
-                    title: "edit ×5 crates/xi-tools/src/bash.rs".into(),
+                    title: "▸ edit ×5 crates/xi-tools/src/bash.rs".into(),
                     meta: "+22 −16".into(),
-                    note: "net diff · 5 edits · the row selected in the log".into(),
+                    note: "net diff · 5 edits".into(),
                     diff: true,
                     text: [
                         "-     let mut command = spec",
-                        "-         .command(&ctx.helper, shell, &args);",
                         "+     let launch_error = |error| {",
-                        "+         if spec.enabled {",
                         "  …",
-                        "      ┄",
-                        "-     // Do not set process_group(0) here.",
-                        "+     // Sandboxed commands need setsid in the helper.",
-                    ].join("\n"),
+                    ]
+                    .join("\n"),
                 },
             }
         }
@@ -618,45 +732,46 @@ mod tests {
             Scene {
                 header_left: Line::default()
                     .brass("ξ ")
-                    .strong(Role::Ink, "XI")
+                    .strong(Role::Ink, "xi")
                     .ink("  ~/src/xi  main*"),
                 header_right: Line::default().dim("chatgpt/gpt-6.1-sol · think xhigh"),
-                sessions: Some(SessionsPane {
-                    cwd: "~/src/xi".into(),
-                    here: vec![
-                        session(
-                            Mark::Current,
-                            "Route sandboxed bash through the egress proxy",
-                            "gpt-6.1-sol · 5m",
-                        ),
-                        session(Mark::Running, "Port footer fit to deck", "sonnet-5.5 · 2m"),
-                        session(Mark::Waiting, "Bump tokio to 1.48", "1 waiting · 12m"),
-                        session(Mark::Idle, "Settings frame hints", "yesterday"),
-                        session(Mark::Idle, "Overlay stack refactor", "2 days ago"),
-                    ],
-                    elsewhere: vec![session(
-                        Mark::Running,
-                        "ledger · Fix export offsets",
-                        "gpt-6.1-sol · 1h",
-                    )],
+                status: Line::default().dim("ctx 11% · cache 94% · ◇ sandbox"),
+                log: LogPane {
+                    title: "Route sandboxed bash through the egress proxy",
+                    meta: "14:02 · head #a3f9 · 41 events",
+                    rows: &self.retained,
+                    selected: None,
+                    reveal: false,
+                    scrolled: 0,
+                    live: &self.live,
+                    cursor: Some((2, 4)),
+                },
+                panel: Panel {
+                    inspect: Some(&self.inspect),
+                    scrolled: 0,
                     asks: vec![AskRow {
                         head: "bash exec".into(),
                         body: "cargo update -p tokio".into(),
                         origin: "Bump tokio to 1.48 · 12m".into(),
                     }],
-                    selected: Some(1),
-                }),
-                log: LogPane {
-                    title: "Route sandboxed bash through the egress proxy",
-                    meta: "○ 14:02 · gpt-6.1-sol · head #a3f9 · 41 events",
-                    rows: &self.retained,
-                    selected: Some(7),
-                    scrolled: 0,
-                    live: &self.live,
-                    cursor: Some((3, 4)),
-                },
-                inspector: InspectorPane {
-                    inspect: Some(&self.inspect),
+                    changed: vec![
+                        ("crates/xi-sandbox/src/lib.rs".into(), 21, 12),
+                        ("crates/xi-tools/src/bash.rs".into(), 22, 16),
+                    ],
+                    sessions: SessionsPane {
+                        here: vec![
+                            session(Mark::Current, "Route sandboxed bash", "gpt-6.1-sol · 5m"),
+                            session(Mark::Running, "Port footer fit to deck", "sonnet-5.5 · 2m"),
+                            session(Mark::Waiting, "Bump tokio to 1.48", "1 waiting · 12m"),
+                            session(Mark::Idle, "Settings frame hints", "yesterday"),
+                        ],
+                        elsewhere: vec![session(
+                            Mark::Idle,
+                            "ledger · Fix export offsets",
+                            "2 days ago",
+                        )],
+                        selected: 0,
+                    },
                     context: ContextGauge {
                         used: 29_800,
                         window: 272_000,
@@ -664,18 +779,8 @@ mod tests {
                         sent: 2_300_000,
                         output: 5_500,
                     },
-                    changed: vec![
-                        ("crates/xi-sandbox/src/lib.rs".into(), 21, 12),
-                        ("crates/xi-tools/src/bash.rs".into(), 22, 16),
-                    ],
-                    queued: vec!["also run clippy on both crates once the tests pass".into()],
-                    session: "approvals ask · ◇ sandbox · trusted · 9 tools".into(),
-                    scrolled: 0,
+                    facts: "approvals ask · ◇ sandbox · trusted · 9 tools".into(),
                 },
-                status: Line::default().dim("ctx 11% · cache 94% · ◇ sandbox · ? 1 waiting"),
-                footer: Line::default()
-                    .ink("~/src/xi  main*")
-                    .dim(" · gpt-6.1-sol · think xhigh · ctx 11% · cache 94% · ◇ · ? 1 waiting"),
                 focus: Focus::Composer,
             }
         }
@@ -686,186 +791,219 @@ mod tests {
     }
 
     #[test]
-    fn columns_fold_at_their_thresholds_and_account_for_separators() {
+    fn the_panel_takes_every_column_beside_the_sheet_once_it_fits() {
         assert_eq!(
             columns(250),
             Columns {
-                rail: Rail::Full(28),
                 log: 122,
-                inspector: Some(98)
+                panel: Some(127)
             }
         );
         assert_eq!(
-            columns(200),
+            columns(159),
             Columns {
-                rail: Rail::Full(28),
                 log: 122,
-                inspector: Some(48)
+                panel: Some(36)
             }
         );
         assert_eq!(
-            columns(199),
+            columns(158),
             Columns {
-                rail: Rail::Full(28),
-                log: 170,
-                inspector: None
+                log: 158,
+                panel: None
             }
         );
-        assert_eq!(
-            columns(150),
-            Columns {
-                rail: Rail::Full(28),
-                log: 121,
-                inspector: None
-            }
-        );
-        assert_eq!(
-            columns(149),
-            Columns {
-                rail: Rail::Marks,
-                log: 145,
-                inspector: None
-            }
-        );
-        assert_eq!(
-            columns(124),
-            Columns {
-                rail: Rail::Marks,
-                log: 120,
-                inspector: None
-            }
-        );
-        assert_eq!(
-            columns(100),
-            Columns {
-                rail: Rail::Marks,
-                log: 96,
-                inspector: None
-            }
-        );
-        assert_eq!(
-            columns(99),
-            Columns {
-                rail: Rail::None,
-                log: 99,
-                inspector: None
-            }
-        );
-        for cols in 0..500 {
+        for cols in 0..400 {
             let c = columns(cols);
-            assert_eq!(
-                c.rail.width()
-                    + usize::from(c.rail != Rail::None)
-                    + c.log
-                    + usize::from(c.inspector.is_some())
-                    + c.inspector.unwrap_or(0),
-                cols,
-            );
+            assert_eq!(c.log + c.panel.map_or(0, |panel| panel + 1), cols);
         }
     }
 
     #[test]
-    fn deck_renders_each_fold_with_a_bottom_aligned_live_cursor() {
-        for cols in [250, 199, 149, 124, 99] {
-            let fixture = Fixture::new(cols);
-            let scene = fixture.scene();
+    fn live_view_lists_what_waits_changed_and_runs_above_the_gauge() {
+        let fixture = Fixture::new();
+        let scene = fixture.scene();
+        for cols in [176, 250] {
             let (lines, cursor) = render(&scene, cols, 36);
             assert_eq!(lines.len(), 36);
             assert!(lines.iter().all(|line| line.width() <= cols));
-            let columns = columns(cols);
-            let log_x = columns.rail.width() + usize::from(columns.rail != Rail::None);
-            assert_eq!(cursor, Some((33, log_x + 5)));
+            assert_eq!(cursor, Some((34, 5)));
             let text = plain(&lines);
-            assert!(text[1].contains(scene.log.title));
-            assert!(text[2].contains(scene.log.meta));
-            assert!(text[33].contains("ξ enter steers"));
-            assert!(text[34].contains("╰"));
-            assert_eq!(text[0].contains("alt+1 sessions"), cols < 150);
-            assert_eq!(text[0].contains("alt+3 inspector"), cols < 200);
-            if cols >= 200 {
-                for section in [
-                    "Other workspaces",
-                    "Waiting · 1",
-                    "? bash exec",
-                    "/new · /resume · /tree",
-                    "net diff · 5 edits",
-                    "let launch_error",
-                    "Context",
-                    "ctx 11%",
-                    "cache 94%",
-                    "Changed · 2 files",
-                    "+43",
-                    "−28",
-                    "Queued",
-                    "» also run clippy",
-                    "Session",
-                    "approvals ask",
-                    "enter opens the whole diff",
-                ] {
-                    assert!(
-                        text.iter().any(|line| line.contains(section)),
-                        "{section} missing"
-                    );
-                }
-                assert!(text[35].ends_with("alt+1 sessions · alt+2 log · alt+3 inspector"));
-            } else {
-                assert_eq!(text[35], scene.footer.plain());
-            }
-            if (100..150).contains(&cols) {
-                assert!(text[1].starts_with("●  │"));
-                assert!(text[2].starts_with("┤  │"));
-                assert!(text[3].starts_with("?  │"));
-                assert!(text[4].starts_with("·  │"));
-                assert!(text[6].starts_with("   │"));
-                assert!(text[7].starts_with("┤  │"));
-            }
+            assert!(text[0].ends_with("think xhigh"));
+            assert!(text[1].starts_with(" Route sandboxed bash"));
+            let side: Vec<String> = text
+                .iter()
+                .skip(1)
+                .map(|line| line.chars().skip(124).collect::<String>())
+                .collect();
+            assert!(side[0].starts_with("Waiting · 1") && side[0].ends_with("tab answers"));
+            assert!(side[1].starts_with("? bash exec  cargo update -p tokio"));
+            assert!(
+                side.iter()
+                    .any(|line| line.starts_with("Changes · 2 files") && line.ends_with("+43 −28"))
+            );
+            assert!(
+                side.iter()
+                    .any(|line| line.starts_with("┤ Port footer fit to deck"))
+            );
+            assert!(
+                side.iter()
+                    .any(|line| line.starts_with("? Bump tokio to 1.48"))
+            );
+            assert!(
+                !side
+                    .iter()
+                    .any(|line| line.contains("Settings frame hints"))
+            );
+            assert!(
+                side.iter()
+                    .any(|line| line.starts_with("Sessions") && line.ends_with("4 others · alt+1"))
+            );
+            let latest = side
+                .iter()
+                .position(|line| line.starts_with("edit ×5 crates/xi-tools/src/bash.rs"))
+                .expect("the newest row fills the spare rows");
+            assert!(side[latest].ends_with("+22 −16"));
+            assert_eq!(side[latest + 1].trim_end(), "-     let mut command = spec");
+            assert!(side[31].starts_with("ctx 10%  █"));
+            assert!(side[31].ends_with("29.8k of 272.0k"));
+            assert!(side[31].chars().count() <= LIVE_MAX);
+            assert_eq!(side[32], "cache 94% · ↑ 2.3M ↓ 5.5k");
+            assert_eq!(side[33], "approvals ask · ◇ sandbox · trusted · 9 tools");
+            assert_eq!(side[34], "alt+1 sessions · alt+2 log · alt+3 inspector");
         }
     }
 
     #[test]
-    fn selected_log_rows_keep_their_roles_and_text_but_become_strong() {
-        let fixture = Fixture::new(250);
-        let scene = fixture.scene();
-        let (rows, _) = log_rows(&scene.log, 122, 34);
-        let selected = rows
-            .iter()
-            .find(|line| line.plain() == fixture.retained[7].plain())
-            .unwrap();
-        assert!(!selected.plain().starts_with('›'));
-        assert_eq!(selected.0.len(), fixture.retained[7].0.len());
-        for (strong, original) in selected.0.iter().zip(&fixture.retained[7].0) {
-            assert!(strong.bold);
-            assert_eq!(strong.role, original.role);
-            assert_eq!(strong.text, original.text);
-        }
-        let (_, cursor) = render(&scene, 250, 36);
-        assert_eq!(cursor, Some((33, 34)));
-    }
-
-    #[test]
-    fn sessions_show_selection_only_while_focused() {
-        let fixture = Fixture::new(250);
+    fn live_view_hides_empty_sections_and_says_so_when_all_are() {
+        let fixture = Fixture::new();
         let mut scene = fixture.scene();
+        scene.panel.asks.clear();
+        scene.panel.sessions.here.truncate(1);
+        scene.panel.sessions.elsewhere.clear();
+        let text = plain(&live_view(&scene.panel, 60, 20));
+        assert_eq!(
+            text[0],
+            "Changes · 2 files                                    +43 −28"
+        );
         assert!(
-            !plain(&session_rows(&scene, Rail::Full(28), 34))
+            !text
+                .iter()
+                .any(|line| line.starts_with("Waiting") || line.starts_with("Sessions"))
+        );
+        scene.panel.changed.clear();
+        let text = plain(&live_view(&scene.panel, 60, 20));
+        assert!(text[0].starts_with("edit ×5 crates/xi-tools/src/bash.rs"));
+        scene.panel.inspect = None;
+        let text = plain(&live_view(&scene.panel, 60, 20));
+        assert_eq!(text[0], "Nothing waits on you and nothing has changed yet.");
+        scene.panel.sessions.here[0].mark = Mark::Idle;
+        scene.panel.sessions.here.push(SessionRow {
+            mark: Mark::Current,
+            title: "this".into(),
+            detail: "now".into(),
+        });
+        let text = plain(&live_view(&scene.panel, 60, 20));
+        assert!(text[0].starts_with("Sessions"));
+        assert_eq!(text[1], "nothing else running");
+    }
+
+    #[test]
+    fn the_newest_row_takes_only_spare_rows_and_counts_what_it_cuts() {
+        let mut fixture = Fixture::new();
+        fixture.inspect.text = (0..30)
+            .map(|n| format!("+ row {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let scene = fixture.scene();
+        // Waiting (3), Changes (3) and Sessions (3) with their gaps take 11
+        // of the 20 body rows above the gauge's gap and three rows.
+        let text = plain(&live_view(&scene.panel, 60, 20));
+        assert!(text[12].starts_with("edit ×5"));
+        assert_eq!(text[13], "+ row 0");
+        assert_eq!(text[15], "… 28 more lines · alt+3");
+        assert_eq!(text[16], "");
+        assert!(text[17].starts_with("ctx 10%"));
+        let text = plain(&live_view(&scene.panel, 60, 17));
+        assert!(!text.iter().any(|line| line.starts_with("edit ×5")));
+    }
+
+    #[test]
+    fn changed_paths_keep_their_file_names_and_long_lists_count_the_rest() {
+        let fixture = Fixture::new();
+        let mut scene = fixture.scene();
+        scene.panel.changed = (0..11)
+            .map(|n| {
+                (
+                    format!("crates/xi-kernel/src/deeply/nested/module_{n}.rs"),
+                    n,
+                    1,
+                )
+            })
+            .collect();
+        let text = plain(&live_view(&scene.panel, 40, 34));
+        let first = text
+            .iter()
+            .position(|line| line.starts_with("Changes · 11 files"))
+            .unwrap();
+        assert!(text[first + 1].starts_with('…'));
+        assert!(text[first + 1].contains("module_0.rs"));
+        assert!(text[first + 1].ends_with("+0 −1"));
+        assert_eq!(text[first + 1 + CHANGED_ROWS], "… 3 more files");
+        assert_eq!(elide_left("abc", 3), "abc");
+        assert_eq!(elide_left("abcdef", 4), "…def");
+        assert_eq!(elide_left("abcdef", 0), "");
+    }
+
+    #[test]
+    fn short_panels_keep_the_gauge_and_cut_the_sections_above_it() {
+        let fixture = Fixture::new();
+        let scene = fixture.scene();
+        let text = plain(&live_view(&scene.panel, 60, 9));
+        assert_eq!(text.len(), 9);
+        assert_eq!(text[4], "…");
+        assert_eq!(text[5], "");
+        assert!(text[6].starts_with("ctx 10%"));
+        assert_eq!(text[8], "approvals ask · ◇ sandbox · trusted · 9 tools");
+        assert_eq!(live_view(&scene.panel, 60, 2).len(), 2);
+        assert!(live_view(&scene.panel, 60, 0).is_empty());
+    }
+
+    #[test]
+    fn the_selected_row_gets_a_gutter_mark_and_stays_in_view() {
+        let fixture = Fixture::new();
+        let mut scene = fixture.scene();
+        scene.focus = Focus::Log;
+        scene.log.selected = Some(3);
+        let (rows, _) = log_rows(&scene.log, 120, 20);
+        let text = plain(&rows);
+        let marked: Vec<_> = text.iter().filter(|line| line.starts_with('›')).collect();
+        assert_eq!(marked, [&format!("›{}", fixture.retained[3].plain())]);
+        let row = rows
+            .iter()
+            .find(|line| line.plain().starts_with('›'))
+            .unwrap();
+        assert_eq!(row.0[0].role, Role::Brass);
+        assert_eq!(&row.0[1..], &fixture.retained[3].0[..]);
+        // Eight rows leave room for two retained rows above the live ones.
+        scene.log.selected = Some(0);
+        assert!(
+            !plain(&log_rows(&scene.log, 120, 8).0)
                 .iter()
                 .any(|line| line.starts_with('›'))
         );
-        scene.focus = Focus::Sessions;
-        assert!(
-            plain(&session_rows(&scene, Rail::Full(28), 34))
-                .iter()
-                .any(|line| line.starts_with("› ┤ Port"))
-        );
-        let marks = session_rows(&scene, Rail::Marks, 34);
-        assert_eq!(marks[1].plain(), "› ┤");
-        scene.sessions.as_mut().unwrap().selected = Some(5);
-        assert_eq!(session_rows(&scene, Rail::Marks, 34)[6].plain(), "› ┤");
+        scene.log.reveal = true;
+        let text = plain(&log_rows(&scene.log, 120, 8).0);
+        assert!(text[2].starts_with("›ξ route"));
+        scene.log.scrolled = 6;
+        scene.log.selected = Some(5);
+        let text = plain(&log_rows(&scene.log, 120, 8).0);
+        assert!(text[3].starts_with("›  … 12 more lines"));
     }
 
     #[test]
     fn log_scrolling_keeps_live_rows_fixed_and_crops_hidden_cursors() {
-        let fixture = Fixture::new(124);
+        let fixture = Fixture::new();
         let mut scene = fixture.scene();
         let (bottom, bottom_cursor) = log_rows(&scene.log, 120, 12);
         assert!(
@@ -873,7 +1011,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("12 more lines"))
         );
-        scene.log.scrolled = 4;
+        scene.log.scrolled = 3;
         let (scrolled, scrolled_cursor) = log_rows(&scene.log, 120, 12);
         assert!(
             !plain(&scrolled)
@@ -881,59 +1019,50 @@ mod tests {
                 .any(|line| line.contains("12 more lines"))
         );
         assert_eq!(bottom_cursor, scrolled_cursor);
-        assert_eq!(&bottom[7..], &scrolled[7..]);
-        let (short, cursor) = log_rows(&scene.log, 120, 6);
-        assert_eq!(short.len(), 6);
-        assert_eq!(cursor, Some((4, 4)));
+        assert_eq!(&bottom[8..], &scrolled[8..]);
+        let (short, cursor) = log_rows(&scene.log, 120, 4);
+        assert_eq!(short.len(), 4);
+        assert_eq!(cursor, Some((2, 4)));
         scene.log.cursor = Some((0, 0));
-        assert_eq!(log_rows(&scene.log, 120, 6).1, None);
+        assert_eq!(log_rows(&scene.log, 120, 3).1, None);
     }
 
     #[test]
-    fn inspector_preserves_sections_cuts_long_diffs_and_scrolls() {
-        let mut fixture = Fixture::new(250);
-        fixture.inspect.title.insert_str(0, "▸ ");
-        fixture.inspect.text = (0..80)
-            .map(|n| format!("+ added {n}"))
+    fn inspector_keeps_its_headline_wraps_scrolls_and_counts_the_rest() {
+        let mut fixture = Fixture::new();
+        fixture.inspect.text = (0..40)
+            .map(|n| format!("+ added {n} {}", "x".repeat(n % 3 * 30)))
             .collect::<Vec<_>>()
             .join("\n");
         let mut scene = fixture.scene();
-        let rows = inspector_rows(&scene.inspector, 98, 34);
+        scene.focus = Focus::Log;
+        let rows = inspector_view(&scene.panel, 40, 20);
         let text = plain(&rows);
-        assert!(text[0].starts_with("edit ×5"));
-        assert!(!text[0].starts_with('▸'));
-        assert!(text.iter().any(|line| line.contains("more lines")));
-        assert!(text.iter().any(|line| line == "Context"));
-        assert!(text.iter().any(|line| line == "Session"));
-        assert_eq!(text.len(), 34);
-        let added = rows
-            .iter()
-            .find(|line| line.plain().starts_with("+ added"))
-            .unwrap();
-        assert_eq!(added.0[0].role, Role::Verdigris);
-        scene.inspector.scrolled = 3;
-        let scrolled = inspector_rows(&scene.inspector, 98, 34);
-        assert_eq!(scrolled, rows[3..]);
-        scene.inspector.queued.clear();
-        scene.inspector.context.window = 0;
-        scene.inspector.context.cache_percent = None;
-        scene.inspector.inspect = None;
-        scene.inspector.scrolled = 0;
-        let text = plain(&inspector_rows(&scene.inspector, 98, 34));
-        assert!(!text.iter().any(|line| line == "Queued"));
-        assert!(
-            !text
-                .iter()
-                .any(|line| line.contains('░') || line.contains('█'))
-        );
-        assert!(text.iter().any(|line| line.contains("ctx unknown")));
-        assert!(text.iter().any(|line| line == "↑ 2.3M ↓ 5.5k"));
+        assert_eq!(rows.len(), 20);
+        assert!(text[0].starts_with("edit ×5 crates/xi-tools"));
+        assert!(text[0].ends_with("+22 −16"));
+        assert_eq!(text[1], "net diff · 5 edits");
+        assert_eq!(text[3].trim_end(), "+ added 0");
+        assert!(text[6].starts_with("xxx"), "wrapped: {text:?}");
+        assert!(text[19].starts_with("… ") && text[19].ends_with(" more lines"));
+        assert!(rows[6].0.iter().all(|span| span.role == Role::Verdigris));
+        scene.panel.scrolled = 4;
+        let scrolled = plain(&inspector_view(&scene.panel, 40, 20));
+        assert_eq!(scrolled[..3], text[..3]);
+        assert_eq!(scrolled[3], text[7]);
+        scene.panel.scrolled = 10_000;
+        let end = plain(&inspector_view(&scene.panel, 40, 20));
+        assert_eq!(end[3].trim_end(), "+ added 39");
+        assert_eq!(end[4], "");
+        fixture.inspect.text.clear();
+        let scene = fixture.scene();
+        assert_eq!(plain(&inspector_view(&scene.panel, 40, 6))[3], "no output");
     }
 
     #[test]
-    fn inspector_diff_rows_use_existing_semantic_roles() {
-        let fixture = Fixture::new(250);
-        let rows = inspector_rows(&fixture.scene().inspector, 98, 34);
+    fn diff_rows_use_existing_semantic_roles() {
+        let fixture = Fixture::new();
+        let rows = inspector_view(&fixture.scene().panel, 98, 20);
         for (prefix, role) in [
             ("- ", Role::Sanguine),
             ("+ ", Role::Verdigris),
@@ -948,35 +1077,78 @@ mod tests {
     }
 
     #[test]
-    fn deck_bounds_hold_on_empty_short_and_zero_sized_screens() {
-        let fixture = Fixture::new(250);
+    fn focus_picks_the_panel_view_and_folded_views_replace_the_log() {
+        let fixture = Fixture::new();
         let mut scene = fixture.scene();
-        scene.sessions = None;
-        for cols in [0, 1, 2, 60, 99, 100, 124, 149, 199, 200, 250] {
-            for rows in 0..20 {
-                let (lines, cursor) = render(&scene, cols, rows);
-                assert_eq!(lines.len(), rows);
-                assert!(lines.iter().all(|line| line.width() <= cols));
-                if let Some((row, col)) = cursor {
-                    assert!(row < rows && col < cols);
-                }
-            }
-        }
+        scene.focus = Focus::Log;
+        let text = plain(&render(&scene, 200, 30).0);
+        assert!(text[1].contains("│ edit ×5 crates/xi-tools/src/bash.rs"));
+        assert!(text[29].ends_with("esc back"));
+        scene.focus = Focus::Sessions;
+        scene.panel.sessions.selected = 4;
+        let (lines, cursor) = render(&scene, 200, 30);
+        let text = plain(&lines);
         assert!(
-            render(&scene, 250, 36).0[0]
-                .plain()
-                .contains("alt+1 sessions")
+            text.iter()
+                .any(|line| line.contains("│ › · ledger · Fix export offsets"))
         );
+        assert!(text.iter().any(|line| line.contains("│ Other workspaces")));
+        assert_eq!(cursor, Some((28, 5)));
+        let (folded, cursor) = render(&scene, 120, 30);
+        let text = plain(&folded);
+        assert!(text[0].ends_with("think xhigh · ctx 11% · cache 94% · ◇ sandbox"));
+        assert_eq!(text[1], " Sessions");
+        assert!(
+            !text
+                .iter()
+                .any(|line| line.contains("Route sandboxed bash through"))
+        );
+        assert_eq!(cursor, None);
+        scene.focus = Focus::Composer;
+        let (folded, cursor) = render(&scene, 120, 30);
+        assert!(plain(&folded)[1].starts_with(" Route sandboxed bash"));
+        assert_eq!(cursor, Some((28, 5)));
     }
 
     #[test]
-    fn deck_plain_text_dumps_at_desktop_and_folded_widths() {
-        for cols in [250, 124] {
-            let fixture = Fixture::new(cols);
-            let (lines, _) = render(&fixture.scene(), cols, 36);
-            println!("--- deck {cols}×36 ---");
-            for line in lines {
-                println!("{}", line.plain().trim_end());
+    fn the_session_list_scrolls_to_keep_the_selection() {
+        let fixture = Fixture::new();
+        let mut pane = fixture.scene().panel.sessions;
+        pane.here.extend((0..30).map(|n| SessionRow {
+            mark: Mark::Idle,
+            title: format!("old {n}"),
+            detail: "last week".into(),
+        }));
+        pane.selected = 34;
+        let text = plain(&sessions_view(&pane, 50, 10));
+        assert_eq!(text.len(), 10);
+        assert!(text[9].starts_with("› · ledger"));
+        pane.selected = 1;
+        let text = plain(&sessions_view(&pane, 50, 10));
+        assert!(text[3].starts_with("› ┤ Port footer"));
+        assert!(text[3].ends_with("sonnet-5.5 · 2m"));
+    }
+
+    #[test]
+    fn deck_bounds_hold_on_empty_short_and_zero_sized_screens() {
+        let fixture = Fixture::new();
+        let mut scene = fixture.scene();
+        for focus in [
+            Focus::Composer,
+            Focus::Log,
+            Focus::Inspector,
+            Focus::Sessions,
+        ] {
+            scene.focus = focus;
+            for cols in [0, 1, 2, 60, 120, 158, 159, 200, 250] {
+                for rows in 0..20 {
+                    let (lines, cursor) = render(&scene, cols, rows);
+                    assert_eq!(lines.len(), rows);
+                    assert!(lines.iter().all(|line| line.width() <= cols));
+                    if let Some((row, col)) = cursor {
+                        assert!(row < rows && col < cols);
+                    }
+                }
             }
         }
     }

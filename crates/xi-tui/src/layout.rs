@@ -5,9 +5,9 @@
 //! under 72 columns, a [`Tier::Pane`] up to 119, and a [`Tier::Sheet`] from
 //! 120, where output stays on a 120-column sheet at the left and prose wraps
 //! at 88. Under 20 rows the live region shrinks too ([`Measure::short`]).
-//! The deck (alternate screen with sessions, the log and an inspector) is a
-//! [`Layout`] choice on top, taken when xi starts at 180×30 or more with
-//! `layout = "auto"`.
+//! The deck (alternate screen with the log and a side panel) is a
+//! [`Layout`] choice on top. `layout = "auto"`, the default, takes it when
+//! xi starts wide enough for the panel beside the sheet ([`DECK_FROM`]).
 
 /// Columns below which the client is a slit.
 pub const SLIT_BELOW: usize = 72;
@@ -19,8 +19,11 @@ pub const SHEET: usize = 120;
 pub const PROSE: usize = 88;
 /// Rows below which the live region shrinks.
 pub const SHORT_BELOW: usize = 20;
-/// The size from which `layout = "auto"` chooses the deck at start.
-pub const DECK_FROM: (usize, usize) = (180, 30);
+/// The narrowest side panel the deck shows beside the log.
+pub const PANEL_MIN: usize = 36;
+/// The size from which `layout = "auto"` chooses the deck at start: the
+/// sheet with its gutter and margin, a separator and the narrowest panel.
+pub const DECK_FROM: (usize, usize) = (SHEET + 3 + PANEL_MIN, 30);
 
 /// Width tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,11 +67,11 @@ impl Tier {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
     /// Scrollback is the log; never enters the alternate screen by itself.
-    #[default]
     Inline,
-    /// The alternate screen with sessions, the log and an inspector.
+    /// The alternate screen with the log and a side panel.
     Deck,
     /// The deck when xi starts at [`DECK_FROM`] or larger, else inline.
+    #[default]
     Auto,
 }
 
@@ -226,9 +229,10 @@ mod tests {
 
     #[test]
     fn auto_opens_the_deck_only_at_start_size() {
-        assert!(Layout::Auto.deck_at(180, 30));
-        assert!(!Layout::Auto.deck_at(179, 30));
-        assert!(!Layout::Auto.deck_at(180, 29));
+        assert!(Layout::Auto.deck_at(159, 30));
+        assert!(!Layout::Auto.deck_at(158, 30));
+        assert!(!Layout::Auto.deck_at(159, 29));
+        assert_eq!(Layout::default(), Layout::Auto);
         assert!(Layout::Deck.deck_at(80, 24));
         assert!(!Layout::Inline.deck_at(250, 36));
         assert_eq!(Layout::parse("deck"), Some(Layout::Deck));

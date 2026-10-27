@@ -787,14 +787,8 @@ impl Call {
                     inspect,
                 );
             }
-            if diff
-                .rows
-                .iter()
-                .any(|(_, row)| Line::default().ink(row).width() + 4 > cols)
-            {
-                inspect.note = format!("{} lines", diff.rows.len());
-                inspect.text = diff_text(&diff);
-            }
+            inspect.note = format!("{} lines", diff.rows.len());
+            inspect.text = diff_text(&diff);
             return (lines, Vec::new(), inspect);
         }
         if quiet {
@@ -843,12 +837,7 @@ impl Call {
             let more = format!("    {}", more.join(" · "));
             lines.push(Line::default().dim(more).truncate(cols));
         }
-        if hidden > 0
-            || exit.is_some()
-            || rows
-                .iter()
-                .any(|(_, row)| inline(row, Role::Ink).width() + 4 > cols)
-        {
+        if !text.is_empty() {
             inspect.note = format!("{count} lines");
             inspect.text.clone_from(&text);
         }
