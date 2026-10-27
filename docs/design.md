@@ -364,6 +364,8 @@ Built-in names are reserved, so an extension cannot shadow them. Model, reasonin
 
 Overlays form a stack, but only the top one is drawn. Its title starts with the levels under it as a breadcrumb, such as `settings › models`. `esc` steps back one level and `ctrl+c` closes them all. A frame leaves a scrollback record only when it changed something: an answer commits one line such as `? allowed for this session · bash exec cargo test`, and checkouts and model switches commit theirs. Closing a frame leaves nothing.
 
+While a frame holds the keys, the composer collapses to one dim line with the draft's first line and where `esc` or `ctrl+c` returns, so brass marks only where the keys go. Streaming text collapses to one row such as `┤ streaming · 34 lines` and full thinking to its newest line; calls, asks and children keep their rows.
+
 | Overlay | Opens with | Contents and keys |
 |---|---|---|
 | Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider under headings that scroll with them: id, then context window, a reasoning mark and price per million input and output tokens at the right. `●` marks the current model. Models without credentials are dimmed with the way to add one. Typing filters on a head row that holds the cursor, `enter` selects, `esc` closes. |

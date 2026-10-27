@@ -1153,21 +1153,44 @@ impl Transcript {
     /// Calls still in flight, then the newest streamed rows.
     #[must_use]
     pub fn live(&self, cols: usize, frame: usize) -> Vec<Line> {
+        self.live_rows(cols, frame, false)
+    }
+
+    /// [`Self::live`] while a frame holds the keys: streamed text shrinks
+    /// to one `┤ streaming · 34 lines` row and thinking to its first line,
+    /// so the frame keeps its room. Calls, asks and children stay.
+    #[must_use]
+    pub fn live_under_frame(&self, cols: usize, frame: usize) -> Vec<Line> {
+        self.live_rows(cols, frame, true)
+    }
+
+    fn live_rows(&self, cols: usize, frame: usize, collapse: bool) -> Vec<Line> {
         let mut lines = Vec::new();
         if !self.stream.trim().is_empty() {
             let rows = prose(self.stream.trim(), cols.saturating_sub(2), Role::Ink);
-            let skip = rows.len().saturating_sub(STREAM_ROWS);
-            for row in rows.into_iter().skip(skip) {
-                lines.push(Line::default().ink("  ").extend(row));
+            if collapse {
+                let noun = if rows.len() == 1 { "line" } else { "lines" };
+                lines.push(
+                    Line::default()
+                        .brass(SPINNER[frame % SPINNER.len()])
+                        .dim(format!(" streaming · {} {noun}", rows.len()))
+                        .truncate(cols),
+                );
+            } else {
+                let skip = rows.len().saturating_sub(STREAM_ROWS);
+                for row in rows.into_iter().skip(skip) {
+                    lines.push(Line::default().ink("  ").extend(row));
+                }
+                lines.push(Line::default());
             }
-            lines.push(Line::default());
         }
         if self.thinking() {
-            lines.extend(
-                self.thinking_display
-                    .rows(&self.stream_thinking, cols, true),
-            );
-            if self.redacted_thinking && self.thinking_display != Thinking::Hidden {
+            let display = match self.thinking_display {
+                Thinking::Full if collapse => Thinking::First,
+                display => display,
+            };
+            lines.extend(display.rows(&self.stream_thinking, cols, true));
+            if self.redacted_thinking && display != Thinking::Hidden {
                 lines.push(Line::default().dim("  ∴ redacted thinking").truncate(cols));
             }
         }
@@ -1764,6 +1787,38 @@ mod tests {
                 mode != Thinking::Hidden,
             );
         }
+    }
+
+    #[test]
+    fn under_a_frame_stream_counts_lines_and_full_thinking_shows_one() {
+        use xi_protocol::methods::client::DeltaParams;
+
+        let mut t = Transcript::default();
+        t.set_thinking(Thinking::Full);
+        let session = SessionId::generate();
+        let delta = |delta| {
+            ClientNotification::Delta(DeltaParams {
+                session,
+                attempt: 0,
+                sequence: 0,
+                delta,
+            })
+        };
+        t.apply(
+            &delta(Delta::Thinking {
+                text: "one\ntwo\nthree\n".into(),
+            }),
+            60,
+        );
+        assert!(t.live(60, 0).len() > 1);
+        assert_eq!(plain(&t.live_under_frame(60, 0)), ["  ∴ three"]);
+        let text: String = (1..=12).map(|n| format!("line {n}\n\n")).collect();
+        t.apply(&delta(Delta::Text { text }), 60);
+        assert_eq!(t.live(60, 0).len(), STREAM_ROWS + 1);
+        assert_eq!(
+            plain(&t.live_under_frame(60, 0)),
+            ["┤ streaming · 23 lines"]
+        );
     }
 
     #[test]

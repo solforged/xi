@@ -231,10 +231,17 @@ impl App {
 
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
         let cols = self.cols;
-        let mut lines = self.transcript.live(cols, self.frame);
+        // While a frame holds the keys, the stream and the composer shrink
+        // to one line each so the frame keeps its room.
+        let framed = !self.overlays.is_empty();
+        let mut lines = if framed {
+            self.transcript.live_under_frame(cols, self.frame)
+        } else {
+            self.transcript.live(cols, self.frame)
+        };
         let transcript_rows = lines.len();
         if self.running() {
-            if !lines.is_empty() {
+            if !lines.is_empty() && !framed {
                 lines.push(Line::default());
             }
             let elapsed = self.started.map_or(0, |s| s.elapsed().as_secs());
@@ -276,19 +283,32 @@ impl App {
                 cols,
             ));
         }
-        let border = if !self.overlays.is_empty() {
-            Role::Dim
-        } else if self.transcript.tainted {
-            Role::Murex
+        let (composer, (row, col)) = if framed {
+            let draft = self.editor.text().lines().next().unwrap_or_default();
+            let back = if self.overlays.len() == 1 {
+                "esc returns here"
+            } else {
+                "ctrl+c returns here"
+            };
+            let line = lr(
+                Line::default().dim(format!("ξ {draft}")),
+                Line::default().dim(back),
+                cols,
+            );
+            (vec![line], (0, 0))
         } else {
-            Role::Brass
+            let border = if self.transcript.tainted {
+                Role::Murex
+            } else {
+                Role::Brass
+            };
+            let hint = if self.running() {
+                "enter steers · alt+enter queues · esc stops"
+            } else {
+                "enter sends · ctrl+j new line · /help"
+            };
+            self.editor.render(cols, border, hint)
         };
-        let hint = if self.running() {
-            "enter steers · alt+enter queues · esc stops"
-        } else {
-            "enter sends · ctrl+j new line · /help"
-        };
-        let (composer, (row, col)) = self.editor.render(cols, border, hint);
         let attachment_rows = usize::from(!self.images.is_empty());
         // The frame gets what is left after the composer, the status line
         // and the turn's own rows; streamed rows above it scroll off first.
@@ -300,9 +320,7 @@ impl App {
                 .draw(&mut ctx, self.waiting(), cols, overlay_rows.max(4));
         let overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
         lines.extend(rows);
-        if self.overlays.is_empty()
-            && let Some(menu) = &self.completion
-        {
+        if !framed && let Some(menu) = &self.completion {
             lines.extend(menu.render(cols, overlay_rows.min(8)));
         }
         if !self.images.is_empty() {
@@ -317,8 +335,7 @@ impl App {
         let top = lines.len();
         lines.extend(composer);
         lines.push(self.footer(cols));
-        let cursor =
-            overlay_cursor.or_else(|| self.overlays.is_empty().then_some((top + row, col)));
+        let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
         (lines, cursor)
     }
 

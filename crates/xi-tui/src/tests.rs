@@ -1400,16 +1400,25 @@ async fn tab_answers_a_waiting_ask_over_another_overlay_and_records_it() {
     assert!(!live_text(&app).contains("waiting"));
 }
 
+fn composer_line(app: &App) -> String {
+    let lines = app.live().0;
+    lines[lines.len() - 2].plain()
+}
+
 #[tokio::test]
 async fn esc_steps_back_one_overlay_and_ctrl_c_closes_the_stack() {
     let (launch, _requests) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 180, 40);
-    app.editor.insert("keep draft");
+    app.editor.insert("keep draft\nsecond line");
     app.command("/settings").await.unwrap();
+    let composer = composer_line(&app);
+    assert!(composer.starts_with("ξ keep draft "), "{composer}");
+    assert!(composer.ends_with("esc returns here"), "{composer}");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     app.key(enter).await.unwrap();
     assert!(app.overlays.on_top::<Picker>());
     assert!(live_text(&app).contains("settings › models"));
+    assert!(composer_line(&app).ends_with("ctrl+c returns here"));
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -1421,7 +1430,8 @@ async fn esc_steps_back_one_overlay_and_ctrl_c_closes_the_stack() {
         .unwrap();
     assert!(app.overlays.is_empty());
     assert!(app.commit.is_empty());
-    assert_eq!(app.editor.text(), "keep draft");
+    assert_eq!(app.editor.text(), "keep draft\nsecond line");
+    assert!(composer_line(&app).starts_with('╰'));
 }
 
 #[tokio::test]
@@ -1677,7 +1687,12 @@ async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live
             assert!(app.running());
             assert!(app.overlays.on_top::<Approvals>());
             assert_eq!(app.transcript.asks().len(), 1);
-            assert!(live_text(&app).contains("target in flight"));
+            assert!(
+                app.transcript
+                    .live(160, 0)
+                    .iter()
+                    .any(|line| line.plain().contains("target in flight"))
+            );
         } else {
             let params = request(&mut requests, "session/open");
             assert_eq!(params["path"], json!(target.info.path));
