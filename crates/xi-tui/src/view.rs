@@ -38,10 +38,10 @@ pub(crate) fn home(path: &Path) -> String {
 impl App {
     /// Prints the header and replays the head's branch, for resumed sessions.
     pub(crate) fn attach(&mut self) {
-        self.title = crate::latest_title(&self.launch.attached.events);
-        self.prompt = crate::first_prompt(&self.launch.attached.events);
-        self.title_written = false;
-        let cols = self.measure().out;
+        self.display.title = crate::latest_title(&self.launch.attached.events);
+        self.display.prompt = crate::first_prompt(&self.launch.attached.events);
+        self.display.title_written = false;
+        let cols = self.display.measure().out;
         let info = &self.launch.attached.info;
         let mut header = vec![
             Line::default()
@@ -66,15 +66,15 @@ impl App {
         let session = info.session;
         let head = info.head;
         // The deck's own header names the workspace, and its panel the trust.
-        if self.deck.is_none() {
+        if self.display.deck.is_none() {
             self.commit_lines(header);
         }
-        self.seen.clear();
+        self.turn.seen.clear();
         self.launch
             .attached
             .events
-            .retain(|event| self.seen.insert(event.id));
-        self.resolved = self
+            .retain(|event| self.turn.seen.insert(event.id));
+        self.turn.resolved = self
             .launch
             .attached
             .events
@@ -89,13 +89,13 @@ impl App {
         let replayed = events.len().saturating_sub(1);
         for event in events {
             let n = ClientNotification::Event(EventParams { session, event });
-            let lines = self.transcript.apply(&n, self.measure());
+            let lines = self.transcript.apply(&n, self.display.measure());
             self.commit_lines(lines);
         }
         if self.launch.attached.running {
-            self.started = Some(Instant::now());
+            self.turn.started = Some(Instant::now());
         } else {
-            let lines = self.transcript.flush(self.measure());
+            let lines = self.transcript.flush(self.display.measure());
             self.commit_lines(lines);
             self.transcript.end_turn();
         }
@@ -115,7 +115,7 @@ impl App {
         for pending in &self.launch.attached.pending_approvals {
             self.transcript.apply(
                 &ClientNotification::ApprovalPending(pending.clone()),
-                self.measure(),
+                self.display.measure(),
             );
         }
         if replayed > 0 {
@@ -252,28 +252,28 @@ impl App {
     /// keeps against the bottom: frames and the composer, whose model row
     /// carries the turn's activity.
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>, usize) {
-        let m = self.measure();
+        let m = self.display.measure();
         let cols = m.out;
-        let deck = self.deck.is_some();
+        let deck = self.display.deck.is_some();
         // Frames keep their room by shrinking streamed rows and the composer.
         // Short panes omit the collapsed composer so title and hints survive.
         let framed = !self.overlays.is_empty();
         let mut lines = if framed {
-            self.transcript.live_under_frame(m, self.frame)
+            self.transcript.live_under_frame(m, self.display.frame)
         } else {
-            self.transcript.live(m, self.frame)
+            self.transcript.live(m, self.display.frame)
         };
         let transcript_rows = lines.len();
         // The deck shows the turn's activity under its composer, which a
         // frame collapses.
-        let activity = self.running().then(|| self.activity(m));
+        let activity = self.turn.running().then(|| self.activity(m));
         if let Some(activity) = activity.clone().filter(|_| !deck || framed) {
             if !lines.is_empty() && !framed {
                 lines.push(Line::default());
             }
             lines.push(activity.dim(" · esc stop").truncate(cols));
         }
-        for content in &self.steering {
+        for content in &self.turn.steering {
             lines.push(lr(
                 Line::default()
                     .ink("  ")
@@ -283,7 +283,7 @@ impl App {
                 cols,
             ));
         }
-        for content in &self.queued {
+        for content in &self.turn.queued {
             lines.push(lr(
                 Line::default()
                     .ink("  ")
@@ -293,7 +293,7 @@ impl App {
                 cols,
             ));
         }
-        let hint = if self.running() {
+        let hint = if self.turn.running() {
             "enter steers · alt+enter queues · esc stops"
         } else {
             "enter sends · ctrl+j new line · /help"
@@ -306,7 +306,13 @@ impl App {
         let (composer, (row, col)) = if framed && m.short {
             (Vec::new(), (0, 0))
         } else if framed {
-            let draft = self.editor.text().lines().next().unwrap_or_default();
+            let draft = self
+                .composer
+                .editor
+                .text()
+                .lines()
+                .next()
+                .unwrap_or_default();
             let back = if self.overlays.len() == 1 {
                 "esc returns here"
             } else {
@@ -323,7 +329,7 @@ impl App {
                 rows: m.composer_rows(),
                 shape: Shape::Bar,
             };
-            let (mut block, cursor) = self.editor.render(cols, border, "", form);
+            let (mut block, cursor) = self.composer.editor.render(cols, border, "", form);
             let bar = || Line::default().span(border, false, "┃");
             // The model shares its row with the turn's activity, and the
             // keys while there is room, so the block ends on the bottom
@@ -331,7 +337,7 @@ impl App {
             let room = cols.saturating_sub(3);
             let model = self.model_line();
             let mut right = activity.clone().unwrap_or_default();
-            if self.running() && model.width() + right.width() + hint.len() + 6 <= room {
+            if self.turn.running() && model.width() + right.width() + hint.len() + 6 <= room {
                 right = right.dim(" · ").dim(hint);
             }
             // A blank row parts the draft from the model, as above it.
@@ -348,13 +354,13 @@ impl App {
                     Shape::Box
                 },
             };
-            self.editor.render(cols, border, hint, form)
+            self.composer.editor.render(cols, border, hint, form)
         };
-        let attachment_rows = usize::from(!self.images.is_empty());
+        let attachment_rows = usize::from(!self.composer.images.is_empty());
         // The frame gets what is left after the composer, the status line
         // and the turn's own rows; streamed rows above it scroll off first.
         let reserved = composer.len() + 1 + attachment_rows + lines.len() - transcript_rows;
-        let overlay_rows = self.rows.saturating_sub(1 + reserved);
+        let overlay_rows = self.display.rows.saturating_sub(1 + reserved);
         let fixed = composer.len() + 1 + attachment_rows;
         let frame_rows = if m.short {
             m.frame_rows(overlay_rows.max(4))
@@ -369,12 +375,12 @@ impl App {
             .draw(&mut ctx, self.waiting(), cols, frame_rows);
         let overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
         lines.extend(rows);
-        if !framed && let Some(menu) = &self.completion {
+        if !framed && let Some(menu) = &self.composer.completion {
             let menu_rows = overlay_rows.min(8).min(frame_rows);
             lines.extend(menu.render(cols, menu_rows));
         }
-        if !self.images.is_empty() {
-            let count = self.images.len();
+        if !self.composer.images.is_empty() {
+            let count = self.composer.images.len();
             let noun = if count == 1 { "image" } else { "images" };
             lines.push(
                 Line::default()
@@ -386,6 +392,7 @@ impl App {
         lines.extend(composer);
         if !deck {
             lines.push(self.footer(cols));
+
         }
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
         let hidden = lines.len().saturating_sub(m.live_rows());
@@ -400,7 +407,7 @@ impl App {
     /// The turn's spinner, what it does and for how long, and its tokens
     /// when the measure has room.
     fn activity(&self, m: crate::layout::Measure) -> Line {
-        let elapsed = self.started.map_or(0, |s| s.elapsed().as_secs());
+        let elapsed = self.turn.started.map_or(0, |s| s.elapsed().as_secs());
         let turn = self.transcript.turn;
         let what = if self.transcript.thinking() {
             "thinking"
@@ -408,7 +415,7 @@ impl App {
             "working"
         };
         let mut line = Line::default()
-            .brass(SPINNER[self.frame % SPINNER.len()])
+            .brass(SPINNER[self.display.frame % SPINNER.len()])
             .dim(format!(" {what} · {elapsed}s"));
         if m.durations() && turn.sent() > 0 {
             line = line.dim(format!(
@@ -439,21 +446,12 @@ impl App {
         &mut self,
         screen: &mut Screen<W>,
     ) -> std::io::Result<()> {
-        if std::mem::take(&mut self.clear_scrollback) {
-            screen.clear();
-        }
-        for control in self.controls.drain(..) {
-            screen.control(&control)?;
-        }
-        if !self.title_written {
-            screen.control(&crate::title_control(self.title.as_deref()))?;
-            self.title_written = true;
-        }
-        if self.deck.is_some() {
+        self.display.controls(screen)?;
+        if self.display.deck.is_some() {
             return self.draw_deck(screen);
         }
         let (live, cursor, _) = self.live();
-        let commit = std::mem::take(&mut self.commit);
-        screen.draw(&commit, &live, cursor, self.measure().live_rows())
+        let commit = std::mem::take(&mut self.display.commit);
+        screen.draw(&commit, &live, cursor, self.display.measure().live_rows())
     }
 }

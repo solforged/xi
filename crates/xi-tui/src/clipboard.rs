@@ -5,7 +5,25 @@ use base64::engine::general_purpose::STANDARD;
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use xi_protocol::Block;
 
-use crate::Error;
+/// A failure reading or encoding a clipboard image.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Clipboard access failed or no image was available.
+    #[error(transparent)]
+    Clipboard(#[from] arboard::Error),
+    /// Pixel dimensions did not match the supplied RGBA bytes.
+    #[error("invalid clipboard image dimensions")]
+    Dimensions,
+    /// The raw pixel buffer exceeded the attachment limit.
+    #[error("clipboard image is too large (maximum 100 MiB of pixels)")]
+    PixelsTooLarge,
+    /// Encoding the image failed.
+    #[error(transparent)]
+    Image(#[from] image::ImageError),
+    /// The encoded PNG exceeded the attachment limit.
+    #[error("clipboard image is too large (maximum 5 MiB PNG)")]
+    EncodedTooLarge,
+}
 
 /// Maximum encoded image size, before base64, accepted for an attachment.
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
@@ -24,22 +42,22 @@ pub fn image() -> Result<Block, Error> {
 }
 
 fn encode_image(image: arboard::ImageData<'_>) -> Result<Block, Error> {
-    let width = u32::try_from(image.width)?;
-    let height = u32::try_from(image.height)?;
+    let width = u32::try_from(image.width).map_err(|_| Error::Dimensions)?;
+    let height = u32::try_from(image.height).map_err(|_| Error::Dimensions)?;
     let bytes = image
         .width
         .checked_mul(image.height)
         .and_then(|n| n.checked_mul(4));
     if width == 0 || height == 0 || bytes != Some(image.bytes.len()) {
-        return Err("invalid clipboard image dimensions".into());
+        return Err(Error::Dimensions);
     }
     if image.bytes.len() > 100 * 1024 * 1024 {
-        return Err("clipboard image is too large (maximum 100 MiB of pixels)".into());
+        return Err(Error::PixelsTooLarge);
     }
     let mut png = Vec::new();
     PngEncoder::new(&mut png).write_image(&image.bytes, width, height, ExtendedColorType::Rgba8)?;
     if png.len() > MAX_IMAGE_BYTES {
-        return Err("clipboard image is too large (maximum 5 MiB PNG)".into());
+        return Err(Error::EncodedTooLarge);
     }
     Ok(Block::Image {
         media_type: "image/png".into(),
@@ -86,14 +104,14 @@ mod tests {
     fn invalid_clipboard_images_are_rejected() {
         for (width, height, bytes) in [(0, 1, vec![]), (1, 1, vec![0; 3]), (usize::MAX, 2, vec![])]
         {
-            assert!(
+            assert!(matches!(
                 encode_image(arboard::ImageData {
                     width,
                     height,
                     bytes: Cow::Owned(bytes),
-                })
-                .is_err()
-            );
+                }),
+                Err(Error::Dimensions)
+            ));
         }
     }
 

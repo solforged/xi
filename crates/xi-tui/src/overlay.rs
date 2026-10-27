@@ -39,19 +39,50 @@ pub(crate) struct Ctx<'a> {
     pub parent: Option<&'static str>,
 }
 
-/// What a key did.
+/// What a component's key did.
 pub(crate) enum Outcome {
     /// Redraw and keep the keys.
     Stay,
-    /// Step back one level.
+    /// Step back one overlay level.
     Close,
-    /// Something only the client's owner can do; the overlay stays until it
-    /// has run.
+    /// Work for the client owner. The component keeps focus until it runs.
     Send(Box<Command>),
 }
 
-/// Work an overlay hands to the client, which owns the connection.
+/// Work a component hands to the client, which owns the connection.
 pub(crate) enum Command {
+    /// Step back one overlay level.
+    Close,
+    /// Close the overlay stack and completion menu.
+    Dismiss,
+    /// Send or queue the composer's prompt.
+    Submit { queue: bool },
+    /// Interrupt the running turn.
+    Cancel,
+    /// Exit the client.
+    Quit,
+    /// Open this session's waiting asks.
+    OwnApprovals,
+    /// Search prompt history.
+    SearchHistory,
+    /// Open the composer in an external editor.
+    External,
+    /// Paste an image from the clipboard.
+    PasteImage,
+    /// Open the model picker.
+    Models,
+    /// Step to the next reasoning level.
+    Reasoning,
+    /// Set the live session's tool sandbox while idle.
+    Sandbox(bool),
+    /// Toggle the live session's tool sandbox while idle.
+    ToggleSandbox,
+    /// Expand the next cut-short result.
+    Expand,
+    /// Step to the next thinking display.
+    Thinking,
+    /// Commit a deck inspection to the log.
+    Note(Vec<Line>),
     /// Answer the shown ask.
     Answer(Choice),
     /// Check out a tree node.

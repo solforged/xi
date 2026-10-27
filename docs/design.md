@@ -398,6 +398,10 @@ Hosted searches count against the search model's plan or API usage; Anthropic al
 
 `xi-tui` is the daily interface: a daemon client that commits finished output to the terminal's native scrollback and redraws only a live region below it. The live region holds the streaming turn, any open overlay, the composer and a one-line footer. Everything about a session goes through the protocol. The client owns only local state: prompt history, key bindings and display preferences. Edits to the user's global config file go through `config/set`.
 
+`App` routes between the transport, transcript and focused component. Display state owns terminal geometry, controls and the retained deck. Turn state owns pending replies, event deduplication, steering and queued prompts. The composer owns its draft, attachments, history and completion sources. Cross-session approval bookkeeping has a separate owner. Composer and overlay key handlers return `Outcome`, handing connection and application effects to one `Command` dispatcher. Terminal resources own raw mode, external-editor handoff, alternate-screen transitions and resize settling. The loop drains requests, refreshes state, draws a settled frame and selects the next event. The public `run` function returns a typed `Error` for terminal I/O or daemon client failures.
+
+`clipboard::image` returns its own typed errors for clipboard access, invalid dimensions, oversized images and PNG encoding. Clipboard and background-task failures are reported in the transcript without ending the client.
+
 The surface below is the target for daily use, including developing xi with xi. [Roadmap](roadmap.md#terminal-client) tracks which parts exist.
 
 #### Layout

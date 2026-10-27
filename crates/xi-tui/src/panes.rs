@@ -4,6 +4,7 @@
 //! [`crate::deck`] composes the screen from a [`Scene`]; this module fills
 //! the scene from the client's state and carries out the deck's keys.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -19,12 +20,13 @@ use crate::icons::Icon;
 use crate::keys::Action;
 use crate::layout::Measure;
 use crate::log::{Inspect, Log};
+use crate::overlay::{Command, Outcome};
 use crate::screen::Screen;
 use crate::sessions::age;
 use crate::style::{Line, Role};
 use crate::transcript::{Transcript, clock};
 use crate::view::{home, short_reasoning};
-use crate::{App, lineage};
+use crate::{App, Display, lineage};
 
 /// How long the sessions and asks lists stay fresh.
 const REFRESH: Duration = Duration::from_secs(5);
@@ -77,13 +79,13 @@ impl App {
     /// Enters the deck. The log starts with the head's branch replayed, as
     /// scrollback already shows it, and committed rows go to it from here on.
     pub(crate) fn enter_deck(&mut self) {
-        if self.deck.is_some() {
+        if self.display.deck.is_some() {
             return;
         }
-        self.deck = Some(Deck::default());
-        self.completion = None;
+        self.display.deck = Some(Deck::default());
+        self.composer.completion = None;
         let (rows, anchors) = self.replay();
-        if let Some(deck) = self.deck.as_mut() {
+        if let Some(deck) = self.display.deck.as_mut() {
             deck.printed = rows.len();
             deck.log.extend(rows, anchors);
         }
@@ -92,7 +94,7 @@ impl App {
     /// The head's branch as the log commits it at the current measure, with
     /// its inspector anchors. Rows the live transcript still holds stay out.
     fn replay(&self) -> (Vec<Line>, Vec<(usize, Inspect)>) {
-        let m = self.measure();
+        let m = self.display.measure();
         let session = self.session_id();
         let mut transcript = Transcript::default();
         transcript.set_thinking(self.transcript.thinking_display());
@@ -114,7 +116,7 @@ impl App {
             let lines = transcript.apply(&n, m);
             take(&mut transcript, lines);
         }
-        if !self.running() {
+        if !self.turn.running() {
             let lines = transcript.flush(m);
             take(&mut transcript, lines);
         }
@@ -124,16 +126,16 @@ impl App {
     /// Leaves the deck, printing the log rows scrollback lacks ahead of
     /// anything committed since.
     pub(crate) fn leave_deck(&mut self) {
-        if let Some(mut deck) = self.deck.take() {
+        if let Some(mut deck) = self.display.deck.take() {
             let mut rows = deck.log.take();
             rows.drain(..deck.printed.min(rows.len()));
-            self.commit.splice(0..0, rows);
+            self.display.commit.splice(0..0, rows);
         }
     }
 
     /// Starts the log over for a newly attached session.
     pub(crate) fn reset_deck_log(&mut self) {
-        if let Some(deck) = self.deck.as_mut() {
+        if let Some(deck) = self.display.deck.as_mut() {
             deck.log = Log::default();
             deck.printed = 0;
             deck.inspector = 0;
@@ -145,6 +147,7 @@ impl App {
     /// go stale.
     pub(crate) async fn refresh_deck(&mut self) {
         let stale = self
+            .display
             .deck
             .as_ref()
             .is_some_and(|deck| deck.refreshed.is_none_or(|at| at.elapsed() >= REFRESH));
@@ -153,7 +156,12 @@ impl App {
         }
         let sessions = self.launch.client.list(ListParams::default()).await;
         let pending = self.launch.client.approvals().await;
-        let settings = if self.deck.as_ref().is_some_and(|d| d.settings.is_none()) {
+        let settings = if self
+            .display
+            .deck
+            .as_ref()
+            .is_some_and(|d| d.settings.is_none())
+        {
             self.launch
                 .client
                 .settings(self.settings_params())
@@ -171,15 +179,22 @@ impl App {
                     .into_iter()
                     .filter(|ask| {
                         ask.session != current
-                            && !self.answered.contains(&(ask.session, ask.call.clone()))
+                            && !self
+                                .approvals
+                                .answered
+                                .contains(&(ask.session, ask.call.clone()))
                     })
                     .map(|pending| {
-                        let cwd = self.approval_workspaces.get(&pending.session).cloned();
+                        let cwd = self
+                            .approvals
+                            .approval_workspaces
+                            .get(&pending.session)
+                            .cloned();
                         Approval { pending, cwd }
                     }),
             );
         }
-        let Some(deck) = self.deck.as_mut() else {
+        let Some(deck) = self.display.deck.as_mut() else {
             return;
         };
         if let Ok(mut sessions) = sessions {
@@ -198,100 +213,6 @@ impl App {
         deck.refreshed = Some(Instant::now());
     }
 
-    /// Whether the deck took `key`: its focus keys, and the keys of the
-    /// pane with the focus.
-    pub(crate) async fn deck_key(&mut self, key: KeyEvent, action: Option<Action>) -> bool {
-        let page = self.rows / 2;
-        let cols = self.cols;
-        let Some(deck) = self.deck.as_mut() else {
-            return false;
-        };
-        let focus = match action {
-            Some(Action::FocusSessions) => Some(Focus::Sessions),
-            Some(Action::FocusLog) => Some(Focus::Log),
-            Some(Action::FocusInspector) => Some(Focus::Inspector),
-            _ => None,
-        };
-        if let Some(focus) = focus {
-            deck.focus = if deck.focus == focus {
-                Focus::Composer
-            } else {
-                focus
-            };
-            match deck.focus {
-                Focus::Composer => {
-                    deck.log.select_newest();
-                    deck.inspector = 0;
-                }
-                Focus::Log => {}
-                Focus::Sessions | Focus::Inspector => deck.log.scroll_end(),
-            }
-            return true;
-        }
-        match (deck.focus, key.code) {
-            (Focus::Composer, _) => return false,
-            (_, KeyCode::Esc) => {
-                // Back at the composer the panel follows the newest row.
-                deck.focus = Focus::Composer;
-                deck.log.select_newest();
-                deck.inspector = 0;
-            }
-            (Focus::Sessions, KeyCode::Up) => deck.session = deck.session.saturating_sub(1),
-            (Focus::Sessions, KeyCode::Down) => {
-                let last = deck.sessions.len().saturating_sub(1);
-                deck.session = (deck.session + 1).min(last);
-            }
-            (Focus::Sessions, KeyCode::Enter) => {
-                let at = deck.session;
-                if let Some(session) = self.deck_sessions().into_iter().nth(at)
-                    && let Err(error) = self.resume(session).await
-                {
-                    self.notice(crate::callout::Kind::Error, error.to_string());
-                }
-            }
-            (Focus::Log, KeyCode::Up) => {
-                deck.log.up();
-                deck.inspector = 0;
-            }
-            (Focus::Log, KeyCode::Down) => {
-                deck.log.down();
-                deck.inspector = 0;
-            }
-            (Focus::Log, KeyCode::PageUp) => deck.log.scroll_up(page),
-            (Focus::Log, KeyCode::PageDown) => deck.log.scroll_down(page),
-            (Focus::Log, KeyCode::Enter) => {
-                if let Some(inspect) = deck.log.selected().cloned() {
-                    let lines = open(&inspect, self.measure());
-                    self.note(lines);
-                }
-            }
-            (Focus::Inspector, KeyCode::Up) => deck.inspector = deck.inspector.saturating_sub(1),
-            (Focus::Inspector, KeyCode::Down) => {
-                let last = deck
-                    .log
-                    .selected()
-                    .map_or(0, |inspect| deck::inspector_rows(inspect, cols))
-                    .saturating_sub(1);
-                deck.inspector = (deck.inspector + 1).min(last);
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    /// The sessions pane's rows in order: this workspace, then the others.
-    fn deck_sessions(&self) -> Vec<SessionSummary> {
-        let Some(deck) = &self.deck else {
-            return Vec::new();
-        };
-        let cwd = &self.launch.attached.info.cwd;
-        let (here, elsewhere): (Vec<_>, Vec<_>) = deck
-            .sessions
-            .iter()
-            .cloned()
-            .partition(|entry| &entry.cwd == cwd);
-        here.into_iter().chain(elsewhere).collect()
-    }
 
     /// Draws the deck.
     pub(crate) fn draw_deck<W: std::io::Write>(
@@ -301,14 +222,14 @@ impl App {
         let (live, cursor, dock) = self.live();
         let meta = self.log_meta();
         let scene = self.scene(&live, cursor, dock, &meta, screen.surfaced());
-        let (rows, cursor) = deck::render(&scene, self.cols, self.rows);
+        let (rows, cursor) = deck::render(&scene, self.display.cols, self.display.rows);
         screen.draw_deck(&rows, cursor)
     }
 
     /// The session's meta row: when it started.
     fn log_meta(&self) -> String {
         let info = &self.launch.attached.info;
-        self.deck
+        self.display.deck
             .as_ref()
             .and_then(|deck| deck.sessions.iter().find(|e| e.session == info.session))
             .and_then(|entry| entry.started)
@@ -317,7 +238,7 @@ impl App {
 
     /// The deck's header segments `names` asks for, joined by ` · `.
     fn bar(&self, names: &[&str]) -> Line {
-        let icons = self.icons;
+        let icons = self.display.icons;
         let info = &self.launch.attached.info;
         let mut line = Line::default();
         for name in names {
@@ -386,6 +307,7 @@ impl App {
     fn facts(&self) -> Line {
         let info = &self.launch.attached.info;
         let mode = self
+            .display
             .deck
             .as_ref()
             .and_then(|deck| deck.settings.as_ref())
@@ -412,7 +334,7 @@ impl App {
             if !line.0.is_empty() {
                 line = line.dim(" · ");
             }
-            let glyph = self.icons.get(icon);
+            let glyph = self.display.icons.get(icon);
             let text = if glyph.is_empty() {
                 words
             } else {
@@ -455,11 +377,11 @@ impl App {
         meta: &'a str,
         surfaces: bool,
     ) -> Scene<'a> {
-        let deck = self.deck.as_ref().expect("scene needs the deck");
+        let deck = self.display.deck.as_ref().expect("scene needs the deck");
         let info = &self.launch.attached.info;
         let now = Timestamp::now();
         let cwd = &info.cwd;
-        let icons = self.icons;
+        let icons = self.display.icons;
         let mut header_left = Line::default()
             .brass("ξ ")
             .strong(Role::Ink, "xi")
@@ -562,9 +484,10 @@ impl App {
         // The client's own log is fresher than `session/list`, which the
         // deck refreshes every five seconds.
         let title = self
+            .display
             .title
             .as_deref()
-            .or(self.prompt.as_deref())
+            .or(self.display.prompt.as_deref())
             .or_else(|| {
                 deck.sessions
                     .iter()
@@ -605,7 +528,7 @@ impl App {
             scrolled: deck.inspector,
             asks,
             changed,
-            agents: self.transcript.children().agents(self.frame),
+            agents: self.transcript.children().agents(self.display.frame),
             sessions,
             context,
             place: self.place(),
@@ -623,6 +546,97 @@ impl App {
             focus: deck.focus,
             surfaces,
         }
+    }
+}
+
+impl Display {
+    /// Handles the deck's focus and pane keys, leaving owner work to the client.
+    pub(crate) fn deck_key(
+        &mut self,
+        key: KeyEvent,
+        action: Option<Action>,
+        cwd: &Path,
+    ) -> Option<Outcome> {
+        let deck = self.deck.as_mut()?;
+        let focus = match action {
+            Some(Action::FocusSessions) => Some(Focus::Sessions),
+            Some(Action::FocusLog) => Some(Focus::Log),
+            Some(Action::FocusInspector) => Some(Focus::Inspector),
+            _ => None,
+        };
+        if let Some(focus) = focus {
+            deck.focus = if deck.focus == focus {
+                Focus::Composer
+            } else {
+                focus
+            };
+            match deck.focus {
+                Focus::Composer => {
+                    deck.log.select_newest();
+                    deck.inspector = 0;
+                }
+                Focus::Log => {}
+                Focus::Sessions | Focus::Inspector => deck.log.scroll_end(),
+            }
+            return Some(Outcome::Stay);
+        }
+        match (deck.focus, key.code) {
+            (Focus::Composer, _) => return None,
+            (_, KeyCode::Esc) => {
+                // Back at the composer the panel follows the newest row.
+                deck.focus = Focus::Composer;
+                deck.log.select_newest();
+                deck.inspector = 0;
+            }
+            (Focus::Sessions, KeyCode::Up) => deck.session = deck.session.saturating_sub(1),
+            (Focus::Sessions, KeyCode::Down) => {
+                let last = deck.sessions.len().saturating_sub(1);
+                deck.session = (deck.session + 1).min(last);
+            }
+            (Focus::Sessions, KeyCode::Enter) => {
+                let session = deck
+                    .sessions
+                    .iter()
+                    .filter(|entry| entry.cwd.as_path() == cwd)
+                    .chain(
+                        deck.sessions
+                            .iter()
+                            .filter(|entry| entry.cwd.as_path() != cwd),
+                    )
+                    .nth(deck.session)
+                    .cloned();
+                if let Some(session) = session {
+                    return Some(Outcome::Send(Box::new(Command::Resume(session))));
+                }
+            }
+            (Focus::Log, KeyCode::Up) => {
+                deck.log.up();
+                deck.inspector = 0;
+            }
+            (Focus::Log, KeyCode::Down) => {
+                deck.log.down();
+                deck.inspector = 0;
+            }
+            (Focus::Log, KeyCode::PageUp) => deck.log.scroll_up(self.rows / 2),
+            (Focus::Log, KeyCode::PageDown) => deck.log.scroll_down(self.rows / 2),
+            (Focus::Log, KeyCode::Enter) => {
+                if let Some(inspect) = self.deck.as_ref().and_then(|deck| deck.log.selected()) {
+                    let lines = open(inspect, self.measure());
+                    return Some(Outcome::Send(Box::new(Command::Note(lines))));
+                }
+            }
+            (Focus::Inspector, KeyCode::Up) => deck.inspector = deck.inspector.saturating_sub(1),
+            (Focus::Inspector, KeyCode::Down) => {
+                let last = deck
+                    .log
+                    .selected()
+                    .map_or(0, |inspect| deck::inspector_rows(inspect, self.cols))
+                    .saturating_sub(1);
+                deck.inspector = (deck.inspector + 1).min(last);
+            }
+            _ => return None,
+        }
+        Some(Outcome::Stay)
     }
 
     /// The measure of the log column on the deck.

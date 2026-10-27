@@ -1,49 +1,61 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::callout::Kind;
-use crate::history::Search;
+use crate::approvals::Approvals;
 use crate::keys::Action;
-use crate::{App, Error, ExternalRequest};
+use crate::overlay::{Command, Outcome};
+use crate::overlays::ctx;
+use crate::{App, Composer, Error};
 
 impl App {
+    /// Routes a key to the focused component and executes its command.
     pub(crate) async fn key(&mut self, key: KeyEvent) -> Result<(), Error> {
         let action = self.keymap.action(key);
-        if self.overlays.is_empty() && self.deck_key(key, action).await {
-            return Ok(());
-        }
-        if matches!(
-            action,
-            Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector)
-        ) {
-            return Ok(());
-        }
-        if matches!(action, Some(Action::Interrupt)) {
-            if !self.overlays.is_empty() || self.completion.is_some() {
-                self.close_overlay();
-            } else if self.running() {
-                self.cancel().await;
-            } else if !self.editor.is_empty() || !self.images.is_empty() {
-                self.editor.clear();
-                self.images.clear();
-                self.update_completion();
-            } else {
-                self.quit = true;
+        let outcome = if self.overlays.is_empty()
+            && let Some(outcome) =
+                self.display
+                    .deck_key(key, action, &self.launch.attached.info.cwd)
+        {
+            outcome
+        } else {
+            match action {
+                Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector) => {
+                    Outcome::Stay
+                }
+                Some(Action::Interrupt) if !self.overlays.is_empty() => {
+                    Outcome::Send(Box::new(Command::Dismiss))
+                }
+                Some(Action::Complete)
+                    if !self.overlays.is_empty()
+                        && !self.overlays.on_top::<Approvals>()
+                        && self.waiting() > 0 =>
+                {
+                    Outcome::Send(Box::new(Command::OwnApprovals))
+                }
+                _ if !self.overlays.is_empty() => self.overlays.key(key, action, &mut ctx!(self)),
+                _ => self.composer.key(key, action, self.turn.running()),
             }
-            return Ok(());
-        }
-        if !self.overlays.is_empty() {
-            self.overlay_key(key, action).await;
-            return Ok(());
-        }
+        };
+        let command = match outcome {
+            Outcome::Stay => return Ok(()),
+            Outcome::Close => Command::Close,
+            Outcome::Send(command) => *command,
+        };
+        self.execute(command).await
+    }
+}
+
+impl Composer {
+    /// Edits the draft locally and hands application effects to its owner.
+    pub(crate) fn key(&mut self, key: KeyEvent, action: Option<Action>, running: bool) -> Outcome {
         if let Some(menu) = self.completion.as_mut() {
             match action {
                 Some(Action::Up) => {
                     menu.up();
-                    return Ok(());
+                    return Outcome::Stay;
                 }
                 Some(Action::Down) => {
                     menu.down();
-                    return Ok(());
+                    return Outcome::Stay;
                 }
                 // A token that already equals the selection is complete, so
                 // enter sends it instead of accepting the same text again.
@@ -56,113 +68,110 @@ impl App {
                 }
                 Some(Action::Send | Action::Complete) => {
                     self.accept_completion();
-                    return Ok(());
+                    return Outcome::Stay;
                 }
                 Some(Action::Escape) => {
                     self.completion = None;
-                    return Ok(());
+                    return Outcome::Stay;
                 }
                 _ => {}
             }
         }
-        match action {
-            Some(Action::Send) => {
-                self.submit(false).await?;
-                return Ok(());
+        let command = match action {
+            Some(Action::Send) => Some(Command::Submit { queue: false }),
+            Some(Action::Queue) => Some(Command::Submit { queue: true }),
+            Some(Action::Newline) => {
+                self.editor.insert("\n");
+                None
             }
-            Some(Action::Queue) => {
-                self.submit(true).await?;
-                return Ok(());
+            Some(Action::Interrupt) => {
+                if self.completion.is_some() {
+                    Some(Command::Dismiss)
+                } else if running {
+                    Some(Command::Cancel)
+                } else if !self.editor.is_empty() || !self.images.is_empty() {
+                    self.editor.clear();
+                    self.images.clear();
+                    None
+                } else {
+                    Some(Command::Quit)
+                }
             }
-            Some(Action::Newline) => self.editor.insert("\n"),
             Some(Action::Escape) => {
-                if self.running() {
-                    self.cancel().await;
-                }
-                return Ok(());
+                return if running {
+                    Outcome::Send(Box::new(Command::Cancel))
+                } else {
+                    Outcome::Stay
+                };
             }
-            Some(Action::Complete) => {
-                self.open_own_approvals();
-                return Ok(());
-            }
-            Some(Action::Search) => {
-                self.overlays.push(Box::new(Search::default()));
-                self.completion = None;
-                return Ok(());
-            }
-            Some(Action::External) => {
-                self.external_requested = Some(ExternalRequest::Composer);
-                return Ok(());
-            }
-            Some(Action::PasteImage) => {
-                self.paste_image().await;
-                return Ok(());
-            }
-            Some(Action::Models) => {
-                self.open_models().await;
-                return Ok(());
-            }
-            Some(Action::Reasoning) => {
-                self.cycle_reasoning().await;
-                return Ok(());
-            }
-            Some(Action::Sandbox) => {
-                self.toggle_sandbox().await;
-                return Ok(());
-            }
-            Some(Action::Expand) => {
-                let m = self.measure();
-                let lines = self.transcript.expand(m).unwrap_or_else(|| {
-                    let why = if self.transcript.collapsed() {
-                        "that was the oldest cut-short result · ctrl+o starts again from the newest"
-                    } else {
-                        "nothing cut short yet · results longer than three lines show whole here"
-                    };
-                    self.transcript.notice(Kind::Info, why, m)
-                });
-                self.commit_lines(lines);
-                return Ok(());
-            }
-            Some(Action::Thinking) => {
-                let thinking = self.transcript.thinking_display().next();
-                self.transcript.set_thinking(thinking);
-                self.notice(
-                    Kind::Info,
-                    format!("thinking display → {}", thinking.name()),
-                );
-                return Ok(());
-            }
+            Some(Action::Complete) => Some(Command::OwnApprovals),
+            Some(Action::Search) => Some(Command::SearchHistory),
+            Some(Action::External) => Some(Command::External),
+            Some(Action::PasteImage) => Some(Command::PasteImage),
+            Some(Action::Models) => Some(Command::Models),
+            Some(Action::Reasoning) => Some(Command::Reasoning),
+            Some(Action::Sandbox) => Some(Command::ToggleSandbox),
+            Some(Action::Expand) => Some(Command::Expand),
+            Some(Action::Thinking) => Some(Command::Thinking),
             Some(Action::DeleteOrQuit) => {
-                if self.editor.is_empty() && self.images.is_empty() && !self.running() {
-                    self.quit = true;
-                    return Ok(());
+                if self.editor.is_empty() && self.images.is_empty() && !running {
+                    Some(Command::Quit)
+                } else {
+                    self.editor.delete();
+                    None
                 }
-                self.editor.delete();
             }
-            Some(Action::Home) => self.editor.home(),
-            Some(Action::End) => self.editor.end(),
-            Some(Action::Left) => self.editor.left(),
-            Some(Action::Right) => self.editor.right(),
-            Some(Action::KillBefore) => self.editor.kill_before(),
-            Some(Action::KillAfter) => self.editor.kill_after(),
-            Some(Action::KillWord) => self.editor.kill_word(),
+            Some(Action::Home) => {
+                self.editor.home();
+                None
+            }
+            Some(Action::End) => {
+                self.editor.end();
+                None
+            }
+            Some(Action::Left) => {
+                self.editor.left();
+                None
+            }
+            Some(Action::Right) => {
+                self.editor.right();
+                None
+            }
+            Some(Action::KillBefore) => {
+                self.editor.kill_before();
+                None
+            }
+            Some(Action::KillAfter) => {
+                self.editor.kill_after();
+                None
+            }
+            Some(Action::KillWord) => {
+                self.editor.kill_word();
+                None
+            }
             Some(Action::Backspace) => {
                 if self.editor.is_empty() {
                     self.images.pop();
                 } else {
                     self.editor.backspace();
                 }
+                None
             }
-            Some(Action::Delete) => self.editor.delete(),
+            Some(Action::Delete) => {
+                self.editor.delete();
+                None
+            }
             Some(Action::Up) => {
                 if !self.editor.text().contains('\n') {
                     self.editor.history_back();
                 }
+                None
             }
             Some(Action::Down) => {
                 if !self.editor.text().contains('\n') {
                     self.editor.history_forward();
                 }
+                None
             }
             None => {
                 if let KeyCode::Char(c) = key.code
@@ -173,17 +182,20 @@ impl App {
                     let mut buf = [0; 4];
                     self.editor.insert(c.encode_utf8(&mut buf));
                 } else {
-                    return Ok(());
+                    return Outcome::Stay;
                 }
+                None
             }
-            Some(
-                Action::Interrupt
-                | Action::FocusSessions
-                | Action::FocusLog
-                | Action::FocusInspector,
-            ) => return Ok(()),
+            Some(Action::FocusSessions | Action::FocusLog | Action::FocusInspector) => {
+                return Outcome::Stay;
+            }
+        };
+        match command {
+            Some(command) => Outcome::Send(Box::new(command)),
+            None => {
+                self.update_completion();
+                Outcome::Stay
+            }
         }
-        self.update_completion();
-        Ok(())
     }
 }
