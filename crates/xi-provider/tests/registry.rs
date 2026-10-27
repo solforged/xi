@@ -163,6 +163,84 @@ fn anthropic_login_does_not_sign_other_wire_apis() {
 }
 
 #[test]
+fn grok_login_is_configurable_and_bundled_models_use_the_account_endpoint() {
+    let config: RegistryConfig = toml::from_str(
+        "[provider.custom]\napi = 'openai-responses'\nbase_url = 'https://example.com/v1'\nauth = { login = 'grok' }",
+    ).unwrap();
+    assert_eq!(
+        config.provider["custom"].auth,
+        Auth::Login(xi_provider::LoginService::Grok)
+    );
+    let credentials = tempfile::tempdir().unwrap();
+    let mut registry = Registry::builtin();
+    let provider = registry.provider("grok").unwrap();
+    assert_eq!(provider.api, Api::OpenaiResponses);
+    assert_eq!(provider.base_url, "https://cli-chat-proxy.grok.com/v1");
+    assert_eq!(provider.auth, Auth::Login(xi_provider::LoginService::Grok));
+    for (id, levels) in [
+        (
+            "grok-4.7",
+            vec![
+                Reasoning::Low,
+                Reasoning::Medium,
+                Reasoning::High,
+                Reasoning::XHigh,
+            ],
+        ),
+        (
+            "grok-4.6",
+            vec![
+                Reasoning::Low,
+                Reasoning::Medium,
+                Reasoning::High,
+                Reasoning::XHigh,
+            ],
+        ),
+        (
+            "grok-4.5",
+            vec![Reasoning::Low, Reasoning::Medium, Reasoning::High],
+        ),
+    ] {
+        let model = ModelRef {
+            provider: "grok".into(),
+            model: id.into(),
+        };
+        let info = registry.model(&model).unwrap();
+        assert_eq!(info.context_window, 500_000);
+        assert_eq!(info.max_output, 64_000);
+        assert_eq!(info.reasoning, levels);
+        assert!(info.pricing.is_none());
+        assert_eq!(error_kind(&registry, &model), ErrorKind::Config);
+    }
+    registry.set_credentials(credentials.path().into());
+    assert!(
+        registry
+            .connect(&ModelRef {
+                provider: "grok".into(),
+                model: "grok-4.7".into()
+            })
+            .is_ok()
+    );
+}
+
+#[test]
+fn grok_login_does_not_sign_anthropic_messages() {
+    let credentials = tempfile::tempdir().unwrap();
+    let mut registry = registry(
+        "https://example.com".into(),
+        Api::AnthropicMessages,
+        "test-model",
+        &[],
+        Auth::Login(xi_provider::LoginService::Grok),
+    );
+    registry.set_credentials(credentials.path().into());
+    assert_eq!(
+        error_kind(&registry, &model_ref("test-model")),
+        ErrorKind::Config
+    );
+}
+
+#[test]
 fn model_tables_split_compat_and_still_reject_unknown_fields() {
     let table = |extra: &str| {
         toml::from_str::<RegistryConfig>(&format!(

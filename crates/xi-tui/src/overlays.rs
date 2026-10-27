@@ -240,10 +240,10 @@ impl App {
             return;
         }
         if !entry.available {
-            let hint = if entry.model.provider == "chatgpt" {
-                " · xi login chatgpt"
-            } else {
-                ""
+            let hint = match entry.model.provider.as_str() {
+                "chatgpt" => " · xi login chatgpt",
+                "grok" => " · xi login grok",
+                _ => "",
             };
             self.notice(Kind::Warn, Line::default().ink("no credentials").dim(hint));
         } else if self.set_model(entry.model.into()).await {

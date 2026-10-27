@@ -142,6 +142,15 @@ fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn
         })?;
         return match service {
             LoginService::Chatgpt => Ok(Box::new(chatgpt::Signer::new(chatgpt_file(credentials)))),
+            LoginService::Grok => {
+                if !matches!(config.api, Api::OpenaiChat | Api::OpenaiResponses) {
+                    return Err(Error::new(
+                        ErrorKind::Config,
+                        "Grok login requires an OpenAI-compatible API",
+                    ));
+                }
+                Ok(Box::new(grok::Signer::new(grok_file(credentials))))
+            }
             LoginService::Anthropic => {
                 if config.api != Api::AnthropicMessages {
                     return Err(Error::new(

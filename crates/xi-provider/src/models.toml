@@ -44,6 +44,13 @@ base_url = "https://chatgpt.com/backend-api/codex"
 auth = { login = "chatgpt" }
 compat = { output_limit = false, session_header = "session-id" }
 
+# Grok Build's OAuth account endpoint (`xi login grok`), not api.x.ai.
+# https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-env/src/lib.rs
+[provider.grok]
+api = "openai-responses"
+base_url = "https://cli-chat-proxy.grok.com/v1"
+auth = { login = "grok" }
+
 # Opus 5.5 always thinks: `thinking: disabled` fails at every effort.
 [[model]]
 provider = "anthropic"
@@ -189,6 +196,32 @@ context_window = 272000
 max_output = 128000
 reasoning = ["low", "medium", "high", "xhigh", "max"]
 compat = { responses_lite = true }
+
+# https://docs.x.ai/developers/models/grok-4.7
+# Account usage omits API token pricing; xi caps each response at 64k tokens.
+[[model]]
+provider = "grok"
+id = "grok-4.7"
+context_window = 500000
+max_output = 64000
+reasoning = ["low", "medium", "high", "xhigh"]
+
+# Grok Build's bundled model metadata; xi caps each response at 64k tokens.
+# Account models omit API token pricing; account limits still apply.
+# https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-models/default_models.json
+[[model]]
+provider = "grok"
+id = "grok-4.6"
+context_window = 500000
+max_output = 64000
+reasoning = ["low", "medium", "high", "xhigh"]
+
+[[model]]
+provider = "grok"
+id = "grok-4.5"
+context_window = 500000
+max_output = 64000
+reasoning = ["low", "medium", "high"]
 
 # Role presets: one model per role for each lab, most capable first.
 # `preset = "<name>"` in config fills all four roles; `[roles]` and

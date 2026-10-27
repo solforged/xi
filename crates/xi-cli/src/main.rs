@@ -96,6 +96,8 @@ enum LoginAccount {
     Chatgpt,
     /// A Claude subscription, for the opt-in `claude/…` models.
     Anthropic,
+    /// A Grok account, for the `grok/…` models.
+    Grok,
 }
 
 #[derive(Subcommand)]
@@ -324,6 +326,17 @@ async fn login(paths: &Paths, account: LoginAccount) -> Result<()> {
             };
             println!("Signed in to ChatGPT{who}. Use `xi -m chatgpt/gpt-6.1-sol`.");
         }
+        LoginAccount::Grok => {
+            let login = xi_provider::GrokLogin::start().await?;
+            let line = login_input(
+                login.url(),
+                "Grok",
+                "Signing in on another machine? Paste the final redirect URL here.",
+            );
+            let file = xi_provider::grok_file(&paths.credentials());
+            login.finish(&file, async { line.await.ok() }).await?;
+            println!("Signed in to Grok. Use `xi -m grok/grok-4.7`.");
+        }
         LoginAccount::Anthropic => {
             eprintln!(
                 "Warning: Anthropic does not support third-party subscription sign-in. \
@@ -422,6 +435,17 @@ async fn open_or_create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_login_is_a_supported_account() {
+        let cli = Cli::try_parse_from(["xi", "login", "grok"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Login {
+                account: LoginAccount::Grok
+            })
+        ));
+    }
 
     #[test]
     fn resume_accepts_a_picker_or_an_explicit_path() {
