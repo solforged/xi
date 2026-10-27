@@ -3586,7 +3586,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
         .find(|line| line.plain().contains("working"))
         .unwrap()
         .plain();
-    assert!(activity.contains("working · "));
+    assert!(activity.contains("working  0s"), "{activity}");
     assert!(activity.ends_with("esc stop"));
     assert!(!activity.contains('↑'));
     assert!(!activity.contains('↓'));
@@ -3598,7 +3598,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
         .unwrap()
         .plain();
     assert!(
-        activity.contains(&format!("↑ {} ↓ {}", tokens(1_000), tokens(10))),
+        activity.contains(&format!("↑ {}  ↓ {}", tokens(1_000), tokens(10))),
         "{activity}"
     );
 }

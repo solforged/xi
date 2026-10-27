@@ -341,7 +341,8 @@ impl Line {
 }
 
 /// `left`, then `right` flush to column `cols`. When both don't fit, `left`
-/// is cut first so the outcome on the right stays readable.
+/// is cut first so the outcome on the right stays readable, and the cut
+/// keeps two cells before `right` so its `…` doesn't run into it.
 #[must_use]
 pub fn lr(left: Line, right: Line, cols: usize) -> Line {
     let (lw, rw) = (left.width(), right.width());
@@ -349,7 +350,7 @@ pub fn lr(left: Line, right: Line, cols: usize) -> Line {
         return left.ink(" ".repeat(cols - lw - rw)).extend(right);
     }
     if rw + 12 <= cols {
-        let left = left.truncate(cols - rw - 1);
+        let left = left.truncate(cols - rw - 2);
         let gap = cols - left.width() - rw;
         return left.ink(" ".repeat(gap)).extend(right);
     }
@@ -378,6 +379,36 @@ pub fn row(left: Line, right: Line, cols: usize) -> Line {
 #[must_use]
 pub fn rule(cols: usize) -> Line {
     Line::default().dim("─".repeat(cols))
+}
+
+/// `text` cut to `cols` cells at its last space, ending in `…`, so a cut
+/// row doesn't end mid-word. A cut that would keep less than half the row
+/// falls back to the last cell that fits.
+#[must_use]
+pub fn clip_words(text: &str, cols: usize) -> String {
+    if text.width() <= cols {
+        return text.to_owned();
+    }
+    if cols == 0 {
+        return String::new();
+    }
+    let budget = cols.saturating_sub(1);
+    let (mut used, mut end, mut space) = (0, 0, None);
+    for (i, c) in text.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        if c == ' ' {
+            space = Some((i, used));
+        }
+        used += w;
+        end = i + c.len_utf8();
+    }
+    let cut = space
+        .filter(|&(_, at)| at * 2 >= budget)
+        .map_or(end, |(i, _)| i);
+    format!("{}…", text[..cut].trim_end())
 }
 
 /// Word-wraps text to `cols` cells, keeping its own line breaks and each

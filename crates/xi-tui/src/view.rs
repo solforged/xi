@@ -349,12 +349,18 @@ impl App {
                 );
                 cursor.0 += 1;
             }
-            // The model shares its row with the turn's activity and keys.
+            // The model shares its row with the turn's activity and keys,
+            // each group set apart by a wider gap and its keys by tone.
             let room = cols.saturating_sub(3);
             let model = self.model_line();
             let mut right = activity.clone().unwrap_or_default();
-            if self.turn.running() && model.width() + right.width() + hint.len() + 6 <= room {
-                right = right.dim(" · ").dim(hint);
+            let keys = key_hints(&[
+                ("enter", "steers"),
+                ("alt+enter", "queues"),
+                ("esc", "stops"),
+            ]);
+            if self.turn.running() && model.width() + right.width() + keys.width() + 7 <= room {
+                right = right.ink("   ").extend(keys);
             }
             // A blank row parts the draft from the model, as above it.
             block.push(bar().raise());
@@ -435,10 +441,10 @@ impl App {
         };
         let mut line = Line::default()
             .brass(SPINNER[self.display.frame % SPINNER.len()])
-            .dim(format!(" {what} · {elapsed}s"));
+            .dim(format!(" {what}  {elapsed}s"));
         if m.durations() && turn.sent() > 0 {
             line = line.dim(format!(
-                " · ↑ {} ↓ {}",
+                "  ↑ {}  ↓ {}",
                 tokens(turn.sent()),
                 tokens(turn.output)
             ));
@@ -475,4 +481,17 @@ impl App {
         let commit = std::mem::take(&mut self.display.commit);
         screen.draw(&commit, &live, cursor, self.display.measure().live_rows())
     }
+}
+
+/// Key hints as `key verb` pairs two cells apart: the key muted, a step
+/// above its dim verb, as `alt+1 sessions` reads under the panel.
+fn key_hints(pairs: &[(&str, &str)]) -> Line {
+    let mut line = Line::default();
+    for (i, (key, verb)) in pairs.iter().enumerate() {
+        if i > 0 {
+            line = line.ink("  ");
+        }
+        line = line.muted(*key).dim(format!(" {verb}"));
+    }
+    line
 }

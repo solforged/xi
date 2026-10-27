@@ -471,7 +471,7 @@ mod tests {
                 "│                                                          │",
                 "│ › 1 Allow once                                           │",
                 "│   2 Allow for this session                               │",
-                "│   3 Always allow in this w… writes .xi/config.local.toml │",
+                "│   3 Always allow in this …  writes .xi/config.local.toml │",
                 "│   4 Deny                                                 │",
                 "│                                                          │",
                 "│ i Allowed once, the next publish asks again. The answer  │",
@@ -530,7 +530,7 @@ mod tests {
                 "│                                                          │",
                 "│ › 1 Allow once                                           │",
                 "│   2 Allow for this session                               │",
-                "│   3 Always allow in this w… writes .xi/config.local.toml ▼",
+                "│   3 Always allow in this …  writes .xi/config.local.toml ▼",
                 "╰─ 1–4 choose · ↑↓ move · tab next ask · esc later ────────╯",
             ]
         );

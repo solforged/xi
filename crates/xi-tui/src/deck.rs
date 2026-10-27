@@ -24,8 +24,6 @@ const ASK_ROWS: usize = 3;
 /// Rows the overview gives changed files and their directories before
 /// counting the rest.
 const CHANGED_ROWS: usize = 10;
-/// The longest the context gauge runs.
-const GAUGE_MAX: usize = 32;
 /// Agents the overview lists before counting the rest.
 const AGENT_ROWS: usize = 4;
 /// Blank columns on either side of the panel's text.
@@ -146,9 +144,10 @@ pub struct Panel<'a> {
     pub sessions: SessionsPane,
     /// Context occupancy and cache.
     pub context: ContextGauge,
-    /// The workspace and branch, on the shared footer baseline.
+    /// The workspace and branch, on the shared baseline under the log.
     pub place: Line,
-    /// Approvals, sandbox, trust, taint and running agents, at the panel's foot.
+    /// Approvals, sandbox, trust, taint and running agents, on the shared
+    /// baseline under the panel.
     pub facts: Line,
     /// Which glyphs mark sessions, asks and tools.
     pub icons: Icons,
@@ -219,7 +218,8 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
     let Some(panel) = columns.panel else {
         return folded(scene, cols, rows);
     };
-    // Both panes end above one unraised workspace / navigation baseline.
+    // Both panes end above one unraised baseline: the workspace under the
+    // log, the session's rules and the sessions key under the panel.
     let body = rows - 1;
     // A blank row above the log, when there is room, matches the panel's.
     let top = usize::from(body >= 8);
@@ -245,11 +245,18 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
         scene.panel.place.clone(),
         columns.log.saturating_sub(5),
     ));
-    let keys = Line::default()
-        .ink(" ".repeat(PANEL_PAD))
-        .ink("alt+1")
-        .dim(" sessions");
-    out.push(pad(pad(place, columns.log).ink(" ").extend(keys), cols));
+    // The rules outrank the hint: when both don't fit, the key keeps only
+    // its name before any rule is cut.
+    let inner = panel.saturating_sub(2 * PANEL_PAD);
+    let facts = &scene.panel.facts;
+    let keys = if facts.width() + "  alt+1 sessions".len() <= inner {
+        Line::default().muted("alt+1").dim(" sessions")
+    } else {
+        Line::default().muted("alt+1")
+    };
+    let foot = lr(facts.clone(), keys, inner);
+    let side = Line::default().ink(" ".repeat(PANEL_PAD)).extend(foot);
+    out.push(pad(pad(place, columns.log).ink(" ").extend(side), cols));
     (out, cursor.map(|(row, col)| (top + row, col + 1)))
 }
 
@@ -467,14 +474,23 @@ fn elide_left(line: Line, cols: usize) -> Line {
 }
 
 /// The session at a glance while the composer has the keys: its title, what
-/// waits on you, its context, what changed and its running agents, with
-/// where it runs and under what rules against the bottom.
+/// waits on you, its context, what changed and its running agents. Rows
+/// past `height` are cut, ending in `…`.
 fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
     let panel = &scene.panel;
     let icons = panel.icons;
     let w = width.min(LIVE_MAX);
     let mut top: Vec<Line> = Vec::new();
-    let title = wrap(scene.title, w.max(1));
+    let mut title = wrap(scene.title, w.max(1));
+    // A title on two rows splits at the narrowest width that still fits
+    // it there, so the second row isn't one stranded word.
+    if title.len() == 2
+        && let Some(even) = (w / 2..w)
+            .map(|cols| wrap(scene.title, cols))
+            .find(|rows| rows.len() == 2)
+    {
+        title = even;
+    }
     for (i, row) in title.iter().take(2).enumerate() {
         let text = if i == 1 && title.len() > 2 {
             title[1..].join(" ")
@@ -556,23 +572,14 @@ fn overview(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
             top.push(Line::default().dim(format!("… {} more", panel.agents.len() - AGENT_ROWS)));
         }
     }
-    let foot: Vec<Line> = [panel.facts.clone().truncate(w)]
-        .into_iter()
-        .filter(|line| !line.plain().trim().is_empty())
-        .collect();
-    // The foot keeps its rows; the sections above it are cut first, with
-    // a gap between the two.
-    let foot = &foot[foot.len().saturating_sub(height)..];
-    let room = height.saturating_sub(foot.len() + 1);
-    if top.len() > room {
-        top.truncate(room.saturating_sub(1));
-        if room > 0 {
+    if top.len() > height {
+        top.truncate(height.saturating_sub(1));
+        if height > 0 {
             top.push(Line::default().dim("…"));
         }
     }
     let mut lines = top;
-    lines.resize(height - foot.len(), Line::default());
-    lines.extend_from_slice(foot);
+    lines.resize(height, Line::default());
     lines
 }
 
@@ -670,7 +677,7 @@ fn context(context: ContextGauge, w: usize) -> Vec<Line> {
     // The footer truncates; the overview agrees with it.
     let percent = u128::from(context.used) * 100 / u128::from(context.window);
     let label = format!(" {percent}%");
-    let bar = w.saturating_sub(label.len()).min(GAUGE_MAX);
+    let bar = w.saturating_sub(label.len());
     let filled = usize::try_from(
         (u128::from(context.used) * bar as u128).div_ceil(u128::from(context.window)),
     )
@@ -841,7 +848,7 @@ mod tests {
                         Line::default()
                             .verdigris("● ")
                             .ink("read crates/xi-sandbox/src/lib.rs:1-180"),
-                        Line::default().dim("180 lines · 0.0s"),
+                        Line::default().dim("180 lines"),
                         width,
                     ),
                     lr(
@@ -1088,10 +1095,13 @@ mod tests {
             assert!(side[5].starts_with("? bash exec  cargo update -p tokio"));
             let at = |name: &str| side.iter().position(|line| line.starts_with(name)).unwrap();
             let context = at("context");
-            assert_eq!(
-                side[context + 1].trim_end(),
-                format!("{} 10%", "━".repeat(GAUGE_MAX))
+            // The gauge ends where the flush-right "tab answers" does.
+            let gauge = side[context + 1].trim_end();
+            assert!(
+                gauge.starts_with('━') && gauge.ends_with("━ 10%"),
+                "{gauge}"
             );
+            assert_eq!(gauge.chars().count(), side[4].trim_end().chars().count());
             assert_eq!(side[context + 2].trim_end(), "29.8k of 272.0k · 94% cached");
             let changes = at("changes");
             assert!(side[changes].trim_end().ends_with("+43 −28"));
@@ -1113,11 +1123,13 @@ mod tests {
             assert!(!side.iter().any(|line| line.contains("Port footer")));
             // The newest tool row stays in the log and the inspector.
             assert!(!side.iter().any(|line| line.contains("edit ×5")));
-            assert_eq!(side[37].trim_end(), "ask · sandboxed · trusted");
+            // The rules and the sessions key share the log's baseline.
             assert_eq!(side[38].trim_end(), "");
-            assert_eq!(side[39].trim_end(), "alt+1 sessions");
+            assert!(side[39].starts_with("ask · sandboxed · trusted"));
+            assert!(side[39].trim_end().ends_with("alt+1 sessions"));
             assert!(lines[39].plain().starts_with("    ~/src/xi  main*"));
             assert!(lines[39].0.iter().all(|span| !span.raised));
+            assert_eq!(side.iter().filter(|l| l.contains("trusted")).count(), 1);
             assert!(!side.iter().any(|line| line.contains("~/src/xi")));
         }
     }
@@ -1186,18 +1198,14 @@ mod tests {
     }
 
     #[test]
-    fn short_panels_keep_the_foot_and_cut_the_sections_above_it() {
+    fn short_panels_cut_the_sections_and_mark_the_cut() {
         let fixture = Fixture::new();
         let scene = fixture.scene();
         let text = plain(&overview(&scene, 60, 12));
         assert_eq!(text.len(), 12);
-        assert_eq!(text[9], "…");
-        assert_eq!(text[10], "");
-        assert_eq!(text[11], "ask · sandboxed · trusted");
-        assert_eq!(
-            plain(&overview(&scene, 60, 1)),
-            ["ask · sandboxed · trusted"]
-        );
+        assert_eq!(text[0], "Route sandboxed bash through the egress proxy");
+        assert_eq!(text[11], "…");
+        assert_eq!(plain(&overview(&scene, 60, 1)), ["…"]);
         assert!(overview(&scene, 60, 0).is_empty());
     }
 
