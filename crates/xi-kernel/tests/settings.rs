@@ -131,6 +131,20 @@ fn approval_presets_protect_xi_and_workspace_paths_and_tainted_egress() {
                 "{preset} {protected}"
             );
         }
+        for worktree in [".xi/worktrees", ".xi/worktrees/lane/file"] {
+            assert_eq!(
+                policy
+                    .evaluate(
+                        Action::Write {
+                            path: &fixture.workspace.join(worktree)
+                        },
+                        Taint::Clean
+                    )
+                    .decision,
+                expected_write,
+                "{preset} {worktree}"
+            );
+        }
         assert_eq!(
             policy
                 .evaluate(
@@ -913,4 +927,18 @@ fn global_sets_keep_existing_file_permissions() {
             & 0o777,
         0o640
     );
+}
+
+#[test]
+fn sandbox_git_ignores_worktrees_under_xi() {
+    let fixture = Fixture::new();
+    let git = fixture.paths.state.join("git");
+    xi_kernel::config::write_sandbox_git(&git, &fixture.paths, false).unwrap();
+    let ignore = std::fs::read_to_string(git.join("ignore")).unwrap();
+    assert!(
+        ignore.ends_with("\n/.xi/worktrees/\n") || ignore == "/.xi/worktrees/\n",
+        "{ignore}"
+    );
+    let config = std::fs::read_to_string(git.join("config")).unwrap();
+    assert!(config.contains("excludesFile"), "{config}");
 }

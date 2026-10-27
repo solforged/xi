@@ -86,6 +86,28 @@ fn protected_paths_stay_read_only() {
 }
 
 #[test]
+fn worktrees_stay_writable_inside_the_protected_xi_directory() {
+    let fixture = Fixture::new();
+    let worktrees = fixture.workspace.join(".xi/worktrees");
+    assert!(!worktrees.exists());
+    let output = sh(
+        &fixture.spec(),
+        "mkdir .xi/worktrees/lane && echo kept > .xi/worktrees/lane/file && echo lane-ok; \
+         mv .xi/worktrees .xi/moved; touch .xi/sibling",
+    );
+    assert_eq!(text(&output.stdout), "lane-ok\n");
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(stderr.lines().count(), 2, "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(worktrees.join("lane/file")).unwrap(),
+        "kept\n"
+    );
+    assert!(!fixture.workspace.join(".xi/moved").exists());
+    assert!(!fixture.workspace.join(".xi/sibling").exists());
+}
+
+#[test]
 fn environment_is_reduced_to_the_allowlist() {
     let fixture = Fixture::new();
     // Cargo sets CARGO_MANIFEST_DIR for test processes; it is not allowlisted.

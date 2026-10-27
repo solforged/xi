@@ -16,7 +16,8 @@
 //!   the sandbox from signalling or reaching abstract Unix sockets outside
 //!   it.
 //! - [`Spec::protected`] paths are bind-mounted read-only over themselves,
-//!   so they stay read-only inside writable roots.
+//!   so they stay read-only inside writable roots. Writable roots inside a
+//!   protected path are bound first, so they stay writable as submounts.
 //! - [`Spec::tmp`] is mounted at `/tmp`.
 //! - [`Network::Isolated`] gives the process a network namespace with only
 //!   loopback, so no host is reachable. With [`Spec::egress`], a forwarder
@@ -45,6 +46,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+
+/// Workspace-relative directory for git worktrees, writable by default
+/// inside the protected `.xi`.
+pub const WORKTREES: &str = ".xi/worktrees";
 
 /// Exit status of the helper when it fails before running the program.
 pub const EXIT_SETUP_FAILED: i32 = 125;
@@ -211,7 +216,9 @@ pub struct Spec {
     /// Whether [`Self::command`] uses the OS sandbox helper. Enabled by default.
     #[serde(default = "enabled")]
     pub enabled: bool,
-    /// Roots that are readable, writable and executable.
+    /// Roots that are readable, writable and executable. A root inside a
+    /// [`Self::protected`] path stays writable; it is created as an empty
+    /// directory when missing, since the sandbox cannot create it.
     pub writable: Vec<PathBuf>,
     /// Roots that are readable and executable. Missing paths are skipped.
     pub readable: Vec<PathBuf>,
@@ -251,7 +258,9 @@ fn enabled() -> bool {
 impl Spec {
     /// The default sandbox for a workspace: the workspace and `tmp` are
     /// writable, system paths are readable, git hooks, git config and `.xi`
-    /// are protected, and the network is isolated.
+    /// are protected, and the network is isolated. `.xi/worktrees` stays
+    /// writable inside the protected `.xi`, so tools can delegate work to
+    /// git worktrees there.
     #[must_use]
     pub fn new(workspace: impl Into<PathBuf>, tmp: impl Into<PathBuf>) -> Self {
         let workspace = workspace.into();
@@ -267,7 +276,7 @@ impl Spec {
         protected.push(workspace.join(".xi"));
         Self {
             enabled: true,
-            writable: vec![workspace.clone(), tmp.clone()],
+            writable: vec![workspace.clone(), tmp.clone(), workspace.join(WORKTREES)],
             readable: SYSTEM_READABLE
                 .iter()
                 .map(PathBuf::from)
@@ -283,6 +292,29 @@ impl Spec {
             allow_partial: false,
             egress: None,
         }
+    }
+
+    /// Writable roots that lie inside a protected path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn nested_writable(&self) -> impl Iterator<Item = &PathBuf> {
+        self.writable
+            .iter()
+            .filter(|root| self.protected.iter().any(|p| root.starts_with(p)))
+    }
+
+    /// Creates missing protected paths and nested writable roots as empty
+    /// directories before the sandbox exists, so it cannot create them.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn create_guarded(&self) -> Result<(), Error> {
+        for path in self.protected.iter().chain(self.nested_writable()) {
+            if !path.exists() {
+                std::fs::create_dir_all(path).map_err(|source| Error::Setup {
+                    step: format!("create {}", path.display()),
+                    source,
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Checks that every path is absolute and socket grants name Unix sockets.
