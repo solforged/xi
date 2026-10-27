@@ -336,6 +336,8 @@ The first pass is skipped when `tiny` shares the session model's endpoint and th
 
 Each event records `by`: `first_prompt`, `first_turn` or `user`. Automatic titles also record the model and the request's usage. Reopening a log that holds any title runs no further pass. The TUI commits `renamed · TITLE` for user titles and shows automatic ones only where it lists sessions.
 
+The TUI also sets the terminal's window and tab title with OSC 0: `ξ: TITLE` from the log's latest title, or `ξ` before the session has one. It follows live titles and session switches, saves the terminal's previous title with the xterm title stack on start and restores it on exit. Terminals without that stack keep the last `ξ` title. Inside tmux, the outer terminal shows it only with `set-titles on`.
+
 ### Terminal client
 
 `xi-tui` is the daily interface: a daemon client that commits finished output to the terminal's native scrollback and redraws only a live region below it. The live region holds the streaming turn, any open overlay, the composer and a one-line footer. Everything about a session goes through the protocol. The client owns only local state: prompt history, key bindings and display preferences. Edits to the user's global config file go through `config/set`.

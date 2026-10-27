@@ -38,6 +38,8 @@ pub(crate) fn home(path: &Path) -> String {
 impl App {
     /// Prints the header and replays the head's branch, for resumed sessions.
     pub(crate) fn attach(&mut self) {
+        self.title = crate::latest_title(&self.launch.attached.events);
+        self.title_written = false;
         let cols = self.measure().out;
         let info = &self.launch.attached.info;
         let mut header = vec![
@@ -388,6 +390,10 @@ impl App {
         }
         for control in self.controls.drain(..) {
             screen.control(&control)?;
+        }
+        if !self.title_written {
+            screen.control(&crate::title_control(self.title.as_deref()))?;
+            self.title_written = true;
         }
         if self.deck.is_some() {
             return self.draw_deck(screen);
