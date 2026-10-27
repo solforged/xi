@@ -17,8 +17,7 @@ use crate::deck::AgentRow;
 use crate::layout::Measure;
 use crate::style::{Line, Role, inline, lr};
 use crate::transcript::{
-    Detail, RESULT_LINES, SPINNER, Totals, blocks_text, clock, counted, duration, headline_arg,
-    more_lines,
+    Detail, RESULT_LINES, SPINNER, Totals, clock, counted, duration, headline_arg, more_lines,
 };
 
 /// Rows the live region gives children before the rest collapse to a count.
@@ -49,20 +48,7 @@ impl Child {
 
     fn event(&mut self, event: &Event, workspace: Option<&Path>) {
         match &event.kind {
-            EventKind::UserMessage { content } if self.label.is_none() => {
-                let text = blocks_text(xi_protocol::skill::typed(content));
-                self.label = Some(
-                    Line::default()
-                        .ink(
-                            text.lines()
-                                .find(|line| !line.trim().is_empty())
-                                .unwrap_or("")
-                                .trim(),
-                        )
-                        .truncate(32)
-                        .plain(),
-                );
-            }
+            EventKind::SessionTitled { title, .. } => self.label = Some(title.clone()),
             EventKind::AssistantMessage {
                 content,
                 stop,
@@ -113,8 +99,15 @@ impl Child {
         }
     }
 
-    /// `├─ ● 2  what` on the left, `3 calls · 12.0s` on the right.
-    fn row(&self, number: usize, width: usize, last: bool, frame: usize, cols: usize) -> Line {
+    fn name(&self, number: usize) -> String {
+        match self.label.as_deref().filter(|name| !name.trim().is_empty()) {
+            Some(name) => format!("{number} · {name}"),
+            None => format!("Agent {number}"),
+        }
+    }
+
+    /// `├─ ● 2 · name  what` on the left, `3 calls · 12.0s` on the right.
+    fn row(&self, number: usize, last: bool, frame: usize, cols: usize) -> Line {
         let elbow = Line::default().dim(if last { "  └─ " } else { "  ├─ " });
         let mark = match &self.state {
             State::Running => Line::default().brass(SPINNER[frame % SPINNER.len()]),
@@ -124,7 +117,7 @@ impl Child {
         let mut left = elbow
             .extend(mark)
             .ink(" ")
-            .strong(Role::Ink, format!("{number:<width$}"))
+            .strong(Role::Ink, self.name(number))
             .ink("  ");
         left = match &self.state {
             State::Running => match self.open.first() {
@@ -168,11 +161,7 @@ impl Child {
             State::Done(text) => (text.as_str(), false),
             State::Failed(reason) => (reason.as_str(), true),
         };
-        let mut title = format!("from child {number}");
-        if let Some(label) = self.label.as_ref().filter(|label| !label.is_empty()) {
-            title.push_str(" · ");
-            title.push_str(label);
-        }
+        let title = format!("from {}", self.name(number));
         let head = if error {
             Line::default().sanguine("✕ ")
         } else {
@@ -276,7 +265,6 @@ impl Children {
     /// and running children keep their rows and the rest become a count.
     #[must_use]
     pub fn live(&self, cols: usize, frame: usize) -> Vec<Line> {
-        let width = self.0.len().to_string().len();
         let mut shown: Vec<usize> = (0..self.0.len()).collect();
         let mut hidden = 0;
         if shown.len() > LIVE_ROWS {
@@ -298,7 +286,7 @@ impl Children {
             .enumerate()
             .map(|(n, &i)| {
                 let last = hidden == 0 && n + 1 == shown.len();
-                self.0[i].row(i + 1, width, last, frame, cols)
+                self.0[i].row(i + 1, last, frame, cols)
             })
             .collect();
         if hidden > 0 {
@@ -351,11 +339,7 @@ impl Children {
                 let elapsed = child.ended.unwrap_or(now).0.saturating_sub(child.started.0);
                 AgentRow {
                     mark,
-                    title: child
-                        .label
-                        .clone()
-                        .filter(|label| !label.is_empty())
-                        .unwrap_or_else(|| format!("agent {}", index + 1)),
+                    title: child.name(index + 1),
                     doing,
                     detail: duration(elapsed),
                 }
@@ -398,6 +382,78 @@ mod tests {
         }
     }
 
+    fn titled(name: &str) -> Event {
+        event(EventKind::SessionTitled {
+            title: name.into(),
+            by: xi_protocol::event::TitleSource::User,
+            model: None,
+            usage: None,
+        })
+    }
+
+    #[test]
+    fn names_replay_in_rows_and_sidebar_without_using_prompt_excerpts() {
+        let parent = SessionId::generate();
+        let session = SessionId::generate();
+        let events = vec![
+            event(EventKind::SessionStarted {
+                session,
+                cwd: "/w".into(),
+                model: ModelRef {
+                    provider: "p".into(),
+                    model: "m".into(),
+                },
+                xi_version: "test".into(),
+                parent_session: Some(parent),
+            }),
+            event(EventKind::UserMessage {
+                content: vec![Block::Text {
+                    text: "not a name".into(),
+                }],
+            }),
+            titled("Rollback UI"),
+            event(EventKind::UserMessage {
+                content: vec![Block::Text {
+                    text: "later steering".into(),
+                }],
+            }),
+        ];
+        let replayed: Vec<Event> =
+            serde_json::from_str(&serde_json::to_string(&events).unwrap()).unwrap();
+        let mut children = Children::default();
+        for (index, event) in replayed.iter().enumerate() {
+            assert!(children.event(parent, session, event, None));
+            let name = if index < 2 {
+                "Agent 1"
+            } else {
+                "1 · Rollback UI"
+            };
+            assert_eq!(children.agents(0)[0].title, name);
+            assert_eq!(children.agents(0)[0].doing.plain(), "thinking");
+            assert!(
+                children.live(100, 0)[0]
+                    .plain()
+                    .contains(&format!("{name}  thinking"))
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_names_fit_narrow_rows_and_stay_complete_in_details() {
+        let name = "復旧 UI 👩🏽‍💻 e\u{301}".repeat(5);
+        let mut child = child();
+        child.event(&titled(&name), None);
+        for cols in 0..=100 {
+            assert!(child.row(2, true, 0, cols).width() <= cols);
+        }
+        child.state = State::Done("done".into());
+        for cols in 0..=100 {
+            let (lines, detail) = child.slip(2, Measure::new(cols, 36)).unwrap();
+            assert!(lines.iter().all(|line| line.width() <= cols));
+            assert_eq!(detail.title, format!("from 2 · {name}"));
+        }
+    }
+
     #[test]
     fn past_eight_children_failed_and_running_keep_rows_and_the_rest_count() {
         let parent = SessionId::generate();
@@ -423,9 +479,9 @@ mod tests {
         assert!(children.event(parent, ids[9], &failed, None));
         let rows: Vec<String> = children.live(100, 0).iter().map(Line::plain).collect();
         assert_eq!(rows.len(), LIVE_ROWS, "{rows:#?}");
-        assert!(rows[0].starts_with("  ├─ ┤ 1 "), "{rows:#?}");
-        assert!(rows[5].starts_with("  ├─ ┤ 6 "), "{rows:#?}");
-        assert!(rows[6].starts_with("  ├─ ✕ 10"), "{rows:#?}");
+        assert!(rows[0].starts_with("  ├─ ┤ Agent 1 "), "{rows:#?}");
+        assert!(rows[5].starts_with("  ├─ ┤ Agent 6 "), "{rows:#?}");
+        assert!(rows[6].starts_with("  ├─ ✕ Agent 10"), "{rows:#?}");
         assert_eq!(rows[7], "  └─ … 3 more · 3 running");
         assert_eq!(children.running(), 9);
         let (slips, details) = children.committed(Measure::new(100, 36));
@@ -447,8 +503,9 @@ mod tests {
     }
 
     #[test]
-    fn finished_child_slip_keeps_the_full_answer_and_first_prompt_label() {
+    fn finished_child_slip_keeps_the_full_answer_and_explicit_name() {
         let mut child = child();
+        child.event(&titled("Check keys"), None);
         for prompt in ["check keys", "later steering"] {
             child.event(
                 &event(EventKind::UserMessage {
@@ -477,14 +534,14 @@ mod tests {
         });
         answer.at = Timestamp((14 * 60 + 22) * 60_000);
         child.event(&answer, None);
-        let live = child.row(1, 1, true, 0, 96).plain();
-        assert!(live.starts_with("  └─ ● 1  one"), "{live}");
+        let live = child.row(1, true, 0, 96).plain();
+        assert!(live.starts_with("  └─ ● 1 · Check keys  one"), "{live}");
         let (lines, detail) = child.slip(1, Measure::new(96, 36)).unwrap();
         let text: Vec<_> = lines.iter().map(Line::plain).collect();
         assert_eq!(
             text,
             [
-                "» from child 1 · check keys · 14:22",
+                "» from 1 · Check keys · 14:22",
                 "  one",
                 "  two",
                 "  three",
@@ -492,7 +549,7 @@ mod tests {
             ]
         );
         assert!(lines[0].0.iter().all(|span| span.role == Role::Dim));
-        assert_eq!(detail.title, "from child 1 · check keys");
+        assert_eq!(detail.title, "from 1 · Check keys");
         assert_eq!(detail.text, "one\ntwo\nthree\nfour\nfive");
         assert!(!detail.error);
     }
@@ -509,9 +566,9 @@ mod tests {
         assert_eq!(text[1..4], ["  ab", "  cd", "  ef"]);
         assert!(lines.iter().all(|line| line.width() <= 4));
         assert_eq!(detail.text, "abcdefghij");
-        assert_eq!(detail.title, "from child 2");
+        assert_eq!(detail.title, "from Agent 2");
         let (lines, _) = child.slip(2, Measure::new(28, 36)).unwrap();
-        assert_eq!(lines[0].plain(), "» from child 2 · 00:01");
+        assert_eq!(lines[0].plain(), "» from Agent 2 · 00:01");
         assert_eq!(lines[1].plain(), "  abcdefghij");
     }
 
@@ -526,7 +583,7 @@ mod tests {
             None,
         );
         let (lines, detail) = child.slip(1, Measure::new(80, 36)).unwrap();
-        assert!(lines[0].plain().starts_with("✕ from child 1 · "));
+        assert!(lines[0].plain().starts_with("✕ from Agent 1 · "));
         assert_eq!(lines[0].0[0].role, Role::Sanguine);
         assert_eq!(lines[1].plain(), "  first reason");
         assert_eq!(lines[2].plain(), "  second reason");

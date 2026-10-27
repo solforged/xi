@@ -28,7 +28,7 @@ impl Tool for Task {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: NAME.into(),
-            description: "Run 1 to 8 child agents concurrently for independent sub-problems. Give each child a self-contained prompt with its files, goal and acceptance criteria. Children share the workspace: assign disjoint files when editing. Do not use for dependent steps, small direct questions, or work you can finish with a few tool calls. Children cannot delegate. Results return in task order after all children finish.".into(),
+            description: "Run 1 to 8 child agents concurrently for independent sub-problems. Give each child a short name and a self-contained prompt with its files, goal and acceptance criteria. Children inherit your enabled tools, including web_search and fetch, or an explicit subset; they cannot delegate and approval asks are denied headlessly. Children share the workspace: assign disjoint files when editing. Do not use for dependent steps, small direct questions, or work you can finish with a few tool calls. Results return in task order after all children finish.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["tasks"],
@@ -41,6 +41,10 @@ impl Tool for Task {
                         "additionalProperties": false,
                         "properties": {
                             "prompt": {"type": "string", "minLength": 1},
+                            "name": {
+                                "type": "string", "minLength": 1, "maxLength": super::title::MAX_CHARS,
+                                "description": "Short task name shown in the UI and results, such as History model or UX review; one line.",
+                            },
                             "tools": {"type": "array", "items": {"type": "string"}},
                             "model": {
                                 "type": "string",
@@ -78,6 +82,7 @@ impl Tool for Task {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Child {
     pub prompt: String,
+    pub name: Option<String>,
     pub tools: Option<Vec<String>>,
     pub model: Option<ModelSelector>,
 }
@@ -92,6 +97,8 @@ struct Input {
 #[serde(deny_unknown_fields)]
 struct Item {
     prompt: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     tools: Option<Vec<String>>,
     #[serde(default)]
@@ -122,6 +129,7 @@ pub(crate) fn parse(input: Value) -> Result<Vec<Child>, String> {
                 .map_err(|error| error.to_string())?;
             Ok(Child {
                 prompt: item.prompt,
+                name: item.name.map(|name| child_name(&name)).transpose()?,
                 tools: item.tools,
                 model,
             })
@@ -129,27 +137,41 @@ pub(crate) fn parse(input: Value) -> Result<Vec<Child>, String> {
         .collect()
 }
 
+/// Uses the same limits as session titles for parent-assigned child names.
+pub(crate) fn child_name(name: &str) -> Result<String, String> {
+    super::title::validate(name)
+        .map(str::to_owned)
+        .map_err(|error| format!("child name: {error}"))
+}
+
+/// A child's answer, with whether its context ended tainted.
+pub(crate) type ChildResult = crate::Result<(AgentRunResult, bool)>;
+
 /// Joins child results in task order. The output is an error when any child
 /// failed, and untrusted when any child's context was tainted, so the
 /// parent cannot launder a child's untrusted reads.
-pub(crate) fn output(results: Vec<crate::Result<(AgentRunResult, bool)>>) -> ToolOutput {
+pub(crate) fn output(results: Vec<(Option<String>, ChildResult)>) -> ToolOutput {
     let mut failed = false;
     let mut untrusted = false;
     let text: Vec<_> = results
         .into_iter()
         .enumerate()
-        .map(|(index, result)| {
-            let number = index + 1;
+        .map(|(index, (name, result))| {
+            let mut label = format!("Task {}", index + 1);
+            if let Some(name) = name {
+                label.push_str(" · ");
+                label.push_str(&name);
+            }
             match result {
                 Ok((result, tainted)) => {
                     failed |= result.failed;
                     untrusted |= tainted;
                     let status = if result.failed { "FAILED" } else { "done" };
-                    format!("Task {number} [{status}]\n{}", result.text)
+                    format!("{label} [{status}]\n{}", result.text)
                 }
                 Err(error) => {
                     failed = true;
-                    format!("Task {number} [FAILED]\n{error}")
+                    format!("{label} [FAILED]\n{error}")
                 }
             }
         })
@@ -173,13 +195,15 @@ mod tests {
     #[test]
     fn parse_accepts_roles_and_models_and_rejects_bad_input() {
         let children = parse(json!({"tasks": [
-            {"prompt": "a", "model": "@smol", "tools": ["read"]},
+            {"prompt": "a", "name": " UX review ", "model": "@smol", "tools": ["read"]},
             {"prompt": "b", "model": "claude/claude-haiku-5-5"},
             {"prompt": "c"},
         ]}))
         .unwrap();
         assert_eq!(children[0].model, Some(ModelRole::Smol.into()));
         assert_eq!(children[0].tools.as_deref(), Some(&["read".to_owned()][..]));
+        assert_eq!(children[0].name.as_deref(), Some("UX review"));
+        assert_eq!(children[2].name, None);
         assert_eq!(
             children[1].model.as_ref().unwrap().to_string(),
             "claude/claude-haiku-5-5"
@@ -209,6 +233,28 @@ mod tests {
     }
 
     #[test]
+    fn names_follow_title_limits_before_any_child_is_started() {
+        let name = "界".repeat(super::super::title::MAX_CHARS);
+        let children = parse(json!({"tasks": [{"prompt": "inspect", "name": name}]})).unwrap();
+        assert_eq!(children[0].name.as_deref(), Some(name.as_str()));
+        for name in [
+            "".into(),
+            " \t ".into(),
+            "a\nb".into(),
+            "a\rb".into(),
+            "界".repeat(81),
+        ] {
+            let error = parse(json!({"tasks": [
+                {"prompt": "inspect", "name": "Valid"},
+                {"prompt": "review", "name": name},
+            ]}))
+            .unwrap_err();
+            assert!(error.contains("child name"), "{name:?}: {error}");
+        }
+        assert!(parse(json!({"tasks": [{"prompt": "inspect", "name": 1}]})).is_err());
+    }
+
+    #[test]
     fn output_keeps_task_order_and_carries_failure_and_taint() {
         let result = |text: &str, failed| AgentRunResult {
             session: SessionId::generate(),
@@ -218,22 +264,25 @@ mod tests {
             usage: Usage::default(),
         };
         let output = output(vec![
-            Ok((result("first", false), false)),
-            Ok((result("second", false), true)),
+            (None, Ok((result("first", false), false))),
+            (Some("Review".into()), Ok((result("second", false), true))),
         ]);
         assert_eq!(
             output.content,
             [OutputBlock::Text {
-                text: "Task 1 [done]\nfirst\n\nTask 2 [done]\nsecond".into()
+                text: "Task 1 [done]\nfirst\n\nTask 2 · Review [done]\nsecond".into()
             }]
         );
         assert!(!output.is_error);
         assert!(output.untrusted);
         let output = super::output(vec![
-            Ok((result("partial", true), false)),
-            Err(crate::Error::Config(
-                "child tool x is not one of the parent's built-in tools".into(),
-            )),
+            (Some("Review".into()), Ok((result("partial", true), false))),
+            (
+                Some("Fix".into()),
+                Err(crate::Error::Config(
+                    "child tool x is not one of the parent's built-in tools".into(),
+                )),
+            ),
         ]);
         assert!(output.is_error);
         assert!(!output.untrusted);
@@ -241,7 +290,7 @@ mod tests {
             panic!("text output")
         };
         assert!(
-            text.starts_with("Task 1 [FAILED]\npartial\n\nTask 2 [FAILED]\n"),
+            text.starts_with("Task 1 · Review [FAILED]\npartial\n\nTask 2 · Fix [FAILED]\n"),
             "{text}"
         );
     }

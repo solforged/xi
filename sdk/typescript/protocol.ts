@@ -31,7 +31,7 @@ export type HookOutcome =
 export interface CommandParams { session: SessionId; name: string; args: string }
 export interface CommandResult { message?: string }
 export interface AppendCustomParams { session: SessionId; kind: string; data: Json }
-export interface AgentRunParams { session: SessionId; prompt: string; tools?: string[]; model?: ModelSelector }
+export interface AgentRunParams { session: SessionId; prompt: string; name?: string; tools?: string[]; model?: ModelSelector }
 export interface AgentRunResult { session: SessionId; path: string; text: string; failed: boolean; usage: Usage }
 export type LogLevel = "debug" | "info" | "warn" | "error";
 export interface LogParams { level: LogLevel; message: string }

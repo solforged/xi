@@ -10,11 +10,14 @@ test("full duplex handlers, ordered concurrent children and hooks", async () => 
   const extension = new RpcPeer(toExtension, toKernel);
   let custom = false;
   kernel.handle("session/append_custom", params => { custom = params.kind === "test"; return "event"; });
-  kernel.handle("agent/run", async params => ({ session: params.prompt, path: "/child.jsonl", text: params.prompt, failed: false, usage: { input: 1, output: 2, cache_read: 0, cache_write: 0 } }));
+  kernel.handle("agent/run", async params => {
+    assert.equal(params.name, `${params.prompt} review`);
+    return { session: params.prompt, path: "/child.jsonl", text: params.prompt, failed: false, usage: { input: 1, output: 2, cache_read: 0, cache_write: 0 } };
+  });
   defineExtension({
     tools: [{ name: "test", description: "Test", input_schema: {}, async invoke(_input, ctx) {
       await ctx.appendCustom("test", {});
-      const children = await Promise.all(["first", "second"].map(prompt => ctx.agentRun({ prompt })));
+      const children = await Promise.all(["first", "second"].map(prompt => ctx.agentRun({ prompt, name: `${prompt} review` })));
       return text(children.map(child => child.text).join(","));
     } }],
     hooks: { compact: () => ({ outcome: "replace_summary", summary: "summary" }) },
@@ -61,5 +64,16 @@ test("agent/run accepts a model or a role and rejects unknown roles", async () =
   }
   for (const model of [{ role: "huge" }, { provider: "claude" }, "@smol"]) {
     assert.throws(() => decode("agent/run", 0, { session: "s", prompt: "p", model }));
+  }
+});
+
+test("agent/run accepts an optional child name and rejects other types", async () => {
+  const { decode } = await import("./validation.ts");
+  for (const name of [undefined, "UX review", "History α"]) {
+    const params = { session: "s", prompt: "p", name };
+    assert.deepEqual(decode("agent/run", 0, params), params);
+  }
+  for (const name of [null, 1, true, []]) {
+    assert.throws(() => decode("agent/run", 0, { session: "s", prompt: "p", name }));
   }
 });
