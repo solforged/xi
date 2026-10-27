@@ -2,19 +2,14 @@
 
 pub(crate) mod actor;
 pub(crate) mod approvals;
-#[path = "../compaction.rs"]
 pub mod compaction;
-#[path = "../extension_session.rs"]
 mod extension_session;
 mod invoke;
 mod restore;
 mod snapshot;
-#[path = "../task.rs"]
 mod task;
-#[path = "../title.rs"]
 pub mod title;
 mod turn;
-#[path = "../web_search.rs"]
 mod web_search;
 
 use std::collections::{HashMap, HashSet, VecDeque};

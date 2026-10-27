@@ -11,9 +11,7 @@
 //! on a tainted branch. [`WebSearch`] resolves the service when the
 //! toolset is built; the session runs the call, as it does for `task`.
 
-#[path = "web_search/exa.rs"]
 mod exa;
-#[path = "web_search/results.rs"]
 mod results;
 
 use exa::ExaResult;
