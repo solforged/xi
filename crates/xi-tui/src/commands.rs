@@ -16,6 +16,7 @@ enum Builtin {
     Resume,
     Approvals,
     Settings,
+    Roles,
     Copy,
     Tree,
     Model,
@@ -46,6 +47,11 @@ const COMMANDS: &[(&str, &str, Builtin)] = &[
         Builtin::Approvals,
     ),
     ("settings", "show and change settings", Builtin::Settings),
+    (
+        "roles",
+        "show and assign the preset and model roles",
+        Builtin::Roles,
+    ),
     (
         "copy",
         "copy the last response to the clipboard",
@@ -163,6 +169,7 @@ impl App {
                 }
             }
             Some(Builtin::Settings) => self.open_settings().await,
+            Some(Builtin::Roles) => self.open_roles().await,
             Some(Builtin::Copy) => {
                 if let Some(text) = self.transcript.last_text() {
                     let lines = text.lines().count();

@@ -438,6 +438,10 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("compaction.keep_recent_tokens", SettingLayer::Local),
         ("sandbox.enabled", SettingLayer::Default),
         ("title.auto", SettingLayer::Default),
+        ("preset", SettingLayer::Default),
+        ("roles.slow", SettingLayer::Default),
+        ("roles.smol", SettingLayer::Default),
+        ("roles.tiny", SettingLayer::Default),
         ("extensions", SettingLayer::Local),
         ("sandbox.readable", SettingLayer::Global),
         (
@@ -449,17 +453,13 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("sandbox.env", SettingLayer::Project),
         ("sandbox.env_command", SettingLayer::Local),
         ("daemon.idle_exit", SettingLayer::Global),
-        ("preset", SettingLayer::Default),
-        ("roles.slow", SettingLayer::Default),
-        ("roles.smol", SettingLayer::Default),
-        ("roles.tiny", SettingLayer::Default),
         ("sandbox.ssh_agent", SettingLayer::Default),
     ];
     assert_eq!(trusted.settings.len(), expected.len());
     for (index, (row, (key, source))) in trusted.settings.iter().zip(expected).enumerate() {
         assert_eq!(row.key, key);
         assert_eq!(row.source, source, "{key}");
-        assert_eq!(row.editable, index < 9, "{key}");
+        assert_eq!(row.editable, index < 13, "{key}");
         assert_eq!(row.held_back, None, "{key}");
     }
     assert_eq!(setting(&trusted, "approvals").value, json!("auto"));
@@ -527,12 +527,18 @@ fn presets_fill_roles_that_later_layers_override_one_at_a_time() {
         "roles.tiny",
     ] {
         assert_eq!(setting(&report, key).source, SettingLayer::Global, "{key}");
+        assert!(setting(&report, key).editable, "{key}");
+        // Only the roles the file leaves to the preset count as its.
         assert_eq!(
-            setting(&report, key).editable,
-            key == "default_model",
+            setting(&report, key).from_preset,
+            key == "roles.slow" || key == "roles.tiny",
             "{key}"
         );
     }
+    assert_eq!(
+        report.presets["claude"][&ModelRole::Tiny].model,
+        "claude-haiku-5-5"
+    );
 
     // A later layer's preset replaces every role, including `default`.
     fixture.paths.trust(&fixture.workspace).unwrap();
@@ -545,10 +551,12 @@ fn presets_fill_roles_that_later_layers_override_one_at_a_time() {
     assert_eq!(model(&config, ModelRole::Default), "chatgpt/gpt-6.1-sol");
     assert_eq!(model(&config, ModelRole::Smol), "chatgpt/gpt-6.1-terra");
     assert_eq!(model(&config, ModelRole::Tiny), "chatgpt/gpt-6-luna");
-    assert_eq!(
-        setting(&fixture.report(), "roles.tiny").source,
-        SettingLayer::Local
-    );
+    let report = fixture.report();
+    for key in ["default_model", "roles.smol", "roles.tiny"] {
+        let row = setting(&report, key);
+        assert_eq!(row.source, SettingLayer::Local, "{key}");
+        assert!(row.from_preset, "{key}");
+    }
 
     // Unassigned roles fall back up the tiers: tiny to smol, smol and slow
     // to default.
@@ -834,6 +842,23 @@ fn global_sets_create_the_directory_file_and_compaction_table() {
         set_global(&fixture.paths, key, &value).unwrap();
         assert_eq!(setting(&fixture.report(), key).value, value, "{key}");
     }
+
+    // A preset fills every role; `[roles]` overrides one; null removes it.
+    set_global(&fixture.paths, "preset", &json!("claude")).unwrap();
+    set_global(&fixture.paths, "roles.tiny", &json!("local/tiny")).unwrap();
+    let report = fixture.report();
+    let tiny = setting(&report, "roles.tiny");
+    assert_eq!(tiny.value, json!("local/tiny"));
+    assert!(!tiny.from_preset);
+    assert!(setting(&report, "roles.smol").from_preset);
+    set_global(&fixture.paths, "roles.tiny", &Value::Null).unwrap();
+    let tiny = setting(&fixture.report(), "roles.tiny").clone();
+    assert_eq!(tiny.value, json!("claude/claude-haiku-5-5"));
+    assert!(tiny.from_preset);
+    set_global(&fixture.paths, "preset", &Value::Null).unwrap();
+    let report = fixture.report();
+    assert_eq!(setting(&report, "preset").value, Value::Null);
+    assert_eq!(setting(&report, "roles.tiny").source, SettingLayer::Default);
 }
 
 #[test]
@@ -969,6 +994,11 @@ fn invalid_global_values_leave_the_file_byte_identical() {
         ("tools", json!(["read", "unknown"])),
         ("tools", json!([1])),
         ("tools", json!("read")),
+        ("preset", json!("openai")),
+        ("preset", json!(1)),
+        ("roles.smol", json!("@tiny")),
+        ("roles.tiny", json!(false)),
+        ("roles.default", json!("a/b")),
         ("compaction.enabled", json!("false")),
         ("sandbox.enabled", json!("false")),
         ("sandbox.enabled", json!(0)),

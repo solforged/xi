@@ -1,6 +1,6 @@
 //! Configuration layers, workspace trust and sandbox construction.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -324,6 +324,8 @@ pub struct Config {
     /// Ignored settings, also printed to stderr during loading.
     pub warnings: Vec<String>,
     pub(crate) setting_sources: BTreeMap<&'static str, SettingLayer>,
+    /// Keys in `setting_sources` whose layer's `preset` supplied the value.
+    pub(crate) preset_sources: BTreeSet<&'static str>,
     pub(crate) held_back: BTreeMap<&'static str, SettingLayer>,
 }
 
@@ -360,6 +362,7 @@ impl Config {
             policy: Arc::new(Policy::new()),
             warnings: Vec::new(),
             setting_sources: BTreeMap::new(),
+            preset_sources: BTreeSet::new(),
             held_back: BTreeMap::new(),
         };
         let mut layers = vec![(
@@ -433,9 +436,14 @@ impl Config {
                 }
             }
             if !settings {
-                record_sources(table, &source, &mut config.held_back);
+                record_sources(table, &source, &mut config.held_back, None);
             } else {
-                record_sources(table, &source, &mut config.setting_sources);
+                record_sources(
+                    table,
+                    &source,
+                    &mut config.setting_sources,
+                    Some(&mut config.preset_sources),
+                );
             }
             if !settings {
                 let table = value
@@ -827,10 +835,13 @@ fn allow_ssh_agent(spec: &mut xi_sandbox::Spec, socket: Option<OsString>) -> Res
     Ok(())
 }
 
+/// Records `source` for each key the layer's `table` sets. `preset`, when
+/// given, tracks which of those keys only the layer's `preset` supplied.
 fn record_sources(
     table: &toml::Table,
     source: &SettingLayer,
     sources: &mut BTreeMap<&'static str, SettingLayer>,
+    mut preset: Option<&mut BTreeSet<&'static str>>,
 ) {
     for key in crate::settings::KEYS {
         if key == "daemon.idle_exit" && *source != SettingLayer::Global {
@@ -838,18 +849,24 @@ fn record_sources(
         }
         // A preset assigns every role, so it is the source of each one
         // until a later `[roles]` entry or `default_model` replaces it.
-        let preset =
+        let by_preset =
             (key == "default_model" || key.starts_with("roles.")) && table.contains_key("preset");
-        let present = preset
-            || match key.split_once('.') {
-                Some((parent, field)) => table
-                    .get(parent)
-                    .and_then(toml::Value::as_table)
-                    .is_some_and(|table| table.contains_key(field)),
-                None => table.contains_key(key),
-            };
-        if present {
+        let explicit = match key.split_once('.') {
+            Some((parent, field)) => table
+                .get(parent)
+                .and_then(toml::Value::as_table)
+                .is_some_and(|table| table.contains_key(field)),
+            None => table.contains_key(key),
+        };
+        if by_preset || explicit {
             sources.insert(key, source.clone());
+            if let Some(preset) = preset.as_deref_mut() {
+                if explicit {
+                    preset.remove(key);
+                } else {
+                    preset.insert(key);
+                }
+            }
         }
     }
 }

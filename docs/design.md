@@ -148,7 +148,7 @@ Client → daemon requests:
 | `session/command` | `{session, name, args}` → command result or null | Route an extension slash command to the worker. The result is the extension protocol's `CommandResult`; null means an unknown command. |
 | `approval/list` | `{}` → `[{session, call, tool, action, rule, taint, trusted}]` | Return pending asks across all sessions. `taint` marks an ask that taint caused; `trusted` is whether the session's workspace is trusted. Clients use both to choose which approval scopes to offer. |
 | `approval/resolve` | `{session, call, approved, remember?}` → null | Route the answer to the owning worker; the first answer wins. `remember` is `once` (default), `session` or `workspace`; see [Terminal client](#terminal-client). A scope other than `once` on a denial, on a taint ask, or `workspace` in an untrusted workspace fails with -32602 and leaves the ask pending. |
-| `config/settings` | `{cwd, configs?}` → `{files: {global, explicit?, project, local}, trusted, settings: [{key, value, source, editable, held_back?}], warnings?}` | Handled by the daemon. Report each setting's effective value for the workspace and the layer that supplied it: `{layer: "default" \| "global" \| "project" \| "local"}` or `{layer: "explicit", path}`. `held_back` names an untrusted project or local layer that set the key and was ignored. Reads the files only; nothing starts and `sandbox.env_command` does not run. |
+| `config/settings` | `{cwd, configs?}` → `{files: {global, explicit?, project, local}, trusted, settings: [{key, value, source, editable, from_preset?, held_back?}], warnings?, presets?}` | Handled by the daemon. Report each setting's effective value for the workspace and the layer that supplied it: `{layer: "default" \| "global" \| "project" \| "local"}` or `{layer: "explicit", path}`. `from_preset` marks a role or `default_model` that the source layer's `preset` supplied rather than the key itself. `held_back` names an untrusted project or local layer that set the key and was ignored. `presets` maps each built-in preset name to its role models. Reads the files only; nothing starts and `sandbox.env_command` does not run. |
 | `config/set` | `{cwd, configs?, key, value}` → same as `config/settings` | Handled by the daemon. Set one editable key in the global `config.toml`, or remove it with `value = null`, then report again. An unknown or read-only key, or a value of the wrong type, fails with -32602 and leaves the file unchanged. The edit keeps comments, ordering and other keys, and the file is replaced atomically. Writes from different clients are serialized. |
 | `daemon/status` | `{}` → `{version, pid, uptime_secs, workers, clients, leases}` | Return daemon status. Each lease entry is `{endpoint, concurrency, active, waiting}`. |
 | `daemon/shutdown` | `{when: "idle" \| "now"}` → null | `idle` exits when there are no workers; `now` cancels running turns, closes workers and kills any still present after five seconds. |
@@ -291,7 +291,7 @@ tiny = "anthropic/claude-haiku-5-5"
 
 Within each config layer, `preset` applies first and replaces every role. `[roles]` (`slow`, `smol` and `tiny`) and `default_model` then replace single roles. A later layer's `preset` therefore replaces roles that earlier layers set, including a global `default_model`. Role values are concrete `PROVIDER/MODEL` strings, never other roles. A role without a model uses the next tier up: `tiny` falls back to `smol`, and `smol` and `slow` fall back to `default`. Without a preset, every role is the default model. Nothing selects a role by itself: `task` children keep the parent's model unless the call names one.
 
-The settings report lists `preset`, `roles.slow`, `roles.smol` and `roles.tiny` as read only, each role with its model after fallbacks. A preset counts as the source of every role it set, and of `default_model`, until a later entry replaces them.
+The settings report lists `preset`, `roles.slow`, `roles.smol` and `roles.tiny` beside `default_model`, each role with its model after fallbacks, and `config/set` edits all five in the global file. A preset counts as the source of every role it set, and of `default_model`, until a later entry replaces them; `from_preset` tells the two apart within one layer. A running worker keeps the roles it started with, so `@ROLE` there still resolves the old way after an edit.
 
 ### Instructions (`AGENTS.md`)
 
@@ -417,6 +417,7 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 | `/rename TITLE` | Set the session's title; see [Session titles](#session-titles). Line mode has it too. |
 | `/approvals` | Open the approvals inbox for all sessions. |
 | `/settings` | Open the settings view. |
+| `/roles` | Open the roles view. |
 | `/copy` | Copy the last response through OSC 52, which also works over SSH. |
 | `/name args` | Any other name runs an extension command through `session/command`; an unknown name points to `/help`. |
 
@@ -437,12 +438,13 @@ While a frame holds the keys, the composer collapses to one dim line with the dr
 
 | Overlay | Opens with | Contents and keys |
 |---|---|---|
-| Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider under headings that scroll with them: id, then the roles that resolve to it such as `@smol @tiny`, context window, a reasoning mark and price per million input and output tokens at the right. `●` marks the current model. Models without credentials are dimmed with the way to add one. Typing filters on a head row that holds the cursor and matches ids and role tags, `enter` selects, `esc` closes. |
+| Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider under headings that scroll with them: id, then the roles that resolve to it such as `@smol @tiny`, context window, a reasoning mark and price per million input and output tokens at the right. `●` marks the current model. Models without credentials are dimmed with the way to add one. Typing filters on a head row that holds the cursor and matches ids and role tags, `enter` selects, `esc` closes. Opened from the roles view, it assigns a role instead; see below. |
 | History search | `ctrl+r` | The query on a head row, then every match, this workspace first and newest first, with the match underlined. `ctrl+r` or `down` moves to older matches, `up` to newer. |
 | Session picker | `/resume` | `session/list` for this workspace, `tab` for all workspaces with each session's workspace: first prompt, then model and age at the right. `●` marks this session, `?` one waiting on you and a spinner one that is running, newest first. Child sessions are hidden. Typing filters on prompt and workspace. `enter` attaches to a live session or opens a saved one, and attaches instead when another worker already holds the log. A running turn keeps running in its worker after you switch away; `/resume` waits only while prompts are queued, since those exist only in the TUI. |
 | Approvals | `tab`, `/approvals` | One ask at a time: its action in bold, then its tool, rule and workspace, the answers and a note on what the selected one does. `1`/`y` allows once, `2` allows for this session, `3` always allows in this workspace, `4`/`n` denies; `up`, `down` and `enter` choose too. Scopes that do not apply are hidden and their keys do nothing. The frame turns murex for an ask on a tainted branch. A new ask opens the frame only when no overlay is open and the composer is empty; otherwise it waits on the status line, and `tab` opens it over whatever is open. Inside the frame `tab` walks to the next waiting ask, and the top border counts them. `esc` leaves the ask waiting. `/approvals` shows the inbox from `approval/list`: this session's asks first, then other sessions' oldest first, each labeled with its session and workspace. |
 | Tree | `/tree` | Branch points of the session; `enter` checks out, `esc` closes. |
 | Settings | `/settings` | See below. |
+| Roles | `/roles`, the settings Roles row | See below. |
 
 Approval scopes: `remember = session` makes the worker allow the same tool and exact action without asking again; the decision records `rule = "session"`. The `approval_resolved` event records the scope, and grants come from the head's lineage like taint: reopening the log restores them, and checking out an earlier point drops the grants recorded after it. `remember = workspace` also appends an allow `[[rule]]` for that exact action, with the subject glob-escaped, to `<workspace>/.xi/config.local.toml`; it is offered only in a trusted workspace, the running session relies on its session grant, and new sessions read the rule. Neither scope is offered for an ask that taint caused, because taint asks exist to stop exfiltration after untrusted input, and a session grant never allows egress on a tainted branch.
 
@@ -455,6 +457,7 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 | Model, reasoning | Session | `enter` opens the model picker or cycles reasoning through the protocol methods; a reasoning change also saves the global default. `ctrl+s` saves the session's value as the global default. |
 | Thinking display | Client | Cycles `full`, `first`, `hidden` and saves `[display] thinking` to `tui.toml`. |
 | Layout | Client | Cycles `inline`, `deck`, `auto` and saves `[display] layout` to `tui.toml`. |
+| Roles | Global default | Shows the preset and its override count; `enter` opens the roles view. |
 | Approvals | Global default | Cycles the `approvals` preset `ask`, `reads`, `auto`. |
 | One row per built-in tool, including `hashline` | Global default | Toggles the tool in `tools`, keeping the order and any other names; the last tool cannot be removed. |
 | Automatic compaction, trigger, kept tail | Global default | Toggles `enabled`, or edits an explicitly unit-tagged threshold or token-count tail. The trigger shows `%` and its effective token count for the selected model, or `tokens (fixed)`. In the trigger editor, `u` switches percent/token units without silently reinterpreting the number; if an exact conversion is unavailable, enter a new value before saving. `r` on the trigger row or in its editor removes the global override, revealing inherited settings or the default 80%. Empty fields are invalid. |
@@ -463,6 +466,20 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 | Sandbox roots and environment, extensions, trust, daemon idle timeout | Read only | `e` opens the file. |
 
 Global defaults go through `config/set`, which edits the global `config.toml` with a format-preserving TOML writer, so comments and ordering survive. `tui.toml` is edited the same way by the client. A running worker keeps the config it started with; new sessions read the change. Provider sections, `[[model]]` and `[[rule]]` stay file-only.
+
+#### Roles view
+
+`/roles`, or `enter` on the settings Roles row, opens the preset and the four roles. The top border names the preset and how many roles override it, such as `claude preset · 2 overrides`, or `no preset`. Each role row shows its model and, at the right, where it comes from: `preset`, its own key's layer, or `fallback` for an unassigned role, which shows `↑ smol · MODEL` dimmed. `●` marks roles whose model the session runs. A note under the rows says what the keys do on the selected row.
+
+| Key | Effect |
+|---|---|
+| `enter` on Preset | Cycles the built-in presets in name order, then none, through `config/set preset`. `[roles]` and `default_model` in the same file still override it. |
+| `enter` on a role | Opens the model picker titled with the role, its model selected and `●`, with tags from the configured roles. `enter` there writes `default_model` or `roles.<role>`. When the global file has its own key for the role, the first row, `↺ preset`, `↺ fallback` or `↺ built-in`, shows what removing the key reveals and removes it. |
+| `r` | Removes the role's own key from the global file. Only offered when there is one. |
+| `u` | Switches this session to the role's concrete model, as `/model PROVIDER/MODEL` would. |
+| `e` | Opens the global `config.toml` in the external editor. |
+
+Rows that `--config`, the project file or the local file set cannot be changed from here; the note names the file. Saved edits apply to new sessions; `u` switches the current one.
 
 #### Footer and rendering
 

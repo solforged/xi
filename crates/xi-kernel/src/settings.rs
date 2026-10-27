@@ -1,12 +1,15 @@
 //! Effective configuration reports and format-preserving global edits.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
+use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{ConfigFiles, Setting, SettingLayer, SettingsReport};
 use xi_protocol::model::{ModelRole, Reasoning};
+use xi_provider::Registry;
 
 use crate::config::{Approvals, Config, Paths, parse_model, validate_global};
 use crate::{Error, Result};
@@ -21,21 +24,21 @@ pub(crate) const KEYS: [&str; 20] = [
     "compaction.keep_recent_tokens",
     "sandbox.enabled",
     "title.auto",
+    "preset",
+    "roles.slow",
+    "roles.smol",
+    "roles.tiny",
     "extensions",
     "sandbox.readable",
     "sandbox.writable",
     "sandbox.env",
     "sandbox.env_command",
     "daemon.idle_exit",
-    "preset",
-    "roles.slow",
-    "roles.smol",
-    "roles.tiny",
     "sandbox.ssh_agent",
 ];
 
 /// The leading `KEYS` that `config/set` may change.
-const EDITABLE: usize = 9;
+const EDITABLE: usize = 13;
 
 /// Effective settings and their layers for a workspace, without running
 /// `sandbox.env_command` or starting anything.
@@ -55,16 +58,16 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
         json!(config.compaction.keep_recent_tokens),
         json!(config.sandbox.enabled),
         json!(config.title.auto),
+        json!(config.preset),
+        role(ModelRole::Slow),
+        role(ModelRole::Smol),
+        role(ModelRole::Tiny),
         json!(config.extensions),
         json!(config.sandbox.readable),
         json!(config.sandbox.writable),
         json!(config.sandbox.env),
         json!(config.sandbox.env_command),
         json!(config.daemon.idle_exit),
-        json!(config.preset),
-        role(ModelRole::Slow),
-        role(ModelRole::Smol),
-        role(ModelRole::Tiny),
         json!(config.sandbox.ssh_agent),
     ];
     let settings = KEYS
@@ -80,6 +83,7 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
                 .cloned()
                 .unwrap_or(SettingLayer::Default),
             editable: index < EDITABLE,
+            from_preset: config.preset_sources.contains(key),
             held_back: config.held_back.get(key).cloned(),
         })
         .collect();
@@ -93,7 +97,24 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
         trusted: config.trusted,
         settings,
         warnings: config.warnings,
+        presets: presets(),
     })
+}
+
+/// Every built-in preset's role assignments.
+fn presets() -> BTreeMap<String, BTreeMap<ModelRole, ModelRef>> {
+    let registry = Registry::builtin();
+    registry
+        .presets()
+        .filter_map(|name| {
+            let preset = registry.preset(name)?;
+            let roles = ModelRole::ALL
+                .into_iter()
+                .filter_map(|role| Some((role, parse_model(preset.get(role)).ok()?)))
+                .collect();
+            Some((name.to_owned(), roles))
+        })
+        .collect()
 }
 
 /// Sets or removes (`Value::Null`) one editable key in the global
@@ -175,6 +196,23 @@ fn validate_value(key: &str, value: &Value) -> Result<Option<toml_edit::Value>> 
             let model = value.as_str().ok_or_else(invalid)?;
             parse_model(model).map_err(|_| invalid())?;
             toml_edit::Value::from(model)
+        }
+        "roles.slow" | "roles.smol" | "roles.tiny" => {
+            let model = value.as_str().ok_or_else(invalid)?;
+            parse_model(model).map_err(|_| invalid())?;
+            toml_edit::Value::from(model)
+        }
+        "preset" => {
+            let name = value.as_str().ok_or_else(invalid)?;
+            let registry = Registry::builtin();
+            if registry.preset(name).is_none() {
+                let known: Vec<_> = registry.presets().collect();
+                return Err(Error::Config(format!(
+                    "{key}: unknown preset {value}; expected one of {}",
+                    known.join(", ")
+                )));
+            }
+            toml_edit::Value::from(name)
         }
         "reasoning" => {
             serde_json::from_value::<Reasoning>(value.clone()).map_err(|_| invalid())?;

@@ -29,6 +29,7 @@ mod overlay;
 mod overlays;
 mod panes;
 pub mod picker;
+pub mod roles;
 pub mod screen;
 pub mod sessions;
 pub mod settings;

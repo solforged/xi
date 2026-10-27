@@ -232,6 +232,11 @@ pub mod client {
         /// Loader warnings, such as ignored keys.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub warnings: Vec<String>,
+        /// Built-in role presets by name, each role's model as written by
+        /// `preset = "<name>"`.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        pub presets:
+            std::collections::BTreeMap<String, std::collections::BTreeMap<ModelRole, ModelRef>>,
     }
 
     /// Configuration file locations for a workspace.
@@ -259,6 +264,10 @@ pub mod client {
         pub source: SettingLayer,
         /// Whether `config/set` accepts this key.
         pub editable: bool,
+        /// Whether the source layer's `preset` supplied the value rather
+        /// than the key itself. Only role keys and `default_model` set it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub from_preset: bool,
         /// Last layer that set this key but was dropped in an untrusted workspace.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub held_back: Option<SettingLayer>,
@@ -1023,6 +1032,8 @@ mod tests {
 
     #[test]
     fn settings_requests_and_report_round_trip() {
+        use crate::model::ModelRole;
+
         let params = SettingsParams {
             cwd: "/work".into(),
             configs: Vec::new(),
@@ -1072,6 +1083,10 @@ mod tests {
                     "source": {"layer": "global"}, "editable": true,
                 },
                 {
+                    "key": "roles.tiny", "value": "lab/small",
+                    "source": {"layer": "global"}, "editable": true, "from_preset": true,
+                },
+                {
                     "key": "tools", "value": ["read"],
                     "source": {"layer": "explicit", "path": "/extra.toml"}, "editable": true,
                     "held_back": {"layer": "local"},
@@ -1083,18 +1098,21 @@ mod tests {
                 },
             ],
             "warnings": ["ignored untrusted settings"],
+            "presets": {"lab": {"slow": {"provider": "lab", "model": "big"}}},
         });
         let report: SettingsReport = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(report.settings[0].source, SettingLayer::Default);
         assert_eq!(report.settings[1].source, SettingLayer::Global);
         assert_eq!(
-            report.settings[2].source,
+            report.settings[3].source,
             SettingLayer::Explicit {
                 path: "/extra.toml".into(),
             }
         );
-        assert_eq!(report.settings[2].held_back, Some(SettingLayer::Local));
-        assert_eq!(report.settings[3].held_back, Some(SettingLayer::Project));
+        assert!(report.settings[2].from_preset && !report.settings[1].from_preset);
+        assert_eq!(report.settings[3].held_back, Some(SettingLayer::Local));
+        assert_eq!(report.settings[4].held_back, Some(SettingLayer::Project));
+        assert_eq!(report.presets["lab"][&ModelRole::Slow].model, "big");
         assert_eq!(serde_json::to_value(&report).unwrap(), wire);
         let minimal = json!({
             "files": {
@@ -1105,7 +1123,7 @@ mod tests {
         });
         let report: SettingsReport = serde_json::from_value(minimal.clone()).unwrap();
         assert!(report.files.explicit.is_empty());
-        assert!(report.warnings.is_empty());
+        assert!(report.warnings.is_empty() && report.presets.is_empty());
         assert_eq!(serde_json::to_value(report).unwrap(), minimal);
     }
 

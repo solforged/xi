@@ -16,6 +16,7 @@ enum Row {
     Reasoning,
     Thinking,
     Layout,
+    Roles,
     Approvals,
     Tool(&'static str),
     Compaction,
@@ -32,6 +33,7 @@ const ROWS: &[Row] = &[
     Row::Reasoning,
     Row::Thinking,
     Row::Layout,
+    Row::Roles,
     Row::Approvals,
     Row::Compaction,
     Row::Trigger,
@@ -60,7 +62,7 @@ fn heading(index: usize) -> Option<&'static str> {
     match ROWS[index] {
         Row::Model => Some("this session"),
         Row::Thinking => Some("client"),
-        Row::Approvals => Some("defaults"),
+        Row::Roles => Some("defaults"),
         Row::Tool("read") => Some("tools"),
         Row::ReadOnly(_, "sandbox.readable") => Some("read only"),
         _ => None,
@@ -78,6 +80,8 @@ pub(crate) enum Action {
     Close,
     /// Open the existing session model picker.
     Models,
+    /// Open the roles view.
+    Roles,
     /// Cycle the current session's reasoning level.
     Reasoning,
     /// Cycle and persist the client thinking display.
@@ -331,6 +335,7 @@ impl Settings {
             _ if enter || (plain && key.code == KeyCode::Char(' ')) => {
                 return match row {
                     Row::Model if enter => Action::Models,
+                    Row::Roles if enter => Action::Roles,
                     Row::Reasoning => Action::Reasoning,
                     Row::Thinking => Action::Thinking,
                     Row::Layout => Action::Layout,
@@ -436,6 +441,13 @@ impl Settings {
                     .into(),
                 );
             }
+            Row::Roles => {
+                return (
+                    "Roles".into(),
+                    crate::roles::summary(&self.report),
+                    self.source("preset"),
+                );
+            }
             Row::Approvals => ("Approvals".into(), "approvals"),
             Row::Tool(tool) => {
                 let checked = self
@@ -488,25 +500,7 @@ impl Settings {
     }
 
     fn source(&self, key: &str) -> String {
-        let Some(setting) = self.setting(key) else {
-            return "default".into();
-        };
-        let mut source = match &setting.source {
-            SettingLayer::Default => "default".into(),
-            SettingLayer::Global => "global".into(),
-            SettingLayer::Explicit { path } => format!(
-                "--config {}",
-                path.file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy()
-            ),
-            SettingLayer::Project => "project".into(),
-            SettingLayer::Local => "local".into(),
-        };
-        if setting.held_back.is_some() {
-            source.push_str(" · held back (untrusted)");
-        }
-        source
+        layer(self.setting(key))
     }
 
     /// The border, the global config path and the keys. `ctrl+s` shows
@@ -526,7 +520,12 @@ impl Settings {
                 hints.push(Hint::new("r resets to inherited/80%", 0).short("r reset 80%"));
             }
         } else {
-            hints.extend(Hint::key(keys, Key::Send, "changes", 0));
+            let verb = if ROWS[self.selected] == Row::Roles {
+                "opens"
+            } else {
+                "changes"
+            };
+            hints.extend(Hint::key(keys, Key::Send, verb, 0));
             if matches!(ROWS[self.selected], Row::Model | Row::Reasoning) {
                 hints.push(Hint::new("ctrl+s saves default", 2).short("ctrl+s"));
             }
@@ -690,4 +689,27 @@ fn display(value: &Value) -> String {
         Value::Array(values) => values.iter().map(display).collect::<Vec<_>>().join(", "),
         _ => value.to_string(),
     }
+}
+
+/// The layer that supplied a setting, as the source column shows it.
+pub(crate) fn layer(setting: Option<&Setting>) -> String {
+    let Some(setting) = setting else {
+        return "default".into();
+    };
+    let mut source = match &setting.source {
+        SettingLayer::Default => "default".into(),
+        SettingLayer::Global => "global".into(),
+        SettingLayer::Explicit { path } => format!(
+            "--config {}",
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+        ),
+        SettingLayer::Project => "project".into(),
+        SettingLayer::Local => "local".into(),
+    };
+    if setting.held_back.is_some() {
+        source.push_str(" · held back (untrusted)");
+    }
+    source
 }
