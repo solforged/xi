@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
-use xi_protocol::ToolCallId;
+use xi_protocol::{SANDBOX_START_FAILED, ToolCallId};
 
 use crate::{Context, Ran, parse};
 
@@ -73,14 +73,17 @@ pub(crate) async fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Resu
     };
     let mut spec = ctx.sandbox.clone();
     spec.cwd.clone_from(&ctx.workspace);
-    let launch_error = if spec.enabled {
-        "Sandbox could not start"
-    } else {
-        "Shell could not start"
+    // Name what failed to launch: the helper when sandboxed, else the shell.
+    let launch_error = |error: &dyn std::fmt::Display| {
+        if spec.enabled {
+            format!("{SANDBOX_START_FAILED}: {}: {error}", ctx.helper.display())
+        } else {
+            format!("Shell could not start: {shell}: {error}")
+        }
     };
     let mut command = spec
         .command(&ctx.helper, shell, ["-c", &input.command])
-        .map_err(|error| format!("{launch_error}: {error}"))?;
+        .map_err(|error| launch_error(&error))?;
     let (reader, writer) = std::io::pipe().map_err(|error| error.to_string())?;
     command
         .stdin(Stdio::null())
@@ -90,9 +93,7 @@ pub(crate) async fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Resu
     // have their own process group from Spec::command.
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("{launch_error}: {error}"))?;
+    let mut child = command.spawn().map_err(|error| launch_error(&error))?;
     drop(command); // Close the parent's write handles so EOF can be observed.
     let mut group = ProcessGroup {
         pid: nix::unistd::Pid::from_raw(child.id().expect("spawned child") as i32),
@@ -135,7 +136,7 @@ pub(crate) async fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Resu
     let footer = stopped.unwrap_or_else(|| {
         use std::os::unix::process::ExitStatusExt;
         if ctx.sandbox.enabled && status.code() == Some(xi_sandbox::EXIT_SETUP_FAILED) {
-            "[Sandbox could not start: helper exited 125]\n[exit 125]".to_owned()
+            format!("[{SANDBOX_START_FAILED}: helper exited 125]\n[exit 125]")
         } else if let Some(code) = status.code() {
             format!("[exit {code}]")
         } else {
@@ -155,5 +156,7 @@ pub(crate) async fn run(call: &ToolCallId, value: &Value, ctx: &Context) -> Resu
 
 #[cfg(not(unix))]
 pub(crate) async fn run(_call: &ToolCallId, _value: &Value, _ctx: &Context) -> Result<Ran, String> {
-    Err("Sandbox could not start: shell tools require a Unix platform".into())
+    Err(format!(
+        "{SANDBOX_START_FAILED}: shell tools require a Unix platform"
+    ))
 }

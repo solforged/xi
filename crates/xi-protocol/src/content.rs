@@ -192,6 +192,10 @@ pub struct ToolOutput {
     pub untrusted: bool,
 }
 
+/// How a tool result starts when the OS sandbox could not launch the
+/// command, so clients can tell a broken sandbox from a failed command.
+pub const SANDBOX_START_FAILED: &str = "Sandbox could not start";
+
 #[cfg(test)]
 mod tests {
     use super::*;
