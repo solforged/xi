@@ -21,6 +21,7 @@ enum Builtin {
     Tree,
     Model,
     Reasoning,
+    Sandbox,
     Compact,
     Layout,
     Rename,
@@ -71,6 +72,11 @@ const COMMANDS: &[(&str, &str, Builtin)] = &[
         "reasoning",
         "set off, low, medium, high; without an argument, show it",
         Builtin::Reasoning,
+    ),
+    (
+        "sandbox",
+        "toggle this session's tool sandbox; or set on or off",
+        Builtin::Sandbox,
     ),
     ("compact", "summarize older context now", Builtin::Compact),
     ("rename", "set this session's title", Builtin::Rename),
@@ -228,6 +234,12 @@ impl App {
                     };
                     self.note(vec![Line::default().dim(format!("  {error}; use {names}"))]);
                 }
+            },
+            Some(Builtin::Sandbox) => match rest {
+                "" => self.toggle_sandbox().await,
+                "on" => self.set_sandbox(true).await,
+                "off" => self.set_sandbox(false).await,
+                _ => self.note(vec![Line::default().dim("  /sandbox expects on or off")]),
             },
             Some(Builtin::Layout) if rest.is_empty() => {
                 self.note(vec![Line::default().dim(format!(

@@ -309,6 +309,16 @@ async fn routes_remaining_typed_requests() {
         },
         ()
     );
+    for enabled in [false, true] {
+        exchange!(
+            client.set_sandbox(session, enabled),
+            SessionSetSandbox,
+            &daemon,
+            &mut incoming,
+            SetSandboxParams { session, enabled },
+            ()
+        );
+    }
     exchange!(
         client.models(session),
         SessionModels,

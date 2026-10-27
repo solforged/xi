@@ -20,7 +20,7 @@ use xi_protocol::methods::client::{
     ApprovalResolve, AttachParams, AttachResult, CreateParams, Delta, DeltaParams, EventParams,
     OpenParams, PromptParams, ResetParams, SessionAttach, SessionCancel, SessionClose,
     SessionCommands, SessionModels, SessionOptions, SessionPrompt, SessionRef, SessionSetReasoning,
-    SetReasoningParams,
+    SessionSetSandbox, SetReasoningParams, SetSandboxParams,
 };
 use xi_protocol::methods::worker::{LeaseParams, WorkerStart, WorkerStartParams};
 use xi_protocol::model::{ModelInfo, Reasoning};
@@ -318,6 +318,74 @@ async fn worker_reports_the_sandbox_setting_it_started_with() {
 }
 
 #[tokio::test]
+async fn sandbox_override_updates_attach_but_not_defaults_or_reopened_workers() {
+    let fixture = Fixture::new();
+    let config = fixture.paths.config.join("config.toml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    let harness = fixture.worker(Script::new(vec![]));
+    let attached = harness.start(&fixture).await;
+    let session = attached.info.session;
+    for enabled in [false, false, true, false] {
+        request::<SessionSetSandbox>(&harness.peer, &SetSandboxParams { session, enabled })
+            .await
+            .unwrap();
+        let changed = request::<SessionAttach>(
+            &harness.peer,
+            &AttachParams {
+                session,
+                since: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.info.sandbox_enabled, enabled);
+        assert!(matches!(
+            changed.events.last().unwrap().kind,
+            EventKind::SandboxChanged { enabled: value } if value == enabled
+        ));
+    }
+    let changed = request::<SessionAttach>(
+        &harness.peer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(changed.events.len(), attached.events.len() + 3);
+    assert_eq!(std::fs::read_to_string(config).unwrap(), original);
+    assert_code(
+        request::<SessionSetSandbox>(
+            &harness.peer,
+            &SetSandboxParams {
+                session: SessionId::generate(),
+                enabled: false,
+            },
+        )
+        .await,
+        RpcError::UNKNOWN_SESSION,
+    );
+    harness.close(session).await;
+
+    let harness = fixture.worker(Script::new(vec![]));
+    let opened = request::<WorkerStart>(
+        &harness.peer,
+        &WorkerStartParams::Open(OpenParams {
+            path: attached.info.path,
+            options: SessionOptions::default(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        opened.info.sandbox_enabled,
+        "audit events must not disable a new worker"
+    );
+    harness.close(session).await;
+}
+
+#[tokio::test]
 async fn requires_start_and_create_returns_root_and_config_details() {
     let fixture = Fixture::new();
     let harness = fixture.worker(Script::new(vec![]));
@@ -327,6 +395,7 @@ async fn requires_start_and_create_returns_root_and_config_details() {
         "session/cancel",
         "unknown",
         "session/set_reasoning",
+        "session/set_sandbox",
         "session/models",
         "session/commands",
     ] {
@@ -689,7 +758,7 @@ async fn reasoning_dispatch_updates_attach_and_reopens_with_an_explicit_override
 }
 
 #[tokio::test]
-async fn reasoning_is_idle_only_but_catalogs_remain_responsive_while_running() {
+async fn reasoning_and_sandbox_are_idle_only_but_catalogs_remain_responsive() {
     let fixture = Fixture::new();
     let gate = Arc::new(Semaphore::new(0));
     let mut harness = fixture.worker(Script::new(vec![Step {
@@ -718,6 +787,17 @@ async fn reasoning_is_idle_only_but_catalogs_remain_responsive_while_running() {
             &SetReasoningParams {
                 session,
                 reasoning: Reasoning::High,
+            },
+        )
+        .await,
+        RpcError::SESSION_RUNNING,
+    );
+    assert_code(
+        request::<SessionSetSandbox>(
+            &harness.peer,
+            &SetSandboxParams {
+                session,
+                enabled: false,
             },
         )
         .await,

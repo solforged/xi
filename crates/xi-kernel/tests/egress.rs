@@ -215,6 +215,52 @@ fn decisions(
 }
 
 #[tokio::test]
+async fn live_sandbox_toggle_switches_file_access_and_restores_the_egress_proxy() {
+    for initial in [true, false] {
+        let fixture = Fixture::new(&format!("[sandbox]\nenabled={initial}\n"));
+        let outside = fixture.paths.home.join("outside.txt");
+        std::fs::write(&outside, "host-file").unwrap();
+        let port = server();
+        let fetch = format!("curl -fsS --max-time 3 http://127.0.0.1:{port}/");
+        let read = format!("cat '{}'", outside.display());
+        let mut replies = Vec::new();
+        for id in ["first", "off", "restored"] {
+            replies.push(calls(&[(id, "bash", &fetch)]));
+            replies.push(done());
+            replies.push(calls(&[(&format!("{id}-file"), "bash", &read)]));
+            replies.push(done());
+        }
+        let session = fixture.session(replies);
+        for (id, enabled) in [("first", true), ("off", false), ("restored", true)] {
+            session.set_sandbox(enabled).await.unwrap();
+            for _ in 0..2 {
+                session
+                    .prompt(vec![Block::Text { text: "go".into() }])
+                    .await
+                    .unwrap();
+            }
+            let events = session.info().await.events;
+            let (output, failed) = result(&events, id);
+            assert_eq!(failed, enabled, "{id}: {output}");
+            if enabled {
+                assert!(output.contains("403"), "{id}: {output}");
+                assert_eq!(
+                    decisions(&events, id).len(),
+                    1,
+                    "egress proxy must be active"
+                );
+            } else {
+                assert_eq!(output, "hello\n[exit 0]");
+                assert!(decisions(&events, id).is_empty());
+            }
+            let (output, failed) = result(&events, &format!("{id}-file"));
+            assert_eq!(failed, enabled, "{id}: {output}");
+            assert_eq!(output.contains("host-file"), !enabled, "{id}: {output}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn bash_reaches_an_allowed_host_by_absolute_form_and_connect() {
     let port = server();
     let fixture = Fixture::new("[[rule]]\naction='net'\npattern='127.0.0.1'\neffect='allow'\n");

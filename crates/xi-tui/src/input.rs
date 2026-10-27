@@ -106,6 +106,10 @@ impl App {
                 self.cycle_reasoning().await;
                 return Ok(());
             }
+            Some(Action::Sandbox) => {
+                self.toggle_sandbox().await;
+                return Ok(());
+            }
             Some(Action::Expand) => {
                 let lines = self.transcript.expand(self.measure()).unwrap_or_else(|| {
                     let why = if self.transcript.collapsed() {

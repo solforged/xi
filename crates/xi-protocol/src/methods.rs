@@ -102,6 +102,10 @@ pub mod client {
         SessionSetReasoning, "session/set_reasoning", SetReasoningParams => ()
     );
     request!(
+        /// Client → daemon: enable or disable the live worker's tool sandbox while idle.
+        SessionSetSandbox, "session/set_sandbox", SetSandboxParams => ()
+    );
+    request!(
         /// Client → daemon: set a session's title. It applies at the next
         /// model boundary of a running turn, or at once when idle.
         SessionRename, "session/rename", RenameParams => ()
@@ -496,6 +500,15 @@ pub mod client {
         pub session: SessionId,
         /// Reasoning depth to select.
         pub reasoning: Reasoning,
+    }
+
+    /// Parameters for [`SessionSetSandbox`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SetSandboxParams {
+        /// Session to update.
+        pub session: SessionId,
+        /// Whether future tool commands run sandboxed.
+        pub enabled: bool,
     }
 
     /// Parameters for [`SessionRename`].

@@ -795,6 +795,54 @@ async fn reasoning_and_catalog_requests_are_forwarded_to_the_worker() {
 }
 
 #[tokio::test]
+async fn sandbox_changes_are_forwarded_and_broadcast_to_attached_clients() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon(vec![], false);
+    let (peer, _) = connection(&daemon);
+    let (observer, mut events) = connection(&daemon);
+    initialize(&peer).await;
+    initialize(&observer).await;
+    let attached = request::<SessionCreate>(&peer, &fixture.create())
+        .await
+        .unwrap();
+    let session = attached.info.session;
+    request::<SessionAttach>(
+        &observer,
+        &AttachParams {
+            session,
+            since: None,
+        },
+    )
+    .await
+    .unwrap();
+    for enabled in [false, true] {
+        request::<SessionSetSandbox>(&peer, &SetSandboxParams { session, enabled })
+            .await
+            .unwrap();
+        loop {
+            let event: EventParams =
+                serde_json::from_value(notification(&mut events, "event/appended").await).unwrap();
+            if let EventKind::SandboxChanged { enabled: value } = event.event.kind {
+                assert_eq!(event.session, session);
+                assert_eq!(value, enabled);
+                break;
+            }
+        }
+        let attached = request::<SessionAttach>(
+            &observer,
+            &AttachParams {
+                session,
+                since: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached.info.sandbox_enabled, enabled);
+    }
+    stop(&peer, &daemon).await;
+}
+
+#[tokio::test]
 async fn asks_enter_inbox_broadcast_and_resolve_once() {
     let fixture = Fixture::new();
     let call = Response {

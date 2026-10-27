@@ -686,6 +686,9 @@ impl App {
                 xi_protocol::EventKind::ReasoningChanged { reasoning } => {
                     self.launch.attached.info.reasoning = *reasoning;
                 }
+                xi_protocol::EventKind::SandboxChanged { enabled } => {
+                    self.launch.attached.info.sandbox_enabled = *enabled;
+                }
                 // The deck lists titles from `session/list`; fetch it now.
                 xi_protocol::EventKind::SessionTitled { title, .. } => {
                     self.title = Some(title.clone());

@@ -1234,6 +1234,15 @@ impl Transcript {
                     ],
                 );
             }
+            EventKind::SandboxChanged { enabled } => {
+                let line = if *enabled {
+                    Line::default().dim("  tool sandbox on · future commands are sandboxed")
+                } else {
+                    Line::default()
+                        .brass("  tool sandbox off · unrestricted host files and network")
+                };
+                self.push(&mut out, [line]);
+            }
             // Reasoning changes are reflected in the footer, and titles in the
             // terminal title and session lists, not the transcript.
             EventKind::ReasoningChanged { .. } | EventKind::SessionTitled { .. } => {}

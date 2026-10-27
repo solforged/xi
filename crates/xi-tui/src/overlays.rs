@@ -603,6 +603,30 @@ impl App {
         }
     }
 
+    pub(crate) async fn toggle_sandbox(&mut self) {
+        self.set_sandbox(!self.launch.attached.info.sandbox_enabled)
+            .await;
+    }
+
+    pub(crate) async fn set_sandbox(&mut self, enabled: bool) {
+        if !self.idle_only("sandbox changes") {
+            return;
+        }
+        match self
+            .launch
+            .client
+            .set_sandbox(self.session_id(), enabled)
+            .await
+        {
+            Ok(()) => {
+                self.launch.attached.info.sandbox_enabled = enabled;
+            }
+            Err(error) => {
+                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+            }
+        }
+    }
+
     /// Answers the shown ask and records the answer in scrollback, such as
     /// `? allowed for this session · bash exec cargo test`.
     pub(crate) async fn answer(&mut self, choice: Choice) {

@@ -820,30 +820,7 @@ impl Config {
         if self.sandbox.ssh_agent {
             allow_ssh_agent(&mut spec, ssh_agent)?;
         }
-        spec.validate().map_err(|e| Error::Config(e.to_string()))?;
-        if spec.enabled
-            && let Ok(dir) = xi_protocol::runtime::dir()
-        {
-            let runtime = comparison_path(&dir);
-            for root in spec.readable.iter().chain(&spec.writable) {
-                if runtime.starts_with(comparison_path(root)) {
-                    return Err(Error::Config(format!(
-                        "runtime directory {} is inside sandbox root {}",
-                        dir.display(),
-                        root.display()
-                    )));
-                }
-            }
-            for socket in &spec.sockets {
-                if comparison_path(socket).starts_with(&runtime) {
-                    return Err(Error::Config(format!(
-                        "sandbox socket {} is inside runtime directory {}",
-                        socket.display(),
-                        dir.display()
-                    )));
-                }
-            }
-        }
+        validate_sandbox(&spec)?;
         Ok(spec)
     }
 
@@ -871,6 +848,36 @@ impl Config {
         serde_json::from_slice(&output.stdout)
             .map_err(|e| fail(format!("expected a JSON object of strings or nulls: {e}")))
     }
+}
+
+/// Validates resolved roots again when enabling a live worker's sandbox,
+/// without rerunning its host environment command.
+pub(crate) fn validate_sandbox(spec: &xi_sandbox::Spec) -> Result<()> {
+    spec.validate().map_err(|e| Error::Config(e.to_string()))?;
+    if spec.enabled
+        && let Ok(dir) = xi_protocol::runtime::dir()
+    {
+        let runtime = comparison_path(&dir);
+        for root in spec.readable.iter().chain(&spec.writable) {
+            if runtime.starts_with(comparison_path(root)) {
+                return Err(Error::Config(format!(
+                    "runtime directory {} is inside sandbox root {}",
+                    dir.display(),
+                    root.display()
+                )));
+            }
+        }
+        for socket in &spec.sockets {
+            if comparison_path(socket).starts_with(&runtime) {
+                return Err(Error::Config(format!(
+                    "sandbox socket {} is inside runtime directory {}",
+                    socket.display(),
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Grants access to the selected socket, never its containing directory.
