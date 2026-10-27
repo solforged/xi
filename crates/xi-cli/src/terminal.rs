@@ -6,10 +6,10 @@ use std::io::{IsTerminal, Write};
 use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
 use xi_client::client::{Client, ClientError, ClientNotification};
-use xi_kernel::config::{Paths, parse_model};
+use xi_kernel::config::Paths;
 use xi_protocol::event::{Decision, EventKind, Remember};
 use xi_protocol::methods::client::{AttachResult, Delta, PromptResult};
-use xi_protocol::model::Reasoning;
+use xi_protocol::model::{ModelSelector, Reasoning};
 use xi_protocol::rpc::RpcError;
 use xi_protocol::{Block, EventId, OutputBlock, SessionId, ToolCallId};
 
@@ -420,12 +420,14 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
                 _ => {}
             }
             if let Some(model) = line.strip_prefix("/model ") {
-                match parse_model(model.trim()) {
-                    Ok(model) => {
-                        if let Err(error) = client.set_model(session, model).await {
-                            eprintln!("xi: {error}");
+                match model.trim().parse::<ModelSelector>() {
+                    Ok(model) => match client.set_model(session, model.clone()).await {
+                        Ok(resolved) if ModelSelector::from(resolved.clone()) != model => {
+                            eprintln!("{model} is {}/{}", resolved.provider, resolved.model);
                         }
-                    }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("xi: {error}"),
+                    },
                     Err(error) => eprintln!("xi: {error}"),
                 }
                 continue;

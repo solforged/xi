@@ -189,3 +189,25 @@ context_window = 272000
 max_output = 128000
 reasoning = ["low", "medium", "high", "xhigh", "max"]
 compat = { responses_lite = true }
+
+# Role presets: one model per role for each lab, most capable first.
+# `preset = "<name>"` in config fills all four roles; `[roles]` and
+# `default_model` override them one at a time. OpenAI's four-model lineup
+# is only on the ChatGPT plan; the API catalog has no Astra or Luna.
+[preset.chatgpt]
+slow = "chatgpt/gpt-6-astra"
+default = "chatgpt/gpt-6.1-sol"
+smol = "chatgpt/gpt-6.1-terra"
+tiny = "chatgpt/gpt-6-luna"
+
+[preset.anthropic]
+slow = "anthropic/claude-fable-5-1"
+default = "anthropic/claude-opus-5-5"
+smol = "anthropic/claude-sonnet-5-5"
+tiny = "anthropic/claude-haiku-5-5"
+
+[preset.claude]
+slow = "claude/claude-fable-5-1"
+default = "claude/claude-opus-5-5"
+smol = "claude/claude-sonnet-5-5"
+tiny = "claude/claude-haiku-5-5"

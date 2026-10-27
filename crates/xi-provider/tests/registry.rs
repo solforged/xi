@@ -64,6 +64,7 @@ async fn provider_and_model_overrides_take_effect_and_unknown_models_connect() {
             }
             .into(),
         ],
+        ..Default::default()
     });
     assert_eq!(registry.models().count(), 1);
     assert_eq!(
@@ -124,6 +125,7 @@ fn model_override_key_includes_provider() {
     registry.extend(RegistryConfig {
         provider: BTreeMap::new(),
         model: vec![custom.clone().into()],
+        ..Default::default()
     });
     assert_eq!(
         registry.model(&ModelRef {
@@ -285,4 +287,30 @@ async fn environment_credentials_are_resolved_without_modifying_process_environm
         requests[0].headers["authorization"],
         format!("Bearer {}", value.trim())
     );
+}
+
+#[test]
+fn builtin_presets_name_registered_models_for_every_role() {
+    let registry = Registry::builtin();
+    assert_eq!(
+        registry.presets().collect::<Vec<_>>(),
+        ["anthropic", "chatgpt", "claude"]
+    );
+    for name in registry.presets() {
+        let preset = registry.preset(name).unwrap();
+        for role in xi_protocol::model::ModelRole::ALL {
+            let model: ModelRef = preset.get(role).parse().unwrap();
+            assert_eq!(model.provider, name, "{name}.{role} stays on its provider");
+            assert!(
+                registry.model(&model).is_some(),
+                "{name}.{role} names unregistered {}",
+                preset.get(role)
+            );
+        }
+    }
+    assert_eq!(
+        registry.preset("claude").unwrap().tiny,
+        "claude/claude-haiku-5-5"
+    );
+    assert!(registry.preset("openai").is_none());
 }

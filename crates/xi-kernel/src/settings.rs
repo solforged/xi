@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 use xi_protocol::methods::client::{ConfigFiles, Setting, SettingLayer, SettingsReport};
-use xi_protocol::model::Reasoning;
+use xi_protocol::model::{ModelRole, Reasoning};
 
 use crate::config::{Approvals, Config, Paths, parse_model, validate_global};
 use crate::{Error, Result};
 
-pub(crate) const KEYS: [&str; 14] = [
+pub(crate) const KEYS: [&str; 18] = [
     "default_model",
     "reasoning",
     "approvals",
@@ -26,12 +26,20 @@ pub(crate) const KEYS: [&str; 14] = [
     "sandbox.env",
     "sandbox.env_command",
     "daemon.idle_exit",
+    "preset",
+    "roles.slow",
+    "roles.smol",
+    "roles.tiny",
 ];
 
 /// Effective settings and their layers for a workspace, without running
 /// `sandbox.env_command` or starting anything.
 pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<SettingsReport> {
     let config = Config::load(paths.clone(), workspace, extra)?;
+    let role = |role| {
+        let model = config.role(role);
+        json!(format!("{}/{}", model.provider, model.model))
+    };
     let values = [
         json!(format!("{}/{}", config.model.provider, config.model.model)),
         json!(config.reasoning),
@@ -47,6 +55,10 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
         json!(config.sandbox.env),
         json!(config.sandbox.env_command),
         json!(config.daemon.idle_exit),
+        json!(config.preset),
+        role(ModelRole::Slow),
+        role(ModelRole::Smol),
+        role(ModelRole::Tiny),
     ];
     let settings = KEYS
         .into_iter()

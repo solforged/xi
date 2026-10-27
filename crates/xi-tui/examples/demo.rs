@@ -278,7 +278,7 @@ async fn main() -> Result<(), xi_tui::Error> {
         xi_client::client::Client::over(reader, writer, "xi-demo").await?;
     let template = CreateParams {
         cwd: workspace,
-        model: Some(config.model),
+        model: Some(config.model.into()),
         options: Default::default(),
     };
     let attached = client.create(template.clone()).await?;

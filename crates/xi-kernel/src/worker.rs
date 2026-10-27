@@ -1,6 +1,6 @@
 //! The worker side of the daemon pipe: one session per worker process.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
+use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
     ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, ChildEvents, Delta, EventAppended,
     EventParams, ModelEntry, ModelsResult, PendingApproval, PromptParams, PromptResult,
@@ -18,7 +19,7 @@ use xi_protocol::methods::client::{
     SetModelParams, SetReasoningParams, StreamDelta, StreamReset,
 };
 use xi_protocol::methods::worker::{LeaseParams, ModelLease, ModelRelease, WorkerStartParams};
-use xi_protocol::model::Reasoning;
+use xi_protocol::model::{ModelRole, Reasoning};
 use xi_protocol::rpc::{RequestId, RpcError};
 use xi_protocol::{Block, Decision, Event, EventId, EventKind, SessionId, ToolCallId};
 use xi_provider::{Auth, LoginService, Registry};
@@ -86,6 +87,8 @@ struct Mirror {
     info: SessionDetails,
     registry: Registry,
     credentials: PathBuf,
+    /// Each role's model; config does not change while the worker runs.
+    roles: BTreeMap<ModelRole, ModelRef>,
     initial_reasoning: Reasoning,
     events: Vec<Event>,
     index: HashMap<EventId, usize>,
@@ -230,7 +233,7 @@ impl Mirror {
             .registry
             .models()
             .map(|info| ModelEntry {
-                model: xi_protocol::event::ModelRef {
+                model: ModelRef {
                     provider: info.provider.clone(),
                     model: info.id.clone(),
                 },
@@ -261,6 +264,7 @@ impl Mirror {
             current: self.info.model.clone(),
             reasoning: self.info.reasoning,
             models,
+            roles: self.roles.clone(),
         }
     }
 
@@ -476,7 +480,7 @@ async fn start(
     validate_options(&options)?;
     let mut config = session_config(&setup.paths, &cwd, &options).map_err(kernel_error)?;
     if let Some(model) = model {
-        config.model = model;
+        config.model = config.resolve(&model);
     }
     let turn = TurnOptions {
         max_turns: options.max_turns.unwrap_or(200),
@@ -556,6 +560,7 @@ async fn start(
         info,
         registry,
         credentials: state.config.paths.credentials(),
+        roles: state.config.resolved_roles(),
         initial_reasoning: state.initial_reasoning,
         events: Vec::with_capacity(state.log.events().len()),
         index: HashMap::new(),
@@ -660,11 +665,12 @@ async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Co
         "session/set_model" => {
             let params: SetModelParams = decode(params)?;
             check_session(&session, params.session)?;
-            session
-                .set_model(params.model)
-                .await
-                .map_err(kernel_error)?;
-            Value::Null
+            encode(
+                session
+                    .set_model(params.model)
+                    .await
+                    .map_err(kernel_error)?,
+            )?
         }
         "session/set_reasoning" => {
             let params: SetReasoningParams = decode(params)?;

@@ -5,6 +5,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::event::ModelRef;
+
 /// How much the model should reason before answering, lowest first. The
 /// names are the union of the providers' effort scales; each model lists
 /// the subset it accepts in [`ModelInfo::reasoning`].
@@ -143,6 +145,152 @@ impl ModelInfo {
     }
 }
 
+/// A model tier that configuration maps to a concrete model, most capable
+/// first. `default` is the session's model unless another is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    /// The most capable model, for the hardest work.
+    Slow,
+    /// The model new sessions start with.
+    Default,
+    /// A faster, cheaper model for routine work.
+    Smol,
+    /// The fastest, cheapest model, for small tasks.
+    Tiny,
+}
+
+impl ModelRole {
+    /// Every role, most capable first.
+    pub const ALL: [Self; 4] = [Self::Slow, Self::Default, Self::Smol, Self::Tiny];
+
+    /// The role's name in config, on the wire and after `@` in selectors.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::Default => "default",
+            Self::Smol => "smol",
+            Self::Tiny => "tiny",
+        }
+    }
+
+    /// The role that stands in when this one has no model: the next tier
+    /// up, and `default` for `slow`. `default` always has a model.
+    #[must_use]
+    pub const fn fallback(self) -> Option<Self> {
+        match self {
+            Self::Slow | Self::Smol => Some(Self::Default),
+            Self::Default => None,
+            Self::Tiny => Some(Self::Smol),
+        }
+    }
+}
+
+impl fmt::Display for ModelRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for ModelRole {
+    type Err = InvalidModel;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|role| role.name() == name)
+            .ok_or_else(|| InvalidModel(format!("@{name}")))
+    }
+}
+
+/// A concrete model, or a role the worker resolves against its config.
+/// Written `PROVIDER/MODEL` or `@ROLE`; on the wire a [`ModelRef`] or
+/// `{"role": ROLE}`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ModelSelector {
+    /// A provider and model id.
+    Model(ModelRef),
+    /// A configured role.
+    Role {
+        /// The role to resolve.
+        role: ModelRole,
+    },
+}
+
+impl From<ModelRef> for ModelSelector {
+    fn from(model: ModelRef) -> Self {
+        Self::Model(model)
+    }
+}
+
+impl From<ModelRole> for ModelSelector {
+    fn from(role: ModelRole) -> Self {
+        Self::Role { role }
+    }
+}
+
+impl fmt::Display for ModelSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model(model) => write!(f, "{}/{}", model.provider, model.model),
+            Self::Role { role } => write!(f, "@{role}"),
+        }
+    }
+}
+
+impl FromStr for ModelSelector {
+    type Err = InvalidModel;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.strip_prefix('@') {
+            Some(role) => Ok(Self::Role {
+                role: role.parse()?,
+            }),
+            None => value.parse().map(Self::Model),
+        }
+    }
+}
+
+impl FromStr for ModelRef {
+    type Err = InvalidModel;
+
+    /// Parses `PROVIDER/MODEL`, keeping slashes inside the model id.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.split_once('/') {
+            Some((provider, model)) if !provider.is_empty() && !model.is_empty() => Ok(Self {
+                provider: provider.into(),
+                model: model.into(),
+            }),
+            _ => Err(InvalidModel(value.into())),
+        }
+    }
+}
+
+/// A selector that is neither `PROVIDER/MODEL` nor a known `@ROLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidModel(pub String);
+
+impl fmt::Display for InvalidModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(role) = self.0.strip_prefix('@') {
+            write!(
+                f,
+                "unknown model role {role:?}; expected slow, default, smol or tiny"
+            )
+        } else {
+            write!(
+                f,
+                "invalid model {:?}; expected PROVIDER/MODEL or @ROLE",
+                self.0
+            )
+        }
+    }
+}
+
+impl std::error::Error for InvalidModel {}
+
 /// Prices in US dollars per million tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +330,50 @@ mod tests {
             assert_eq!(level.name().parse::<Reasoning>(), Ok(level));
         }
         assert!("none".parse::<Reasoning>().is_err());
+    }
+
+    #[test]
+    fn selectors_parse_models_and_roles_and_keep_the_wire() {
+        let model: ModelSelector = "openrouter/meta/llama".parse().unwrap();
+        assert_eq!(
+            serde_json::to_value(&model).unwrap(),
+            serde_json::json!({"provider": "openrouter", "model": "meta/llama"})
+        );
+        assert_eq!(model.to_string(), "openrouter/meta/llama");
+        let role: ModelSelector = "@smol".parse().unwrap();
+        assert_eq!(
+            role,
+            ModelSelector::Role {
+                role: ModelRole::Smol
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&role).unwrap(),
+            serde_json::json!({"role": "smol"})
+        );
+        for selector in [model, role] {
+            let wire = serde_json::to_string(&selector).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ModelSelector>(&wire).unwrap(),
+                selector
+            );
+        }
+        for role in ModelRole::ALL {
+            assert_eq!(format!("@{role}").parse(), Ok(ModelSelector::from(role)));
+        }
+        assert_eq!(
+            "@huge".parse::<ModelSelector>().unwrap_err().to_string(),
+            "unknown model role \"huge\"; expected slow, default, smol or tiny"
+        );
+        for invalid in ["gpt", "/gpt", "openai/", ""] {
+            assert!(invalid.parse::<ModelSelector>().is_err(), "{invalid}");
+        }
+        let roles: std::collections::BTreeMap<ModelRole, u8> =
+            serde_json::from_str(r#"{"tiny": 1, "slow": 2}"#).unwrap();
+        assert_eq!(
+            roles.keys().copied().collect::<Vec<_>>(),
+            [ModelRole::Slow, ModelRole::Tiny]
+        );
     }
 
     #[test]

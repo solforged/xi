@@ -2,12 +2,11 @@ use crossterm::event::KeyEvent;
 use futures::stream::FuturesUnordered;
 use xi_client::client::{ClientError, ClientNotification};
 use xi_protocol::SessionId;
-use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
     AttachResult, EventParams, ListParams, ModelEntry, OpenParams, PendingApproval, SessionSummary,
     SetSettingParams, SettingsParams, SettingsReport,
 };
-use xi_protocol::model::Reasoning;
+use xi_protocol::model::{ModelSelector, Reasoning};
 use xi_protocol::rpc::RpcError;
 
 use crate::approvals::{Approval, Approvals, Choice};
@@ -170,7 +169,7 @@ impl App {
                 ""
             };
             self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
-        } else if self.set_model(entry.model).await {
+        } else if self.set_model(entry.model.into()).await {
             // The model change event records the switch in scrollback.
             self.launch.attached.info.model_info = Some(entry.info);
             self.overlays.close::<Picker>();
@@ -448,17 +447,14 @@ impl App {
         }
     }
 
-    pub(crate) async fn set_model(&mut self, model: ModelRef) -> bool {
+    /// Selects a model or role; the worker answers with the model a role
+    /// resolved to, which the footer shows until the next attach.
+    pub(crate) async fn set_model(&mut self, model: ModelSelector) -> bool {
         if !self.idle_only("model selection") {
             return false;
         }
-        match self
-            .launch
-            .client
-            .set_model(self.session_id(), model.clone())
-            .await
-        {
-            Ok(()) => {
+        match self.launch.client.set_model(self.session_id(), model).await {
+            Ok(model) => {
                 self.launch.attached.info.model = model;
                 self.launch.attached.info.model_info = None;
                 self.refresh = true;

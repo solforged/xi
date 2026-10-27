@@ -74,6 +74,7 @@ pub fn registry(
             }
             .into(),
         ],
+        ..Default::default()
     });
     registry
 }

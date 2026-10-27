@@ -27,6 +27,7 @@ impl Registry {
     /// Adds or overrides providers and models from a config layer.
     pub fn extend(&mut self, config: RegistryConfig) {
         self.providers.extend(config.provider);
+        self.presets.extend(config.preset);
         for model in config.model {
             if let Some(existing) = self.models.iter_mut().find(|existing| {
                 existing.info.provider == model.info.provider && existing.info.id == model.info.id
@@ -50,6 +51,17 @@ impl Registry {
     /// All known models.
     pub fn models(&self) -> impl Iterator<Item = &ModelInfo> {
         self.models.iter().map(|entry| &entry.info)
+    }
+
+    /// A role preset by name.
+    #[must_use]
+    pub fn preset(&self, name: &str) -> Option<&Preset> {
+        self.presets.get(name)
+    }
+
+    /// Preset names in order.
+    pub fn presets(&self) -> impl Iterator<Item = &str> {
+        self.presets.keys().map(String::as_str)
     }
 
     /// Connection settings for a provider key.

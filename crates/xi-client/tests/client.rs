@@ -13,7 +13,7 @@ use xi_protocol::ids::{EventId, SessionId, Timestamp};
 use xi_protocol::manifest::CommandSpec;
 use xi_protocol::methods::client::*;
 use xi_protocol::methods::extension::CommandResult;
-use xi_protocol::model::{ModelInfo, Reasoning};
+use xi_protocol::model::{ModelInfo, ModelRole, Reasoning};
 use xi_protocol::rpc::{RequestId, RequestMethod, RpcError};
 use xi_rpc::{Incoming, Peer, PeerError};
 
@@ -122,7 +122,7 @@ async fn initializes_first_and_sends_typed_create_prompt_and_approval_requests()
     let session = attached.info.session;
     let create = CreateParams {
         cwd: attached.info.cwd.clone(),
-        model: Some(attached.info.model.clone()),
+        model: Some(attached.info.model.clone().into()),
         options: SessionOptions {
             max_turns: Some(12),
             ..Default::default()
@@ -288,12 +288,15 @@ async fn routes_remaining_typed_requests() {
     );
     let model = attached.info.model;
     exchange!(
-        client.set_model(session, model.clone()),
+        client.set_model(session, ModelRole::Smol),
         SessionSetModel,
         &daemon,
         &mut incoming,
-        SetModelParams { session, model },
-        ()
+        SetModelParams {
+            session,
+            model: ModelRole::Smol.into()
+        },
+        model
     );
     exchange!(
         client.set_reasoning(session, Reasoning::High),
@@ -318,6 +321,7 @@ async fn routes_remaining_typed_requests() {
                 model: "model".into()
             },
             reasoning: Reasoning::High,
+            roles: Default::default(),
             models: vec![ModelEntry {
                 model: ModelRef {
                     provider: "test".into(),

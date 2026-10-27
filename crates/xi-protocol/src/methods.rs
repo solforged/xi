@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::content::{Block, ToolOutput};
 use crate::event::{Event, ModelRef, Remember, Usage};
 use crate::ids::{EventId, SessionId, Timestamp, ToolCallId};
-use crate::model::{ModelInfo, Reasoning};
+use crate::model::{ModelInfo, ModelRole, ModelSelector, Reasoning};
 use crate::rpc::{NotificationMethod, RequestMethod};
 
 macro_rules! request {
@@ -93,8 +93,9 @@ pub mod client {
         SessionClose, "session/close", SessionRef => ()
     );
     request!(
-        /// Client → daemon: select a session's model.
-        SessionSetModel, "session/set_model", SetModelParams => ()
+        /// Client → daemon: select a session's model, returning the
+        /// concrete model a role resolved to.
+        SessionSetModel, "session/set_model", SetModelParams => ModelRef
     );
     request!(
         /// Client → daemon: select a session's reasoning depth.
@@ -321,9 +322,9 @@ pub mod client {
     pub struct CreateParams {
         /// Workspace root.
         pub cwd: PathBuf,
-        /// Model to start with; the configured default when absent.
+        /// Model or role to start with; the `default` role when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub model: Option<ModelRef>,
+        pub model: Option<ModelSelector>,
         /// Per-invocation settings.
         #[serde(default)]
         pub options: SessionOptions,
@@ -465,8 +466,8 @@ pub mod client {
     pub struct SetModelParams {
         /// Session to update.
         pub session: SessionId,
-        /// Model to select.
-        pub model: ModelRef,
+        /// Model or role to select.
+        pub model: ModelSelector,
     }
 
     /// Parameters for [`SessionSetReasoning`].
@@ -487,6 +488,9 @@ pub mod client {
         pub reasoning: Reasoning,
         /// Models sorted by provider and model id.
         pub models: Vec<ModelEntry>,
+        /// The model each role resolves to, after fallbacks.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        pub roles: std::collections::BTreeMap<ModelRole, ModelRef>,
     }
 
     /// Public metadata and credential availability for one model.
@@ -944,9 +948,9 @@ pub mod extension {
         /// are never offered to a child, so subagents do not nest.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tools: Option<Vec<String>>,
-        /// Model for the child; the parent's when absent.
+        /// Model or role for the child; the parent's model when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub model: Option<ModelRef>,
+        pub model: Option<ModelSelector>,
     }
 
     /// Result of [`AgentRun`].
@@ -1089,7 +1093,7 @@ mod tests {
     #[test]
     fn reasoning_models_and_commands_wire_shapes() {
         use crate::manifest::CommandSpec;
-        use crate::model::{ModelInfo, Reasoning};
+        use crate::model::{ModelInfo, ModelRole, Reasoning};
 
         let session = SessionId::generate();
         let params = SetReasoningParams {
@@ -1110,9 +1114,10 @@ mod tests {
             provider: "test".into(),
             model: "m".into(),
         };
-        let models = ModelsResult {
+        let mut models = ModelsResult {
             current: model.clone(),
             reasoning: Reasoning::High,
+            roles: [(ModelRole::Default, model.clone())].into(),
             models: vec![ModelEntry {
                 model,
                 info: ModelInfo {
@@ -1126,8 +1131,9 @@ mod tests {
                 available: false,
             }],
         };
-        let wire = json!({
+        let mut wire = json!({
             "current": {"provider": "test", "model": "m"}, "reasoning": "high",
+            "roles": {"default": {"provider": "test", "model": "m"}},
             "models": [{
                 "model": {"provider": "test", "model": "m"},
                 "info": {
@@ -1139,8 +1145,15 @@ mod tests {
         });
         assert_eq!(serde_json::to_value(&models).unwrap(), wire);
         assert_eq!(
-            serde_json::from_value::<ModelsResult>(wire).unwrap(),
+            serde_json::from_value::<ModelsResult>(wire.clone()).unwrap(),
             models
+        );
+        wire.as_object_mut().unwrap().remove("roles");
+        models.roles.clear();
+        assert_eq!(
+            serde_json::from_value::<ModelsResult>(wire).unwrap(),
+            models,
+            "older workers send no roles"
         );
         for (request, method) in [
             (

@@ -130,7 +130,7 @@ Client → daemon requests:
 | Method | Params → result | Purpose |
 |---|---|---|
 | `initialize` | `{protocol_version, client: {name, version}}` → `{protocol_version, daemon_version, capabilities: {private}}` | Initialize the connection and require the exact protocol version. `private` is true when the daemon has no listener. |
-| `session/create` | `{cwd, model?, options}` → attach result | Spawn a worker and attach the caller. |
+| `session/create` | `{cwd, model?, options}` → attach result | Spawn a worker and attach the caller. `model` is a `ModelRef` or `{role}`; absent means the `default` role. |
 | `session/open` | `{path, options}` → attach result | Spawn a worker for an existing log. If a live worker holds the same canonical path, fail with -32005 and return its session id so the client can attach instead. |
 | `session/attach` | `{session, since?}` → `{info, events, partial, running, pending_approvals, stream_sequence, children}` | Subscribe the connection to the session's notifications. `since` is the last event id the client already has; `events` contains the events after it on disk, or the whole log without `since`. `partial` contains in-flight assistant blocks not yet persisted. `children` holds the `agent/run` children started since the session's last tool result, each `{session, events}` from its root, in start order. |
 | `session/detach` | `{session}` → null | Unsubscribe; the turn keeps running. |
@@ -140,9 +140,9 @@ Client → daemon requests:
 | `session/cancel` | `{session}` → null | Route to the worker; stop the running turn. |
 | `session/checkout` | `{session, event}` → null | Route to the worker; move the head to an earlier event to branch. Idle only. |
 | `session/compact` | `{session}` → `{head, tokens_before}` | Route to the worker; summarize older context at an idle prompt. |
-| `session/set_model` | `{session, model}` → null | Idle only; record `model_changed`. |
+| `session/set_model` | `{session, model}` → `ModelRef` | Idle only. `model` is a `ModelRef` or `{role}`. Resolve a role, record `model_changed` with the concrete model when it changes, and return it. |
 | `session/set_reasoning` | `{session, reasoning}` → null | Idle only; record `reasoning_changed` when the level changes. A model that reasons must list the level, or the request fails with the levels it accepts. Reopening a log restores the last level on the head's lineage. Models without reasoning keep the setting and ignore it. |
-| `session/models` | `{session}` → `{current, reasoning, models: [{model, info, available}]}` | Route to the worker; list the session's model registry with `ModelInfo`. `available` is false when the provider's credential is missing. No credential value is ever returned. |
+| `session/models` | `{session}` → `{current, reasoning, roles, models: [{model, info, available}]}` | Route to the worker; list the session's model registry with `ModelInfo`. `roles` maps each [model role](#model-roles) to its model after fallbacks. `available` is false when the provider's credential is missing. No credential value is ever returned. |
 | `session/commands` | `{session}` → `[{name, description}]` | Route to the worker; list the session's extension slash commands for completion. |
 | `session/command` | `{session, name, args}` → command result or null | Route an extension slash command to the worker. The result is the extension protocol's `CommandResult`; null means an unknown command. |
 | `approval/list` | `{}` → `[{session, call, tool, action, rule, taint, trusted}]` | Return pending asks across all sessions. `taint` marks an ask that taint caused; `trusted` is whether the session's workspace is trusted. Clients use both to choose which approval scopes to offer. |
@@ -246,7 +246,7 @@ Each worker owns its session's extension host and supervisor. It starts the conf
 
 Stdio carries full-duplex NDJSON JSON-RPC. A reader routes responses independently from extension requests, so several `agent/run` requests can run while `tool/invoke` is pending. Requests reach the session in the order the extension sent them, so concurrent children start, and are numbered, in that order. The turn owner services `session/append_custom` without reacquiring its session lock. Every extension has a stderr and diagnostic log beside the first session that loaded it. Crashes are logged and the call returns an error result. Turn cancellation cancels child sessions and stops the extension's process group, so no cancelled invocation keeps changing the workspace. This affects only the owning session; it cannot stop an extension serving another session. A stopped extension starts again on its next use: the next turn, command or compaction. Normal worker exit sends `shutdown`, closes the connection, terminates descendants and reaps the process. The SDK also accepts `$/cancelRequest` for cooperative `AbortSignal` handling.
 
-`agent/run` requires `subagents = true`. Children have fresh logs in the parent's session directory with `parent_session` set, the same workspace and sandbox configuration, and the parent's built-in tools or a requested subset of them. Unknown or extension tool names fail. Children never load extensions, so they cannot delegate further. Approval asks are recorded and denied headlessly. The result contains the final text, failure flag and usage summed across child requests. Children share files, so callers must assign disjoint edit scopes.
+`agent/run` requires `subagents = true`. Children have fresh logs in the parent's session directory with `parent_session` set, the same workspace and sandbox configuration, and the parent's built-in tools or a requested subset of them. `model`, a `ModelRef` or `{role}` resolved against the parent's config, picks the child's model; the parent's current model is the default. Unknown or extension tool names fail. Children never load extensions, so they cannot delegate further. Approval asks are recorded and denied headlessly. The result contains the final text, failure flag and usage summed across child requests. Children share files, so callers must assign disjoint edit scopes.
 
 Compaction runs `compact` hooks before its own summary request. The last summary an extension supplies replaces the kernel's, and the `compaction` event then records no usage.
 
@@ -263,6 +263,31 @@ The built-in Anthropic catalog includes Fable 5.1, Opus 5.5, Sonnet 5.5 and [Hai
 Code grows per wire API (Anthropic Messages, OpenAI-compatible Chat, OpenAI Responses), not per provider. A new provider that speaks one of them is a `[provider.<name>]` table. Its differences go in `compat`, named for the behavior rather than the vendor: `output_limit`, `session_header` and `responses_lite`. A `[[model]]` table may set its own `compat`, which overrides the provider's one field at a time. These settings stay in the provider crate, so the protocol's model metadata carries none of them. The credential source is `auth`: an environment variable, a `0600` file, or `{ login = "chatgpt" }` / `{ login = "anthropic" }` for tokens from `xi login`. Each one signs requests through the same interface, which may refresh the credential once after a 401.
 
 Reasoning levels are one ordered scale, the union of the providers' effort names: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`. Each `[[model]]` lists the levels it accepts in `reasoning`, for example `reasoning = ["low", "medium", "high", "xhigh", "max"]`; an empty or missing list means the model doesn't reason. `off` is listed only when the model can stop reasoning, so models that always think leave it out. The session keeps the level the user chose and each request runs at the model's nearest accepted level: the closest one below, never `off` unless `off` was chosen, else the closest one above. A config default or `--reasoning` therefore carries across models, and switching back restores the chosen level. Adapters reject a level the model doesn't list before sending anything. Each wire API maps a level to its own field: Chat and Responses send the name as `reasoning_effort` or `reasoning.effort` (`off` as `none`), current Claude models send it as `output_config.effort`, and older Claude models turn it into a thinking budget.
+
+#### Model roles
+
+Four roles name a model by tier instead of by id, most capable first: `slow`, `default`, `smol` and `tiny`. `@ROLE` works wherever `PROVIDER/MODEL` does: `--model` and `/model`. On the wire a selector is a `ModelRef` or `{"role": "smol"}`. The worker resolves it against its own config, and `model_changed` records the concrete model, so reopening a log never depends on the current roles.
+
+A preset fills all four roles from one lab's lineup. Presets are `[preset.<name>]` tables in the built-in registry file, beside the models they name:
+
+| Preset | `slow` | `default` | `smol` | `tiny` |
+|---|---|---|---|---|
+| `chatgpt` | `gpt-6-astra` | `gpt-6.1-sol` | `gpt-6.1-terra` | `gpt-6-luna` |
+| `anthropic`, `claude` | `claude-fable-5-1` | `claude-opus-5-5` | `claude-sonnet-5-5` | `claude-haiku-5-5` |
+
+Presets are named after providers, not labs, because the provider decides the credential: `anthropic` uses the API key and `claude` the subscription. OpenAI's four-model lineup exists only on the ChatGPT plan, so there is no `openai` preset.
+
+```toml
+preset = "claude"
+default_model = "claude/claude-sonnet-5-5" # optional; sets the default role
+
+[roles]
+tiny = "anthropic/claude-haiku-5-5"
+```
+
+Within each config layer, `preset` applies first and replaces every role. `[roles]` (`slow`, `smol` and `tiny`) and `default_model` then replace single roles. A later layer's `preset` therefore replaces roles that earlier layers set, including a global `default_model`. Role values are concrete `PROVIDER/MODEL` strings, never other roles. A role without a model uses the next tier up: `tiny` falls back to `smol`, and `smol` and `slow` fall back to `default`. Without a preset, every role is the default model. Nothing selects a role by itself.
+
+The settings report lists `preset`, `roles.slow`, `roles.smol` and `roles.tiny` as read only, each role with its model after fallbacks. A preset counts as the source of every role it set, and of `default_model`, until a later entry replaces them.
 
 ### Instructions (`AGENTS.md`)
 
@@ -366,7 +391,7 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 | `/new` | Start a session in the same workspace. |
 | `/resume` | Open the session picker. |
 | `/tree` | Open the branch overlay and check out an earlier point. |
-| `/model [PROVIDER/MODEL]` | Switch model; without an argument, open the model picker. |
+| `/model [PROVIDER/MODEL \| @ROLE]` | Switch model; without an argument, open the model picker. A role prints the model it resolved to in line mode. |
 | `/reasoning [LEVEL]` | Set reasoning and save it as the global default; without an argument, show it and the levels the model accepts. |
 | `/layout [inline\|deck\|auto]` | Change and save the client layout; without an argument, show the choice, tier and pane size. |
 | `/compact` | Summarize older context now. |
@@ -392,7 +417,7 @@ While a frame holds the keys, the composer collapses to one dim line with the dr
 
 | Overlay | Opens with | Contents and keys |
 |---|---|---|
-| Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider under headings that scroll with them: id, then context window, a reasoning mark and price per million input and output tokens at the right. `●` marks the current model. Models without credentials are dimmed with the way to add one. Typing filters on a head row that holds the cursor, `enter` selects, `esc` closes. |
+| Model picker | `alt+m`, `/model` | Models from `session/models`, grouped by provider under headings that scroll with them: id, then the roles that resolve to it such as `@smol @tiny`, context window, a reasoning mark and price per million input and output tokens at the right. `●` marks the current model. Models without credentials are dimmed with the way to add one. Typing filters on a head row that holds the cursor and matches ids and role tags, `enter` selects, `esc` closes. |
 | History search | `ctrl+r` | The query on a head row, then every match, this workspace first and newest first, with the match underlined. `ctrl+r` or `down` moves to older matches, `up` to newer. |
 | Session picker | `/resume` | `session/list` for this workspace, `tab` for all workspaces with each session's workspace: first prompt, then model and age at the right. `●` marks this session, `?` one waiting on you and a spinner one that is running, newest first. Child sessions are hidden. Typing filters on prompt and workspace. `enter` attaches to a live session or opens a saved one, and attaches instead when another worker already holds the log. A running turn keeps running in its worker after you switch away; `/resume` waits only while prompts are queued, since those exist only in the TUI. |
 | Approvals | `tab`, `/approvals` | One ask at a time: its action in bold, then its tool, rule and workspace, the answers and a note on what the selected one does. `1`/`y` allows once, `2` allows for this session, `3` always allows in this workspace, `4`/`n` denies; `up`, `down` and `enter` choose too. Scopes that do not apply are hidden and their keys do nothing. The frame turns murex for an ask on a tainted branch. A new ask opens the frame only when no overlay is open and the composer is empty; otherwise it waits on the status line, and `tab` opens it over whatever is open. Inside the frame `tab` walks to the next waiting ask, and the top border counts them. `esc` leaves the ask waiting. `/approvals` shows the inbox from `approval/list`: this session's asks first, then other sessions' oldest first, each labeled with its session and workspace. |
@@ -600,6 +625,7 @@ The subscription profile stays inside the Anthropic Messages adapter. It uses Cl
 - Compaction: automatic compaction off; a context overflow always compacts once and retries. The summary is structured (goal, decisions, touched files, open work) and visible as a `compaction` event.
 - Approvals: preset `ask`, so every boundary crossing without a rule asks.
 - TUI: differential rendering into the terminal's native scrollback.
+- Model roles: no preset, so every role is `chatgpt/gpt-6.1-sol` until `preset`, `[roles]` or `default_model` says otherwise.
 - Config: one TOML format, layered global, project, local.
 
 ## Crate map
