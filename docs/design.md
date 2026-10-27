@@ -117,6 +117,8 @@ The log doubles as the audit trail (policy decisions and approvals are events), 
 
 All links use newline-delimited JSON (NDJSON), with one JSON-RPC 2.0 message per line. Types live in `xi-protocol`, with one marker type per method, following the pattern of `lsp-types`.
 
+Receiving dispatch uses the markers' method constants. `xi-rpc` decodes request and notification parameters and encodes request results through those markers. Request decoding and result encoding are separate so handlers can queue delayed replies without changing dispatch order. The daemon forwards session calls and their results unchanged to workers. It reads routing and attachment metadata, while workers own full request decoding and result encoding.
+
 | Link | Transport |
 |---|---|
 | Client ↔ daemon | Unix stream socket; in-memory duplex for private clients, or stdio for `xi serve` |

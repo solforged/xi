@@ -15,6 +15,35 @@ use xi_protocol::rpc::{
 
 type Reply = oneshot::Sender<Result<Value, PeerError>>;
 
+/// Decodes incoming request parameters using the method's protocol type.
+///
+/// # Errors
+/// Returns [`RpcError::INVALID_PARAMS`] if the parameters cannot be decoded.
+pub fn decode_request<M: RequestMethod>(params: Value) -> Result<M::Params, RpcError> {
+    serde_json::from_value(params)
+        .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))
+}
+
+/// Encodes an incoming request's result using the method's protocol type.
+///
+/// This is separate from decoding so handlers can queue or spawn delayed replies.
+///
+/// # Errors
+/// Returns [`RpcError::INTERNAL_ERROR`] if the result cannot be encoded.
+pub fn encode_result<M: RequestMethod>(result: M::Result) -> Result<Value, RpcError> {
+    serde_json::to_value(result)
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))
+}
+
+/// Decodes incoming notification parameters using the method's protocol type.
+///
+/// # Errors
+/// Returns [`RpcError::INVALID_PARAMS`] if the parameters cannot be decoded.
+pub fn decode_notification<M: NotificationMethod>(params: Value) -> Result<M::Params, RpcError> {
+    serde_json::from_value(params)
+        .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))
+}
+
 /// A full-duplex NDJSON JSON-RPC 2.0 connection. Cheap to clone.
 #[derive(Clone)]
 pub struct Peer {

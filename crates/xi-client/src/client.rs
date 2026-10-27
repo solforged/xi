@@ -16,7 +16,7 @@ use xi_protocol::model::{ModelSelector, Reasoning};
 use xi_protocol::rpc::{NotificationMethod, RequestMethod, RpcError};
 
 use crate::connect;
-use xi_rpc::{Incoming, Peer, PeerError};
+use xi_rpc::{Incoming, Peer, PeerError, decode_notification};
 
 /// A negotiated daemon connection. Clones share the connection and its identity.
 ///
@@ -354,24 +354,20 @@ async fn route(
                 );
             }
             Incoming::Notification { method, params } => {
-                let notification = match method.as_str() {
-                    EventAppended::METHOD => {
-                        serde_json::from_value(params).map(ClientNotification::Event)
-                    }
-                    StreamDelta::METHOD => {
-                        serde_json::from_value(params).map(ClientNotification::Delta)
-                    }
-                    StreamReset::METHOD => {
-                        serde_json::from_value(params).map(ClientNotification::Reset)
-                    }
-                    SessionExited::METHOD => {
-                        serde_json::from_value(params).map(ClientNotification::Exited)
-                    }
-                    ApprovalPending::METHOD => {
-                        serde_json::from_value(params).map(ClientNotification::ApprovalPending)
-                    }
-                    _ => continue,
-                };
+                let notification =
+                    match method.as_str() {
+                        EventAppended::METHOD => decode_notification::<EventAppended>(params)
+                            .map(ClientNotification::Event),
+                        StreamDelta::METHOD => decode_notification::<StreamDelta>(params)
+                            .map(ClientNotification::Delta),
+                        StreamReset::METHOD => decode_notification::<StreamReset>(params)
+                            .map(ClientNotification::Reset),
+                        SessionExited::METHOD => decode_notification::<SessionExited>(params)
+                            .map(ClientNotification::Exited),
+                        ApprovalPending::METHOD => decode_notification::<ApprovalPending>(params)
+                            .map(ClientNotification::ApprovalPending),
+                        _ => continue,
+                    };
                 if let Ok(notification) = notification {
                     let _ = notifications.send(notification);
                 }

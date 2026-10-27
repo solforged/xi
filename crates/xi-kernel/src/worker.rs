@@ -5,7 +5,6 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -13,17 +12,20 @@ use tokio::task::JoinSet;
 use xi_protocol::BoxFuture;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
-    ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, ChildEvents, Delta, EventAppended,
-    EventParams, ModelEntry, ModelsResult, PendingApproval, PromptParams, PromptResult,
-    RenameParams, ResolveParams, SessionCommandParams, SessionDetails, SessionOptions, SessionRef,
-    SetModelParams, SetReasoningParams, SetSandboxParams, StreamDelta, StreamReset,
+    ApprovalPolicy, ApprovalResolve, AttachResult, ChildEvents, Delta, EventAppended, EventParams,
+    ModelEntry, ModelsResult, PendingApproval, PromptResult, SessionAttach, SessionCancel,
+    SessionCheckout, SessionClose, SessionCommand, SessionCommands, SessionCompact, SessionDetails,
+    SessionModels, SessionOptions, SessionPrompt, SessionRename, SessionSetModel,
+    SessionSetReasoning, SessionSetSandbox, StreamDelta, StreamReset,
 };
-use xi_protocol::methods::worker::{LeaseParams, ModelLease, ModelRelease, WorkerStartParams};
+use xi_protocol::methods::worker::{
+    LeaseParams, ModelLease, ModelRelease, WorkerStart, WorkerStartParams,
+};
 use xi_protocol::model::{ModelRole, Reasoning};
-use xi_protocol::rpc::{RequestId, RpcError};
+use xi_protocol::rpc::{RequestId, RequestMethod, RpcError};
 use xi_protocol::{Block, Decision, Event, EventId, EventKind, SessionId, ToolCallId};
 use xi_provider::{Auth, LoginService, Registry};
-use xi_rpc::{Incoming, Peer};
+use xi_rpc::{Incoming, Peer, decode_request, encode_result};
 use xi_session::SessionLog;
 
 use crate::config::{Config, Paths};
@@ -274,7 +276,7 @@ impl Mirror {
         }
     }
 
-    fn attach(&self, since: Option<EventId>, running: bool) -> RpcResult<Value> {
+    fn attach(&self, since: Option<EventId>, running: bool) -> RpcResult<AttachResult> {
         let start =
             match since {
                 Some(id) => self.index.get(&id).map(|index| index + 1).ok_or_else(|| {
@@ -282,7 +284,7 @@ impl Mirror {
                 })?,
                 None => 0,
             };
-        encode(AttachResult {
+        Ok(AttachResult {
             info: self.info.clone(),
             events: self.events[start..].to_vec(),
             partial: self.partial.clone(),
@@ -296,7 +298,7 @@ impl Mirror {
 
 enum Completion {
     Value(Value),
-    Checkout(EventId),
+    Checkout { head: EventId, value: Value },
 }
 
 /// Serves one session over a daemon pipe until the session closes or the pipe ends.
@@ -327,13 +329,13 @@ where
                 };
                 drain(&mut notifications, &mut worker, &peer);
                 let Some(active) = worker.as_mut() else {
-                    if method != "worker/start" {
+                    if method != WorkerStart::METHOD {
                         let _ = peer.respond(id, Err(RpcError::new(
                             RpcError::NOT_INITIALIZED, "worker/start is required",
                         )));
                         continue;
                     }
-                    let result = match decode(params) {
+                    let result = match decode_request::<WorkerStart>(params) {
                         Ok(params) => start(params, &mut setup, &peer, &bus).await,
                         Err(error) => Err(error),
                     };
@@ -342,7 +344,7 @@ where
                             worker = Some(active);
                             drain(&mut notifications, &mut worker, &peer);
                             worker.as_ref().expect("worker was just started")
-                                .mirror.attach(None, false)
+                                .mirror.attach(None, false).and_then(encode_result::<WorkerStart>)
                         }
                         Err(error) => Err(error),
                     };
@@ -350,31 +352,35 @@ where
                     continue;
                 };
                 match method.as_str() {
-                    "session/models" | "session/commands" => {
-                        let result = decode::<SessionRef>(params).and_then(|params| {
+                    SessionModels::METHOD => {
+                        let result = decode_request::<SessionModels>(params).and_then(|params| {
                             check_session(&active.session, params.session)?;
-                            if method == "session/models" {
-                                encode(active.mirror.models())
-                            } else {
-                                encode(active.session.commands())
-                            }
+                            encode_result::<SessionModels>(active.mirror.models())
                         });
                         let _ = peer.respond(id, result);
                     }
-                    "session/attach" => {
-                        let result = decode::<AttachParams>(params).and_then(|params| {
+                    SessionCommands::METHOD => {
+                        let result = decode_request::<SessionCommands>(params).and_then(|params| {
+                            check_session(&active.session, params.session)?;
+                            encode_result::<SessionCommands>(active.session.commands())
+                        });
+                        let _ = peer.respond(id, result);
+                    }
+                    SessionAttach::METHOD => {
+                        let result = decode_request::<SessionAttach>(params).and_then(|params| {
                             check_session(&active.session, params.session)?;
                             active.mirror.attach(params.since, active.session.is_running())
+                                .and_then(encode_result::<SessionAttach>)
                         });
                         let _ = peer.respond(id, result);
                     }
-                    "session/close" => {
-                        let result = decode::<SessionRef>(params).and_then(|params| {
+                    SessionClose::METHOD => {
+                        let result = decode_request::<SessionClose>(params).and_then(|params| {
                             check_session(&active.session, params.session)?;
                             if active.session.is_running() {
                                 return Err(kernel_error(Error::Running));
                             }
-                            Ok(Value::Null)
+                            encode_result::<SessionClose>(())
                         });
                         let close = result.is_ok();
                         let _ = peer.respond(id, result);
@@ -382,8 +388,8 @@ where
                             break true;
                         }
                     }
-                    "session/prompt" => {
-                        let prompt = decode::<PromptParams>(params).and_then(|params| {
+                    SessionPrompt::METHOD => {
+                        let prompt = decode_request::<SessionPrompt>(params).and_then(|params| {
                             check_session(&active.session, params.session)?;
                             Ok(active.session.submit(params.content))
                         });
@@ -396,7 +402,7 @@ where
                                                 "turn task stopped".into(),
                                             )))?
                                             .map_err(|error| kernel_error(Error::Config(error)))?;
-                                        Ok(Completion::Value(encode(PromptResult {
+                                        Ok(Completion::Value(encode_result::<SessionPrompt>(PromptResult {
                                             head: outcome.head,
                                             failed: outcome.failed,
                                             cancelled: outcome.cancelled,
@@ -424,11 +430,11 @@ where
                     drain(&mut notifications, &mut worker, &peer);
                     let result = result.map(|completion| match completion {
                         Completion::Value(value) => value,
-                        Completion::Checkout(head) => {
+                        Completion::Checkout { head, value } => {
                             if let Some(active) = worker.as_mut() {
                                 active.mirror.checkout(head);
                             }
-                            Value::Null
+                            value
                         }
                     });
                     let _ = peer.respond(id, result);
@@ -451,7 +457,7 @@ where
             drain(&mut notifications, &mut worker, &peer);
             let result = result.map(|completion| match completion {
                 Completion::Value(value) => value,
-                Completion::Checkout(_) => Value::Null,
+                Completion::Checkout { value, .. } => value,
             });
             let _ = peer.respond(id, result);
         }
@@ -656,74 +662,77 @@ fn session_config(paths: &Paths, cwd: &Path, options: &SessionOptions) -> Result
 
 async fn dispatch(session: Session, method: &str, params: Value) -> RpcResult<Completion> {
     let value = match method {
-        "session/cancel" => {
-            let params: SessionRef = decode(params)?;
+        SessionCancel::METHOD => {
+            let params = decode_request::<SessionCancel>(params)?;
             check_session(&session, params.session)?;
             session.cancel();
-            Value::Null
+            encode_result::<SessionCancel>(())?
         }
-        "session/checkout" => {
-            let params: CheckoutParams = decode(params)?;
+        SessionCheckout::METHOD => {
+            let params = decode_request::<SessionCheckout>(params)?;
             check_session(&session, params.session)?;
             session.checkout(params.event).await.map_err(kernel_error)?;
-            return Ok(Completion::Checkout(params.event));
+            return Ok(Completion::Checkout {
+                head: params.event,
+                value: encode_result::<SessionCheckout>(())?,
+            });
         }
-        "session/compact" => {
-            let params: SessionRef = decode(params)?;
+        SessionCompact::METHOD => {
+            let params = decode_request::<SessionCompact>(params)?;
             check_session(&session, params.session)?;
-            encode(session.compact().await.map_err(kernel_error)?)?
+            encode_result::<SessionCompact>(session.compact().await.map_err(kernel_error)?)?
         }
-        "session/set_model" => {
-            let params: SetModelParams = decode(params)?;
+        SessionSetModel::METHOD => {
+            let params = decode_request::<SessionSetModel>(params)?;
             check_session(&session, params.session)?;
-            encode(
+            encode_result::<SessionSetModel>(
                 session
                     .set_model(params.model)
                     .await
                     .map_err(kernel_error)?,
             )?
         }
-        "session/set_reasoning" => {
-            let params: SetReasoningParams = decode(params)?;
+        SessionSetReasoning::METHOD => {
+            let params = decode_request::<SessionSetReasoning>(params)?;
             check_session(&session, params.session)?;
             session
                 .set_reasoning(params.reasoning)
                 .await
                 .map_err(kernel_error)?;
-            Value::Null
+            encode_result::<SessionSetReasoning>(())?
         }
-        "session/set_sandbox" => {
-            let params: SetSandboxParams = decode(params)?;
+        SessionSetSandbox::METHOD => {
+            let params = decode_request::<SessionSetSandbox>(params)?;
             check_session(&session, params.session)?;
             session
                 .set_sandbox(params.enabled)
                 .await
                 .map_err(kernel_error)?;
-            Value::Null
+            encode_result::<SessionSetSandbox>(())?
         }
-        "session/rename" => {
-            let params: RenameParams = decode(params)?;
+        SessionRename::METHOD => {
+            let params = decode_request::<SessionRename>(params)?;
             check_session(&session, params.session)?;
             session.rename(&params.title).await.map_err(kernel_error)?;
-            Value::Null
+            encode_result::<SessionRename>(())?
         }
-        "session/command" => {
-            let params: SessionCommandParams = decode(params)?;
+        SessionCommand::METHOD => {
+            let params = decode_request::<SessionCommand>(params)?;
             check_session(&session, params.session)?;
-            encode(
+            encode_result::<SessionCommand>(
                 session
                     .command(&params.name, &params.args)
                     .await
                     .map_err(kernel_error)?,
             )?
         }
-        "approval/resolve" => {
-            let params: ResolveParams = decode(params)?;
+        ApprovalResolve::METHOD => {
+            let params = decode_request::<ApprovalResolve>(params)?;
             check_session(&session, params.session)?;
             session
                 .approve(&params.call, params.approved, params.remember)
                 .map_err(kernel_error)?;
-            Value::Null
+            encode_result::<ApprovalResolve>(())?
         }
         _ => {
             return Err(RpcError::new(
@@ -788,16 +797,6 @@ fn check_session(session: &Session, id: SessionId) -> RpcResult<()> {
         return Err(RpcError::new(RpcError::UNKNOWN_SESSION, "unknown session"));
     }
     Ok(())
-}
-
-fn decode<T: DeserializeOwned>(params: Value) -> RpcResult<T> {
-    serde_json::from_value(params)
-        .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))
-}
-
-fn encode<T: Serialize>(value: T) -> RpcResult<Value> {
-    serde_json::to_value(value)
-        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))
 }
 
 fn kernel_error(error: Error) -> RpcError {
