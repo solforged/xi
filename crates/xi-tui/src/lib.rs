@@ -59,7 +59,7 @@ use crate::editor::Editor;
 use crate::history::History;
 use crate::keys::Keymap;
 use crate::overlay::Overlays;
-use crate::screen::Screen;
+use crate::screen::{Screen, Settle};
 use crate::style::{Line, Role};
 use crate::transcript::{Transcript, duration, tokens};
 
@@ -177,6 +177,7 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     app.initialize().await;
     let mut raw = Some(Raw::enter()?);
     let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
+    let mut settle = Settle::new(cols);
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     let mut git_tick = tokio::time::interval(Duration::from_secs(1));
@@ -219,13 +220,22 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
         if app.inbox_refresh {
             app.refresh_inbox().await;
         }
-        // The terminal may have reflowed since the last resize event, so the
-        // rewind counts rows at the width it has now.
-        if let Ok((c, _)) = crossterm::terminal::size() {
-            screen.resize(usize::from(c));
-        }
         app.git.refresh(&app.launch.attached.info.cwd).await;
-        app.draw(&mut screen)?;
+        // Use one current size for layout and cursor tracking. Queued resize
+        // events can describe an older size while the window is being dragged.
+        // Frames wait until the width settles: a frame read after a further
+        // resize would rewind short and leave a copy of the live region.
+        if let Ok((c, r)) = crossterm::terminal::size() {
+            app.cols = usize::from(c).max(20);
+            app.rows = usize::from(r).max(4);
+            if settle.ready(c, Instant::now()) {
+                screen.resize(usize::from(c));
+                app.draw(&mut screen)?;
+            }
+        } else {
+            app.draw(&mut screen)?;
+        }
+        let settled = settle.deadline().map(tokio::time::Instant::from_std);
         tokio::select! {
             // The worker sends a turn's last events before its reply.
             biased;
@@ -248,14 +258,14 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
                     app.editor.insert(&text);
                     app.update_completion();
                 }
-                Some(Ok(TermEvent::Resize(c, r))) => {
-                    app.cols = usize::from(c).max(20);
-                    app.rows = usize::from(r).max(4);
-                }
+                // Resize events only wake the loop; the next frame queries
+                // the current size rather than rendering a queued stale one.
+                Some(Ok(TermEvent::Resize(..))) => {}
                 Some(Ok(_)) => {}
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
             },
+            () = tokio::time::sleep_until(settled.unwrap_or_else(tokio::time::Instant::now)), if settled.is_some() => {}
             _ = git_tick.tick() => {},
             _ = tick.tick(), if app.started.is_some() => {
                 app.frame += 1;
@@ -264,6 +274,9 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
                 }
             },
         }
+    }
+    if let Ok((c, _)) = crossterm::terminal::size() {
+        screen.resize(usize::from(c));
     }
     screen.draw(&std::mem::take(&mut app.commit), &[], None, app.rows)?;
     screen.finish()?;
