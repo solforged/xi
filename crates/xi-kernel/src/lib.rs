@@ -465,7 +465,7 @@ impl Session {
         let spill = spill.canonicalize()?;
         let tmp = tmp.canonicalize()?;
         let git = log.file_path().with_extension("git");
-        config::write_sandbox_git(&git, &config.paths)?;
+        config::write_sandbox_git(&git, &config.paths, config.sandbox.ssh_agent)?;
         let git = git.canonicalize()?;
         let mut sandbox = config.sandbox_spec(&tmp, &spill, &system.skill_roots, &git)?;
         let listener = if sandbox.enabled {

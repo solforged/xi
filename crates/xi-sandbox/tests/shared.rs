@@ -129,6 +129,27 @@ fn unix_sockets_are_reachable_only_inside_allowed_roots() {
 }
 
 #[test]
+fn explicit_socket_access_does_not_allow_unlinking_or_expose_siblings() {
+    let fixture = Fixture::new();
+    let agent = fixture.outside.join("agent.sock");
+    let sibling = fixture.outside.join("other.sock");
+    let _agent = UnixListener::bind(&agent).unwrap();
+    let _sibling = UnixListener::bind(&sibling).unwrap();
+    let mut spec = fixture.spec();
+    spec.sockets.push(agent.clone());
+    let output = run_probe(&spec, &format!("unix:{}", agent.display()));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let output = run_probe(&spec, &format!("unix:{}", sibling.display()));
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output.stderr));
+    let output = sh(&spec, &format!("cat {}/secret", fixture.outside.display()));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let output = sh(&spec, &format!("rm {}", agent.display()));
+    assert!(!output.status.success());
+    assert!(agent.exists());
+}
+
+#[test]
 fn cannot_signal_processes_outside_the_sandbox() {
     let fixture = Fixture::new();
     let output = sh(

@@ -110,6 +110,9 @@ pub(crate) fn enter_and_exec(
     for path in &spec.writable {
         rules.extend(open_rule(path, AccessFs::from_all(abi), true)?);
     }
+    for path in &spec.sockets {
+        rules.extend(open_rule(path, AccessFs::ResolveUnix.into(), true)?);
+    }
     let device_access = make_bitflags!(AccessFs::{ReadFile | WriteFile | ReadDir | IoctlDev});
     for path in DEVICES {
         rules.extend(open_rule(Path::new(path), device_access, false)?);
@@ -369,7 +372,12 @@ fn bind_read_only(path: &Path) -> Result<(), Error> {
 fn mount_tmp(spec: &Spec) -> Result<(), Error> {
     let host_tmp = Path::new("/tmp");
     let roots = spec.writable.iter().map(|root| (root, true));
-    let roots = roots.chain(spec.readable.iter().map(|root| (root, false)));
+    let roots = roots.chain(
+        spec.readable
+            .iter()
+            .chain(&spec.sockets)
+            .map(|root| (root, false)),
+    );
     for (root, writable) in roots {
         if *root == spec.tmp {
             continue;

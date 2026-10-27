@@ -11,7 +11,7 @@ use xi_protocol::model::{ModelRole, Reasoning};
 use crate::config::{Approvals, Config, Paths, parse_model, validate_global};
 use crate::{Error, Result};
 
-pub(crate) const KEYS: [&str; 18] = [
+pub(crate) const KEYS: [&str; 19] = [
     "default_model",
     "reasoning",
     "approvals",
@@ -30,6 +30,7 @@ pub(crate) const KEYS: [&str; 18] = [
     "roles.slow",
     "roles.smol",
     "roles.tiny",
+    "sandbox.ssh_agent",
 ];
 
 /// Effective settings and their layers for a workspace, without running
@@ -59,6 +60,7 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
         role(ModelRole::Slow),
         role(ModelRole::Smol),
         role(ModelRole::Tiny),
+        json!(config.sandbox.ssh_agent),
     ];
     let settings = KEYS
         .into_iter()
