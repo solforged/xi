@@ -19,7 +19,7 @@ use crate::callout::{self, Kind, markdown};
 use crate::children::Children;
 use crate::layout::Measure;
 use crate::log::Inspect;
-use crate::style::{Line, Role, inline, lr, wrap};
+use crate::style::{Line, Role, clip_words, inline, lr, wrap};
 
 /// Terminal spinner frames, one every 125 ms.
 pub const SPINNER: [&str; 8] = ["┤", "┘", "┴", "└", "├", "┌", "┬", "┐"];
@@ -419,6 +419,12 @@ pub fn duration(ms: u64) -> String {
     } else {
         format!("{}m{:02}s", ms / 60_000, ms % 60_000 / 1000)
     }
+}
+
+/// A finished call's duration, or `None` under 0.1s, which would print as
+/// `0.0s` on nearly every read and search.
+fn took(ms: u64) -> Option<String> {
+    (ms >= 100).then(|| duration(ms))
 }
 
 /// `path` relative to the workspace when it lies inside it; `.` for the
@@ -880,10 +886,15 @@ impl Call {
                 counted(count, "hit", "hits")
             });
         }
+        // A failed command shows its exit code there instead.
+        if self.name == "bash" && !output.is_error && count > 0 {
+            meta.push(counted(count, "line", "lines"));
+        }
         if m.durations()
             && let Some(from) = self.decided_at
+            && let Some(took) = took(at.0.saturating_sub(from.0))
         {
-            meta.push(duration(at.0.saturating_sub(from.0)));
+            meta.push(took);
         }
         let role = if self.mark().plain() == "↺" {
             Role::Brass
@@ -1151,10 +1162,10 @@ impl Transcript {
         let mut meta = format!("+{added} −{removed}");
         if m.durations()
             && let Some((_, _, at)) = &edits[edits.len() - 1].result
+            && let Some(took) =
+                took(at.0.saturating_sub(first.decided_at.unwrap_or(first.started_at).0))
         {
-            let elapsed =
-                at.0.saturating_sub(first.decided_at.unwrap_or(first.started_at).0);
-            meta.push_str(&format!(" · {}", duration(elapsed)));
+            meta.push_str(&format!(" · {took}"));
         }
         let text: String = diffs.iter().flatten().map(diff_text).collect();
         let head = edit_head(&edits, m);
@@ -1697,7 +1708,7 @@ impl Transcript {
                 let head = Line::default()
                     .dim("─── ")
                     .strong(Role::Ink, "≡ compacted")
-                    .dim(format!(" {} tokens before ", tokens(*tokens_before)));
+                    .dim(format!(" from {} tokens ", tokens(*tokens_before)));
                 let fill = cols.saturating_sub(head.width());
                 let mut lines = vec![head.dim("─".repeat(fill)).truncate(cols)];
                 let (rows, hidden) = digest(summary);
@@ -1707,15 +1718,13 @@ impl Transcript {
                     } else {
                         format!("  {label:<9} ")
                     };
-                    lines.push(Line::default().dim(lead).ink(text).truncate(cols));
+                    let room = cols.saturating_sub(lead.len());
+                    lines.push(Line::default().dim(lead).ink(clip_words(&text, room)));
                 }
                 if hidden > 0 {
                     lines.push(
                         Line::default()
-                            .dim(format!(
-                                "  … {} of summary · ctrl+o",
-                                counted(hidden, "more line", "more lines")
-                            ))
+                            .dim(format!("  {}", more_lines(hidden)))
                             .truncate(cols),
                     );
                     self.details.push(Detail {
@@ -1967,8 +1976,12 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let mut rows = Vec::new();
+    let mut rows: Vec<(&'static str, String)> = Vec::new();
     let mut label = None;
+    // An entry ending in `:` introduces a list; its first item joins the
+    // row so the row doesn't end on the colon.
+    let mut open = false;
+    let mut joined = 0;
     for line in &lines {
         // A heading is a `#` line or a bold lead naming one of the kernel's
         // sections; bold words inside an entry are not.
@@ -1983,6 +1996,7 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
         let text = match found {
             Some((known, rest)) => {
                 label = known;
+                open = false;
                 if rest.is_empty() {
                     continue;
                 }
@@ -1993,9 +2007,17 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
                 .or_else(|| line.strip_prefix("* "))
                 .unwrap_or(line),
         };
+        if open && let Some((_, row)) = rows.last_mut() {
+            row.push(' ');
+            row.push_str(text);
+            open = false;
+            joined += 1;
+            continue;
+        }
         if let Some(l) = label.take()
             && rows.len() < ROWS
         {
+            open = text.ends_with(':');
             rows.push((l, text.to_owned()));
         }
     }
@@ -2006,7 +2028,7 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
             .map(|l| ("", (*l).to_owned()))
             .collect();
     }
-    let hidden = lines.len().saturating_sub(rows.len());
+    let hidden = lines.len().saturating_sub(rows.len() + joined);
     (rows, hidden)
 }
 
@@ -2466,7 +2488,7 @@ mod tests {
 
     #[test]
     fn compaction_commits_a_digest_and_keeps_the_summary_for_ctrl_o() {
-        let summary = "## User goal and constraints\n- Fix covered_length.\n- Keep tests.\n\n## Decisions\n- Skip empty ranges.\n\n## Commands run and results\n- cargo test: ok\n\n## Open questions\n- None.\n";
+        let summary = "## User goal and constraints\n- Fix covered_length so empty ranges never count toward the total.\n- Keep tests.\n\n## Decisions\n- Nothing settled. Assistant recommended:\n- Skip empty ranges.\n\n## Commands run and results\n- cargo test: ok\n\n## Open questions\n- None.\n";
         let mut t = Transcript::default();
         let rows = plain(&t.apply(
             &ev(
@@ -2481,23 +2503,25 @@ mod tests {
             m(60),
         ));
         assert!(
-            rows[1].starts_with("─── ≡ compacted 30.7k tokens before ─"),
+            rows[1].starts_with("─── ≡ compacted from 30.7k tokens ─"),
             "{rows:?}"
         );
+        // A long entry is cut between words, and one ending in `:` takes
+        // the first item of the list it introduces.
         assert_eq!(
             rows[2..6],
             [
-                "  goal      Fix covered_length.",
-                "  decided   Skip empty ranges.",
+                "  goal      Fix covered_length so empty ranges never count…",
+                "  decided   Nothing settled. Assistant recommended: Skip…",
                 "  open      None.",
-                "  … 6 more lines of summary · ctrl+o",
+                "  … 6 more lines · ctrl+o",
             ]
         );
         let full = plain(&t.expand(m(60)).unwrap());
         // The divider already ended in a blank row, so no gap comes first.
         assert_eq!(full[0], "── ≡ compacted · summary ──");
         assert_eq!(full[1], "## User goal and constraints");
-        assert_eq!(full.last().unwrap(), "── end · 12 lines ──");
+        assert_eq!(full.last().unwrap(), "── end · 13 lines ──");
     }
 
     #[test]
@@ -3092,7 +3116,10 @@ mod tests {
         );
         assert!(plain(&t.live(m(100), 0))[0].contains("allowed for this session"));
         let rows = plain(&t.apply(&ev(result("a", "done", false), 0), m(100)));
-        assert!(rows[0].ends_with("allowed for this session · 0.0s"));
+        assert!(
+            rows[0].ends_with("allowed for this session · 1 line"),
+            "{rows:?}"
+        );
     }
 
     #[test]

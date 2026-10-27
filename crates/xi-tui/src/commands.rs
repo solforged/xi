@@ -280,7 +280,7 @@ impl App {
                         Kind::Done,
                         Line::default()
                             .ink("compacted")
-                            .dim(format!(" · {} tokens before", tokens(result.tokens_before))),
+                            .dim(format!(" from {} tokens", tokens(result.tokens_before))),
                     ),
                     Err(error) => self.notice(Kind::Error, error.to_string()),
                 }

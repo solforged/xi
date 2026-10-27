@@ -230,7 +230,7 @@ impl Tree {
                     )
                 }
                 EventKind::Compaction { tokens_before, .. } => (
-                    format!("compacted · {} tokens before", tokens(*tokens_before)),
+                    format!("compacted from {} tokens", tokens(*tokens_before)),
                     None,
                     event.id,
                 ),
@@ -541,7 +541,7 @@ mod tests {
             "  ▸ 2 calls · 1 edit · 1 failed · Tests fail on archive.",
             "  ├─ ξ try a shim",
             "  │  ▸ 1 call · shim done",
-            "  └─ ≡ compacted · 1.2k tokens before",
+            "  └─ ≡ compacted from 1.2k tokens",
             "     ξ ok, now deleted.py",
             "›    ▸ done",
         ];
