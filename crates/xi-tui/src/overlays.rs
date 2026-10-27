@@ -87,7 +87,10 @@ impl App {
             Command::Thinking => {
                 let thinking = self.transcript.thinking_display().next();
                 self.transcript.set_thinking(thinking);
-                self.notice(Kind::Info, format!("thinking display → {}", thinking.name()));
+                self.notice(
+                    Kind::Info,
+                    format!("thinking display → {}", thinking.name()),
+                );
             }
             Command::Note(lines) => self.note(lines),
             Command::Answer(choice) => self.answer(choice).await,

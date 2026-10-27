@@ -392,7 +392,6 @@ impl App {
         lines.extend(composer);
         if !deck {
             lines.push(self.footer(cols));
-
         }
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
         let hidden = lines.len().saturating_sub(m.live_rows());
