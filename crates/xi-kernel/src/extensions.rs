@@ -17,20 +17,31 @@ use xi_protocol::methods::extension::*;
 use xi_protocol::rpc::{self, Message, RequestId, RequestMethod};
 use xi_protocol::{ExtensionId, SessionId, ToolOutput};
 
-use crate::{Error, Result, config::Config};
+use crate::{Error, Result, config::Config, egress};
 
 type Reply = oneshot::Sender<Result<Value>>;
 
-pub(crate) struct Incoming {
-    pub extension: ExtensionId,
-    pub request: rpc::Request,
-    pub reply: Reply,
+/// What a session services for its extensions while it waits.
+pub(crate) enum Incoming {
+    /// A request from an extension process.
+    Request {
+        extension: ExtensionId,
+        request: rpc::Request,
+        reply: Reply,
+    },
+    /// A connection through an extension's egress listener.
+    Connect(egress::Connect),
 }
 
 struct Route {
     peers: HashSet<ExtensionId>,
     sender: mpsc::UnboundedSender<Incoming>,
+    /// Order of opening. An extension's connection goes to the newest route
+    /// that serves it, since a connection carries no session id.
+    opened: u64,
 }
+
+static ROUTES_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One extension supervisor per kernel event bus. Packages are cached by
 /// workspace and canonical package root; session catalogs remain independent.
@@ -184,6 +195,7 @@ impl ExtensionHost {
                 .map(|p| p.manifest.name.clone())
                 .collect(),
             sender,
+            opened: ROUTES_OPENED.fetch_add(1, Ordering::Relaxed),
         };
         self.routes
             .lock()
@@ -362,6 +374,8 @@ struct Peer {
     wire: Wire,
     stop: CancellationToken,
     exited: CancellationToken,
+    /// The extension's own egress listener, when its manifest declares `net`.
+    _egress: Option<egress::Listener>,
 }
 
 #[derive(Clone)]
@@ -426,11 +440,39 @@ impl Peer {
                 "extension name must contain only letters, digits, '-' or '_'".into(),
             ));
         }
-        if !manifest.capabilities.net.is_empty() {
-            return Err(Error::Config(format!(
-                "extension {name} requests net access, but the egress proxy is not implemented"
-            )));
-        }
+        let egress = if manifest.capabilities.net.is_empty() {
+            None
+        } else {
+            let hosts = egress::host_set(&manifest.capabilities.net).map_err(|error| {
+                Error::Config(format!("extension {name}: invalid net pattern: {error}"))
+            })?;
+            let mut listener = egress::Listener::bind(&name)?;
+            let routes = routes.clone();
+            let extension = ExtensionId(name.clone());
+            listener.start(
+                Some(name.clone()),
+                Some(hosts),
+                Box::new(move |connect| {
+                    let routes = routes.lock().expect("extension routes");
+                    let Some(route) = routes
+                        .values()
+                        .filter(|route| route.peers.contains(&extension))
+                        .max_by_key(|route| route.opened)
+                    else {
+                        return Some(connect);
+                    };
+                    route
+                        .sender
+                        .send(Incoming::Connect(connect))
+                        .err()
+                        .map(|error| match error.0 {
+                            Incoming::Connect(connect) => connect,
+                            Incoming::Request { .. } => unreachable!("sent a connection"),
+                        })
+                }),
+            );
+            Some(listener)
+        };
         let Some((program, args)) = manifest.run.split_first() else {
             return Err(Error::Config(format!(
                 "extension {name} has an empty run command"
@@ -442,6 +484,7 @@ impl Peer {
         spec.writable = vec![spec.tmp.clone()];
         spec.protected.clear();
         spec.readable.push(root.to_owned());
+        spec.egress = egress.as_ref().map(|listener| listener.egress().clone());
         // Runtime roots only: never inherit workspace, skills or user sandbox grants.
         for runtime in [
             "~/.local/share/mise/installs",
@@ -633,6 +676,7 @@ impl Peer {
             wire,
             stop,
             exited,
+            _egress: egress,
         };
         let handshake = tokio::time::timeout(
             Duration::from_secs(15),
@@ -787,7 +831,7 @@ fn route(
         .ok_or_else(|| Error::Config("session is not serving this extension".into()))?;
     route
         .sender
-        .send(Incoming {
+        .send(Incoming::Request {
             extension,
             request,
             reply,

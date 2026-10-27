@@ -177,7 +177,12 @@ fn read_xi(reader: impl BufRead, acc: &mut Accumulator) -> Result<bool> {
                     acc.usage(usage);
                 }
             }
-            EventKind::ToolDecision { call, .. } => {
+            EventKind::ToolDecision {
+                call,
+                during,
+                extension,
+                ..
+            } if during.is_none() && extension.is_none() && acc.names.contains_key(&call.0) => {
                 acc.starts.insert(call.to_string(), at);
             }
             EventKind::ToolResult { call, output, .. } => {
@@ -281,6 +286,36 @@ mod tests {
         assert_eq!(metrics.turn_failures, 1);
         assert_eq!((metrics.edit_results, metrics.edit_failures), (1, 1));
         assert_eq!(metrics.incomplete_tool_spans, 0);
+    }
+
+    #[test]
+    fn egress_decisions_do_not_count_calls_or_open_spans() {
+        let fixture = include_str!("../tests/fixtures/xi-session.jsonl");
+        let mut acc = Accumulator::default();
+        read_xi(fixture.as_bytes(), &mut acc).unwrap();
+        for (during, extension) in [(Some("a"), None), (None, Some("fetch")), (None, None)] {
+            let event = Event {
+                id: xi_protocol::EventId::generate(),
+                parent: None,
+                at: xi_protocol::Timestamp(1700),
+                kind: EventKind::ToolDecision {
+                    call: "connection".into(),
+                    action: "net example.org:443".into(),
+                    decision: xi_protocol::event::Decision::Ask,
+                    rule: None,
+                    taint: false,
+                    during: during.map(Into::into),
+                    extension: extension.map(Into::into),
+                },
+            };
+            let line = format!("{fixture}{}\n", serde_json::to_string(&event).unwrap());
+            let mut with_egress = Accumulator::default();
+            read_xi(line.as_bytes(), &mut with_egress).unwrap();
+            let metrics = with_egress.finish(1000.0);
+            assert_eq!(metrics.tool_calls, acc.metrics.tool_calls);
+            assert_eq!(metrics.incomplete_tool_spans, 0);
+            assert_eq!(metrics.tool_busy_ms, 300.0);
+        }
     }
 
     #[test]

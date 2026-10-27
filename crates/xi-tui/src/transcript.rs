@@ -136,6 +136,43 @@ struct Call {
     result: Option<(ToolOutput, Option<std::path::PathBuf>, Timestamp)>,
     /// Children the call started, once its result has landed.
     children: Children,
+    egress: Vec<EgressDecision>,
+}
+
+/// A connection decision shown below its owning tool call.
+struct EgressDecision {
+    id: ToolCallId,
+    action: String,
+    decision: Decision,
+    rule: Option<String>,
+    approved: Option<bool>,
+}
+
+impl EgressDecision {
+    fn line(&self, cols: usize, child: bool, extension: Option<&str>) -> Line {
+        let status = match (self.decision, self.approved) {
+            (_, Some(true)) | (Decision::Allow, None) => "allowed",
+            (_, Some(false)) | (Decision::Deny, None) => "denied",
+            (Decision::Ask, None) => "asked",
+        };
+        let mut line = Line::default().dim(if child { "  ⇄ " } else { "⇄ " });
+        if let Some(extension) = extension {
+            line = line.dim(extension).dim(" · ");
+        }
+        line = line.dim(&self.action).dim(" · ");
+        line = match status {
+            "allowed" => line.verdigris(status),
+            "denied" => line.sanguine(status),
+            _ => line.brass(status),
+        };
+        if self.decision == Decision::Allow
+            && self.approved.is_none()
+            && let Some(rule) = &self.rule
+        {
+            line = line.dim(format!(" by {rule}"));
+        }
+        line.truncate(cols)
+    }
 }
 
 /// Text the transcript showed cut short, kept whole for ctrl+o.
@@ -593,6 +630,7 @@ impl Call {
         }
         right = right.span(role, false, meta.join(" · "));
         let mut lines = vec![lr(self.head(self.mark()), right, cols)];
+        lines.extend(self.egress.iter().map(|row| row.line(cols, true, None)));
         if !self.children.is_empty() {
             let (slips, mut details) = self.children.committed(cols);
             lines.extend(slips);
@@ -1002,6 +1040,7 @@ impl Transcript {
                             remember: Remember::Once,
                             result: None,
                             children: Children::default(),
+                            egress: Vec::new(),
                         }),
                         _ => {}
                     }
@@ -1021,27 +1060,52 @@ impl Transcript {
                 decision,
                 rule,
                 taint,
-                ..
+                during,
+                extension,
             } => {
-                if let Some(c) = self.call(call) {
+                let tool = if during.is_some()
+                    || extension.is_some()
+                    || (action.starts_with("net ") && !self.calls.iter().any(|c| &c.id == call))
+                {
+                    let row = EgressDecision {
+                        id: call.clone(),
+                        action: action.clone(),
+                        decision: *decision,
+                        rule: rule.clone(),
+                        approved: None,
+                    };
+                    if let Some(c) = during.as_ref().and_then(|id| self.call(id)) {
+                        let tool = (*decision == Decision::Ask).then(|| c.name.clone());
+                        c.egress.push(row);
+                        tool
+                    } else {
+                        self.push(&mut out, [row.line(cols, false, extension.as_deref())]);
+                        (*decision == Decision::Ask).then(|| extension.clone().unwrap_or_default())
+                    }
+                } else if let Some(c) = self.call(call) {
                     c.decision = Some(*decision);
                     c.rule.clone_from(rule);
                     c.decided_at = Some(at);
                     c.since = Some(Instant::now());
-                    if *decision == Decision::Ask {
-                        let ask = Ask {
-                            call: call.clone(),
-                            tool: c.name.clone(),
-                            action: action.clone(),
-                            rule: rule.clone(),
-                            taint: *taint,
-                            trusted: None,
-                        };
-                        if let Some(pending) = self.asks.iter_mut().find(|a| a.call == *call) {
-                            *pending = ask;
-                        } else {
-                            self.asks.push(ask);
-                        }
+                    (*decision == Decision::Ask).then(|| c.name.clone())
+                } else {
+                    None
+                };
+                if *decision == Decision::Ask
+                    && let Some(tool) = tool
+                {
+                    let ask = Ask {
+                        call: call.clone(),
+                        tool,
+                        action: action.clone(),
+                        rule: rule.clone(),
+                        taint: *taint,
+                        trusted: None,
+                    };
+                    if let Some(pending) = self.asks.iter_mut().find(|a| a.call == *call) {
+                        *pending = ask;
+                    } else {
+                        self.asks.push(ask);
                     }
                 }
             }
@@ -1056,6 +1120,11 @@ impl Transcript {
                     c.approved = Some(*approved);
                     c.remember = *remember;
                     c.since = Some(Instant::now());
+                }
+                for row in self.calls.iter_mut().flat_map(|c| &mut c.egress) {
+                    if &row.id == call {
+                        row.approved = Some(*approved);
+                    }
                 }
             }
             EventKind::ToolResult {
@@ -1293,6 +1362,7 @@ impl Transcript {
                 )
             };
             lines.push(lr(call.head(mark), meta, cols));
+            lines.extend(call.egress.iter().map(|row| row.line(cols, true, None)));
             if call.result.is_none()
                 && !waiting
                 && let Some(children) = roster.take()
@@ -1465,6 +1535,107 @@ mod tests {
             during: None,
             extension: None,
         }
+    }
+
+    fn egress(
+        id: &str,
+        during: Option<&str>,
+        extension: Option<&str>,
+        decision: Decision,
+    ) -> EventKind {
+        EventKind::ToolDecision {
+            call: id.into(),
+            action: "net github.com:443".into(),
+            decision,
+            rule: Some("user#2".into()),
+            taint: false,
+            during: during.map(Into::into),
+            extension: extension.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn egress_rows_resolve_and_commit_under_their_parent_in_call_order() {
+        for approved in [true, false] {
+            let mut t = Transcript::default();
+            t.apply(
+                &ev(
+                    assistant(vec![
+                        use_("a", "bash", json!({"command": "curl github.com"})),
+                        use_("b", "read", json!({"path": "file"})),
+                    ]),
+                    0,
+                ),
+                100,
+            );
+            assert!(
+                t.apply(&ev(egress("net1", Some("a"), None, Decision::Ask), 1), 100)
+                    .is_empty()
+            );
+            t.apply(
+                &ev(egress("net2", Some("a"), None, Decision::Allow), 2),
+                100,
+            );
+            assert_eq!(t.asks().len(), 1);
+            assert_eq!(t.asks()[0].call, "net1".into());
+            assert_eq!(t.asks()[0].tool, "bash");
+            let live = plain(&t.live(100, 0));
+            assert!(live[0].starts_with("┤ bash curl github.com"));
+            assert_eq!(live[1], "  ⇄ net github.com:443 · asked");
+            assert_eq!(live[2], "  ⇄ net github.com:443 · allowed by user#2");
+            t.apply(
+                &ev(
+                    EventKind::ApprovalResolved {
+                        call: "net1".into(),
+                        approved,
+                        by: xi_protocol::event::Approver::User,
+                        remember: Remember::Once,
+                    },
+                    3,
+                ),
+                100,
+            );
+            assert!(t.asks().is_empty());
+            let status = if approved { "allowed" } else { "denied" };
+            assert_eq!(
+                plain(&t.live(100, 0))[1],
+                format!("  ⇄ net github.com:443 · {status}")
+            );
+            assert!(
+                t.apply(&ev(result("b", "1|file", false), 4), 100)
+                    .is_empty()
+            );
+            let rows = plain(&t.apply(&ev(result("a", "", false), 5), 100));
+            assert!(rows[0].starts_with("● bash curl github.com"), "{rows:?}");
+            assert_eq!(rows[1], format!("  ⇄ net github.com:443 · {status}"));
+            assert_eq!(rows[2], "  ⇄ net github.com:443 · allowed by user#2");
+            assert!(rows[3].starts_with("● read file"), "{rows:?}");
+            assert!(t.live(100, 0).is_empty());
+        }
+    }
+
+    #[test]
+    fn extension_and_stray_egress_decisions_commit_standalone() {
+        let mut t = Transcript::default();
+        let mut event = egress("net1", None, Some("fetch"), Decision::Allow);
+        if let EventKind::ToolDecision { rule, .. } = &mut event {
+            *rule = None;
+        }
+        assert_eq!(
+            plain(&t.apply(&ev(event, 0), 100)),
+            ["⇄ fetch · net github.com:443 · allowed"]
+        );
+        assert_eq!(
+            plain(&t.apply(&ev(egress("net2", None, None, Decision::Ask), 1), 100)),
+            ["⇄ net github.com:443 · asked"]
+        );
+        t.apply(
+            &ev(egress("net3", None, Some("fetch"), Decision::Ask), 2),
+            100,
+        );
+        assert_eq!(t.asks().len(), 2);
+        assert_eq!(t.asks()[1].tool, "fetch");
+        assert!(t.live(100, 0).is_empty());
     }
 
     fn plain(lines: &[Line]) -> Vec<String> {

@@ -32,7 +32,7 @@ Rows 1 to 5 are done; their results are below.
 | 5 | Subagents | `extensions/subagents` | Done as an optional package. Not used unprompted by Qwen 3.8. |
 | 6 | LSP diagnostics after edits | package | Calls and time to green on the Rust and TypeScript tasks. |
 | 7 | Todo or plan tool | package | Pass rate on multi-step tasks (`invoice-rounding`, `revision-store`), prompt size. |
-| 8 | `fetch` and web search, with taint wired in | package plus platform egress proxy | Tasks that need docs; taint must turn later egress into `ask`. |
+| 8 | `fetch` and web search, with taint wired in | package | Tasks that need docs; taint must turn later egress into `ask`. The egress proxy and `net` capability it needs exist. |
 | 9 | Memory | package | Last: needs multi-session tasks to measure. |
 | 10 | TUI | client | Daemon client with event replay and deduplication, streaming retry resets and a `/tree` checkout overlay. The surface for daily use is tracked in [Terminal client](#terminal-client). Not benchmarked. |
 
@@ -56,13 +56,13 @@ After these, in rough order of daily value: `!cmd` and `!!cmd` run in the sessio
 
 Children of a running call now get live rows under it and commit one line each when the call's result lands, with running children in the footer; a mid-call attach replays them. Opening a child in its own view, letting a child ask through the parent instead of being denied headlessly, and naming children are next.
 
-Self-hosting limits outside the client: tools have no network, so adding a crate or pushing happens in the user's shell until the egress proxy exists. Daily use runs the `mise run install` build; workers keep the binary they started with, so rebuilding the repository does not disturb running sessions.
+Self-hosting outside the client: tools reach the network only through the egress proxy, so `cargo add` and `git push` ask once per host unless a `net` rule allows it. Daily use runs the `mise run install` build; workers keep the binary they started with, so rebuilding the repository does not disturb running sessions.
 
 ## Platform queue
 
 | Item | Why |
 |---|---|
-| Egress proxy and in-namespace forwarder | Tools and extensions have no network at all today; `fetch`, package installs and `git push` need it. Extensions that declare `net` refuse to start until it exists. |
+| Egress proxy on Linux | The proxy, the Seatbelt rule and the Linux forwarder are implemented and the macOS path is tested end to end with `curl`, `bash` and an extension `fetch`. The Linux forwarder only compiles for `x86_64-unknown-linux-gnu`; its tests need a Landlock ABI 9 host. |
 | Harder tasks for frontier models | `gpt-6.1-sol` passes every hard task in every arm (36/36; see [Frontier model](#frontier-model)), so the suite can no longer rank harnesses or features on a frontier model. Anthropic subscription sign-in and the `claude/…` catalog are implemented. Local tests cover metadata-bearing multi-tool turns, failed and denied tools, older-log recovery and compressed streams; live-service compatibility requires manual verification. |
 | Credentials from the keychain | Only env vars and 0600 files work now. |
 | Extension package pinning | Packages load from configured directories; the content-hash lockfile is not built. |

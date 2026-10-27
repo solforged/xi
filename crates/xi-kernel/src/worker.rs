@@ -133,13 +133,19 @@ impl Mirror {
                 decision: Decision::Ask,
                 rule,
                 taint,
-                ..
+                during,
+                extension,
             } => {
                 if !self.pending.iter().any(|pending| pending.call == *call) {
                     self.pending.push(PendingApproval {
                         session: self.info.session,
                         call: call.clone(),
-                        tool: self.tools.get(call).cloned().unwrap_or_default(),
+                        tool: self
+                            .tools
+                            .get(during.as_ref().unwrap_or(call))
+                            .cloned()
+                            .or_else(|| extension.clone())
+                            .unwrap_or_default(),
                         action: action.clone(),
                         rule: rule.clone(),
                         taint: *taint,

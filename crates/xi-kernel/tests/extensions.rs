@@ -307,18 +307,101 @@ async fn crash_is_an_error_result_logged_and_restarted_on_next_use() {
     bus.shutdown_extensions().await;
 }
 
+/// A loopback HTTP server answering every request with `hello`.
+fn server() -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                head.push(byte[0]);
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            );
+        }
+    });
+    port
+}
+
+fn egress_decision(events: &[xi_protocol::Event]) -> (String, Decision, Option<String>) {
+    events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ToolDecision {
+                action,
+                decision,
+                rule,
+                during: None,
+                extension: Some(extension),
+                ..
+            } if extension == "probe" => Some((action.clone(), *decision, rule.clone())),
+            _ => None,
+        })
+        .unwrap()
+}
+
 #[tokio::test]
-async fn net_refuses_before_start_and_subagents_require_capability() {
-    let fixture = Fixture::new("net=['example.org']");
-    let (session, bus, _) = fixture.session(json!({}));
-    let error = session
-        .prompt(vec![Block::Text {
-            text: "hello".into(),
-        }])
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("egress proxy"));
+async fn extension_egress_follows_its_manifest_and_policy() {
+    let port = server();
+    let fixture = Fixture::new("net=['127.0.0.1']");
+    std::fs::write(
+        fixture.paths.config.join("config.toml"),
+        "[[rule]]\naction='net'\npattern='127.0.0.1'\neffect='allow'\n",
+    )
+    .unwrap();
+    let (session, bus, _) =
+        fixture.session(json!({"mode":"fetch","url":format!("http://127.0.0.1:{port}/")}));
+    run(&session).await;
+    let info = session.info().await;
+    assert_eq!(text(output(&info.events)), "200 hello");
+    let (action, decision, rule) = egress_decision(&info.events);
+    assert_eq!(action, format!("net 127.0.0.1:{port}"));
+    assert_eq!(decision, Decision::Allow);
+    assert!(rule.is_some_and(|rule| rule.ends_with("#0")));
     bus.shutdown_extensions().await;
+
+    // A host outside the manifest's `net` list never reaches policy.
+    let (session, bus, _) =
+        fixture.session(json!({"mode":"fetch","url":format!("http://localhost:{port}/")}));
+    run(&session).await;
+    let info = session.info().await;
+    assert!(text(output(&info.events)).starts_with("403 "));
+    assert_eq!(
+        egress_decision(&info.events),
+        (
+            format!("net localhost:{port}"),
+            Decision::Deny,
+            Some("manifest".into())
+        )
+    );
+    bus.shutdown_extensions().await;
+
+    // Without a rule the connection asks, and headless mode denies.
+    std::fs::write(fixture.paths.config.join("config.toml"), "").unwrap();
+    let (session, bus, _) =
+        fixture.session(json!({"mode":"fetch","url":format!("http://127.0.0.1:{port}/")}));
+    run(&session).await;
+    let info = session.info().await;
+    assert!(text(output(&info.events)).contains("403 xi egress proxy: egress denied"));
+    assert_eq!(egress_decision(&info.events).1, Decision::Ask);
+    assert!(info.events.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ApprovalResolved {
+            approved: false,
+            by: Approver::Headless,
+            ..
+        }
+    )));
+    bus.shutdown_extensions().await;
+}
+
+#[tokio::test]
+async fn subagents_require_capability() {
     let fixture = Fixture::new("");
     let (session, bus, _) = fixture.session(json!({"mode":"child"}));
     run(&session).await;

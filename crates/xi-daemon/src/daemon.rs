@@ -1038,12 +1038,18 @@ impl Router {
                     decision: Decision::Ask,
                     rule,
                     taint,
-                    ..
+                    during,
+                    extension,
                 } if worker.approval == ApprovalPolicy::Client => {
                     let approval = PendingApproval {
                         session,
                         call: call.clone(),
-                        tool: worker.tools.get(call).cloned().unwrap_or_default(),
+                        tool: worker
+                            .tools
+                            .get(during.as_ref().unwrap_or(call))
+                            .cloned()
+                            .or_else(|| extension.clone())
+                            .unwrap_or_default(),
                         action: action.clone(),
                         rule: rule.clone(),
                         taint: *taint,
@@ -1057,7 +1063,10 @@ impl Router {
                         pending = Some(approval);
                     }
                 }
-                EventKind::ApprovalResolved { call, .. } | EventKind::ToolResult { call, .. } => {
+                EventKind::ApprovalResolved { call, .. } => {
+                    self.inbox.remove(&(session, call.clone()));
+                }
+                EventKind::ToolResult { call, .. } => {
                     self.inbox.remove(&(session, call.clone()));
                     worker.tools.remove(call);
                 }
@@ -1543,6 +1552,118 @@ mod tests {
                 parent_session: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn synthetic_asks_keep_the_parent_tool_and_resolving_keeps_live_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: temp.path().join("home"),
+            config: temp.path().join("config"),
+            data: temp.path().join("data"),
+            state: temp.path().join("state"),
+        };
+        let options = DaemonOptions {
+            settings: DaemonSettings::default(),
+            paths: paths.clone(),
+            spawner: Arc::new(crate::spawn::InProcessSpawner {
+                paths,
+                backend: None,
+            }),
+            private: false,
+        };
+        let (commands, _incoming) = mpsc::unbounded_channel();
+        let mut router = Router {
+            scheduler: Scheduler::new(&options.settings.limit),
+            options,
+            commands,
+            clients: HashMap::new(),
+            workers: HashMap::new(),
+            starts: HashMap::new(),
+            inbox: HashMap::new(),
+            next_id: 1,
+            started: Instant::now(),
+            idle_since: Instant::now(),
+            forwards: 0,
+            shutdown: None,
+            exe_changed: false,
+            config_edits: Arc::new(Mutex::new(())),
+        };
+        let session = SessionId::generate();
+        let root = root(session);
+        let (connection, _remote) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(connection);
+        let (peer, _messages) = Peer::spawn(reader, writer);
+        router.workers.insert(
+            1,
+            Worker {
+                peer,
+                kill: None,
+                info: Some(SessionDetails {
+                    session,
+                    path: temp.path().join("session.jsonl"),
+                    head: root.id,
+                    cwd: "/work".into(),
+                    trusted: true,
+                    model: xi_protocol::event::ModelRef {
+                        provider: "test".into(),
+                        model: "test".into(),
+                    },
+                    reasoning: xi_protocol::model::Reasoning::Medium,
+                    sandbox_enabled: true,
+                    model_info: None,
+                    parent_session: None,
+                }),
+                start_reply: None,
+                path: None,
+                buffered: Vec::new(),
+                tools: HashMap::from([("bash-call".into(), "bash".into())]),
+                approval: ApprovalPolicy::Client,
+                compactions: 0,
+                checking_idle: false,
+                idle_since: Instant::now(),
+                activity: 0,
+                closing: false,
+                close_deadline: None,
+                close_replies: Vec::new(),
+            },
+        );
+        for (id, during, extension, tool) in [
+            ("net1", Some("bash-call"), None, "bash"),
+            ("net2", Some("bash-call"), None, "bash"),
+            ("extension", None, Some("fetch"), "fetch"),
+            ("stray", None, None, ""),
+            ("bash-call", None, None, "bash"),
+        ] {
+            let mut event = root.clone();
+            event.id = EventId::generate();
+            event.kind = EventKind::ToolDecision {
+                call: id.into(),
+                action: "net github.com:443".into(),
+                decision: Decision::Ask,
+                rule: None,
+                taint: false,
+                during: during.map(Into::into),
+                extension: extension.map(Into::into),
+            };
+            router.notification(1, "event/appended", json!(EventParams { session, event }));
+            assert_eq!(router.inbox[&(session, id.into())].1.tool, tool);
+        }
+        assert_eq!(router.inbox.len(), 5);
+        for id in ["net1", "bash-call"] {
+            let mut event = root.clone();
+            event.id = EventId::generate();
+            event.kind = EventKind::ApprovalResolved {
+                call: id.into(),
+                approved: true,
+                by: xi_protocol::event::Approver::User,
+                remember: xi_protocol::event::Remember::Once,
+            };
+            router.notification(1, "event/appended", json!(EventParams { session, event }));
+            assert!(!router.inbox.contains_key(&(session, id.into())));
+            assert_eq!(router.workers[&1].tools[&"bash-call".into()], "bash");
+        }
+        assert!(router.inbox.contains_key(&(session, "net2".into())));
     }
 
     #[test]

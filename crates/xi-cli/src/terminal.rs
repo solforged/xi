@@ -1,6 +1,6 @@
 //! Line-mode interaction and notification rendering for daemon clients.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 
 use rustyline::error::ReadlineError;
@@ -33,7 +33,8 @@ pub(super) struct Renderer {
     head: Option<EventId>,
     seen: HashSet<EventId>,
     stream_sequence: u64,
-    approvals: HashSet<ToolCallId>,
+    approvals: HashMap<ToolCallId, String>,
+    tools: HashMap<ToolCallId, String>,
     pending_input: VecDeque<ToolCallId>,
     line_mode: bool,
     reading: bool,
@@ -48,7 +49,8 @@ impl Renderer {
             head: None,
             seen: HashSet::new(),
             stream_sequence: 0,
-            approvals: HashSet::new(),
+            approvals: HashMap::new(),
+            tools: HashMap::new(),
             pending_input: VecDeque::new(),
             line_mode: false,
             reading: false,
@@ -67,6 +69,10 @@ impl Renderer {
         }
         self.approvals.clear();
         self.pending_input.clear();
+        self.tools.clear();
+        for event in &attached.events {
+            self.track_tools(&event.kind);
+        }
     }
 
     /// Prints one notification and starts approval input when needed.
@@ -105,6 +111,7 @@ impl Renderer {
                 return Ok(());
             }
             self.head = Some(params.event.id);
+            self.track_tools(&params.event.kind);
             match &params.event.kind {
                 EventKind::ApprovalResolved { call, .. } | EventKind::ToolResult { call, .. } => {
                     self.pending_input.retain(|pending| pending != call);
@@ -166,14 +173,26 @@ impl Renderer {
                 }
                 EventKind::ToolDecision {
                     call,
+                    action,
+                    during,
+                    extension,
                     decision: Decision::Ask,
                     ..
                 } => {
-                    self.ask(client, session, call);
+                    let tool = self
+                        .tools
+                        .get(during.as_ref().unwrap_or(&call))
+                        .map(String::as_str)
+                        .or(extension.as_deref());
+                    let prompt = approval_prompt(&action, tool);
+                    self.ask(client, session, call, prompt);
                 }
                 _ => {}
             },
-            ClientNotification::ApprovalPending(params) => self.ask(client, session, params.call),
+            ClientNotification::ApprovalPending(params) => {
+                let prompt = approval_prompt(&params.action, Some(&params.tool));
+                self.ask(client, session, params.call, prompt);
+            }
             ClientNotification::Exited(params) => {
                 if let Some(message) = params.message {
                     eprintln!("xi: {message}");
@@ -184,22 +203,46 @@ impl Renderer {
         Ok(())
     }
 
-    fn ask(&mut self, client: &Client, session: SessionId, call: ToolCallId) {
-        if !self.approvals.insert(call.clone()) {
+    fn track_tools(&mut self, kind: &EventKind) {
+        match kind {
+            EventKind::AssistantMessage { content, .. } => {
+                for block in content {
+                    if let Block::ToolUse { id, name, .. } = block {
+                        self.tools.insert(id.clone(), name.clone());
+                    }
+                }
+            }
+            EventKind::ToolResult { call, .. } => {
+                self.tools.remove(call);
+            }
+            _ => {}
+        }
+    }
+
+    fn input_prompt(&self) -> &str {
+        self.pending_input
+            .front()
+            .and_then(|call| self.approvals.get(call))
+            .map_or("xi> ", String::as_str)
+    }
+
+    fn ask(&mut self, client: &Client, session: SessionId, call: ToolCallId, prompt: String) {
+        if self.approvals.contains_key(&call) {
             return;
         }
         if self.line_mode {
             if self.reading && self.pending_input.is_empty() {
-                print!("\nallow? [y/N] ");
+                print!("\n{prompt}");
             }
+            self.approvals.insert(call.clone(), prompt);
             self.pending_input.push_back(call);
             return;
         }
+        self.approvals.insert(call.clone(), prompt.clone());
         let client = client.clone();
         tokio::spawn(async move {
-            let answer = tokio::task::spawn_blocking(|| {
-                rustyline::DefaultEditor::new()
-                    .and_then(|mut editor| editor.readline("allow? [y/N] "))
+            let answer = tokio::task::spawn_blocking(move || {
+                rustyline::DefaultEditor::new().and_then(|mut editor| editor.readline(&prompt))
             })
             .await;
             let result = match answer {
@@ -216,6 +259,16 @@ impl Renderer {
                 eprintln!("xi: {error}");
             }
         });
+    }
+}
+
+fn approval_prompt(action: &str, tool: Option<&str>) -> String {
+    if !action.starts_with("net ") {
+        return "allow? [y/N] ".to_owned();
+    }
+    match tool.filter(|tool| !tool.is_empty()) {
+        Some(tool) => format!("{tool} · {action} · allow? [y/N] "),
+        None => format!("{action} · allow? [y/N] "),
     }
 }
 
@@ -294,10 +347,10 @@ pub(super) async fn run(launch: xi_tui::Launch, paths: &Paths) -> Result<()> {
             editor.load_history(&history)?;
         }
         loop {
-            let prompt = if renderer.pending_input.is_empty() { "xi> " } else { "allow? [y/N] " };
+            let prompt = renderer.input_prompt().to_owned();
             renderer.reading = true;
             let input = tokio::task::spawn_blocking(move || {
-                let line = editor.readline(prompt);
+                let line = editor.readline(&prompt);
                 (editor, line)
             });
             tokio::pin!(input);
@@ -473,6 +526,134 @@ async fn release(client: &Client, session: SessionId, head: Option<EventId>) -> 
 mod tests {
     use super::*;
     use xi_protocol::methods::client::ResetParams;
+
+    #[tokio::test]
+    async fn synthetic_asks_prompt_and_resolve_by_connection_id() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use xi_protocol::event::{Approver, ModelRef, StopReason, Usage};
+        use xi_protocol::methods::client::EventParams;
+        use xi_protocol::{Event, Timestamp};
+
+        let (connection, server) = tokio::io::duplex(16 * 1024);
+        let (reader, mut writer) = tokio::io::split(server);
+        let (observed, mut requests) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let Some(id) = message.get("id") else {
+                    continue;
+                };
+                let result = if message["method"] == "initialize" {
+                    serde_json::json!({
+                        "protocol_version": xi_protocol::PROTOCOL_VERSION,
+                        "daemon_version": "test",
+                        "capabilities": {"private": true},
+                    })
+                } else {
+                    observed.send(message.clone()).unwrap();
+                    serde_json::Value::Null
+                };
+                let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let (reader, writer) = tokio::io::split(connection);
+        let (client, _notifications) = Client::over(reader, writer, "test").await.unwrap();
+        let session = SessionId::generate();
+        let notification = |kind| {
+            ClientNotification::Event(EventParams {
+                session,
+                event: Event {
+                    id: EventId::generate(),
+                    parent: None,
+                    at: Timestamp(0),
+                    kind,
+                },
+            })
+        };
+        let mut renderer = Renderer::new(Render::Interactive);
+        renderer.session = Some(session);
+        renderer.line_mode = true;
+        renderer
+            .display(
+                notification(EventKind::AssistantMessage {
+                    model: ModelRef {
+                        provider: "test".into(),
+                        model: "test".into(),
+                    },
+                    content: vec![Block::ToolUse {
+                        id: "bash-call".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({"command": "curl github.com"}),
+                        extra: Default::default(),
+                    }],
+                    stop: StopReason::ToolUse,
+                    usage: Usage::default(),
+                }),
+                &client,
+            )
+            .unwrap();
+        renderer
+            .display(
+                notification(EventKind::ToolDecision {
+                    call: "connection".into(),
+                    action: "net github.com:443".into(),
+                    decision: Decision::Ask,
+                    rule: None,
+                    taint: false,
+                    during: Some("bash-call".into()),
+                    extension: None,
+                }),
+                &client,
+            )
+            .unwrap();
+        assert_eq!(
+            renderer.input_prompt(),
+            "bash · net github.com:443 · allow? [y/N] "
+        );
+        let call = renderer.pending_input.pop_front().unwrap();
+        assert_eq!(call, "connection".into());
+        client
+            .resolve(session, call, true, Remember::Once)
+            .await
+            .unwrap();
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["method"], "approval/resolve");
+        assert_eq!(request["params"]["call"], "connection");
+        renderer
+            .display(
+                notification(EventKind::ApprovalResolved {
+                    call: "connection".into(),
+                    approved: true,
+                    by: Approver::User,
+                    remember: Remember::Once,
+                }),
+                &client,
+            )
+            .unwrap();
+        assert!(renderer.pending_input.is_empty());
+        assert_eq!(renderer.tools[&"bash-call".into()], "bash");
+    }
+
+    #[test]
+    fn network_prompts_include_extension_names_without_changing_tool_prompts() {
+        assert_eq!(
+            approval_prompt("net example.org:443", Some("fetch")),
+            "fetch · net example.org:443 · allow? [y/N] "
+        );
+        assert_eq!(
+            approval_prompt("net example.org:443", None),
+            "net example.org:443 · allow? [y/N] "
+        );
+        assert_eq!(
+            approval_prompt("exec pytest", Some("bash")),
+            "allow? [y/N] "
+        );
+    }
 
     #[test]
     fn json_notifications_keep_the_rpc_envelope() {
