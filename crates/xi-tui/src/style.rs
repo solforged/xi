@@ -1,11 +1,16 @@
 //! Pigments, spans and width-bounded lines.
 //!
 //! Every pigment maps to an ANSI index, so the user's terminal theme decides
-//! the hue. A line never exceeds the width it was built for: anything wider is
-//! cut with `…`, because a wrapped line would break the live region's row
-//! count.
+//! the hue. The one exception is the raised surface: the deck lifts the
+//! terminal's own background a little behind its panel, prompts and
+//! composer, when the terminal reports that background. A line never
+//! exceeds the width it was built for: anything wider is cut with `…`,
+//! because a wrapped line would break the live region's row count.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// A background colour as red, green and blue.
+pub type Rgb = [u8; 3];
 
 /// A colour role. Each has exactly one meaning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +57,8 @@ pub struct Span {
     /// Underlined, for marks that must not change the text's role, such as
     /// a search match on a selected row.
     pub underline: bool,
+    /// Set on the raised surface, where the deck draws one.
+    pub raised: bool,
 }
 
 /// One terminal row of spans.
@@ -134,6 +141,7 @@ impl Line {
                 role,
                 bold,
                 underline: false,
+                raised: false,
             });
         }
         self
@@ -157,6 +165,7 @@ impl Line {
                 role,
                 bold: false,
                 underline: true,
+                raised: false,
             });
         }
         self
@@ -167,6 +176,28 @@ impl Line {
     pub fn extend(mut self, other: Self) -> Self {
         self.0.extend(other.0);
         self
+    }
+
+    /// Sets every span on the raised surface. [`Line::fill`] carries it to
+    /// the edge of a column.
+    #[must_use]
+    pub fn raise(mut self) -> Self {
+        for span in &mut self.0 {
+            span.raised = true;
+        }
+        self
+    }
+
+    /// Cuts the line to `cols` cells and, when it starts on the raised
+    /// surface, pads it with that surface to exactly `cols`.
+    #[must_use]
+    pub fn fill(self, cols: usize) -> Self {
+        let line = self.truncate(cols);
+        let gap = cols - line.width();
+        if gap == 0 || !line.0.first().is_some_and(|span| span.raised) {
+            return line;
+        }
+        line.extend(Line::default().ink(" ".repeat(gap)).raise())
     }
 
     /// Display width in terminal cells.
@@ -210,34 +241,49 @@ impl Line {
         }
         let mut line = Self(out);
         if cols > 0 {
-            let role = line.0.last().map_or(Role::Dim, |s| s.role);
+            let (role, raised) = line
+                .0
+                .last()
+                .map_or((Role::Dim, false), |s| (s.role, s.raised));
             line = line.span(role, false, "…");
+            if let Some(last) = line.0.last_mut() {
+                last.raised = raised;
+            }
         }
         line
     }
 
-    /// Writes the line with SGR codes, or plain when `color` is off.
-    pub fn write_ansi(&self, out: &mut String, color: bool) {
+    /// Writes the line with SGR codes, or plain when `color` is off. Raised
+    /// spans get `surface` as their background when one is given.
+    pub fn write_ansi(&self, out: &mut String, color: bool, surface: Option<Rgb>) {
+        use std::fmt::Write as _;
         for span in &self.0 {
-            let mut codes = Vec::new();
-            if color {
-                if span.bold {
-                    codes.push("1");
-                }
-                if span.underline {
-                    codes.push("4");
-                }
-                codes.extend(span.role.sgr());
-            }
-            if codes.is_empty() {
+            let bg = surface.filter(|_| color && span.raised);
+            let codes = [
+                (color && span.bold).then_some("1"),
+                (color && span.underline).then_some("4"),
+                span.role.sgr().filter(|_| color),
+            ];
+            if bg.is_none() && codes.iter().all(Option::is_none) {
                 out.push_str(&span.text);
-            } else {
-                out.push_str("\x1b[");
-                out.push_str(&codes.join(";"));
-                out.push('m');
-                out.push_str(&span.text);
-                out.push_str("\x1b[0m");
+                continue;
             }
+            out.push_str("\x1b[");
+            let mut first = true;
+            for code in codes.into_iter().flatten() {
+                if !first {
+                    out.push(';');
+                }
+                out.push_str(code);
+                first = false;
+            }
+            if let Some([r, g, b]) = bg {
+                let sep = if first { "" } else { ";" };
+                let _ = write!(out, "{sep}48;2;{r};{g};{b}");
+            }
+            out.push('m');
+            out.push_str(&span.text);
+            out.push_str("\x1b[0m");
         }
     }
 }
@@ -543,10 +589,31 @@ mod tests {
     fn color_is_optional() {
         let line = Line::default().strong(Role::Ink, "bash").dim(" 1.8s");
         let (mut colored, mut plain) = (String::new(), String::new());
-        line.write_ansi(&mut colored, true);
-        line.write_ansi(&mut plain, false);
+        line.write_ansi(&mut colored, true, None);
+        line.write_ansi(&mut plain, false, Some([1, 2, 3]));
         assert_eq!(colored, "\x1b[1mbash\x1b[0m\x1b[90m 1.8s\x1b[0m");
         assert_eq!(plain, "bash 1.8s");
+    }
+
+    #[test]
+    fn raised_rows_fill_their_column_on_the_surface_only_when_one_is_known() {
+        let line = Line::default().brass("┃").ink(" hi").raise().fill(6);
+        assert_eq!(line.plain(), "┃ hi  ");
+        assert!(line.0.iter().all(|span| span.raised));
+        let (mut lifted, mut flat) = (String::new(), String::new());
+        line.write_ansi(&mut lifted, true, Some([30, 24, 22]));
+        line.write_ansi(&mut flat, true, None);
+        assert_eq!(
+            lifted,
+            "\x1b[33;48;2;30;24;22m┃\x1b[0m\x1b[48;2;30;24;22m hi\x1b[0m\x1b[48;2;30;24;22m  \x1b[0m"
+        );
+        assert_eq!(flat, "\x1b[33m┃\x1b[0m hi  ");
+        // A cut raised row keeps its ellipsis on the surface; a base row
+        // isn't padded.
+        let cut = Line::default().ink("abcdef").raise().fill(4);
+        assert_eq!(cut.plain(), "abc…");
+        assert!(cut.0.iter().all(|span| span.raised));
+        assert_eq!(Line::default().ink("ab").fill(6).plain(), "ab");
     }
 
     #[test]
@@ -606,6 +673,7 @@ mod tests {
                 role: Role::Dim,
                 bold: true,
                 underline: false,
+                raised: false,
             }]
         );
         let fenced = prose("```sh\nls `pwd` **x**\n```\n`y`", 40, Role::Ink);

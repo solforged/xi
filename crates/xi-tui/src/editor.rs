@@ -9,8 +9,20 @@ use crate::style::{Line, Role};
 pub struct Form {
     /// Text rows shown before the composer scrolls.
     pub rows: usize,
+    /// How the composer is bordered.
+    pub shape: Shape,
+}
+
+/// The composer's border.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// A rounded box with a `ξ` prompt.
+    Box,
     /// A rule and prompt without side borders.
-    pub bare: bool,
+    Rule,
+    /// The deck's block: a bar down its left on the raised surface, a blank
+    /// row above the text and no prompt. The caller closes it below.
+    Bar,
 }
 
 /// Text being composed, with a cursor and history.
@@ -255,20 +267,26 @@ impl Editor {
         hint: &str,
         form: Form,
     ) -> (Vec<Line>, (usize, usize)) {
-        let inner = cols.saturating_sub(if form.bare { 2 } else { 6 });
+        let inner = cols.saturating_sub(match form.shape {
+            Shape::Box => 6,
+            Shape::Rule => 2,
+            Shape::Bar => 4,
+        });
         let (rows, (crow, ccol)) = self.layout(inner);
         let visible = form.rows.max(1);
         let top = crow
             .saturating_sub(visible - 1)
             .min(rows.len().saturating_sub(visible));
         let b = |s: &str| Line::default().span(border, false, s);
-        let mut lines = vec![if form.bare {
-            b(&"─".repeat(cols))
-        } else {
-            b(&format!("╭{}╮", "─".repeat(cols.saturating_sub(2))))
+        let mut lines = vec![match form.shape {
+            Shape::Box => b(&format!("╭{}╮", "─".repeat(cols.saturating_sub(2)))),
+            Shape::Rule => b(&"─".repeat(cols)),
+            Shape::Bar => b("┃").raise(),
         }];
         for (i, row) in rows.iter().enumerate().skip(top).take(visible) {
-            let lead = if i == 0 {
+            let lead = if form.shape == Shape::Bar {
+                b("┃").ink("  ")
+            } else if i == 0 {
                 Line::default().brass("ξ ")
             } else {
                 Line::default().ink("  ")
@@ -278,25 +296,29 @@ impl Editor {
             } else {
                 Line::default().ink(row)
             };
-            let line = if form.bare {
-                lead.extend(body)
-            } else {
-                let pad = inner.saturating_sub(body.width());
-                b("│ ")
-                    .extend(lead)
-                    .extend(body)
-                    .ink(" ".repeat(pad))
-                    .extend(b(" │"))
+            let line = match form.shape {
+                Shape::Box => {
+                    let pad = inner.saturating_sub(body.width());
+                    b("│ ")
+                        .extend(lead)
+                        .extend(body)
+                        .ink(" ".repeat(pad))
+                        .extend(b(" │"))
+                }
+                Shape::Rule => lead.extend(body),
+                Shape::Bar => lead.extend(body).raise(),
             };
             lines.push(line.truncate(cols));
         }
-        if !form.bare {
+        if form.shape == Shape::Box {
             lines.push(b(&format!("╰{}╯", "─".repeat(cols.saturating_sub(2)))));
         }
-        (
-            lines,
-            (1 + crow - top, if form.bare { 2 } else { 4 } + ccol),
-        )
+        let lead = match form.shape {
+            Shape::Box => 4,
+            Shape::Rule => 2,
+            Shape::Bar => 3,
+        };
+        (lines, (1 + crow - top, lead + ccol))
     }
 }
 
@@ -365,7 +387,7 @@ mod tests {
         e.insert("one\ntwo three four");
         let form = Form {
             rows: 8,
-            bare: false,
+            shape: Shape::Box,
         };
         let (lines, cursor) = e.render(16, Role::Brass, "", form);
         assert!(lines.iter().all(|l| l.width() == 16), "{lines:?}");
@@ -384,7 +406,7 @@ mod tests {
         editor.set_text("one\ntwo\nthree\nfour");
         let form = Form {
             rows: 3,
-            bare: true,
+            shape: Shape::Rule,
         };
         let (lines, cursor) = editor.render(16, Role::Murex, "", form);
         assert_eq!(
@@ -402,5 +424,30 @@ mod tests {
         assert_eq!(empty[1].plain(), "ξ enter sends");
         assert_eq!(empty[1].0.last().unwrap().role, Role::Dim);
         assert_eq!(cursor, (1, 2));
+    }
+
+    #[test]
+    fn the_bar_block_sits_on_the_raised_surface_without_a_prompt() {
+        let mut editor = Editor::default();
+        editor.set_text("one\ntwo");
+        let form = Form {
+            rows: 4,
+            shape: Shape::Bar,
+        };
+        let (lines, cursor) = editor.render(20, Role::Murex, "", form);
+        assert_eq!(
+            lines.iter().map(Line::plain).collect::<Vec<_>>(),
+            ["┃", "┃  one", "┃  two"]
+        );
+        assert_eq!(cursor, (2, 6));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.0.iter().all(|span| span.raised))
+        );
+        assert_eq!(lines[1].0[0].role, Role::Murex);
+        let (empty, cursor) = Editor::default().render(20, Role::Brass, "", form);
+        assert_eq!(empty[1].plain(), "┃  ");
+        assert_eq!(cursor, (1, 3));
     }
 }

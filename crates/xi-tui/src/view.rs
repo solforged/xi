@@ -5,7 +5,7 @@ use xi_client::client::ClientNotification;
 use xi_protocol::methods::client::EventParams;
 use xi_protocol::model::Reasoning;
 
-use crate::editor::Form;
+use crate::editor::{Form, Shape};
 use crate::layout::Tier;
 use crate::screen::Screen;
 use crate::status::{Segment, fit};
@@ -246,9 +246,12 @@ impl App {
         segs
     }
 
-    pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
+    /// The live region, its cursor, and how many of its last rows the deck
+    /// keeps against the bottom: frames, the composer and its status row.
+    pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>, usize) {
         let m = self.measure();
         let cols = m.out;
+        let deck = self.deck.is_some();
         // Frames keep their room by shrinking streamed rows and the composer.
         // Short panes omit the collapsed composer so title and hints survive.
         let framed = !self.overlays.is_empty();
@@ -258,28 +261,14 @@ impl App {
             self.transcript.live(m, self.frame)
         };
         let transcript_rows = lines.len();
-        if self.running() {
+        // The deck shows the turn's activity under its composer, which a
+        // frame collapses.
+        let activity = self.running().then(|| self.activity(m));
+        if let Some(activity) = activity.clone().filter(|_| !deck || framed) {
             if !lines.is_empty() && !framed {
                 lines.push(Line::default());
             }
-            let elapsed = self.started.map_or(0, |s| s.elapsed().as_secs());
-            let turn = self.transcript.turn;
-            let what = if self.transcript.thinking() {
-                "thinking"
-            } else {
-                "working"
-            };
-            let mut line = Line::default()
-                .brass(SPINNER[self.frame % SPINNER.len()])
-                .dim(format!(" {what} · {elapsed}s"));
-            if m.durations() && turn.sent() > 0 {
-                line = line.dim(format!(
-                    " · ↑ {} ↓ {}",
-                    tokens(turn.sent()),
-                    tokens(turn.output)
-                ));
-            }
-            lines.push(line.dim(" · esc stop").truncate(cols));
+            lines.push(activity.dim(" · esc stop").truncate(cols));
         }
         for content in &self.steering {
             lines.push(lr(
@@ -301,6 +290,16 @@ impl App {
                 cols,
             ));
         }
+        let hint = if self.running() {
+            "enter steers · alt+enter queues · esc stops"
+        } else {
+            "enter sends · ctrl+j new line · /help"
+        };
+        let border = if self.transcript.tainted {
+            Role::Murex
+        } else {
+            Role::Brass
+        };
         let (composer, (row, col)) = if framed && m.short {
             (Vec::new(), (0, 0))
         } else if framed {
@@ -316,26 +315,26 @@ impl App {
                 cols,
             );
             (vec![line], (0, 0))
+        } else if deck {
+            let form = Form {
+                rows: m.composer_rows(),
+                shape: Shape::Bar,
+            };
+            let (mut block, cursor) = self.editor.render(cols, border, "", form);
+            let bar = || Line::default().span(border, false, "┃");
+            block.push(bar().ink("  ").extend(self.model_line()).raise());
+            block.push(bar().raise());
+            (block, cursor)
         } else {
-            let border = if self.transcript.tainted {
-                Role::Murex
-            } else {
-                Role::Brass
-            };
-            let hint = if self.running() {
-                "enter steers · alt+enter queues · esc stops"
-            } else {
-                "enter sends · ctrl+j new line · /help"
-            };
-            self.editor.render(
-                cols,
-                border,
-                hint,
-                Form {
-                    rows: m.composer_rows(),
-                    bare: m.tier == Tier::Slit,
+            let form = Form {
+                rows: m.composer_rows(),
+                shape: if m.tier == Tier::Slit {
+                    Shape::Rule
+                } else {
+                    Shape::Box
                 },
-            )
+            };
+            self.editor.render(cols, border, hint, form)
         };
         let attachment_rows = usize::from(!self.images.is_empty());
         // The frame gets what is left after the composer, the status line
@@ -349,6 +348,7 @@ impl App {
         } else {
             m.frame_rows(overlay_rows.max(4))
         };
+        let dock_from = lines.len();
         let mut ctx = crate::overlays::ctx!(self);
         let (rows, cursor) = self
             .overlays
@@ -370,8 +370,14 @@ impl App {
         }
         let top = lines.len();
         lines.extend(composer);
-        if self.deck.is_none() {
+        if !deck {
             lines.push(self.footer(cols));
+        } else if !framed {
+            lines.push(lr(
+                activity.unwrap_or_default(),
+                Line::default().dim(hint),
+                cols,
+            ));
         }
         let cursor = overlay_cursor.or_else(|| (!framed).then_some((top + row, col)));
         let hidden = lines.len().saturating_sub(m.live_rows());
@@ -379,7 +385,46 @@ impl App {
             lines.drain(..hidden);
         }
         let cursor = cursor.and_then(|(row, col)| row.checked_sub(hidden).map(|row| (row, col)));
-        (lines, cursor)
+        let dock = lines.len().min(lines.len() + hidden - dock_from);
+        (lines, cursor, dock)
+    }
+
+    /// The turn's spinner, what it does and for how long, and its tokens
+    /// when the measure has room.
+    fn activity(&self, m: crate::layout::Measure) -> Line {
+        let elapsed = self.started.map_or(0, |s| s.elapsed().as_secs());
+        let turn = self.transcript.turn;
+        let what = if self.transcript.thinking() {
+            "thinking"
+        } else {
+            "working"
+        };
+        let mut line = Line::default()
+            .brass(SPINNER[self.frame % SPINNER.len()])
+            .dim(format!(" {what} · {elapsed}s"));
+        if m.durations() && turn.sent() > 0 {
+            line = line.dim(format!(
+                " · ↑ {} ↓ {}",
+                tokens(turn.sent()),
+                tokens(turn.output)
+            ));
+        }
+        line
+    }
+
+    /// The model and its reasoning level, under the deck's composer.
+    fn model_line(&self) -> Line {
+        let info = &self.launch.attached.info;
+        let model = Line::default().ink(format!("{}/{}", info.model.provider, info.model.model));
+        match &info.model_info {
+            Some(model_info) if model_info.reasoning.is_empty() => model.dim(" · no think"),
+            model_info => {
+                let level = model_info
+                    .as_ref()
+                    .map_or(info.reasoning, |m| m.resolve(info.reasoning));
+                model.dim(" · ").dim(short_reasoning(level))
+            }
+        }
     }
 
     pub(crate) fn draw<W: std::io::Write>(
@@ -399,7 +444,7 @@ impl App {
         if self.deck.is_some() {
             return self.draw_deck(screen);
         }
-        let (live, cursor) = self.live();
+        let (live, cursor, _) = self.live();
         let commit = std::mem::take(&mut self.commit);
         screen.draw(&commit, &live, cursor, self.measure().live_rows())
     }

@@ -593,7 +593,7 @@ async fn footer_shows_usage_sandbox_and_safety_in_color_or_monochrome() {
         assert!(text.contains(label), "{text}");
     }
     let mut mono = String::new();
-    footer.write_ansi(&mut mono, false);
+    footer.write_ansi(&mut mono, false, None);
     assert_eq!(mono, text);
     let narrow = app.footer(36).plain();
     assert!(!narrow.contains('◇'));
@@ -1630,11 +1630,12 @@ async fn tab_answers_a_waiting_ask_over_another_overlay_and_records_it() {
     assert!(!live_text(&app).contains("waiting"));
 }
 
-/// The live region's composer row, above the footer inline; the deck has
-/// no footer.
+/// The live region's last composer row: above the footer inline and above
+/// the deck's status row, which a frame drops.
 fn composer_line(app: &App) -> String {
     let lines = app.live().0;
-    lines[lines.len() - 1 - usize::from(app.deck.is_none())].plain()
+    let below = usize::from(app.deck.is_none() || app.overlays.is_empty());
+    lines[lines.len() - 1 - below].plain()
 }
 
 #[tokio::test]
@@ -1663,7 +1664,7 @@ async fn esc_steps_back_one_overlay_and_ctrl_c_closes_the_stack() {
     assert!(app.overlays.is_empty());
     assert!(app.commit.is_empty());
     assert_eq!(app.editor.text(), "keep draft\nsecond line");
-    assert!(composer_line(&app).starts_with('╰'));
+    assert_eq!(composer_line(&app), "┃");
 }
 
 #[tokio::test]
@@ -2820,7 +2821,7 @@ async fn settings_cycles_approvals_and_edits_kept_tail_tokens() {
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    let (live, cursor) = app.live();
+    let (live, cursor, _) = app.live();
     let (row, col) = cursor.expect("the token field holds the cursor");
     let field = live[row].plain();
     assert!(
@@ -3101,7 +3102,7 @@ async fn settings_trigger_nonintegral_unit_conversion_requires_new_value_and_kee
         .unwrap();
     for cols in [16, 24, 40, 80] {
         app.cols = cols;
-        let (live, cursor) = app.live();
+        let (live, cursor, _) = app.live();
         let (row, col) = cursor.expect("the inline cursor survives a narrow terminal");
         let field = live[row].plain();
         assert!(live[row].width() <= cols, "{field}");
@@ -3229,7 +3230,7 @@ async fn startup_resume_uses_the_attached_workspace_for_new_sessions() {
 async fn slit_composer_is_a_rule_and_bare_prompt() {
     let (launch, _) = launch(snapshot(false)).await;
     let app = App::new(launch, 60, 36);
-    let (lines, cursor) = app.live();
+    let (lines, cursor, _) = app.live();
     assert_eq!(lines[0].plain(), "─".repeat(60));
     assert_eq!(
         composer_line(&app),
@@ -3244,7 +3245,7 @@ async fn slit_composer_is_a_rule_and_bare_prompt() {
 async fn sheet_chrome_stays_on_the_output_measure() {
     let (launch, _) = launch(snapshot(true)).await;
     let app = App::new(launch, 250, 36);
-    let (lines, _) = app.live();
+    let (lines, ..) = app.live();
     let activity = lines
         .iter()
         .find(|line| line.plain().contains("working"))
@@ -3265,7 +3266,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
     let (launch, _) = launch(snapshot(true)).await;
     let mut app = App::new(launch, 60, 36);
     append(&mut app, reply(Vec::new(), StopReason::ToolUse));
-    let (lines, _) = app.live();
+    let (lines, ..) = app.live();
     let activity = lines
         .iter()
         .find(|line| line.plain().contains("working"))
@@ -3276,7 +3277,7 @@ async fn slit_activity_drops_token_counts_but_keeps_elapsed_time() {
     assert!(!activity.contains('↑'));
     assert!(!activity.contains('↓'));
     app.cols = 250;
-    let (lines, _) = app.live();
+    let (lines, ..) = app.live();
     let activity = lines
         .iter()
         .find(|line| line.plain().contains("working"))
@@ -3295,7 +3296,7 @@ async fn short_live_region_keeps_the_frame_title_five_rows_and_hints() {
     app.editor.set_text(&"draft\n".repeat(20));
     assert!(app.live().0.len() <= 8);
     app.command("/settings").await.unwrap();
-    let (lines, _) = app.live();
+    let (lines, ..) = app.live();
     assert_eq!(lines.len(), 8);
     assert!(lines[0].plain().contains("settings"));
     assert!(lines[6].plain().contains("enter changes"));
@@ -3461,17 +3462,21 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     let mut screen = Screen::new(&mut out, false, 250);
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
-    // Nerd Font icons are the default.
+    // The panel names the session, its context and changes, and at its
+    // foot the workspace and the rules it runs under.
     for expected in [
-        "ξ xi",
-        "\u{f413} /tmp/xi-tui-demo",
         "Route sandboxed bash",
-        "\u{f442} Sessions",
+        "Context",
+        "Changes",
+        "+1 −1",
+        "Sessions",
         "1 idle",
         "● edit src/a.rs",
         "● read docs/policies.md",
-        "\u{f440} Changes · 1 file",
-        "\u{f45e} \u{f49c} \u{f4a1}",
+        "/tmp/xi-tui-demo",
+        "approvals ask · sandboxed · trusted",
+        "ξ xi",
+        "enter sends",
     ] {
         assert!(text.contains(expected), "{expected:?} missing in {text}");
     }
@@ -3479,7 +3484,6 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
         !text.contains("alt+2"),
         "the composer's panel has no keys row"
     );
-    // The header spells out only the unusual: sandbox off, untrusted.
     app.launch.attached.info.sandbox_enabled = false;
     app.launch.attached.info.trusted = false;
     let mut out = Vec::new();
@@ -3487,7 +3491,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
     app.draw(&mut screen).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains("\u{f45e} \u{f513} sandbox off \u{f4a3} untrusted"),
+        text.contains("approvals ask · sandbox off · untrusted"),
         "{text}"
     );
     // alt+1 lists every session; idle ones stay out of the live view.
@@ -3536,7 +3540,7 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
 }
 
 #[tokio::test]
-async fn deck_log_titles_a_session_by_its_prompt_until_it_is_titled() {
+async fn the_deck_panel_titles_a_session_by_its_prompt_until_it_is_titled() {
     let attached = snapshot(false);
     let mut listed = summary(&attached, true, "", 1);
     listed.title = None;
@@ -3552,9 +3556,10 @@ async fn deck_log_titles_a_session_by_its_prompt_until_it_is_titled() {
         let mut screen = Screen::new(&mut out, false, 250);
         app.draw(&mut screen).unwrap();
         let text = String::from_utf8(out).unwrap();
-        text.split("\r\n").nth(1).unwrap().trim().to_owned()
+        let row = text.split("\r\n").nth(1).unwrap();
+        row.rsplit('│').next().unwrap().trim().to_owned()
     };
-    assert!(log_title(&mut app).starts_with("new session"));
+    assert_eq!(log_title(&mut app), "new session");
     // `session/list` still has no title; the client's own log does.
     append(
         &mut app,
@@ -3564,7 +3569,7 @@ async fn deck_log_titles_a_session_by_its_prompt_until_it_is_titled() {
             }],
         },
     );
-    assert!(log_title(&mut app).starts_with("route bash through the proxy "));
+    assert_eq!(log_title(&mut app), "route bash through the proxy");
     append(
         &mut app,
         EventKind::SessionTitled {
@@ -3574,7 +3579,7 @@ async fn deck_log_titles_a_session_by_its_prompt_until_it_is_titled() {
             usage: None,
         },
     );
-    assert!(log_title(&mut app).starts_with("Proxy bash egress "));
+    assert_eq!(log_title(&mut app), "Proxy bash egress");
     // A resumed session reads its first prompt from the attached log.
     let mut attached = snapshot(false);
     let root = attached.events[0].id;
@@ -3590,7 +3595,7 @@ async fn deck_log_titles_a_session_by_its_prompt_until_it_is_titled() {
     });
     let (launch, _) = launch_with(attached, FakeData::default()).await;
     let mut app = App::new(launch, 250, 36);
-    assert!(log_title(&mut app).starts_with("resume me "));
+    assert_eq!(log_title(&mut app), "resume me");
 }
 
 #[tokio::test]

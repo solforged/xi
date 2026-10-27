@@ -15,7 +15,7 @@ use crate::approvals::Approval;
 use crate::deck::{
     self, AskRow, ContextGauge, Focus, LogPane, Mark, Panel, Scene, SessionRow, SessionsPane,
 };
-use crate::icons::{Icon, Icons};
+use crate::icons::Icon;
 use crate::keys::Action;
 use crate::layout::Measure;
 use crate::log::{Inspect, Log};
@@ -32,7 +32,7 @@ const REFRESH: Duration = Duration::from_secs(5);
 /// The title of a session with no prompt yet.
 const UNTITLED: &str = "new session";
 
-/// What the deck's header carries beside the title.
+/// What the folded deck's header carries beside the workspace.
 const HEADER: [&str; 6] = [
     "model",
     "reasoning",
@@ -42,8 +42,11 @@ const HEADER: [&str; 6] = [
     "facts",
 ];
 
-/// What the header adds when the side panel, which shows it, is folded.
+/// What the folded header adds; the panel shows it when it fits.
 const STATUS: [&str; 2] = ["context", "cache"];
+
+/// The rules the session runs under, at the panel's foot.
+const FACTS: [&str; 3] = ["facts", "taint", "children"];
 
 /// The deck's state while the client owns the screen.
 #[derive(Default)]
@@ -295,17 +298,15 @@ impl App {
         &mut self,
         screen: &mut Screen<W>,
     ) -> std::io::Result<()> {
-        let (live, cursor) = self.live();
+        let (live, cursor, dock) = self.live();
         let meta = self.log_meta();
-        let scene = self.scene(&live, cursor, &meta);
+        let scene = self.scene(&live, cursor, dock, &meta);
         let (rows, cursor) = deck::render(&scene, self.cols, self.rows);
         screen.draw_deck(&rows, cursor)
     }
 
-    /// The log's meta row: when the session started, its head and event
-    /// count.
+    /// The session's meta row: when it started, its head and event count.
     fn log_meta(&self) -> String {
-        let icons = self.icons;
         let info = &self.launch.attached.info;
         let started = self
             .deck
@@ -314,15 +315,13 @@ impl App {
             .and_then(|entry| entry.started);
         let mut parts = Vec::new();
         if let Some(started) = started {
-            parts.push(icons.tag(Icon::Clock, &clock(started)));
+            parts.push(clock(started));
         }
         let head = info.head.to_string();
-        parts.push(icons.tag(Icon::Head, &head[..head.len().min(8)]));
-        let events = self.launch.attached.events.len();
-        parts.push(match (icons, events) {
-            (Icons::Nerd, _) => icons.tag(Icon::Events, &events.to_string()),
-            (Icons::Unicode, 1) => "1 event".to_owned(),
-            (Icons::Unicode, _) => format!("{events} events"),
+        parts.push(head[..head.len().min(8)].to_owned());
+        parts.push(match self.launch.attached.events.len() {
+            1 => "1 event".to_owned(),
+            events => format!("{events} events"),
         });
         parts.join(" · ")
     }
@@ -392,12 +391,10 @@ impl App {
         line
     }
 
-    /// The approval mode, sandbox and trust as bare icons, with words in
-    /// brass only for what differs from the usual: approvals other than
-    /// `ask`, the sandbox off, an untrusted workspace. In Unicode the usual
-    /// states are left out but the sandbox's `◇`.
+    /// The approval mode, sandbox and trust in words, with what differs
+    /// from the usual in brass: approvals other than `ask`, the sandbox
+    /// off, an untrusted workspace.
     fn facts(&self) -> Line {
-        let icons = self.icons;
         let info = &self.launch.attached.info;
         let mode = self
             .deck
@@ -405,37 +402,41 @@ impl App {
             .and_then(|deck| deck.settings.as_ref())
             .and_then(|report| report.settings.iter().find(|s| s.key == "approvals"))
             .and_then(|setting| setting.value.as_str().map(str::to_owned));
-        let facts = [
-            match mode.as_deref() {
-                None | Some("ask") => (Icon::Approvals, None),
-                Some(mode) => (Icon::Approvals, Some(format!("approvals {mode}"))),
-            },
-            if info.sandbox_enabled {
-                (Icon::Sandbox, None)
-            } else {
-                (Icon::SandboxOff, Some("sandbox off".to_owned()))
-            },
-            if info.trusted {
-                (Icon::Trusted, None)
-            } else {
-                (Icon::Untrusted, Some("untrusted".to_owned()))
-            },
-        ];
+        let approvals = match mode.as_deref() {
+            None | Some("ask") => Line::default().dim("approvals ask"),
+            Some(mode) => Line::default().brass(format!("approvals {mode}")),
+        };
+        let sandbox = if info.sandbox_enabled {
+            Line::default().dim("sandboxed")
+        } else {
+            Line::default().brass("sandbox off")
+        };
+        let trust = if info.trusted {
+            Line::default().dim("trusted")
+        } else {
+            Line::default().brass("untrusted")
+        };
+        approvals
+            .dim(" · ")
+            .extend(sandbox)
+            .dim(" · ")
+            .extend(trust)
+    }
+
+    /// The workspace with its last component and the branch set apart.
+    fn place(&self) -> Line {
+        let cwd = &self.launch.attached.info.cwd;
+        let path = home(cwd);
+        let (parent, base) = path
+            .rsplit_once('/')
+            .map_or(("", path.as_str()), |(parent, base)| (parent, base));
         let mut line = Line::default();
-        for (icon, unusual) in facts {
-            let fact = match (icons, unusual) {
-                (Icons::Nerd, None) => Line::default().dim(icons.get(icon)),
-                (Icons::Nerd, Some(word)) => {
-                    Line::default().brass(format!("{} {word}", icons.get(icon)))
-                }
-                (Icons::Unicode, None) if icon == Icon::Sandbox => Line::default().dim("◇"),
-                (Icons::Unicode, None) => continue,
-                (Icons::Unicode, Some(word)) => Line::default().brass(word),
-            };
-            if !line.0.is_empty() {
-                line = line.ink(" ");
-            }
-            line = line.extend(fact);
+        if !parent.is_empty() || path.starts_with('/') {
+            line = line.dim(format!("{parent}/"));
+        }
+        line = line.ink(base);
+        if let Some(branch) = self.git.label(cwd) {
+            line = line.dim(":").ink(branch);
         }
         line
     }
@@ -445,6 +446,7 @@ impl App {
         &'a self,
         live: &'a [Line],
         cursor: Option<(usize, usize)>,
+        dock: usize,
         meta: &'a str,
     ) -> Scene<'a> {
         let deck = self.deck.as_ref().expect("scene needs the deck");
@@ -566,8 +568,6 @@ impl App {
             .filter(|title| !title.trim().is_empty())
             .unwrap_or(UNTITLED);
         let log = LogPane {
-            title,
-            meta,
             rows: deck.log.rows(),
             selected: matches!(deck.focus, Focus::Log | Focus::Inspector)
                 .then(|| deck.log.selected_row())
@@ -575,6 +575,7 @@ impl App {
             reveal: deck.log.reveal(),
             scrolled: deck.log.scrolled(),
             live,
+            dock,
             cursor,
         };
         let session = self.transcript.session;
@@ -600,15 +601,20 @@ impl App {
             changed,
             sessions,
             context,
+            place: self.place(),
+            facts: self.bar(&FACTS),
             icons,
         };
         Scene {
             header_left,
             header_right,
             status: self.bar(&STATUS),
+            title,
+            meta,
             log,
             panel,
             focus: deck.focus,
+            surfaces: self.surfaces,
         }
     }
 
@@ -616,7 +622,7 @@ impl App {
     pub(crate) fn deck_measure(&self) -> Measure {
         let columns = deck::columns(self.cols);
         // A gutter cell and a cell of margin beside the log's rows; the
-        // header, the title and the gap under it are the deck's.
+        // folded deck's header, title and the gap under it take three rows.
         Measure::new(
             columns.log.saturating_sub(2),
             self.rows.saturating_sub(3).max(4),
