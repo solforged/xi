@@ -9,8 +9,47 @@
 //! frame.
 
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use crate::style::Line;
+
+/// How long the width must hold still before a frame is drawn.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// Holds frames back while the terminal width changes.
+///
+/// A frame's rewind counts the rows the terminal reflowed at the width read
+/// before drawing. While a window is dragged, the terminal can resize again
+/// before it reads the frame, so the rewind stops short and leaves a copy of
+/// the live region behind. Drawing only once the width settles avoids that.
+pub struct Settle {
+    width: u16,
+    until: Option<Instant>,
+}
+
+impl Settle {
+    /// Settled at `width`.
+    pub fn new(width: u16) -> Self {
+        Self { width, until: None }
+    }
+
+    /// Records the width read `now` and returns whether a frame may draw.
+    pub fn ready(&mut self, width: u16, now: Instant) -> bool {
+        if width != self.width {
+            self.width = width;
+            self.until = Some(now + SETTLE);
+        }
+        if self.until.is_some_and(|until| until <= now) {
+            self.until = None;
+        }
+        self.until.is_none()
+    }
+
+    /// When a held-back frame may draw, if one is waiting.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.until
+    }
+}
 
 /// The bottom of the main screen, as last drawn.
 pub struct Screen<W: Write> {
@@ -69,7 +108,8 @@ impl<W: Write> Screen<W> {
 
     /// Commits `committed` to scrollback and redraws `live` below it. `live`
     /// keeps its last `rows` lines when the screen is shorter. `cursor` is a
-    /// row and column within `live`; without one the cursor is hidden.
+    /// row and column within `live`; without one the cursor is hidden. Live
+    /// lines and the cursor are clipped to the current terminal width.
     pub fn draw(
         &mut self,
         committed: &[Line],
@@ -84,7 +124,11 @@ impl<W: Write> Screen<W> {
             buf.push_str("\r\n");
         }
         let skip = live.len().saturating_sub(rows.max(1));
-        let live = &live[skip..];
+        let live: Vec<_> = live[skip..]
+            .iter()
+            .cloned()
+            .map(|line| line.truncate(self.cols))
+            .collect();
         for (i, line) in live.iter().enumerate() {
             if i > 0 {
                 buf.push_str("\r\n");
@@ -92,7 +136,10 @@ impl<W: Write> Screen<W> {
             line.write_ansi(&mut buf, self.color);
         }
         let last = live.len().saturating_sub(1);
-        let target = cursor.and_then(|(r, c)| r.checked_sub(skip).map(|r| (r.min(last), c)));
+        let target = cursor.and_then(|(r, c)| {
+            r.checked_sub(skip)
+                .map(|r| (r.min(last), c.min(self.cols - 1)))
+        });
         match target {
             Some((row, col)) => {
                 if last > row {
@@ -105,10 +152,11 @@ impl<W: Write> Screen<W> {
                 buf.push_str("\x1b[?25h");
                 self.cursor = (row, col);
             }
-            // The cursor rests on the last row's final cell.
+            // Short rows leave the cursor after the text; a full row leaves
+            // it on the final cell with autowrap pending.
             None => {
                 let width = live.last().map_or(0, Line::width);
-                self.cursor = (last, width.saturating_sub(1));
+                self.cursor = (last, width.min(self.cols - 1));
             }
         }
         self.widths = live.iter().map(Line::width).collect();
@@ -174,6 +222,58 @@ mod tests {
         s.draw(&[], &[l("a"), l("b"), l("c")], Some((2, 0)), 2)
             .unwrap();
         assert!(text(&s).contains("b\r\nc\r\x1b[?25h"), "{:?}", text(&s));
+    }
+
+    #[test]
+    fn stale_live_widths_are_clipped_without_wrapping_or_clipping_commits() {
+        let mut s = Screen::new(Vec::new(), false, 8);
+        let l = |t: &str| Line::default().ink(t);
+        let live = [l("╭──────────╮"), l("│ ξ draft  │"), l("╰──────────╯")];
+        s.draw(&[], &live, Some((1, 10)), 24).unwrap();
+        s.draw(
+            &[l("committed output stays unwrapped")],
+            &[l("ready")],
+            None,
+            24,
+        )
+        .unwrap();
+        let out = text(&s);
+        let frames: Vec<_> = out.split("\x1b[?2026h").skip(1).collect();
+        assert_eq!(
+            frames[0],
+            "\x1b[?25l╭──────…\r\n│ ξ dra…\r\n╰──────…\x1b[1A\r\x1b[7C\x1b[?25h\x1b[?2026l"
+        );
+        assert_eq!(
+            frames[1],
+            "\x1b[?25l\x1b[1A\r\x1b[Jcommitted output stays unwrapped\r\nready\x1b[?2026l"
+        );
+    }
+
+    #[test]
+    fn frames_wait_until_the_width_holds_still() {
+        let t = Instant::now();
+        let mut s = Settle::new(80);
+        assert!(s.ready(80, t));
+        assert_eq!(s.deadline(), None);
+        assert!(!s.ready(70, t));
+        assert!(!s.ready(60, t + SETTLE / 2));
+        // Each change restarts the wait.
+        assert!(!s.ready(60, t + SETTLE));
+        assert_eq!(s.deadline(), Some(t + SETTLE / 2 + SETTLE));
+        assert!(s.ready(60, t + SETTLE / 2 + SETTLE));
+        assert_eq!(s.deadline(), None);
+        assert!(s.ready(60, t + SETTLE * 3));
+    }
+
+    #[test]
+    fn narrowing_tracks_the_hidden_cursor_after_a_short_last_row() {
+        let mut s = Screen::new(Vec::new(), false, 10);
+        let l = |t: &str| Line::default().ink(t);
+        s.draw(&[], &[l("top"), l("footer")], None, 24).unwrap();
+        assert_eq!(s.cursor, (1, 6));
+        s.resize(3);
+        s.finish().unwrap();
+        assert!(text(&s).ends_with("\x1b[3A\r\x1b[J\x1b[?25h"));
     }
 
     #[test]
