@@ -212,6 +212,16 @@ pub fn columns(cols: usize) -> Columns {
     }
 }
 
+/// Rows available to the log and its dock, excluding deck chrome.
+pub(crate) fn log_height(cols: usize, rows: usize) -> usize {
+    if columns(cols).panel.is_some() {
+        let body = rows.saturating_sub(1);
+        body.saturating_sub(usize::from(body >= 8))
+    } else {
+        rows.saturating_sub(3)
+    }
+}
+
 /// Composes exactly `rows` width-bounded lines and an absolute cursor.
 #[must_use]
 pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option<(usize, usize)>) {
@@ -227,7 +237,7 @@ pub fn render(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option
     let body = rows - 1;
     // A blank row above the log, when there is room, matches the panel's.
     let top = usize::from(body >= 8);
-    let (log, cursor) = log_rows(&scene.log, columns.log - 2, body - top);
+    let (log, cursor) = log_rows(&scene.log, columns.log - 2, log_height(cols, rows));
     let rule = if scene.surfaces {
         Line::default().ink(" ")
     } else {
@@ -289,7 +299,7 @@ fn folded(scene: &Scene<'_>, cols: usize, rows: usize) -> (Vec<Line>, Option<(us
         .collect();
     let above = 1 + head.len();
     out.extend(head.into_iter().map(gutter));
-    let (log, cursor) = log_rows(&scene.log, inner, rows - above);
+    let (log, cursor) = log_rows(&scene.log, inner, log_height(cols, rows));
     out.extend(log.into_iter().map(|line| line.truncate(cols)));
     (out, cursor.map(|(row, col)| (above + row, col + 1)))
 }

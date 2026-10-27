@@ -3854,6 +3854,68 @@ async fn deck_wheel_scrolls_live_output_without_touching_prompt_history() {
 }
 
 #[tokio::test]
+async fn deck_wheel_stops_at_the_first_full_page_without_erasing_history() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+
+    for cols in [80, 250] {
+        for count in [4, 60] {
+            let (launch, _) = launch(snapshot(false)).await;
+            let mut app = App::new(launch, cols, 24);
+            app.enter_deck();
+            app.composer.editor.set_text("draft\nsecond line");
+            let log = &mut app.display.deck.as_mut().unwrap().log;
+            log.take();
+            log.extend(
+                (0..count)
+                    .map(|n| Line::default().ink(format!("history {n:02}")))
+                    .collect(),
+                Vec::new(),
+            );
+            let draw = |app: &mut App| {
+                let mut out = Vec::new();
+                app.draw(&mut Screen::new(&mut out, false, cols)).unwrap();
+                String::from_utf8(out).unwrap()
+            };
+            draw(&mut app);
+            let wheel = |kind| MouseEvent {
+                kind,
+                column: 4,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            for _ in 0..30 {
+                app.display.deck_mouse(wheel(MouseEventKind::ScrollUp));
+                draw(&mut app);
+            }
+            let top = draw(&mut app);
+            let (_, _, dock) = app.live();
+            let room = deck::log_height(cols, app.display.rows).saturating_sub(dock);
+            for n in 0..count.min(room) {
+                assert!(top.contains(&format!("history {n:02}")), "{top}");
+            }
+            let scrolled = app.display.deck.as_ref().unwrap().log.scrolled();
+            assert_eq!(scrolled, count.saturating_sub(room));
+            for _ in 0..10 {
+                app.display.deck_mouse(wheel(MouseEventKind::ScrollUp));
+                assert_eq!(
+                    draw(&mut app),
+                    top,
+                    "extra wheel events leave the page intact"
+                );
+            }
+            assert_eq!(app.display.deck.as_ref().unwrap().log.rows().len(), count);
+            app.display.deck_mouse(wheel(MouseEventKind::ScrollDown));
+            assert_eq!(
+                app.display.deck.as_ref().unwrap().log.scrolled(),
+                scrolled.saturating_sub(3),
+                "reversing direction takes effect immediately"
+            );
+            assert_eq!(app.composer.editor.text(), "draft\nsecond line");
+        }
+    }
+}
+
+#[tokio::test]
 async fn deck_focus_keys_are_in_help_and_noop_inline() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 120, 36);

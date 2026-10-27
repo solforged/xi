@@ -36,6 +36,8 @@ pub struct Log {
     end: Option<usize>,
     /// Live rows that flow after the retained rows, excluding the dock.
     live_rows: usize,
+    /// Rows available to history and live output, excluding the dock.
+    viewport_rows: usize,
     /// Whether the rows shown follow the selection, after it moved.
     reveal: bool,
 }
@@ -61,6 +63,7 @@ impl Log {
         self.selected = None;
         self.end = None;
         self.live_rows = 0;
+        self.viewport_rows = 0;
         self.reveal = false;
         std::mem::take(&mut self.rows)
     }
@@ -111,13 +114,16 @@ impl Log {
         self.reveal
     }
 
-    /// Updates the live extent without moving a scrolled viewport as text
-    /// arrives or moves from the stream into retained rows.
-    pub fn set_live_rows(&mut self, rows: usize) {
-        self.live_rows = rows;
-        if self.end.is_some_and(|end| end >= self.len()) {
-            self.end = None;
-        }
+    /// Updates the live extent and viewport height without moving a scrolled
+    /// viewport as text arrives. Resizing clamps it to the first full page.
+    pub fn set_viewport(&mut self, live_rows: usize, viewport_rows: usize) {
+        self.live_rows = live_rows;
+        self.viewport_rows = viewport_rows;
+        let len = self.len();
+        self.end = self
+            .end
+            .map(|end| end.max(viewport_rows.min(len)))
+            .filter(|&end| end < len);
     }
 
     fn len(&self) -> usize {
@@ -130,11 +136,15 @@ impl Log {
         self.end.map_or(0, |end| self.len().saturating_sub(end))
     }
 
-    /// Scrolls `by` rows up, keeping at least one row visible, and lets
+    /// Scrolls `by` rows up, stopping at the first full page, and lets
     /// the selection leave the rows shown.
     pub fn scroll_up(&mut self, by: usize) {
         let len = self.len();
-        let end = self.end.unwrap_or(len).saturating_sub(by).max(1);
+        let end = self
+            .end
+            .unwrap_or(len)
+            .saturating_sub(by)
+            .max(self.viewport_rows.min(len));
         self.end = (end < len).then_some(end);
         self.reveal = false;
     }
@@ -208,22 +218,22 @@ mod tests {
     #[test]
     fn scrolling_holds_the_viewport_through_stream_growth_and_commit() {
         let mut log = Log::default();
-        log.set_live_rows(20);
+        log.set_viewport(20, 5);
         log.scroll_up(5);
         assert_eq!(log.scrolled(), 5);
-        log.set_live_rows(25);
+        log.set_viewport(25, 5);
         assert_eq!(log.scrolled(), 10, "new lines do not move the viewport");
         log.extend(vec![Line::default(); 25], Vec::new());
-        log.set_live_rows(0);
+        log.set_viewport(0, 5);
         assert_eq!(log.scrolled(), 10, "committing the stream does not move it");
         log.extend(vec![Line::default(); 3], Vec::new());
         assert_eq!(log.scrolled(), 13);
         log.scroll_down(100);
         assert_eq!(log.scrolled(), 0);
-        log.set_live_rows(5);
+        log.set_viewport(5, 5);
         assert_eq!(log.scrolled(), 0, "reaching the bottom resumes following");
         log.scroll_up(10);
-        log.set_live_rows(0);
+        log.set_viewport(0, 5);
         assert_eq!(log.scrolled(), 5);
         log.take();
         log.scroll_up(10);
@@ -231,13 +241,35 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_stops_at_a_full_page_and_reverses_without_overscroll_debt() {
+        let mut log = Log::default();
+        log.extend(vec![Line::default(); 12], Vec::new());
+        log.set_viewport(8, 6);
+        for _ in 0..20 {
+            log.scroll_up(3);
+        }
+        assert_eq!(log.scrolled(), 14);
+        log.scroll_down(1);
+        assert_eq!(log.scrolled(), 13);
+        log.scroll_up(usize::MAX);
+        assert_eq!(log.scrolled(), 14);
+        log.set_viewport(8, 10);
+        assert_eq!(log.scrolled(), 10, "a taller viewport stays filled");
+        log.set_viewport(0, 15);
+        log.scroll_up(3);
+        assert_eq!(log.scrolled(), 0, "short history cannot overscroll");
+        assert_eq!(log.rows().len(), 12, "scrolling never drops stored rows");
+    }
+
+    #[test]
     fn scrolling_stays_within_the_rows() {
         let mut log = Log::default();
         log.extend(vec![Line::default(); 5], Vec::new());
+        log.set_viewport(0, 2);
         log.scroll_up(10);
-        assert_eq!(log.scrolled(), 4);
-        log.scroll_down(1);
         assert_eq!(log.scrolled(), 3);
+        log.scroll_down(1);
+        assert_eq!(log.scrolled(), 2);
         log.scroll_end();
         assert_eq!(log.scrolled(), 0);
     }
