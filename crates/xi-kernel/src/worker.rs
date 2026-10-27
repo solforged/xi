@@ -133,6 +133,7 @@ impl Mirror {
                 decision: Decision::Ask,
                 rule,
                 taint,
+                ..
             } => {
                 if !self.pending.iter().any(|pending| pending.call == *call) {
                     self.pending.push(PendingApproval {

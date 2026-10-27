@@ -1134,6 +1134,8 @@ impl Session {
                             decision: Decision::Deny,
                             rule: Some("extension pre_tool".into()),
                             taint: false,
+                            during: None,
+                            extension: None,
                         },
                     )?;
                     return self.append(
@@ -1283,6 +1285,8 @@ impl Session {
                 decision,
                 rule: rule.clone(),
                 taint: taint_ask,
+                during: None,
+                extension: None,
             },
         )?;
         let approved = match decision {

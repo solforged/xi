@@ -3,12 +3,13 @@
 
 mod common;
 
+use std::net::TcpListener;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::{Fixture, HELPER, run_probe, sh, text};
-use xi_sandbox::{EXIT_CANNOT_EXECUTE, EXIT_NOT_FOUND, EXIT_SETUP_FAILED, Network};
+use xi_sandbox::{EXIT_CANNOT_EXECUTE, EXIT_NOT_FOUND, EXIT_SETUP_FAILED, Egress, Network};
 
 #[test]
 fn tmpdir_is_writable_without_granting_the_host_temporary_directories() {
@@ -55,6 +56,46 @@ fn isolated_network_cannot_even_bind_its_own_loopback() {
         let output = run_probe(&host, action);
         assert!(output.status.success(), "{}", text(&output.stderr));
     }
+}
+
+#[test]
+fn isolated_egress_allows_only_its_exact_ipv4_proxy_port() {
+    let fixture = Fixture::new();
+    let (proxy, other) = loop {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let Some(next) = proxy.local_addr().unwrap().port().checked_add(1) else {
+            continue;
+        };
+        if let Ok(other) = TcpListener::bind(("127.0.0.1", next)) {
+            break (proxy, other);
+        }
+    };
+    let port = proxy.local_addr().unwrap().port();
+    let mut spec = fixture.spec();
+    let output = sh(&spec, "test \"${HTTPS_PROXY+x}\" != x");
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    spec.egress = Some(Egress {
+        port,
+        socket: PathBuf::from("/nonexistent"),
+    });
+    let output = run_probe(&spec, &format!("tcp:127.0.0.1:{port}"));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    for action in [
+        format!("tcp:{}", other.local_addr().unwrap()),
+        "loopback:".into(),
+        "ipv6:".into(),
+    ] {
+        let output = run_probe(&spec, &action);
+        assert_eq!(output.status.code(), Some(3), "{}", text(&output.stderr));
+        assert!(
+            text(&output.stderr).contains("Operation not permitted"),
+            "{action}: {}",
+            text(&output.stderr)
+        );
+    }
+    let output = sh(&spec, "printf '%s' \"$HTTPS_PROXY\"");
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), format!("http://127.0.0.1:{port}"));
 }
 
 #[test]

@@ -68,10 +68,12 @@ pub enum EventKind {
         /// Error shown to the user.
         message: String,
     },
-    /// Policy outcome for a tool call. Recorded for every call, so the log is
-    /// a complete audit trail.
+    /// Policy outcome for a tool call, or for one connection through the
+    /// egress proxy. Recorded for every call and connection, so the log is
+    /// a complete audit trail. A connection gets its own `call` id and names
+    /// its origin in `during` or `extension`; its `action` is `net host:port`.
     ToolDecision {
-        /// The call being decided.
+        /// The call or connection being decided.
         call: ToolCallId,
         /// Human-readable description of the boundary crossing.
         action: String,
@@ -83,6 +85,13 @@ pub enum EventKind {
         /// Whether branch taint changed an allow into an ask.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         taint: bool,
+        /// Egress only: the tool call whose process connected, if one was
+        /// running.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        during: Option<ToolCallId>,
+        /// Egress only: the extension whose process connected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension: Option<String>,
     },
     /// Answer to an [`Decision::Ask`].
     ApprovalResolved {
@@ -335,7 +344,12 @@ mod tests {
         let event: EventKind = serde_json::from_value(old.clone()).unwrap();
         assert!(matches!(
             event,
-            EventKind::ToolDecision { taint: false, .. }
+            EventKind::ToolDecision {
+                taint: false,
+                during: None,
+                extension: None,
+                ..
+            }
         ));
         assert_eq!(serde_json::to_value(event).unwrap(), old);
         let event = EventKind::ToolDecision {
@@ -344,11 +358,34 @@ mod tests {
             decision: Decision::Ask,
             rule: None,
             taint: true,
+            during: None,
+            extension: None,
         };
         assert_eq!(serde_json::to_value(&event).unwrap()["taint"], true);
         assert_eq!(
             serde_json::from_value::<EventKind>(serde_json::to_value(&event).unwrap()).unwrap(),
             event,
         );
+        let event = EventKind::ToolDecision {
+            call: "connection".into(),
+            action: "net example.org:443".into(),
+            decision: Decision::Ask,
+            rule: None,
+            taint: false,
+            during: Some("c1".into()),
+            extension: None,
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "type": "tool_decision",
+                "call": "connection",
+                "action": "net example.org:443",
+                "decision": "ask",
+                "during": "c1",
+            })
+        );
+        assert_eq!(serde_json::from_value::<EventKind>(wire).unwrap(), event);
     }
 }

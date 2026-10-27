@@ -1038,6 +1038,7 @@ impl Router {
                     decision: Decision::Ask,
                     rule,
                     taint,
+                    ..
                 } if worker.approval == ApprovalPolicy::Client => {
                     let approval = PendingApproval {
                         session,

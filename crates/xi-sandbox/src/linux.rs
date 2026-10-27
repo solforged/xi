@@ -5,9 +5,10 @@ use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::net::UdpSocket;
-use std::os::fd::AsRawFd;
+use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,12 +17,15 @@ use landlock::{
     ABI, Access, AccessFs, BitFlags, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr,
     RulesetError, RulesetStatus, Scope, make_bitflags,
 };
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
+use nix::sys::prctl::set_pdeathsig;
+use nix::sys::signal::Signal;
 use nix::sys::statvfs::{FsFlags, statvfs};
-use nix::unistd::{getgid, getuid, setsid};
+use nix::unistd::{ForkResult, Pid, fork, getgid, getpid, getppid, getuid, setsid};
 
-use crate::{Error, Network, Spec};
+use crate::{Egress, Error, Network, Spec};
 
 /// Highest Landlock ABI this crate requests. Version 9 adds control over
 /// connecting to pathname Unix sockets.
@@ -58,7 +62,7 @@ pub(crate) fn enter_and_exec(
 
     let uid = getuid();
     let gid = getgid();
-    let mut namespaces = CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS;
+    let mut namespaces = CloneFlags::CLONE_NEWUSER;
     if spec.network == Network::Isolated {
         namespaces |= CloneFlags::CLONE_NEWNET;
     }
@@ -66,6 +70,15 @@ pub(crate) fn enter_and_exec(
     fs::write("/proc/self/setgroups", "deny").map_err(setup("deny setgroups"))?;
     fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).map_err(setup("map uid"))?;
     fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).map_err(setup("map gid"))?;
+    if spec.network == Network::Isolated {
+        loopback_up().map_err(setup("bring up loopback"))?;
+        if let Some(egress) = &spec.egress {
+            start_egress(egress)?;
+        }
+    }
+    // The forwarder keeps the host mount view, including sockets under
+    // /tmp. Only the target enters the namespace whose mounts change.
+    unshare(CloneFlags::CLONE_NEWNS).map_err(setup("unshare mount namespace"))?;
     mount(
         None::<&str>,
         "/",
@@ -113,9 +126,6 @@ pub(crate) fn enter_and_exec(
     // Binding a writable root leaves an inherited cwd on the covered mount.
     // Re-enter through the new mount tree so relative paths see the guards.
     std::env::set_current_dir(&spec.cwd).map_err(setup("enter sandbox working directory"))?;
-    if spec.network == Network::Isolated {
-        loopback_up().map_err(setup("bring up loopback"))?;
-    }
 
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))?
@@ -150,6 +160,106 @@ pub(crate) fn enter_and_exec(
         program: program.to_owned(),
         source,
     })
+}
+
+/// Starts a forwarder before mounts and Landlock hide the kernel's socket.
+#[allow(unsafe_code)]
+fn start_egress(egress: &Egress) -> Result<(), Error> {
+    let listener =
+        TcpListener::bind(("127.0.0.1", egress.port)).map_err(setup("bind egress forwarder"))?;
+    let listener = if listener.as_raw_fd() < 3 {
+        let fd = fcntl(&listener, FcntlArg::F_DUPFD_CLOEXEC(3))
+            .map_err(setup("preserve egress listener"))?;
+        drop(listener);
+        // SAFETY: fcntl returned a new, owned TCP listener descriptor.
+        unsafe { TcpListener::from_raw_fd(fd) }
+    } else {
+        listener
+    };
+    fcntl(&listener, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+        .map_err(setup("mark egress listener close-on-exec"))?;
+    let helper = getpid();
+    // SAFETY: the sandbox helper is single-threaded and has not installed
+    // restrictions yet. The child stays in Rust and never execs a target.
+    match unsafe { fork() }.map_err(setup("fork egress forwarder"))? {
+        ForkResult::Parent { .. } => {
+            drop(listener);
+            Ok(())
+        }
+        ForkResult::Child => {
+            let error = run_egress(listener, &egress.socket, helper).unwrap_err();
+            eprintln!("xi-sandbox-exec: {error}");
+            std::process::exit(crate::EXIT_SETUP_FAILED);
+        }
+    }
+}
+
+fn run_egress(listener: TcpListener, socket: &Path, helper: Pid) -> Result<Infallible, Error> {
+    set_pdeathsig(Signal::SIGKILL).map_err(setup("set egress parent death signal"))?;
+    // The helper may have exited before the death signal was installed.
+    if getppid() != helper {
+        std::process::exit(0);
+    }
+    std::env::set_current_dir("/").map_err(setup("detach egress working directory"))?;
+    close_egress_fds(listener.as_raw_fd()).map_err(setup("detach egress file descriptors"))?;
+    std::thread::scope(|scope| {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                continue;
+            };
+            let _ = std::thread::Builder::new().spawn_scoped(scope, move || {
+                if let Ok(upstream) = UnixStream::connect(socket) {
+                    relay_egress(stream, upstream);
+                }
+            });
+        }
+    });
+    std::process::exit(0);
+}
+
+/// Keeps only the listener and null standard streams in the forwarder.
+#[allow(unsafe_code)]
+fn close_egress_fds(listener: libc::c_int) -> io::Result<()> {
+    let null = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")?;
+    for target in 0..=2 {
+        // SAFETY: null is open, and target is a standard descriptor. The
+        // listener was moved above these descriptors before the fork.
+        if unsafe { libc::dup2(null.as_raw_fd(), target) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    drop(null);
+    for (first, last) in [
+        (3, listener as libc::c_uint - 1),
+        (listener as libc::c_uint + 1, libc::c_uint::MAX),
+    ] {
+        if first > last {
+            continue;
+        }
+        // SAFETY: close_range takes only integer bounds and flags. Neither
+        // range contains the listener or the standard descriptors.
+        if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn relay_egress(stream: TcpStream, upstream: UnixStream) {
+    std::thread::scope(|scope| {
+        let relay = std::thread::Builder::new().spawn_scoped(scope, || {
+            let _ = io::copy(&mut &stream, &mut &upstream);
+            let _ = upstream.shutdown(Shutdown::Write);
+        });
+        if relay.is_err() {
+            return;
+        }
+        let _ = io::copy(&mut &upstream, &mut &stream);
+        let _ = stream.shutdown(Shutdown::Write);
+    });
 }
 
 /// Opens `path` for a Landlock rule. Directory-only rights are dropped for

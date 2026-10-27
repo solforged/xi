@@ -2193,6 +2193,8 @@ async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
             decision: Decision::Ask,
             rule: None,
             taint: false,
+            during: None,
+            extension: None,
         },
         EventKind::ToolDecision {
             call: "resolved".into(),
@@ -2200,6 +2202,8 @@ async fn reopening_repairs_unresolved_asks_and_every_unfinished_call() {
             decision: Decision::Ask,
             rule: None,
             taint: false,
+            during: None,
+            extension: None,
         },
         EventKind::ApprovalResolved {
             call: "resolved".into(),
