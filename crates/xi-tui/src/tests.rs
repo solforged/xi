@@ -3481,6 +3481,64 @@ async fn deck_draws_the_panes_walks_the_log_and_prints_it_when_left() {
 }
 
 #[tokio::test]
+async fn deck_log_titles_a_session_by_its_prompt_until_it_is_titled() {
+    let attached = snapshot(false);
+    let mut listed = summary(&attached, true, "", 1);
+    listed.title = None;
+    let data = FakeData {
+        summaries: vec![listed],
+        ..Default::default()
+    };
+    let (launch, _) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 250, 36);
+    app.refresh_deck().await;
+    let log_title = |app: &mut App| {
+        let mut out = Vec::new();
+        let mut screen = Screen::new(&mut out, false, 250);
+        app.draw(&mut screen).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        text.split("\r\n").nth(1).unwrap().trim().to_owned()
+    };
+    assert!(log_title(&mut app).starts_with("new session"));
+    // `session/list` still has no title; the client's own log does.
+    append(
+        &mut app,
+        EventKind::UserMessage {
+            content: vec![Block::Text {
+                text: "\n  route bash through the proxy  \nmore".into(),
+            }],
+        },
+    );
+    assert!(log_title(&mut app).starts_with("route bash through the proxy "));
+    append(
+        &mut app,
+        EventKind::SessionTitled {
+            title: "Proxy bash egress".into(),
+            by: xi_protocol::event::TitleSource::FirstPrompt,
+            model: None,
+            usage: None,
+        },
+    );
+    assert!(log_title(&mut app).starts_with("Proxy bash egress "));
+    // A resumed session reads its first prompt from the attached log.
+    let mut attached = snapshot(false);
+    let root = attached.events[0].id;
+    attached.events.push(Event {
+        id: EventId::generate(),
+        parent: Some(root),
+        at: Timestamp(1),
+        kind: EventKind::UserMessage {
+            content: vec![Block::Text {
+                text: "resume me".into(),
+            }],
+        },
+    });
+    let (launch, _) = launch_with(attached, FakeData::default()).await;
+    let mut app = App::new(launch, 250, 36);
+    assert!(log_title(&mut app).starts_with("resume me "));
+}
+
+#[tokio::test]
 async fn entering_the_deck_mid_session_replays_the_branch_without_reprinting_it() {
     let (launch, _) = launch(snapshot(false)).await;
     let mut app = App::new(launch, 140, 36);

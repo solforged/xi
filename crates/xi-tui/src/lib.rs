@@ -172,6 +172,9 @@ struct App {
     controls: Vec<String>,
     /// The session's latest title, from its log.
     title: Option<String>,
+    /// The first line of the session's first prompt, which titles the deck's
+    /// log until `title` arrives.
+    prompt: Option<String>,
     /// Whether the terminal shows `title`; frames write it only when not.
     title_written: bool,
     history: History,
@@ -373,6 +376,27 @@ fn latest_title(events: &[Event]) -> Option<String> {
     })
 }
 
+/// The first non-blank line of the first user message in `events`, cut to
+/// 80 characters, as `session/list` titles a session before it is titled.
+fn first_prompt(events: &[Event]) -> Option<String> {
+    events.iter().find_map(|event| match &event.kind {
+        xi_protocol::EventKind::UserMessage { content } => prompt_line(content),
+        _ => None,
+    })
+}
+
+/// The first non-blank line of `content`, trimmed and cut to 80 characters.
+fn prompt_line(content: &[Block]) -> Option<String> {
+    let text = crate::transcript::blocks_text(content);
+    let first = text.lines().find(|line| !line.trim().is_empty())?;
+    let mut chars = first.trim().chars();
+    let mut line: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        line.push('…');
+    }
+    Some(line)
+}
+
 /// The OSC 0 sequence that titles the terminal `ξ: title`, or `ξ` before
 /// the session has a title. Control characters are dropped so a title
 /// cannot end the sequence early.
@@ -412,6 +436,7 @@ impl App {
             deck: config.layout.deck_at(cols, rows).then(Deck::default),
             controls: Vec::new(),
             title: None,
+            prompt: None,
             title_written: false,
             history,
             commands: builtin_commands(),
@@ -628,6 +653,9 @@ impl App {
         match notification {
             ClientNotification::Event(p) => match &p.event.kind {
                 xi_protocol::EventKind::UserMessage { content } => {
+                    if self.prompt.is_none() {
+                        self.prompt = prompt_line(content);
+                    }
                     if self.started.is_none() {
                         self.started = Some(Instant::now());
                         self.transcript.begin_turn();

@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::icons::{Icon, Icons};
 use crate::layout::{PANEL_MIN, SHEET};
 use crate::log::Inspect;
-use crate::style::{Line, Role, lr, row, wrap};
+use crate::style::{Line, Role, lr, wrap};
 use crate::transcript::tokens;
 
 /// The widest the live view sets its rows, so counts stay near their names.
@@ -458,7 +458,7 @@ fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
             Line::default().dim(right.join(" · ")),
         );
         for session in active.iter().take(SESSION_ROWS) {
-            top.push(row(
+            top.push(lr(
                 mark(session.mark, icons).ink(format!(" {}", session.title)),
                 Line::default().dim(&session.detail),
                 w,
@@ -617,7 +617,7 @@ fn sessions_view(pane: &SessionsPane, icons: Icons, width: usize, height: usize)
         } else {
             Line::default().ink(format!(" {}", session.title))
         };
-        lines.push(row(
+        lines.push(lr(
             lead.extend(mark(session.mark, icons)).extend(title),
             Line::default().dim(&session.detail),
             width,
@@ -1192,6 +1192,12 @@ mod tests {
         let text = plain(&sessions_view(&pane, Icons::Unicode, 50, 10));
         assert!(text[3].starts_with("› ┤ Port footer"));
         assert!(text[3].ends_with("sonnet-5.5 · 2m"));
+        // A title too long for the row is cut so its age stays readable.
+        pane.here[1].title = "a title far too long to fit beside its age ".repeat(3);
+        let text = plain(&sessions_view(&pane, Icons::Unicode, 50, 10));
+        assert!(text[3].starts_with("› ┤ a title far") && text[3].contains('…'));
+        assert!(text[3].ends_with("sonnet-5.5 · 2m"));
+        assert_eq!(text[3].chars().count(), 50);
     }
 
     #[test]
