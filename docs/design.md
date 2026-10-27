@@ -311,7 +311,7 @@ The assembled prompt stays unchanged while the session is open, even if an instr
 
 ### Compaction
 
-Automatic compaction is off by default, because the benchmark found it costly when it fires early (see [roadmap](roadmap.md#compaction)). Enable it with `[compaction] enabled = true`. `trigger_tokens` defaults to 80% of the selected model's context window. `keep_recent_tokens` defaults to 20,000 and is capped at half the effective trigger, leaving room for the summary and new work. `/compact` in line mode and `session/compact` over RPC work at an idle prompt even when automatic compaction is off. A context-overflow response always causes one compaction and one retry, enabled or not, since the request has already failed. A second overflow fails the request.
+Automatic compaction is off by default, because the benchmark found it costly when it fires early (see [roadmap](roadmap.md#compaction)). Enable it with `[compaction] enabled = true`. The `trigger` setting is explicitly unit-tagged: `trigger = { percent = 50 }` compacts at 50% of the selected model's context window, while `trigger = { tokens = 24000 }` uses a fixed token estimate. The default is `{ percent = 80 }`. Percentages are integers from 1 to 100; token counts are positive TOML integers. A percentage remains model-relative when the model changes, and a higher configuration layer replaces the whole trigger, including its unit. `keep_recent_tokens` defaults to 20,000 and is capped at half the effective trigger, leaving room for the summary and new work. `/compact` in line mode and `session/compact` over RPC work at an idle prompt even when automatic compaction is off. A context-overflow response always causes one compaction and one retry, enabled or not, since the request has already failed. A second overflow fails the request.
 
 Before each model request, the kernel estimates context size from the latest assistant's input, cache-read, cache-write and output usage, plus one token per four characters appended since. Before the first response, and after compaction until new usage arrives, it estimates the static prompt, tool schemas, summary and retained conversation by characters instead. Usage from before compaction is never reused for the smaller prefix.
 
@@ -430,7 +430,7 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 
 #### Settings view
 
-`/settings` opens a view of the settings that matter day to day, in five sections: this session, client, defaults, tools and read only. Each row shows the effective value and, at the right, the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted. `up` and `down` move, `enter` or `space` changes the selected row, `e` opens the global `config.toml` in the external editor and reloads the view afterwards, and `esc` closes. The top border names the global config file; results and errors show as a note under the rows. In an inline token field, `enter` saves and `esc` cancels the edit.
+`/settings` opens a view of the settings that matter day to day, in five sections: this session, client, defaults, tools and read only. Each row shows the effective value and, at the right, the layer it came from: built-in default, global, `--config`, project, local, or held back because the workspace is untrusted. `up` and `down` move, `enter` or `space` changes the selected row, `e` opens the global `config.toml` in the external editor and reloads the view afterwards, and `esc` closes. The top border names the global config file; results and errors show as a note under the rows. In an inline number field, units remain visible, `enter` saves and `esc` cancels the edit.
 
 | Row | Scope | Change |
 |---|---|---|
@@ -439,7 +439,7 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 | Layout | Client | Cycles `inline`, `deck`, `auto` and saves `[display] layout` to `tui.toml`. |
 | Approvals | Global default | Cycles the `approvals` preset `ask`, `reads`, `auto`. |
 | One row per built-in tool, including `hashline` | Global default | Toggles the tool in `tools`, keeping the order and any other names; the last tool cannot be removed. |
-| Automatic compaction, trigger, kept tail | Global default | Toggles `enabled`, or edits a token count inline; an empty trigger means 80% of the window. |
+| Automatic compaction, trigger, kept tail | Global default | Toggles `enabled`, or edits an explicitly unit-tagged threshold or token-count tail. The trigger shows `%` and its effective token count for the selected model, or `tokens (fixed)`. In the trigger editor, `u` switches percent/token units without silently reinterpreting the number; if an exact conversion is unavailable, enter a new value before saving. `r` on the trigger row or in its editor removes the global override, revealing inherited settings or the default 80%. Empty fields are invalid. |
 | Tool sandbox | Global default | Toggles `sandbox.enabled`; off gives tool commands unrestricted host filesystem and network access. |
 | Sandbox roots and environment, extensions, trust, daemon idle timeout | Read only | `e` opens the file. |
 

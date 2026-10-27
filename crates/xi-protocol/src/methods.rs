@@ -1021,12 +1021,12 @@ mod tests {
         let params = SetSettingParams {
             cwd: "/work".into(),
             configs: vec!["/extra.toml".into()],
-            key: "compaction.trigger_tokens".into(),
-            value: serde_json::Value::Null,
+            key: "compaction.trigger".into(),
+            value: json!({"percent": 50}),
         };
         let wire = json!({
             "cwd": "/work", "configs": ["/extra.toml"],
-            "key": "compaction.trigger_tokens", "value": null,
+            "key": "compaction.trigger", "value": {"percent": 50},
         });
         assert_eq!(serde_json::to_value(&params).unwrap(), wire);
         assert_eq!(
@@ -1045,7 +1045,7 @@ mod tests {
             "trusted": false,
             "settings": [
                 {
-                    "key": "compaction.trigger_tokens", "value": null,
+                    "key": "compaction.trigger", "value": {"percent": 80},
                     "source": {"layer": "default"}, "editable": true,
                 },
                 {

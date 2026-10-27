@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use xi_kernel::compaction::Trigger;
 use xi_kernel::config::{Approvals, Config, Paths};
 use xi_kernel::settings::{report, set_global};
 use xi_policy::{Action, Taint};
@@ -325,7 +326,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
     let fixture = Fixture::new();
     write(
         &fixture.global(),
-        "default_model='global/model'\nreasoning='low'\napprovals='reads'\ntools=['read','bash']\n[compaction]\nenabled=true\ntrigger_tokens=8000\nkeep_recent_tokens=2000\n[sandbox]\nreadable=['~/readable']\n[daemon]\nidle_exit=42\n",
+        "default_model='global/model'\nreasoning='low'\napprovals='reads'\ntools=['read','bash']\n[compaction]\nenabled=true\ntrigger={percent=50}\nkeep_recent_tokens=2000\n[sandbox]\nreadable=['~/readable']\n[daemon]\nidle_exit=42\n",
     );
     let explicit = fixture.paths.home.join("extra.toml");
     write(
@@ -334,7 +335,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
     );
     write(
         &fixture.workspace.join(".xi/config.toml"),
-        "tools=['read']\n[compaction]\ntrigger_tokens=12000\n[sandbox]\nenv=['PROJECT']\n",
+        "tools=['read']\n[compaction]\ntrigger={tokens=12000}\n[sandbox]\nenv=['PROJECT']\n",
     );
     write(
         &fixture.workspace.join(".xi/config.local.toml"),
@@ -387,8 +388,8 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
             None,
         ),
         (
-            "compaction.trigger_tokens",
-            json!(8000),
+            "compaction.trigger",
+            json!({"percent": 50}),
             SettingLayer::Global,
             Some(SettingLayer::Project),
         ),
@@ -433,7 +434,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("approvals", SettingLayer::Local),
         ("tools", SettingLayer::Local),
         ("compaction.enabled", SettingLayer::Global),
-        ("compaction.trigger_tokens", SettingLayer::Project),
+        ("compaction.trigger", SettingLayer::Project),
         ("compaction.keep_recent_tokens", SettingLayer::Local),
         ("sandbox.enabled", SettingLayer::Default),
         ("extensions", SettingLayer::Local),
@@ -462,8 +463,8 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
     }
     assert_eq!(setting(&trusted, "approvals").value, json!("auto"));
     assert_eq!(
-        setting(&trusted, "compaction.trigger_tokens").value,
-        json!(12000)
+        setting(&trusted, "compaction.trigger").value,
+        json!({"tokens": 12000})
     );
     assert_eq!(
         setting(&trusted, "compaction.keep_recent_tokens").value,
@@ -780,9 +781,9 @@ fn removing_global_values_restores_defaults_and_keeps_the_rest() {
     let fixture = Fixture::new();
     write(
         &fixture.global(),
-        "default_model='old/model'\napprovals='auto'\n# keep\n[compaction]\ntrigger_tokens=5000\nenabled=true # keep enabled\n",
+        "default_model='old/model'\napprovals='auto'\n# keep\n[compaction]\ntrigger={tokens=5000}\nenabled=true # keep enabled\n",
     );
-    for key in ["default_model", "approvals", "compaction.trigger_tokens"] {
+    for key in ["default_model", "approvals", "compaction.trigger"] {
         set_global(&fixture.paths, key, &Value::Null).unwrap();
     }
     let text = std::fs::read_to_string(fixture.global()).unwrap();
@@ -790,7 +791,7 @@ fn removing_global_values_restores_defaults_and_keeps_the_rest() {
     assert!(text.contains("enabled=true # keep enabled"));
     assert!(!text.contains("default_model"));
     assert!(!text.contains("approvals"));
-    assert!(!text.contains("trigger_tokens"));
+    assert!(!text.contains("trigger"));
     let report = fixture.report();
     assert_eq!(
         setting(&report, "default_model").source,
@@ -798,11 +799,11 @@ fn removing_global_values_restores_defaults_and_keeps_the_rest() {
     );
     assert_eq!(setting(&report, "approvals").value, json!("ask"));
     assert_eq!(
-        setting(&report, "compaction.trigger_tokens").value,
-        Value::Null
+        setting(&report, "compaction.trigger").value,
+        json!({"percent": 80})
     );
     assert_eq!(
-        setting(&report, "compaction.trigger_tokens").source,
+        setting(&report, "compaction.trigger").source,
         SettingLayer::Default
     );
 }
@@ -822,7 +823,11 @@ fn global_sets_create_the_directory_file_and_compaction_table() {
         ("reasoning", json!("high")),
         ("approvals", json!("reads")),
         ("tools", json!(["read", "hashline"])),
-        ("compaction.trigger_tokens", json!(9000)),
+        ("compaction.trigger", json!({"tokens": 9000})),
+        ("compaction.trigger", json!({"percent": 1})),
+        ("compaction.trigger", json!({"percent": 100})),
+        ("compaction.trigger", json!({"tokens": i64::MAX})),
+        ("compaction.trigger", json!({"percent": 50})),
         ("compaction.keep_recent_tokens", json!(1000)),
     ] {
         set_global(&fixture.paths, key, &value).unwrap();
@@ -844,6 +849,103 @@ fn global_set_supports_existing_inline_and_dotted_compaction_tables() {
             original.replacen("true", "false", 1)
         );
     }
+}
+
+#[test]
+fn global_trigger_sets_and_resets_support_inline_dotted_and_nested_tables() {
+    let fixture = Fixture::new();
+    for compaction in [
+        "[compaction]\nenabled=true # keep enabled\nkeep_recent_tokens=1000\ntrigger={percent=50}\n",
+        "compaction = { enabled = true, trigger = { percent = 50 }, keep_recent_tokens = 1000 } # keep container\n",
+        "compaction.enabled = true # keep enabled\ncompaction.keep_recent_tokens = 1000\ncompaction.trigger.percent = 50\n",
+        "[compaction]\nenabled=true # keep enabled\nkeep_recent_tokens=1000\ntrigger.percent=50\n",
+        "[compaction]\nenabled=true # keep enabled\nkeep_recent_tokens=1000\n[compaction.trigger] # keep threshold\npercent=50\n",
+    ] {
+        let original = format!(
+            "# keep header\ndefault_model='test/model' # keep model\n{compaction}[daemon]\nidle_exit=42 # keep daemon\n"
+        );
+        for replacement in [
+            json!({"tokens": 24000}),
+            json!({"percent": 25}),
+            Value::Null,
+        ] {
+            write(&fixture.global(), &original);
+            set_global(&fixture.paths, "compaction.trigger", &replacement).unwrap();
+            let report = fixture.report();
+            let row = setting(&report, "compaction.trigger");
+            if replacement.is_null() {
+                assert_eq!(row.value, json!({"percent": 80}));
+                assert_eq!(row.source, SettingLayer::Default);
+            } else {
+                assert_eq!(row.value, replacement);
+                assert_eq!(row.source, SettingLayer::Global);
+            }
+            let config = fixture.load();
+            assert!(config.compaction.enabled);
+            assert_eq!(config.compaction.keep_recent_tokens, 1000);
+            assert_eq!(config.daemon.idle_exit, 42);
+            let text = std::fs::read_to_string(fixture.global()).unwrap();
+            assert!(text.contains("# keep header\n"));
+            assert!(text.contains("default_model='test/model' # keep model"));
+            assert!(text.contains("idle_exit=42 # keep daemon"));
+            assert!(text.contains("# keep enabled") || text.contains("# keep container"));
+            if !replacement.is_null() {
+                if compaction.contains("# keep threshold") {
+                    assert!(text.contains("# keep threshold"));
+                }
+                let document: toml_edit::DocumentMut = text.parse().unwrap();
+                assert!(document["compaction"]["trigger"].is_inline_table());
+            }
+        }
+    }
+}
+
+#[test]
+fn global_trigger_mode_changes_and_reset_preserve_whole_layer_precedence() {
+    let fixture = Fixture::new();
+    let explicit = fixture.paths.home.join("extra.toml");
+    let extras = std::slice::from_ref(&explicit);
+    for (global, inherited, expected) in [
+        (
+            json!({"percent": 50}),
+            "tokens=24000",
+            Trigger::Tokens(24000),
+        ),
+        (json!({"tokens": 12000}), "percent=25", Trigger::Percent(25)),
+    ] {
+        set_global(&fixture.paths, "compaction.trigger", &global).unwrap();
+        let global_report = fixture.report();
+        let global_row = setting(&global_report, "compaction.trigger");
+        assert_eq!(global_row.value, global);
+        assert_eq!(global_row.source, SettingLayer::Global);
+        write(
+            &explicit,
+            &format!("[compaction]\ntrigger={{{inherited}}}\n"),
+        );
+        let config = Config::load(fixture.paths.clone(), &fixture.workspace, extras).unwrap();
+        assert_eq!(config.compaction.trigger, expected);
+        let layered = report(&fixture.paths, &fixture.workspace, extras).unwrap();
+        let row = setting(&layered, "compaction.trigger");
+        assert_eq!(row.value, json!(expected));
+        assert_eq!(
+            row.source,
+            SettingLayer::Explicit {
+                path: explicit.clone()
+            }
+        );
+    }
+    set_global(&fixture.paths, "compaction.trigger", &Value::Null).unwrap();
+    let defaults = fixture.report();
+    let default_row = setting(&defaults, "compaction.trigger");
+    assert_eq!(default_row.value, json!({"percent": 80}));
+    assert_eq!(default_row.source, SettingLayer::Default);
+    let layered = report(&fixture.paths, &fixture.workspace, extras).unwrap();
+    let inherited_row = setting(&layered, "compaction.trigger");
+    assert_eq!(inherited_row.value, json!({"percent": 25}));
+    assert_eq!(
+        inherited_row.source,
+        SettingLayer::Explicit { path: explicit }
+    );
 }
 
 #[test]
@@ -869,10 +971,23 @@ fn invalid_global_values_leave_the_file_byte_identical() {
         ("compaction.enabled", json!("false")),
         ("sandbox.enabled", json!("false")),
         ("sandbox.enabled", json!(0)),
-        ("compaction.trigger_tokens", json!(0)),
-        ("compaction.trigger_tokens", json!(-1)),
-        ("compaction.trigger_tokens", json!(1.5)),
-        ("compaction.trigger_tokens", json!(u64::MAX)),
+        ("compaction.trigger", json!(50)),
+        ("compaction.trigger", json!({})),
+        ("compaction.trigger", json!({"percent": 0})),
+        ("compaction.trigger", json!({"percent": 101})),
+        ("compaction.trigger", json!({"percent": -1})),
+        ("compaction.trigger", json!({"percent": 1.5})),
+        ("compaction.trigger", json!({"percent": "50"})),
+        ("compaction.trigger", json!({"percent": null})),
+        ("compaction.trigger", json!({"percent": true})),
+        ("compaction.trigger", json!({"tokens": 0})),
+        ("compaction.trigger", json!({"tokens": -1})),
+        ("compaction.trigger", json!({"tokens": 1.5})),
+        ("compaction.trigger", json!({"tokens": "24000"})),
+        ("compaction.trigger", json!({"tokens": u64::MAX})),
+        ("compaction.trigger", json!({"percent": 50, "tokens": 9000})),
+        ("compaction.trigger", json!({"percent": 50, "unknown": 1})),
+        ("compaction.trigger", json!({"unknown": 50})),
         ("compaction.keep_recent_tokens", json!(0)),
         ("compaction.keep_recent_tokens", json!("1000")),
     ] {

@@ -1,10 +1,8 @@
 //! Effective settings, their sources and the settings editor overlay.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use serde_json::Value;
-use xi_protocol::event::ModelRef;
+use serde_json::{Value, json};
 use xi_protocol::methods::client::{Setting, SettingLayer, SettingsReport};
-use xi_protocol::model::Reasoning;
 
 use crate::editor::Editor;
 use crate::frame::{Body, Cursor, Frame, Hint, Note, Tone};
@@ -95,9 +93,70 @@ pub(crate) enum Action {
     EditFile,
 }
 
+#[derive(Clone, Copy)]
+enum NumberUnit {
+    Percent,
+    Tokens,
+}
+
+impl NumberUnit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Percent => "%",
+            Self::Tokens => "tokens",
+        }
+    }
+}
+
 struct NumberInput {
     key: &'static str,
     editor: Editor,
+    unit: NumberUnit,
+}
+
+impl NumberInput {
+    fn number(&self) -> Result<u64, &'static str> {
+        match self.unit {
+            NumberUnit::Percent => self
+                .editor
+                .text()
+                .parse::<u64>()
+                .ok()
+                .filter(|value| (1..=100).contains(value))
+                .ok_or("enter a percentage from 1 to 100"),
+            NumberUnit::Tokens => self
+                .editor
+                .text()
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+                .ok_or("enter a positive token count"),
+        }
+    }
+
+    fn switch_unit(&mut self, window: Option<u64>) {
+        let number = self.number().ok();
+        let converted = match self.unit {
+            NumberUnit::Percent => {
+                self.unit = NumberUnit::Tokens;
+                number
+                    .zip(window)
+                    .map(|(percent, window)| threshold(percent, window))
+                    .filter(|tokens| *tokens > 0 && *tokens <= i64::MAX as u64)
+            }
+            NumberUnit::Tokens => {
+                self.unit = NumberUnit::Percent;
+                number.zip(window).and_then(|(tokens, window)| {
+                    let scaled = u128::from(tokens) * 100;
+                    let percent = scaled / u128::from(window);
+                    (scaled % u128::from(window) == 0 && (1..=100).contains(&percent))
+                        .then_some(percent as u64)
+                })
+            }
+        };
+        self.editor
+            .set_text(&converted.map_or_else(String::new, |value| value.to_string()));
+    }
 }
 
 /// The settings overlay, keeping the selected row across report refreshes.
@@ -154,46 +213,70 @@ impl Settings {
     }
 
     fn start_number(&mut self, key: &'static str) {
+        let value = self.value(key);
+        let (unit, number) = if key == "compaction.trigger" {
+            if let Some(tokens) = value.get("tokens").and_then(Value::as_u64) {
+                (NumberUnit::Tokens, tokens)
+            } else {
+                (
+                    NumberUnit::Percent,
+                    value.get("percent").and_then(Value::as_u64).unwrap_or(80),
+                )
+            }
+        } else {
+            (NumberUnit::Tokens, value.as_u64().unwrap_or(0))
+        };
         let mut editor = Editor::default();
-        if !self.value(key).is_null() {
-            editor.set_text(&self.value(key).to_string());
-        }
-        self.input = Some(NumberInput { key, editor });
+        editor.set_text(&number.to_string());
+        self.input = Some(NumberInput { key, editor, unit });
         self.note = None;
     }
 
     /// Handles navigation and prepares a change for the application owner.
     /// `action` is the key's keymap action, so rebound keys work here too.
-    pub(crate) fn key(
-        &mut self,
-        key: KeyEvent,
-        action: Option<Key>,
-        model: &ModelRef,
-        reasoning: Reasoning,
-    ) -> Action {
+    pub(crate) fn key(&mut self, key: KeyEvent, action: Option<Key>, ctx: &Ctx) -> Action {
         let plain = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if let Some(input) = self.input.as_mut() {
+            if plain && input.key == "compaction.trigger" {
+                match key.code {
+                    KeyCode::Char('u') => {
+                        input.switch_unit(context_window(ctx));
+                        self.note = input.editor.text().is_empty().then(|| {
+                            "Cannot preserve this threshold in the other unit; enter a new value before saving.".into()
+                        });
+                        return Action::None;
+                    }
+                    KeyCode::Char('r') => {
+                        return Action::Set {
+                            key: "compaction.trigger",
+                            value: Value::Null,
+                        };
+                    }
+                    _ => {}
+                }
+            }
             match (action, key.code) {
                 (_, KeyCode::Char(c)) if plain && c.is_ascii_digit() => {
                     input.editor.insert(&c.to_string());
                 }
                 (Some(Key::Escape), _) => self.input = None,
                 (Some(Key::Send), _) => {
-                    let text = input.editor.text();
-                    let value = if text.is_empty() && input.key == "compaction.trigger_tokens" {
-                        Value::Null
-                    } else {
-                        match text.parse::<u64>() {
-                            Ok(value) if value > 0 && value <= i64::MAX as u64 => {
-                                Value::from(value)
-                            }
-                            _ => {
-                                self.note("enter a positive token count");
-                                return Action::None;
-                            }
+                    let number = match input.number() {
+                        Ok(number) => number,
+                        Err(message) => {
+                            self.note(message);
+                            return Action::None;
                         }
+                    };
+                    let value = if input.key == "compaction.trigger" {
+                        match input.unit {
+                            NumberUnit::Percent => json!({ "percent": number }),
+                            NumberUnit::Tokens => json!({ "tokens": number }),
+                        }
+                    } else {
+                        Value::from(number)
                     };
                     return Action::Set {
                         key: input.key,
@@ -217,15 +300,24 @@ impl Settings {
             return Action::EditFile;
         }
         let row = ROWS[self.selected];
+        if row == Row::Trigger && plain && key.code == KeyCode::Char('r') {
+            return Action::Set {
+                key: "compaction.trigger",
+                value: Value::Null,
+            };
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             return match row {
                 Row::Model => Action::Set {
                     key: "default_model",
-                    value: Value::String(format!("{}/{}", model.provider, model.model)),
+                    value: Value::String(format!(
+                        "{}/{}",
+                        ctx.info.model.provider, ctx.info.model.model
+                    )),
                 },
                 Row::Reasoning => Action::Set {
                     key: "reasoning",
-                    value: Value::String(reasoning.name().into()),
+                    value: Value::String(ctx.info.reasoning.name().into()),
                 },
                 _ => Action::None,
             };
@@ -283,7 +375,7 @@ impl Settings {
                         ),
                     },
                     Row::Trigger if enter => {
-                        self.start_number("compaction.trigger_tokens");
+                        self.start_number("compaction.trigger");
                         Action::None
                     }
                     Row::Tail if enter => {
@@ -352,7 +444,7 @@ impl Settings {
             }
             Row::Sandbox => ("Tool sandbox".into(), "sandbox.enabled"),
             Row::Compaction => ("Automatic compaction".into(), "compaction.enabled"),
-            Row::Trigger => ("Compaction trigger".into(), "compaction.trigger_tokens"),
+            Row::Trigger => ("Compaction trigger".into(), "compaction.trigger"),
             Row::Tail => ("Kept tail".into(), "compaction.keep_recent_tokens"),
             Row::ReadOnly(label, key) => (label.into(), key),
             Row::Trust => {
@@ -369,7 +461,19 @@ impl Settings {
             }
         };
         let value = match row {
-            Row::Trigger if self.value(key).is_null() => "80% of window".into(),
+            Row::Trigger => {
+                if let Some(tokens) = self.value(key).get("tokens").and_then(Value::as_u64) {
+                    format!("{tokens} tokens (fixed)")
+                } else {
+                    let percent = self
+                        .value(key)
+                        .get("percent")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(80);
+                    trigger_display(percent, context_window(ctx))
+                }
+            }
+            Row::Tail => format!("{} tokens", display(self.value(key))),
             Row::ReadOnly(_, "daemon.idle_exit") => format!("{} seconds", display(self.value(key))),
             _ => display(self.value(key)),
         };
@@ -406,10 +510,21 @@ impl Settings {
         if self.input.is_some() {
             hints.extend(Hint::key(keys, Key::Send, "saves", 0));
             hints.extend(Hint::key(keys, Key::Escape, "cancels", 0));
+            if self
+                .input
+                .as_ref()
+                .is_some_and(|input| input.key == "compaction.trigger")
+            {
+                hints.push(Hint::new("u switches %/tokens", 0).short("u unit"));
+                hints.push(Hint::new("r resets to inherited/80%", 0).short("r reset 80%"));
+            }
         } else {
             hints.extend(Hint::key(keys, Key::Send, "changes", 0));
             if matches!(ROWS[self.selected], Row::Model | Row::Reasoning) {
                 hints.push(Hint::new("ctrl+s saves default", 2).short("ctrl+s"));
+            }
+            if ROWS[self.selected] == Row::Trigger {
+                hints.push(Hint::new("r resets to inherited/80%", 0).short("r reset 80%"));
             }
             hints.push(Hint::new("e edits file", 3));
             hints.extend(Hint::key(keys, Key::Escape, "closes", 0));
@@ -448,19 +563,50 @@ impl Settings {
             }
             let line = if here && let Some(input) = &self.input {
                 let text = input.editor.text();
-                let available = inner.saturating_sub(prefix.width() + 2).max(1);
+                let unit = input.unit.label();
+                let unit = if inner < unit.len() + 4 && matches!(input.unit, NumberUnit::Tokens) {
+                    "tok"
+                } else {
+                    unit
+                };
+                let gap = if inner < unit.len() + 5 { "[" } else { " [" };
+                let reserve = (unit.len() + gap.len() + 1 + (text.len() + 1).min(6)).min(inner);
+                let room = inner.saturating_sub(reserve);
+                let prefix = if prefix.width() > room && room > 0 {
+                    prefix.truncate(room - 1).ink(" ")
+                } else {
+                    prefix.truncate(room)
+                };
+                let prefix = prefix.brass(unit).brass(gap);
+                let available = inner.saturating_sub(prefix.width() + 1).max(1);
                 let from = input.editor.cursor().saturating_sub(available - 1);
                 let to = (from + available).min(text.len());
                 cursor = Some(Cursor::List(
                     list.len(),
-                    prefix.width() + 1 + input.editor.cursor() - from,
+                    prefix.width() + input.editor.cursor() - from,
                 ));
-                prefix
-                    .brass("[")
-                    .ink(&text[from..to])
-                    .brass("]")
-                    .dim(" · enter saves")
+                let mut line = prefix.ink(&text[from..to]).brass("]");
+                if matches!(input.unit, NumberUnit::Percent)
+                    && let Ok(percent) = input.number()
+                {
+                    let effective = context_window(ctx).map_or_else(
+                        || "token count unknown".into(),
+                        |window| format!("{} tokens", threshold(percent, window)),
+                    );
+                    line = line.dim(format!(" · {effective}"));
+                }
+                line
             } else {
+                let prefix = if matches!(row, Row::Trigger | Row::Tail) {
+                    let room = inner.saturating_sub(value.chars().count().min(24));
+                    if prefix.width() > room && room > 0 {
+                        prefix.truncate(room - 1).ink(" ")
+                    } else {
+                        prefix.truncate(room)
+                    }
+                } else {
+                    prefix
+                };
                 style::row(
                     prefix.span(role, false, value),
                     Line::default().dim(source),
@@ -472,6 +618,8 @@ impl Settings {
         let note = self.note.clone().or_else(|| {
             if ROWS[self.selected] == Row::Sandbox {
                 Some("Off gives tool commands unrestricted host file and network access. Extensions stay sandboxed.".into())
+            } else if ROWS[self.selected] == Row::Trigger {
+                Some("u switches units while editing; r removes the global override and uses inherited settings (default 80%).".into())
             } else {
                 (!self.report.warnings.is_empty()).then(|| self.report.warnings.join(" · "))
             }
@@ -500,12 +648,31 @@ impl Overlay for Settings {
     }
 
     fn key(&mut self, key: KeyEvent, action: Option<Key>, ctx: &Ctx) -> Outcome {
-        match Self::key(self, key, action, &ctx.info.model, ctx.info.reasoning) {
+        match Self::key(self, key, action, ctx) {
             Action::None => Outcome::Stay,
             Action::Close => Outcome::Close,
             change => Outcome::Send(Box::new(Command::Setting(change))),
         }
     }
+}
+
+fn context_window(ctx: &Ctx) -> Option<u64> {
+    ctx.info
+        .model_info
+        .as_ref()
+        .map(|model| model.context_window)
+        .filter(|window| *window > 0)
+}
+
+fn threshold(percent: u64, window: u64) -> u64 {
+    (u128::from(window) * u128::from(percent) / 100) as u64
+}
+
+fn trigger_display(percent: u64, window: Option<u64>) -> String {
+    window.map_or_else(
+        || format!("{percent}% · token count unknown"),
+        |window| format!("{percent}% · {} tokens", threshold(percent, window)),
+    )
 }
 
 fn display(value: &Value) -> String {

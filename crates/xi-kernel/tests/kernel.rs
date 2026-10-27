@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::{Notify, Semaphore};
+use xi_kernel::compaction::Trigger;
 use xi_kernel::config::{Config, DaemonSettings, Paths, daemon_settings, sessions_root};
 use xi_kernel::{ApprovalMode, Backend, EventBus, Leaser, Notification, Session, TurnOptions};
 use xi_policy::{Action, Taint};
@@ -1607,7 +1608,7 @@ fn seeded_session(
     events: Vec<EventKind>,
     compaction: xi_kernel::compaction::Config,
 ) -> (Session, tokio::sync::mpsc::UnboundedReceiver<Notification>) {
-    seeded_session_with_options(fixture, script, events, compaction, opts())
+    seeded_session_with_options(fixture, script, events, compaction, opts(), model())
 }
 
 fn seeded_session_with_options(
@@ -1616,6 +1617,7 @@ fn seeded_session_with_options(
     events: Vec<EventKind>,
     compaction: xi_kernel::compaction::Config,
     options: TurnOptions,
+    model: ModelInfo,
 ) -> (Session, tokio::sync::mpsc::UnboundedReceiver<Notification>) {
     let mut log = xi_session::SessionLog::create(
         fixture.workspace.join("seed.jsonl"),
@@ -1646,7 +1648,7 @@ fn seeded_session_with_options(
         options,
         Some(Backend {
             provider: script,
-            model: model(),
+            model,
             tools: vec![Arc::new(FakeTool { gate: None })],
         }),
     )
@@ -1659,20 +1661,26 @@ fn compaction_defaults_layering_and_keep_clamp() {
     let fixture = Fixture::new();
     let config = fixture.config().compaction;
     assert!(!config.enabled);
-    assert_eq!(config.trigger_tokens, None);
+    assert_eq!(config.trigger, Trigger::Percent(80));
     assert_eq!(config.trigger(10_000), 8_000);
+    assert_eq!(
+        config.trigger(u64::MAX),
+        (u128::from(u64::MAX) * 80 / 100) as u64
+    );
     assert_eq!(config.keep_recent_tokens, 20_000);
     assert_eq!(config.keep(10_000), 4_000);
     write(
         &fixture.paths.config.join("config.toml"),
-        "[compaction]\nenabled=true\ntrigger_tokens=24000\nkeep_recent_tokens=20000\n",
+        "[compaction]\nenabled=true\ntrigger={percent=50}\nkeep_recent_tokens=20000\n",
     );
     let extra = fixture.workspace.join("extra.toml");
-    write(&extra, "[compaction]\ntrigger_tokens=8000\n");
+    write(&extra, "[compaction]\ntrigger={tokens=8000}\n");
     let config = Config::load(fixture.paths.clone(), &fixture.workspace, &[extra])
         .unwrap()
         .compaction;
     assert!(config.enabled);
+    assert_eq!(config.trigger, Trigger::Tokens(8_000));
+    assert_eq!(config.trigger(100_000), 8_000);
     assert_eq!(config.keep_recent_tokens, 20_000);
     assert_eq!(config.keep(100_000), 4_000);
     write(
@@ -1686,6 +1694,120 @@ fn compaction_defaults_layering_and_keep_clamp() {
     fixture.paths.trust(&fixture.workspace).unwrap();
     assert!(!fixture.config().compaction.enabled);
     assert_eq!(fixture.config().compaction.keep_recent_tokens, 3);
+}
+
+#[test]
+fn compaction_trigger_validates_units_and_boundaries() {
+    let fixture = Fixture::new();
+    for (trigger, expected) in [
+        ("{percent=1}", Trigger::Percent(1)),
+        ("{percent=100}", Trigger::Percent(100)),
+        ("{tokens=1}", Trigger::Tokens(1)),
+        (
+            "{tokens=9223372036854775807}",
+            Trigger::Tokens(i64::MAX as u64),
+        ),
+    ] {
+        write(
+            &fixture.paths.config.join("config.toml"),
+            &format!("[compaction]\ntrigger={trigger}\n"),
+        );
+        assert_eq!(fixture.config().compaction.trigger, expected);
+    }
+    for trigger in [
+        "{}",
+        "50",
+        "{percent=0}",
+        "{percent=101}",
+        "{percent=-1}",
+        "{percent=1.5}",
+        "{percent='50'}",
+        "{percent=50,tokens=24000}",
+        "{percent=50,unknown=1}",
+        "{unknown=50}",
+        "{tokens=0}",
+        "{tokens=-1}",
+        "{tokens=1.5}",
+        "{tokens='24000'}",
+        "{tokens=9223372036854775808}",
+    ] {
+        write(
+            &fixture.paths.config.join("config.toml"),
+            &format!("[compaction]\ntrigger={trigger}\n"),
+        );
+        assert!(
+            Config::load(fixture.paths.clone(), &fixture.workspace, &[]).is_err(),
+            "{trigger}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn percentage_compaction_uses_selected_model_context_without_repeating_after_each_tool_batch()
+{
+    for (context_window, expected_compactions) in [(8_192, 1), (16_384, 0)] {
+        let fixture = Fixture::new();
+        write(
+            &fixture.paths.config.join("config.toml"),
+            "[compaction]\nenabled=true\ntrigger={percent=50}\nkeep_recent_tokens=10\n",
+        );
+        let compaction = fixture.config().compaction;
+        assert_eq!(compaction.trigger(context_window), context_window / 2);
+        let mut steps = vec![Step::Reply(Response {
+            content: vec![call("a", "fake", json!({}))],
+            stop: StopReason::ToolUse,
+            usage: Usage {
+                input: 4_096,
+                ..Usage::default()
+            },
+        })];
+        if expected_compactions == 1 {
+            steps.push(Step::Reply(done()));
+        }
+        steps.extend([
+            batch(vec![call("b", "fake", json!({}))]),
+            batch(vec![call("c", "fake", json!({}))]),
+            Step::Reply(done()),
+        ]);
+        let script = Script::new(steps);
+        let (session, _) = seeded_session_with_options(
+            &fixture,
+            script.clone(),
+            vec![EventKind::UserMessage {
+                content: input(&"old ".repeat(100)),
+            }],
+            compaction,
+            opts(),
+            ModelInfo {
+                context_window,
+                ..model()
+            },
+        );
+        assert!(!session.prompt(input("work")).await.unwrap().failed);
+        let info = session.info().await;
+        let compactions: Vec<_> = info
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event.kind, EventKind::Compaction { .. }))
+            .collect();
+        assert_eq!(compactions.len(), expected_compactions);
+        if let Some((index, _)) = compactions.first() {
+            assert!(matches!(
+                &info.events[*index - 1].kind,
+                EventKind::ToolResult { call, .. } if call.0 == "a"
+            ));
+        }
+        let requests = script.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4 + expected_compactions);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.tools.is_empty())
+                .count(),
+            expected_compactions
+        );
+    }
 }
 
 #[tokio::test]
@@ -1717,7 +1839,7 @@ async fn compaction_triggers_at_threshold_using_all_usage_fields_and_new_charact
             ],
             xi_kernel::compaction::Config {
                 enabled: true,
-                trigger_tokens: Some(1_000),
+                trigger: Trigger::Tokens(1_000),
                 keep_recent_tokens: 2,
             },
         );
@@ -1911,7 +2033,7 @@ async fn overflow_compacts_and_retries_once_even_when_disabled() {
             }],
             xi_kernel::compaction::Config {
                 enabled,
-                trigger_tokens: Some(100_000),
+                trigger: Trigger::Tokens(100_000),
                 keep_recent_tokens: 1,
             },
         );
@@ -2022,7 +2144,7 @@ async fn compaction_runs_after_tool_results_and_resets_old_usage_estimates() {
         }],
         xi_kernel::compaction::Config {
             enabled: true,
-            trigger_tokens: Some(1_000),
+            trigger: Trigger::Tokens(1_000),
             keep_recent_tokens: 10,
         },
     );
@@ -2058,7 +2180,7 @@ async fn compaction_without_an_older_prefix_is_a_noop() {
         vec![],
         xi_kernel::compaction::Config {
             enabled: true,
-            trigger_tokens: Some(1),
+            trigger: Trigger::Tokens(1),
             keep_recent_tokens: 20_000,
         },
     );
@@ -2390,6 +2512,7 @@ async fn summary_requests_hold_one_lease_across_retries_without_streaming() {
             })),
             ..opts()
         },
+        model(),
     );
     session.compact().await.unwrap();
     let spans = spans.lock().unwrap();
