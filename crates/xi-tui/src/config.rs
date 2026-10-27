@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::icons::Icons;
 use crate::keys::{Action, Binding, Keymap};
 use crate::layout::Layout;
+use crate::surface::Surfaces;
 use crate::transcript::Thinking;
 
 /// Effective client settings.
@@ -19,6 +20,8 @@ pub struct TuiConfig {
     pub layout: Layout,
     /// Which glyphs the deck draws.
     pub icons: Icons,
+    /// Whether the deck tints its raised surfaces.
+    pub surfaces: Surfaces,
 }
 
 impl TuiConfig {
@@ -121,6 +124,10 @@ impl TuiConfig {
                 "icons" => match value.as_str().and_then(Icons::parse) {
                     Some(icons) => self.icons = icons,
                     None => warnings.push("display.icons must be nerd or unicode".into()),
+                },
+                "surfaces" => match value.as_str().and_then(Surfaces::parse) {
+                    Some(surfaces) => self.surfaces = surfaces,
+                    None => warnings.push("display.surfaces must be auto or off".into()),
                 },
                 _ => warnings.push(format!("unknown setting display.{name}")),
             }
@@ -374,6 +381,21 @@ mod tests {
         let (config, warnings) = TuiConfig::load(Some(&path));
         assert_eq!(config.icons, Icons::Nerd);
         assert_eq!(warnings, ["display.icons must be nerd or unicode"]);
+    }
+
+    #[test]
+    fn surfaces_turn_off_from_display_and_invalid_values_keep_auto_and_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        assert_eq!(TuiConfig::load(None).0.surfaces, Surfaces::Auto);
+        std::fs::write(&path, "[display]\nsurfaces = 'off'\n").unwrap();
+        let (config, warnings) = TuiConfig::load(Some(&path));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.surfaces, Surfaces::Off);
+        std::fs::write(&path, "[display]\nsurfaces = false\n").unwrap();
+        let (config, warnings) = TuiConfig::load(Some(&path));
+        assert_eq!(config.surfaces, Surfaces::Auto);
+        assert_eq!(warnings, ["display.surfaces must be auto or off"]);
     }
 
     #[test]
