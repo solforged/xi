@@ -76,8 +76,22 @@ pub(crate) fn body(request: &Request, shape: &Shape, reasoning: bool) -> Result<
         "stream": true,
         "include": ["reasoning.encrypted_content"],
     });
-    if !shape.lite && !tools.is_empty() {
-        body["tools"] = tools.into();
+    let mut hosted = Vec::new();
+    if request.web_search {
+        if shape.lite {
+            return Err(Error::new(
+                ErrorKind::InvalidRequest,
+                "Responses Lite has no hosted web search",
+            ));
+        }
+        hosted.push(json!({"type": "web_search"}));
+        body["include"]
+            .as_array_mut()
+            .expect("include is an array")
+            .push("web_search_call.action.sources".into());
+    }
+    if !shape.lite && (!tools.is_empty() || !hosted.is_empty()) {
+        body["tools"] = tools.into_iter().chain(hosted).collect::<Vec<_>>().into();
     }
     if reasoning {
         let effort = crate::openai::effort(request.reasoning);

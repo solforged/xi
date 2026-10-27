@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut request = Request {
         model, system: "Follow instructions exactly. Use the supplied tool when asked to calculate. After a tool result, answer with the result and do not call it again.".into(),
         messages: vec![Message::User(vec![Block::Text { text: "Reply with exactly: Ready.".into() }])],
-        tools: Vec::new(), max_tokens: 1024, reasoning: Reasoning::Off, cache_key: None,
+        tools: Vec::new(), max_tokens: 1024, reasoning: Reasoning::Off, cache_key: None, web_search: false,
     };
     println!("Text stream:");
     let reply = provider.stream(&request, &mut print_delta).await?;

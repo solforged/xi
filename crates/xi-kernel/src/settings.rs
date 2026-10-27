@@ -14,7 +14,7 @@ use xi_provider::Registry;
 use crate::config::{Approvals, Config, Paths, parse_model, validate_global};
 use crate::{Error, Result};
 
-pub(crate) const KEYS: [&str; 20] = [
+pub(crate) const KEYS: [&str; 22] = [
     "default_model",
     "reasoning",
     "approvals",
@@ -35,6 +35,8 @@ pub(crate) const KEYS: [&str; 20] = [
     "sandbox.env_command",
     "daemon.idle_exit",
     "sandbox.ssh_agent",
+    "web_search.backend",
+    "web_search.model",
 ];
 
 /// The leading `KEYS` that `config/set` may change.
@@ -69,6 +71,8 @@ pub fn report(paths: &Paths, workspace: &Path, extra: &[PathBuf]) -> Result<Sett
         json!(config.sandbox.env_command),
         json!(config.daemon.idle_exit),
         json!(config.sandbox.ssh_agent),
+        json!(config.web_search.backend),
+        json!(config.web_search.model.to_string()),
     ];
     let settings = KEYS
         .into_iter()

@@ -60,6 +60,12 @@ pub(crate) fn body(request: &Request, reasoning: bool) -> Result<Value, Error> {
             }
         }
     }
+    if request.web_search {
+        return Err(Error::new(
+            ErrorKind::Config,
+            "Chat Completions has no hosted web search",
+        ));
+    }
     let mut body = json!({
         "model": request.model, "messages": messages, "stream": true,
         "stream_options": {"include_usage": true},

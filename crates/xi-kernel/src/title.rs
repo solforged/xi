@@ -217,6 +217,7 @@ impl Session {
             max_tokens: MAX_TOKENS.min(info.max_output),
             reasoning: info.resolve(Reasoning::Off),
             cache_key: None,
+            web_search: false,
         };
         let titles = &mut state.titles;
         if let Some(cancel) = titles.cancel.take() {

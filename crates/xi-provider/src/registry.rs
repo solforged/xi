@@ -172,7 +172,7 @@ fn signer(config: &ProviderConfig, credentials: Option<&Path>) -> Result<Box<dyn
     Ok(Box::new(Key(Some((HeaderName::from_static(name), value)))))
 }
 
-fn resolve_auth(auth: &Auth) -> Result<Option<String>, Error> {
+pub(crate) fn resolve_auth(auth: &Auth) -> Result<Option<String>, Error> {
     let raw = match auth {
         Auth::None | Auth::Login(_) => return Ok(None),
         Auth::Env(name) => std::env::var(name).map_err(|_| {

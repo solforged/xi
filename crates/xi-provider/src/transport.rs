@@ -205,7 +205,17 @@ impl Provider for HttpProvider {
         on_delta: &'a mut (dyn FnMut(Delta) + Send),
     ) -> BoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
-            let shape = self.shapes.get(&request.model).unwrap_or(&self.unlisted);
+            let mut shape = self.shapes.get(&request.model).unwrap_or(&self.unlisted);
+            // Responses Lite only takes function tools, so a hosted search
+            // uses the full Responses shape even for Lite models.
+            let full;
+            if request.web_search && shape.lite {
+                full = Shape {
+                    lite: false,
+                    ..shape.clone()
+                };
+                shape = &full;
+            }
             let reasoning = shape.reasons(request)?;
             let mut headers = self.headers.clone();
             if let Some(name) = &shape.session_header
@@ -451,6 +461,7 @@ mod tests {
                     max_tokens: 1024,
                     reasoning: Reasoning::Off,
                     cache_key: Some("session-1".into()),
+                    web_search: false,
                 },
                 &mut |_| {},
             )

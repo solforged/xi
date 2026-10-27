@@ -509,7 +509,7 @@ async fn start(
         // Registration needs tool schemas, not a model connection or credential.
         let specs = match &state.backend {
             Some(backend) => Ok(std::borrow::Cow::Borrowed(backend.specs.as_slice())),
-            None => crate::toolset(&state.config.tools).map(|tools| {
+            None => crate::toolset(&state.config).map(|tools| {
                 std::borrow::Cow::Owned(tools.iter().map(|tool| tool.spec()).collect())
             }),
         };

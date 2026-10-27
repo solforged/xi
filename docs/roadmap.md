@@ -21,7 +21,7 @@ The arm everything is compared against: `read`, `edit` (exact replacement), `wri
 
 ## Feature queue
 
-Rows 1 to 5 are done; their results are below.
+Rows 1 to 5 are done; their results are below. Row 8 is built and waits for its measurement.
 
 | # | Feature | Home | Outcome or deciding measurement |
 |---|---|---|---|
@@ -32,7 +32,7 @@ Rows 1 to 5 are done; their results are below.
 | 5 | Subagents | Opt-in built-in `task` tool | Done; moved from the `extensions/subagents` package into the kernel, still off by default. Not used unprompted by Qwen 3.8. |
 | 6 | LSP diagnostics after edits | package | Calls and time to green on the Rust and TypeScript tasks. |
 | 7 | Todo or plan tool | package | Pass rate on multi-step tasks (`invoice-rounding`, `revision-store`), prompt size. |
-| 8 | `fetch` and web search, with taint wired in | package | Tasks that need docs; taint must turn later egress into `ask`. The egress proxy and `net` capability it needs exist. |
+| 8 | `fetch` and web search, with taint wired in | Opt-in built-in `fetch` and `web_search` tools | Built: hosted search on the `@tiny` model's provider or Exa, every call a `net` crossing, output untrusted (see [design](design.md#web-search-and-fetch)). Still to measure: pass rate and cost on tasks that need current docs, which the suite does not have yet. |
 | 9 | Memory | package | Last: needs multi-session tasks to measure. |
 | 10 | TUI | client | Daemon client with event replay and deduplication, streaming retry resets and a `/tree` checkout overlay. The surface for daily use is tracked in [Terminal client](#terminal-client). Not benchmarked. |
 

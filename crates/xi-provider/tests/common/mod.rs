@@ -27,6 +27,7 @@ pub fn request() -> Request {
         max_tokens: 8192,
         reasoning: Reasoning::Medium,
         cache_key: None,
+        web_search: false,
     }
 }
 

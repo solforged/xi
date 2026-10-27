@@ -37,6 +37,7 @@ mod registry;
 mod responses;
 mod sse;
 mod transport;
+mod web;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,6 +50,7 @@ pub use futures::future::BoxFuture;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+pub use web::{EXA_HOST, ExaResult, Source, WebResults, exa_search, web_results};
 use xi_protocol::event::{ModelRef, StopReason, Usage};
 use xi_protocol::manifest::ToolSpec;
 use xi_protocol::methods::client::Delta;
@@ -94,6 +96,10 @@ pub struct Request {
     /// Stable per-session key for provider-side cache affinity, where the
     /// API accepts one.
     pub cache_key: Option<String>,
+    /// Lets the model run the provider's hosted web search. Only the
+    /// Anthropic Messages and OpenAI Responses APIs have one; Chat
+    /// Completions requests with it fail before they are sent.
+    pub web_search: bool,
 }
 
 /// A complete model response.

@@ -327,6 +327,7 @@ impl Session {
                 max_tokens: backend.model.max_output,
                 reasoning: backend.model.resolve(state.config.reasoning),
                 cache_key: Some(self.id().to_string()),
+                web_search: false,
             };
             // Summary deltas are not assistant output. Only the finished durable
             // compaction is broadcast, and cancellation never publishes a partial.
