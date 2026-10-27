@@ -919,6 +919,15 @@ impl Call {
         };
         let mut lines = vec![lr(self.head(self.mark(), m), right, cols)];
         lines.extend(self.egress.iter().map(|row| row.line(cols, true, None)));
+        for block in &output.content {
+            if let OutputBlock::Image { media_type, data } = block {
+                lines.extend(
+                    crate::images::rows(media_type, data, cols.saturating_sub(2))
+                        .into_iter()
+                        .map(|line| Line::from("  ").extend(line)),
+                );
+            }
+        }
         if !self.children.is_empty() {
             let (slips, mut details) = self.children.committed(m);
             lines.extend(slips);
@@ -1286,6 +1295,7 @@ impl Transcript {
                         .into_iter()
                         .map(|row| Line::default().ink("  ").ink(row).truncate(cols)),
                 );
+                lines.extend(image_rows(content, cols));
                 out.extend(self.note(lines));
                 return out;
             }
@@ -1458,6 +1468,7 @@ impl Transcript {
                         rows.iter()
                             .map(|row| bar().ink("  ").ink(row).raise().truncate(cols)),
                     )
+                    .chain(image_rows(xi_protocol::skill::typed(content), cols))
                     .chain(std::iter::once(bar()));
                 self.push(&mut out, lines.collect::<Vec<_>>());
                 self.blank = false;
@@ -2032,6 +2043,21 @@ fn digest(summary: &str) -> (Vec<(&'static str, String)>, usize) {
     (rows, hidden)
 }
 
+fn image_rows(content: &[Block], cols: usize) -> Vec<Line> {
+    content
+        .iter()
+        .flat_map(|block| match block {
+            Block::Image { media_type, data } => {
+                crate::images::rows(media_type, data, cols.saturating_sub(3))
+                    .into_iter()
+                    .map(|line| Line::from("   ").extend(line))
+                    .collect()
+            }
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
 pub(crate) fn blocks_text(content: &[Block]) -> String {
     content
         .iter()
@@ -2135,6 +2161,61 @@ mod tests {
             taint: false,
             during: during.map(Into::into),
             extension: extension.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn image_results_and_local_remote_and_replayed_prompts_keep_previews() {
+        let enabled = crate::images::Protocol::detect().is_some();
+        let data = crate::images::tests::png();
+        let check = |lines: &[Line]| {
+            assert_eq!(lines.iter().any(|line| line.1.is_some()), enabled);
+            if enabled {
+                assert!(lines.iter().any(|line| line.plain().contains("80×64")));
+            }
+            assert!(lines.iter().all(|line| line.width() <= 80));
+        };
+        let content = vec![
+            Block::Text {
+                text: "look at this".into(),
+            },
+            Block::Image {
+                media_type: "image/png".into(),
+                data: data.clone(),
+            },
+        ];
+        let prompt = ev(
+            EventKind::UserMessage {
+                content: content.clone(),
+            },
+            0,
+        );
+        let mut t = Transcript::default();
+        check(&t.apply(&prompt, m(80)));
+        check(&t.apply_live(&prompt, m(80)));
+        t.sent(&content);
+        check(&t.apply_live(&prompt, m(80)));
+        for name in ["read", "screenshot"] {
+            t.apply(
+                &ev(
+                    assistant(vec![use_("a", name, json!({"path": "screen.png"}))]),
+                    1,
+                ),
+                m(80),
+            );
+            let output = EventKind::ToolResult {
+                call: "a".into(),
+                output: ToolOutput {
+                    content: vec![OutputBlock::Image {
+                        media_type: "image/png".into(),
+                        data: data.clone(),
+                    }],
+                    is_error: false,
+                    untrusted: true,
+                },
+                spill: None,
+            };
+            check(&t.apply(&ev(output, 2), m(80)));
         }
     }
 

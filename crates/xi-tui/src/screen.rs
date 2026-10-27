@@ -10,6 +10,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+use crate::images::{self, Protocol};
 use crate::style::{Line, Rgb};
 
 /// How long the width must hold still before a frame is drawn.
@@ -66,6 +67,9 @@ pub struct Screen<W: Write> {
     cursor: (usize, usize),
     /// Erases the display and scrollback at the start of the next frame.
     clear: bool,
+    graphics: Option<Protocol>,
+    next_image: u32,
+    deck_images: Vec<u32>,
 }
 
 impl<W: Write> Screen<W> {
@@ -79,6 +83,9 @@ impl<W: Write> Screen<W> {
             widths: Vec::new(),
             cursor: (0, 0),
             clear: false,
+            graphics: Protocol::detect(),
+            next_image: 1,
+            deck_images: Vec::new(),
         }
     }
 
@@ -127,7 +134,10 @@ impl<W: Write> Screen<W> {
     /// # Errors
     /// Returns the writer's I/O error.
     pub fn leave_deck(&mut self) -> io::Result<()> {
-        self.out.write_all(b"\x1b[?1049l")?;
+        let mut buf = String::new();
+        self.clear_deck_images(&mut buf);
+        buf.push_str("\x1b[?1049l");
+        self.out.write_all(buf.as_bytes())?;
         self.widths.clear();
         self.cursor = (0, 0);
         self.out.flush()
@@ -140,6 +150,7 @@ impl<W: Write> Screen<W> {
     /// Returns the writer's I/O error.
     pub fn draw_deck(&mut self, rows: &[Line], cursor: Option<(usize, usize)>) -> io::Result<()> {
         let mut buf = String::from("\x1b[?2026h\x1b[?25l\x1b[H");
+        self.clear_deck_images(&mut buf);
         for (i, line) in rows.iter().enumerate() {
             if i > 0 {
                 buf.push_str("\r\n");
@@ -157,6 +168,9 @@ impl<W: Write> Screen<W> {
             if width < self.cols {
                 buf.push_str("\x1b[K");
             }
+            if let Some(id) = self.draw_image(&mut buf, rows, i, rows.len()) {
+                self.deck_images.push(id);
+            }
         }
         if let Some((row, col)) = cursor {
             buf.push_str(&format!("\x1b[{};{}H\x1b[?25h", row + 1, col + 1));
@@ -164,6 +178,37 @@ impl<W: Write> Screen<W> {
         buf.push_str("\x1b[?2026l");
         self.out.write_all(buf.as_bytes())?;
         self.out.flush()
+    }
+
+    fn clear_deck_images(&mut self, buf: &mut String) {
+        if self.graphics == Some(Protocol::Iterm) && !self.deck_images.is_empty() {
+            // OSC 1337 images have no placement IDs; erasing the alternate
+            // screen removes the previous frame's images before redrawing.
+            buf.push_str("\x1b[2J");
+        }
+        for id in self.deck_images.drain(..) {
+            if self.graphics == Some(Protocol::Kitty) {
+                buf.push_str(&format!("\x1b_Ga=d,d=I,i={id},q=2;\x1b\\"));
+            }
+        }
+    }
+
+    fn draw_image(
+        &mut self,
+        buf: &mut String,
+        lines: &[Line],
+        end: usize,
+        height: usize,
+    ) -> Option<u32> {
+        let protocol = self.graphics?;
+        let row = images::ending_at(lines, end, self.cols)?;
+        if row.preview.rows > height {
+            return None;
+        }
+        let id = self.next_image;
+        self.next_image = self.next_image.wrapping_add(1).max(1);
+        row.write(buf, protocol, id);
+        Some(id)
     }
 
     fn rewind(&self, buf: &mut String) {
@@ -199,8 +244,9 @@ impl<W: Write> Screen<W> {
         } else {
             self.rewind(&mut buf);
         }
-        for line in committed {
+        for (i, line) in committed.iter().enumerate() {
             line.write_ansi(&mut buf, self.color, None);
+            self.draw_image(&mut buf, committed, i, rows);
             buf.push_str("\r\n");
         }
         let skip = live.len().saturating_sub(rows.max(1));
@@ -270,6 +316,64 @@ mod tests {
 
     fn text(screen: &Screen<Vec<u8>>) -> String {
         String::from_utf8(screen.output().clone()).unwrap()
+    }
+
+    #[test]
+    fn image_commits_print_once_and_do_not_change_live_cursor_accounting() {
+        let mut s = Screen::new(Vec::new(), false, 80);
+        s.graphics = Some(Protocol::Kitty);
+        let lines = images::tests::lines();
+        let live = [Line::from("draft")];
+        s.draw(&lines, &live, Some((0, 3)), 24).unwrap();
+        assert_eq!(text(&s).matches("\x1b_Ga=T").count(), 1);
+        assert_eq!(s.widths, vec![5]);
+        assert_eq!(s.cursor, (0, 3));
+        s.draw(&[], &live, Some((0, 3)), 24).unwrap();
+        assert_eq!(text(&s).matches("\x1b_Ga=T").count(), 1);
+        assert!(!text(&s).contains("\x1b_Ga=d"));
+    }
+
+    #[test]
+    fn deck_images_are_removed_before_redraw_and_on_exit() {
+        let mut s = Screen::new(Vec::new(), false, 80);
+        s.graphics = Some(Protocol::Kitty);
+        let lines = images::tests::lines();
+        s.draw_deck(&lines, None).unwrap();
+        assert_eq!(s.deck_images, vec![1]);
+        s.draw_deck(&lines, None).unwrap();
+        assert_eq!(s.deck_images, vec![2]);
+        assert!(text(&s).contains("\x1b_Ga=d,d=I,i=1,q=2;\x1b\\"));
+        s.leave_deck().unwrap();
+        assert!(s.deck_images.is_empty());
+        assert!(text(&s).contains("\x1b_Ga=d,d=I,i=2,q=2;\x1b\\\x1b[?1049l"));
+    }
+
+    #[test]
+    fn clipped_images_and_short_terminals_do_not_draw_over_other_rows() {
+        let lines = images::tests::lines();
+        for protocol in [Protocol::Kitty, Protocol::Iterm] {
+            let mut s = Screen::new(Vec::new(), false, 80);
+            s.graphics = Some(protocol);
+            s.draw_deck(&lines[2..], None).unwrap();
+            s.draw(&lines, &[Line::from("draft")], None, 2).unwrap();
+            s.resize(3);
+            s.draw_deck(&lines, None).unwrap();
+            assert!(!text(&s).contains("\x1b_G"));
+            assert!(!text(&s).contains("\x1b]1337;"));
+        }
+    }
+
+    #[test]
+    fn iterm_deck_images_clear_without_erasing_main_screen_scrollback() {
+        let mut s = Screen::new(Vec::new(), false, 80);
+        s.graphics = Some(Protocol::Iterm);
+        let lines = images::tests::lines();
+        s.draw_deck(&lines, None).unwrap();
+        assert!(text(&s).contains("\x1b]1337;File="));
+        s.out.clear();
+        s.draw_deck(&[], None).unwrap();
+        assert!(text(&s).contains("\x1b[2J"));
+        assert!(!text(&s).contains("\x1b[3J"));
     }
 
     #[test]
