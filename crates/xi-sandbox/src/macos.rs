@@ -139,6 +139,20 @@ fn profile(spec: &Spec, helper: &Path) -> Result<String, Error> {
             writeln!(policy, "(allow file-read* (literal {}))", quote(&link)?).unwrap();
         }
     }
+    for path in &spec.sockets {
+        let canonical = canonicalize(path)?;
+        if canonical != *path {
+            writeln!(policy, "(allow file-read* (literal {}))", quote(path)?).unwrap();
+        }
+        metadata.extend(path.ancestors().map(Path::to_owned));
+        metadata.extend(canonical.ancestors().map(Path::to_owned));
+        writeln!(
+            policy,
+            "(allow network-outbound (remote unix-socket (literal {})))",
+            quote(&canonical)?
+        )
+        .unwrap();
+    }
     // Allow only this executable, not its containing build or home directory.
     writeln!(
         policy,
@@ -248,5 +262,34 @@ fn setup<E: Into<io::Error>>(step: impl Into<String>) -> impl FnOnce(E) -> Error
     move |source| Error::Setup {
         step,
         source: source.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_socket_access_allows_only_outbound_connections() {
+        use std::os::unix::net::UnixListener;
+
+        let executable = std::env::current_exe().unwrap();
+        let root = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let socket = root.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let tmp = root.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let mut spec = Spec::new(root.path().join("workspace"), tmp);
+        for path in spec.protected.iter().chain(&spec.writable) {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        spec.sockets.push(socket.clone());
+        let policy = profile(&spec, Path::new("/helper")).unwrap();
+        let socket = quote(&socket.canonicalize().unwrap()).unwrap();
+        assert!(policy.contains(&format!(
+            "(allow network-outbound (remote unix-socket (literal {socket})))"
+        )));
+        assert!(!policy.contains(&format!("(subpath {socket})")));
+        assert!(!policy.contains(&format!("(local unix-socket (literal {socket}))")));
     }
 }

@@ -437,6 +437,7 @@ fn report_tracks_sources_per_field_and_last_untrusted_layer() {
         ("roles.slow", SettingLayer::Default),
         ("roles.smol", SettingLayer::Default),
         ("roles.tiny", SettingLayer::Default),
+        ("sandbox.ssh_agent", SettingLayer::Default),
     ];
     assert_eq!(trusted.settings.len(), expected.len());
     for (index, (row, (key, source))) in trusted.settings.iter().zip(expected).enumerate() {
@@ -654,6 +655,50 @@ fn sandbox_enabled_respects_explicit_layers_and_workspace_authority() {
             .warnings
             .iter()
             .any(|warning| warning.contains("ignoring sandbox.enabled"))
+    );
+}
+
+#[test]
+fn ssh_agent_requires_user_or_trusted_local_opt_in() {
+    let fixture = Fixture::new();
+    assert!(!fixture.load().sandbox.ssh_agent);
+    write(
+        &fixture.workspace.join(".xi/config.toml"),
+        "[sandbox]\nssh_agent=true\n",
+    );
+    fixture.paths.trust(&fixture.workspace).unwrap();
+    assert!(!fixture.load().sandbox.ssh_agent);
+    assert!(
+        fixture
+            .report()
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("ignoring sandbox.ssh_agent") })
+    );
+    let explicit = fixture.paths.home.join("extra.toml");
+    write(&explicit, "[sandbox]\nssh_agent=true\n");
+    let config = Config::load(fixture.paths.clone(), &fixture.workspace, &[explicit]).unwrap();
+    assert!(config.sandbox.ssh_agent);
+    write(&fixture.global(), "[sandbox]\nssh_agent=true\n");
+    assert!(fixture.load().sandbox.ssh_agent);
+    write(
+        &fixture.workspace.join(".xi/config.local.toml"),
+        "[sandbox]\nssh_agent=false\n",
+    );
+    assert!(!fixture.load().sandbox.ssh_agent);
+    let row = setting(&fixture.report(), "sandbox.ssh_agent").clone();
+    assert_eq!(row.source, SettingLayer::Local);
+    assert!(!row.editable);
+
+    let untrusted = Fixture::new();
+    write(
+        &untrusted.workspace.join(".xi/config.local.toml"),
+        "[sandbox]\nssh_agent=true\n",
+    );
+    assert!(!untrusted.load().sandbox.ssh_agent);
+    assert_eq!(
+        setting(&untrusted.report(), "sandbox.ssh_agent").held_back,
+        Some(SettingLayer::Local)
     );
 }
 

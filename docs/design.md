@@ -472,7 +472,7 @@ Tool processes run sandboxed by default; extensions always run sandboxed. The ke
 
 - Writes: the workspace and a per-session tmp directory. Linux mounts the latter at `/tmp`; workspaces under the host `/tmp` keep their paths. macOS cannot remount and instead sets `TMPDIR` to the session directory. The real `/tmp`, `/private/tmp` and `/private/var/folders` stay unwritable except for explicitly writable roots.
 - Reads: system paths, every `PATH` directory except the home directory and its ancestors, `CARGO_HOME`, `RUSTUP_HOME`, common toolchain roots (mise installs, Homebrew, Nix profiles), skills, and the session's spill and git directories. The rest of the home directory is not readable, so credential stores (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.netrc`) are covered without a denylist.
-- Git: `GIT_CONFIG_GLOBAL` points at a per-session config holding the user's name, email and global ignore patterns, with signing off. The user's own global config stays unreadable, because it can name hooks, credential helpers and signing keys that need secrets. On macOS, git also exits when its global config is unreadable.
+- Git: `GIT_CONFIG_GLOBAL` points at a per-session config holding the user's name, email and global ignore patterns, with global signing off unless SSH-agent access is enabled below. The user's own global config stays unreadable, because it can name hooks, credential helpers and signing keys that need secrets. On macOS, git also exits when its global config is unreadable.
 - Protected paths: `.git/config`, `.git/hooks` and `.xi` are read-only even inside the writable workspace. Missing ones are created empty first, so the sandbox can't create them. Hooks and repo config run code outside the sandbox the next time the user runs git, and `.xi` holds policy.
 - Environment: cleared except for an allowlist; `TMPDIR` is `/tmp` on Linux and the session tmp path on macOS.
 - Tool managers: shims from mise, asdf and similar managers choose a version by reading config under the home directory, which the sandbox hides. Making that config readable would also expose whatever secrets it holds, so instead `[sandbox] env_command` names a host command that prints the resolved environment as a JSON object of strings or `null`, such as `mise env --json` or `direnv export json`. The kernel runs it once per session in the workspace, outside the sandbox. Its values replace the host's only for variables the allowlist already passes, so `PATH` and `RUSTUP_TOOLCHAIN` arrive and anything else it prints stays outside. A failing command stops the session from starting. Project files can set it only in trusted workspaces.
@@ -515,6 +515,23 @@ The policy is informed by [Codex's base profile](https://github.com/openai/codex
 - No seccomp filter yet. With namespaces and Landlock in place, its remaining job would be reducing kernel attack surface (`io_uring`, `bpf`, `userfaultfd`).
 - A repository created inside the sandbox with `git init` has unprotected hooks until a later spec sees its `.git`. Hooks planted in that window persist.
 - Platforms other than Linux and macOS fail closed. macOS paths that cannot be represented losslessly in the generated profile (non-UTF-8 or control characters) fail setup rather than widening permissions.
+
+#### SSH-agent access and signed commits
+
+To use an SSH agent such as Proton Pass for Git signing, opt in from the global config or a trusted `.xi/config.local.toml`:
+
+```toml
+[sandbox]
+ssh_agent = true
+```
+
+The default is `false`. Committed project config cannot change it. The worker resolves `SSH_AUTH_SOCK` from its host environment or `sandbox.env_command`, requires an absolute Unix socket path, and grants connect-only access to that socket, not filesystem writes or access to its containing directory. The variable points at that resolved socket inside tools. Missing or invalid sockets stop session startup rather than widening access. Network isolation and extension sandboxes stay unchanged.
+
+When the host's global `gpg.format` is `ssh`, the session Git config also keeps `user.signingkey`, `gpg.ssh.program`, `gpg.ssh.defaultKeyCommand`, `commit.gpgsign` and `tag.gpgsign`. Inline public keys work unchanged. For file-based signing keys, xi copies the `.pub` file into the session Git directory; a configured private-key path uses its adjacent `.pub` file instead. Private-key files, host hooks and credential helpers are not exposed. Git still honors the repository's own signing settings.
+
+This grants raw agent access to tool processes and their children, including delegated tasks. They can request signatures or authentication with any key the agent permits, not just sign commits. Use the agent's own confirmation and key restrictions where available. Removing the option restores the default for new sessions.
+
+Changes apply when opening a session. The daemon must receive the Proton Pass `SSH_AUTH_SOCK`, not an unrelated system agent; after changing its environment, restart the daemon too. A host `sandbox.env_command` can supply the socket when the daemon's environment does not have it.
 
 #### Disabling the tool sandbox
 

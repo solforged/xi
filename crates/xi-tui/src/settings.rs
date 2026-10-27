@@ -49,6 +49,7 @@ const ROWS: &[Row] = &[
     Row::ReadOnly("Sandbox writable", "sandbox.writable"),
     Row::ReadOnly("Sandbox env", "sandbox.env"),
     Row::ReadOnly("Sandbox env command", "sandbox.env_command"),
+    Row::ReadOnly("SSH agent", "sandbox.ssh_agent"),
     Row::ReadOnly("Extensions", "extensions"),
     Row::Trust,
     Row::ReadOnly("Daemon idle exit", "daemon.idle_exit"),

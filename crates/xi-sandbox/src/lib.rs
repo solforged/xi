@@ -11,7 +11,8 @@
 //! network namespace, and Landlock:
 //!
 //! - Landlock limits filesystem access, including connecting to pathname
-//!   Unix sockets, to the spec's readable and writable roots. It also stops
+//!   Unix sockets, to the spec's readable and writable roots and explicit
+//!   connect-only socket grants. It also stops
 //!   the sandbox from signalling or reaching abstract Unix sockets outside
 //!   it.
 //! - [`Spec::protected`] paths are bind-mounted read-only over themselves,
@@ -23,7 +24,8 @@
 //!   socket outside the sandbox's filesystem restrictions.
 //!
 //! On macOS the helper uses Seatbelt through `/usr/bin/sandbox-exec`.
-//! Filesystem and Unix socket access follow the same roots. Isolated
+//! Filesystem and Unix socket access follow the same roots, with additional
+//! connect-only access to [`Spec::sockets`]. Isolated
 //! networking denies all IP traffic, including loopback, except the exact
 //! IPv4 loopback proxy port when egress is configured. The session tmp is
 //! exposed through `TMPDIR`, not mounted over `/tmp`.
@@ -216,6 +218,10 @@ pub struct Spec {
     /// Paths kept read-only even inside writable roots. A missing path is
     /// created as an empty directory first, so the sandbox cannot create it.
     pub protected: Vec<PathBuf>,
+    /// Exact pathname Unix sockets that processes may connect to. This grants
+    /// no filesystem writes, socket binding, or access to sibling sockets.
+    #[serde(default)]
+    pub sockets: Vec<PathBuf>,
     /// Linux: directory mounted at `/tmp`; writable roots under the host
     /// `/tmp` stay reachable at their original paths.
     /// macOS: writable directory used as `TMPDIR`, without a remount.
@@ -268,6 +274,7 @@ impl Spec {
                 .filter(|path| path.exists())
                 .collect(),
             protected,
+            sockets: Vec::new(),
             tmp,
             cwd: workspace,
             network: Network::Isolated,
@@ -278,15 +285,16 @@ impl Spec {
         }
     }
 
-    /// Checks that every path is absolute.
+    /// Checks that every path is absolute and socket grants name Unix sockets.
     ///
     /// # Errors
-    /// Names the first relative path.
+    /// Names the first relative path or invalid socket.
     pub fn validate(&self) -> Result<(), Error> {
         let fields = [
             ("writable", self.writable.as_slice()),
             ("readable", self.readable.as_slice()),
             ("protected", self.protected.as_slice()),
+            ("sockets", self.sockets.as_slice()),
             ("tmp", std::slice::from_ref(&self.tmp)),
             ("cwd", std::slice::from_ref(&self.cwd)),
         ];
@@ -297,6 +305,24 @@ impl Spec {
                     path: path.clone(),
                 });
             }
+        }
+        #[cfg(unix)]
+        for socket in &self.sockets {
+            use std::os::unix::fs::FileTypeExt;
+            let check = || {
+                if socket.metadata()?.file_type().is_socket() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "not a Unix socket",
+                    ))
+                }
+            };
+            check().map_err(|source| Error::Setup {
+                step: format!("validate socket {}", socket.display()),
+                source,
+            })?;
         }
         Ok(())
     }
@@ -310,7 +336,7 @@ impl Spec {
     /// returned command afterwards pass through too.
     ///
     /// # Errors
-    /// Fails if a path is relative or the spec cannot be encoded.
+    /// Fails for relative paths, invalid sockets or an unencodable spec.
     pub fn command<I, S>(
         &self,
         helper: &Path,
@@ -407,11 +433,36 @@ mod tests {
         assert!(spec.enabled);
         let mut wire = serde_json::to_value(&spec).unwrap();
         wire.as_object_mut().unwrap().remove("enabled");
-        assert!(serde_json::from_value::<Spec>(wire).unwrap().enabled);
+        wire.as_object_mut().unwrap().remove("sockets");
+        let legacy: Spec = serde_json::from_value(wire).unwrap();
+        assert!(legacy.enabled);
+        assert!(legacy.sockets.is_empty());
         let command = spec
             .command(Path::new("/helper"), "/bin/true", ["arg"])
             .unwrap();
         assert_eq!(command.get_program(), "/helper");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_grants_reject_directories_and_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = Spec::new("/workspace", "/tmp/session");
+        spec.sockets.push(root.path().to_owned());
+        assert!(
+            spec.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("not a Unix socket")
+        );
+        spec.sockets = vec!["relative.sock".into()];
+        assert!(matches!(
+            spec.validate(),
+            Err(Error::RelativePath {
+                field: "sockets",
+                ..
+            })
+        ));
     }
 
     #[test]
