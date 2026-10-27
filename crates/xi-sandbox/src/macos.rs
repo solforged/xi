@@ -177,6 +177,16 @@ fn profile(spec: &Spec, helper: &Path) -> Result<String, Error> {
     if spec.network == Network::Host {
         policy.push_str(HOST_NETWORK);
     }
+    if spec.network == Network::Isolated
+        && let Some(egress) = &spec.egress
+    {
+        writeln!(
+            policy,
+            "(allow network-outbound (remote ip \"localhost:{}\"))",
+            egress.port
+        )
+        .unwrap();
+    }
 
     // Denies must come after the allows. Pin ancestors against rename/unlink
     // so moving .git out of the protected pathname cannot bypass the policy.

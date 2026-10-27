@@ -1531,6 +1531,8 @@ async fn untrusted_approval_hides_workspace_scope_and_uses_session_details_for_e
             decision: xi_protocol::event::Decision::Ask,
             rule: None,
             taint: false,
+            during: None,
+            extension: None,
         },
     );
     assert!(app.overlays.on_top::<Approvals>());

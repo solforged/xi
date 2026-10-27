@@ -18,12 +18,15 @@
 //!   so they stay read-only inside writable roots.
 //! - [`Spec::tmp`] is mounted at `/tmp`.
 //! - [`Network::Isolated`] gives the process a network namespace with only
-//!   loopback, so no host is reachable.
+//!   loopback, so no host is reachable. With [`Spec::egress`], a forwarder
+//!   listens on the proxy port and relays connections to the kernel's Unix
+//!   socket outside the sandbox's filesystem restrictions.
 //!
 //! On macOS the helper uses Seatbelt through `/usr/bin/sandbox-exec`.
 //! Filesystem and Unix socket access follow the same roots. Isolated
-//! networking denies all IP traffic, including loopback. The session tmp
-//! is exposed through `TMPDIR`, not mounted over `/tmp`.
+//! networking denies all IP traffic, including loopback, except the exact
+//! IPv4 loopback proxy port when egress is configured. The session tmp is
+//! exposed through `TMPDIR`, not mounted over `/tmp`.
 //!
 //! Other platforms fail closed.
 
@@ -177,11 +180,27 @@ impl Error {
 #[serde(rename_all = "snake_case")]
 pub enum Network {
     /// Linux: a private network namespace with only loopback.
-    /// macOS: no IP networking, including loopback inside the sandbox.
+    /// macOS: no IP networking except a configured egress proxy.
     #[default]
     Isolated,
     /// The host network, unrestricted.
     Host,
+}
+
+/// The session's egress proxy, reachable from inside an isolated sandbox.
+///
+/// Sandboxed processes get `HTTP_PROXY` and friends pointing at
+/// `127.0.0.1:port`. On macOS the kernel listens there and the Seatbelt
+/// profile allows exactly that destination. On Linux the helper starts a
+/// forwarder on that port inside the network namespace which relays each
+/// connection to `socket`, the Unix socket the kernel listens on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Egress {
+    /// Loopback TCP port the sandboxed process may connect to.
+    pub port: u16,
+    /// Linux: the kernel's Unix socket the in-namespace forwarder relays to.
+    /// Unused on macOS.
+    pub socket: PathBuf,
 }
 
 /// What a sandboxed process may access.
@@ -210,6 +229,10 @@ pub struct Spec {
     /// Variables set to fixed values, applied after the passthrough list.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
+    /// The egress proxy. `None` means no host network access under
+    /// [`Network::Isolated`]. Ignored under [`Network::Host`].
+    #[serde(default)]
+    pub egress: Option<Egress>,
     /// Run even when the kernel can enforce only some Landlock restrictions.
     /// Ignored on macOS, where Seatbelt must install the complete policy.
     pub allow_partial: bool,
@@ -251,6 +274,7 @@ impl Spec {
             env: DEFAULT_ENV.iter().map(|&name| name.to_owned()).collect(),
             vars: BTreeMap::new(),
             allow_partial: false,
+            egress: None,
         }
     }
 
@@ -279,9 +303,10 @@ impl Spec {
 
     /// Builds a command that runs `program` through the helper binary at
     /// `helper`, or directly when [`Self::enabled`] is false. Direct commands
-    /// get their own process group on Unix. The environment is cleared except
-    /// for [`Self::env`], then [`Self::vars`] are set. `TMPDIR` is `/tmp` on
-    /// sandboxed Linux and [`Self::tmp`] otherwise. Variables added to the
+    /// get their own process group on Unix and no egress proxy variables.
+    /// The environment is cleared except for [`Self::env`], then egress proxy
+    /// variables and [`Self::vars`] are set, in that order. `TMPDIR` is `/tmp`
+    /// on sandboxed Linux and [`Self::tmp`] otherwise. Variables added to the
     /// returned command afterwards pass through too.
     ///
     /// # Errors
@@ -316,6 +341,22 @@ impl Spec {
             if self.env.iter().any(|allowed| name == OsStr::new(allowed)) {
                 command.env(name, value);
             }
+        }
+        if self.enabled
+            && self.network == Network::Isolated
+            && let Some(egress) = &self.egress
+        {
+            let proxy = format!("http://127.0.0.1:{}", egress.port);
+            for name in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "ALL_PROXY",
+            ] {
+                command.env(name, &proxy);
+            }
+            command.env("NODE_USE_ENV_PROXY", "1");
         }
         command.envs(&self.vars);
         #[cfg(target_os = "macos")]
@@ -378,6 +419,10 @@ mod tests {
         let mut spec = Spec::new("/workspace", "/tmp/xi-sandbox-test");
         spec.enabled = false;
         spec.env.clear();
+        spec.egress = Some(Egress {
+            port: 3128,
+            socket: "/tmp/xi-egress.sock".into(),
+        });
         spec.vars.insert("EXTRA".into(), "value".into());
         let command = spec
             .command(Path::new("/missing-helper"), "/bin/echo", ["hello"])
@@ -391,5 +436,77 @@ mod tests {
             Some(spec.tmp.as_os_str())
         );
         assert_eq!(environment[OsStr::new("EXTRA")], Some(OsStr::new("value")));
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "NODE_USE_ENV_PROXY",
+        ] {
+            assert!(!environment.contains_key(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn command_sets_proxy_environment_only_for_isolated_egress() {
+        let mut spec = Spec::new("/workspace", "/tmp/xi-sandbox-test");
+        spec.env.clear();
+        let proxy_names = [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "NODE_USE_ENV_PROXY",
+        ];
+        for network in [Network::Isolated, Network::Host] {
+            for egress in [
+                None,
+                Some(Egress {
+                    port: 3128,
+                    socket: PathBuf::from("/tmp/xi-egress.sock"),
+                }),
+            ] {
+                spec.network = network;
+                spec.egress = egress;
+                let command = spec
+                    .command(Path::new("/helper"), "/bin/true", [""; 0])
+                    .unwrap();
+                let environment = command.get_envs().collect::<BTreeMap<_, _>>();
+                for name in proxy_names {
+                    let expected = if network == Network::Isolated && spec.egress.is_some() {
+                        Some(OsStr::new(if name == "NODE_USE_ENV_PROXY" {
+                            "1"
+                        } else {
+                            "http://127.0.0.1:3128"
+                        }))
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        environment.get(OsStr::new(name)).copied().flatten(),
+                        expected,
+                        "{network:?}: {name}"
+                    );
+                }
+            }
+        }
+        spec.network = Network::Isolated;
+        spec.vars
+            .insert("HTTPS_PROXY".into(), "http://override:8080".into());
+        spec.vars.insert("NODE_USE_ENV_PROXY".into(), "0".into());
+        let command = spec
+            .command(Path::new("/helper"), "/bin/true", [""; 0])
+            .unwrap();
+        let environment = command.get_envs().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment[OsStr::new("HTTPS_PROXY")],
+            Some(OsStr::new("http://override:8080"))
+        );
+        assert_eq!(
+            environment[OsStr::new("NODE_USE_ENV_PROXY")],
+            Some(OsStr::new("0"))
+        );
     }
 }

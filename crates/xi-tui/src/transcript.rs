@@ -1021,6 +1021,7 @@ impl Transcript {
                 decision,
                 rule,
                 taint,
+                ..
             } => {
                 if let Some(c) = self.call(call) {
                     c.decision = Some(*decision);
@@ -1461,6 +1462,8 @@ mod tests {
             decision,
             rule: rule.map(Into::into),
             taint: false,
+            during: None,
+            extension: None,
         }
     }
 
@@ -2187,6 +2190,8 @@ mod tests {
                     decision: Decision::Ask,
                     rule: None,
                     taint: true,
+                    during: None,
+                    extension: None,
                 },
                 0,
             ),

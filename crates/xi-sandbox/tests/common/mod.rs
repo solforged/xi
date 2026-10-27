@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -62,6 +62,10 @@ pub fn text(bytes: &[u8]) -> String {
 }
 
 pub fn run_probe(spec: &Spec, action: &str) -> Output {
+    probe_command(spec, action).output().unwrap()
+}
+
+pub fn probe_command(spec: &Spec, action: &str) -> Command {
     // Linux remounts /tmp, which may contain Cargo's target directory. Put
     // the probe in the workspace so it survives that remount.
     let exe = spec.cwd.join(".xi-test-probe");
@@ -80,7 +84,8 @@ pub fn run_probe(spec: &Spec, action: &str) -> Output {
             ],
         )
         .unwrap();
-    command.env(PROBE_ENV, action).output().unwrap()
+    command.env(PROBE_ENV, action);
+    command
 }
 
 #[test]
@@ -92,6 +97,18 @@ fn probe() {
         Some(("unix", path)) => UnixStream::connect(path).map(drop),
         Some(("unix-bind", path)) => UnixListener::bind(path).map(drop),
         Some(("tcp", address)) => TcpStream::connect(address).map(drop),
+        Some(("echo", address)) => TcpStream::connect(address).and_then(|mut stream| {
+            stream.write_all(b"ping")?;
+            let mut reply = [0; 4];
+            stream.read_exact(&mut reply)?;
+            if reply == *b"ping" || reply == *b"pong" {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "unexpected echo reply: {reply:?}"
+                )))
+            }
+        }),
         Some(("udp", address)) => UdpSocket::bind("0.0.0.0:0")
             .and_then(|socket| socket.send_to(b"probe", address))
             .map(drop),
