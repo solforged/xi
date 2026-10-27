@@ -16,7 +16,7 @@ use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::{NotificationMethod, RequestMethod, RpcError};
 
 use crate::connect;
-use crate::peer::{Incoming, Peer, PeerError};
+use xi_rpc::{Incoming, Peer, PeerError};
 
 /// A negotiated daemon connection. Clones share the connection and its identity.
 ///

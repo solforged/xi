@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
-use xi_client::peer::{Incoming, Peer};
+use xi_rpc::{Incoming, Peer};
 use xi_protocol::methods::client::{
     ApprovalPolicy, AttachParams, AttachResult, CheckoutParams, ChildEvents, Delta, EventAppended,
     EventParams, ModelEntry, ModelsResult, PendingApproval, PromptParams, PromptResult,

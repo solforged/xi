@@ -165,7 +165,7 @@ pub fn save_thinking(path: &Path, thinking: Thinking) -> io::Result<()> {
         file.as_file().set_permissions(metadata.permissions())?;
     }
     file.write_all(document.to_string().as_bytes())?;
-    file.flush()?;
+    file.as_file().sync_all()?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())
 }

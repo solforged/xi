@@ -16,6 +16,7 @@ xi-kernel = { path = "crates/xi-kernel" }
 xi-policy = { path = "crates/xi-policy" }
 xi-protocol = { path = "crates/xi-protocol" }
 xi-provider = { path = "crates/xi-provider" }
+xi-rpc = { path = "crates/xi-rpc" }
 xi-sandbox = { path = "crates/xi-sandbox" }
 xi-session = { path = "crates/xi-session" }
 xi-tools = { path = "crates/xi-tools" }

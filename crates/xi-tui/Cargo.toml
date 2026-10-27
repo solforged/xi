@@ -28,6 +28,7 @@ xi-protocol.workspace = true
 xi-daemon.workspace = true
 xi-kernel.workspace = true
 xi-provider.workspace = true
+xi-rpc.workspace = true
 xi-tools.workspace = true
 
 [lints]

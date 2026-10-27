@@ -858,6 +858,28 @@ fn env_command_fills_only_passed_through_variables() {
 }
 
 #[test]
+fn global_instructions_are_optional_and_report_read_errors() {
+    let fixture = Fixture::new();
+    let config = fixture.config();
+    let path = fixture.paths.config.join("AGENTS.md");
+    let heading = format!("\nInstructions: {}\n", path.display());
+    let context = xi_kernel::context::SystemContext::build(&config).unwrap();
+    assert!(!context.prompt.contains(&heading));
+
+    write(&path, "GLOBAL_ONLY_MARKER");
+    let context = xi_kernel::context::SystemContext::build(&config).unwrap();
+    assert!(
+        context
+            .prompt
+            .contains(&format!("{heading}GLOBAL_ONLY_MARKER\n"))
+    );
+
+    std::fs::write(&path, [0xff]).unwrap();
+    let error = xi_kernel::context::SystemContext::build(&config).unwrap_err();
+    assert!(error.to_string().contains(&path.display().to_string()));
+}
+
+#[test]
 fn instructions_order_skills_frontmatter_and_workspace_trust() {
     let fixture = Fixture::new();
     write(&fixture.paths.config.join("AGENTS.md"), "GLOBAL_MARKER");
@@ -1399,6 +1421,10 @@ async fn retry_limit_backoff_and_retry_after_cap() {
 async fn cached_instructions_ignore_mid_session_file_changes() {
     let fixture = Fixture::new();
     write(
+        &fixture.paths.config.join("AGENTS.md"),
+        "original global instructions",
+    );
+    write(
         &fixture.workspace.join("AGENTS.md"),
         "original instructions",
     );
@@ -1416,13 +1442,30 @@ async fn cached_instructions_ignore_mid_session_file_changes() {
     );
     let reply = session.submit(input("work"));
     gate.entered.notified().await;
+    write(
+        &fixture.paths.config.join("AGENTS.md"),
+        "changed global instructions",
+    );
     write(&fixture.workspace.join("AGENTS.md"), "changed instructions");
     gate.release.add_permits(1);
     reply.await.unwrap().unwrap();
+    {
+        let requests = script.requests.lock().unwrap();
+        assert_eq!(requests[0].system, requests[1].system);
+        assert!(requests[1].system.contains("original instructions"));
+        assert!(!requests[1].system.contains("changed instructions"));
+        assert!(requests[1].system.contains("original global instructions"));
+        assert!(!requests[1].system.contains("changed global instructions"));
+    }
+
+    let script = Script::new(vec![Step::Reply(done())]);
+    let (session, _) = fixture.session(script.clone(), FakeTool { gate: None }, opts());
+    session.prompt(input("new session")).await.unwrap();
     let requests = script.requests.lock().unwrap();
-    assert_eq!(requests[0].system, requests[1].system);
-    assert!(requests[1].system.contains("original instructions"));
-    assert!(!requests[1].system.contains("changed instructions"));
+    assert!(requests[0].system.contains("changed instructions"));
+    assert!(!requests[0].system.contains("original instructions"));
+    assert!(requests[0].system.contains("changed global instructions"));
+    assert!(!requests[0].system.contains("original global instructions"));
 }
 
 #[tokio::test]

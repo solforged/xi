@@ -14,9 +14,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-xi-client.workspace = true
 xi-kernel.workspace = true
 xi-protocol.workspace = true
+xi-rpc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 listenfd.workspace = true

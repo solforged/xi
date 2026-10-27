@@ -262,7 +262,23 @@ Code grows per wire API (Anthropic Messages, OpenAI-compatible Chat, OpenAI Resp
 
 Reasoning levels are one ordered scale, the union of the providers' effort names: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`. Each `[[model]]` lists the levels it accepts in `reasoning`, for example `reasoning = ["low", "medium", "high", "xhigh", "max"]`; an empty or missing list means the model doesn't reason. `off` is listed only when the model can stop reasoning, so models that always think leave it out. The session keeps the level the user chose and each request runs at the model's nearest accepted level: the closest one below, never `off` unless `off` was chosen, else the closest one above. A config default or `--reasoning` therefore carries across models, and switching back restores the chosen level. Adapters reject a level the model doesn't list before sending anything. Each wire API maps a level to its own field: Chat and Responses send the name as `reasoning_effort` or `reasoning.effort` (`off` as `none`), current Claude models send it as `output_config.effort`, and older Claude models turn it into a thinking budget.
 
-Context is built to keep the cached prefix stable: the system prompt has no timestamps or dynamic state, history is append-only, and compaction is the only operation that changes the prefix.
+### Instructions (`AGENTS.md`)
+
+Create `~/.config/xi/AGENTS.md` for instructions shared by every workspace. If `XDG_CONFIG_HOME` is set and nonempty, xi uses `$XDG_CONFIG_HOME/xi/AGENTS.md` instead. No `config.toml` setting is needed. For example:
+
+```markdown
+Prefer small, focused changes.
+Run relevant tests before finishing, and report what ran.
+```
+
+When a session opens, xi appends instruction files to its built-in system prompt in this order, labeling each with its path:
+
+1. The global `AGENTS.md`.
+2. Repository `AGENTS.md` files, from the nearest ancestor containing `.git` down to the session's workspace directory. Outside a repository, only the workspace's file is loaded after the global file.
+
+Missing files are ignored; other read errors, including invalid UTF-8, stop the session from opening and identify the file. Instructions load in both trusted and untrusted workspaces; they do not grant sandbox permissions or workspace trust.
+
+The assembled prompt stays unchanged while the session is open, even if an instruction file changes. Start a new session or close and reopen a saved session to load edits. Context is built to keep the cached prefix stable: the system prompt is assembled once per open session, history is append-only, and compaction is the only operation that changes the prefix.
 
 ### Compaction
 
@@ -546,7 +562,8 @@ The subscription profile stays inside the Anthropic Messages adapter. It uses Cl
 | Crate | Purpose | Status |
 |---|---|---|
 | `xi-protocol` | Event, content, JSON-RPC envelope, client and worker method types, manifests, daemon error codes, runtime paths and shared model metadata. | Implemented |
-| `xi-client` | Full-duplex NDJSON `Peer`, typed daemon `Client`, Unix socket connection and daemon autostart. | Implemented |
+| `xi-rpc` | Full-duplex NDJSON JSON-RPC `Peer` shared by clients, the daemon and workers. | Implemented |
+| `xi-client` | Typed daemon `Client`, Unix socket connection and daemon autostart. | Implemented |
 | `xi-session` | Append-only session tree log with crash recovery and locking. | Implemented |
 | `xi-policy` | Policy rules, layering and taint-aware evaluation. | Implemented |
 | `xi-sandbox` | `xi-sandbox-exec` helper; Linux namespaces and Landlock, macOS Seatbelt. | Implemented |

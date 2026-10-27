@@ -9,7 +9,7 @@ use xi_protocol::model::Reasoning;
 use crate::approvals::Choice;
 use crate::keys::Action;
 use serde_json::{Value, json};
-use xi_client::peer::{Incoming, Peer};
+use xi_rpc::{Incoming, Peer};
 use xi_protocol::event::{Remember, StopReason, Usage};
 use xi_protocol::methods::client::{
     ChildEvents, ConfigFiles, Delta, DeltaParams, PendingApproval, ResetParams, SessionDetails,
