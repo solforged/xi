@@ -1033,7 +1033,6 @@ async fn model_reasoning_and_compaction_changes_are_refused_while_running() {
     app.command("/model demo/second").await.unwrap();
     app.command("/compact").await.unwrap();
     app.command("/new").await.unwrap();
-    app.command("/resume").await.unwrap();
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::Medium);
     assert_eq!(app.launch.attached.info.model.model, "script");
     while let Ok((method, _)) = requests.try_recv() {
@@ -1905,6 +1904,56 @@ async fn resume_lists_the_workspace_toggles_all_and_opens_saved_or_attaches_live
         assert_eq!(app.launch.template.cwd, target.info.cwd);
         assert!(app.editor.is_empty());
     }
+}
+
+#[tokio::test]
+async fn resume_mid_turn_leaves_the_turn_running_unless_prompts_are_queued() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut attached = snapshot(true);
+    attached.info.cwd = temp.path().into();
+    let mut target = snapshot(false);
+    target.info.cwd = temp.path().into();
+    target.info.path = temp.path().join("target.jsonl");
+    let data = FakeData {
+        sessions: vec![target.clone()],
+        summaries: vec![summary(&target, false, "target prompt", 200)],
+        ..FakeData::default()
+    };
+    let (launch, mut requests) = launch_with(attached, data).await;
+    let mut app = App::new(launch, 160, 32);
+    let previous = app.session_id();
+    assert!(app.running());
+    app.queued.push(vec![Block::Text {
+        text: "queued".into(),
+    }]);
+    app.command("/resume").await.unwrap();
+    assert!(app.overlays.is_empty());
+    assert!(
+        app.commit
+            .iter()
+            .any(|line| line.plain().contains("waits for queued prompts"))
+    );
+    app.queued.clear();
+    app.command("/resume").await.unwrap();
+    assert!(app.overlays.on_top::<Sessions>());
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let mut methods = Vec::new();
+    while let Ok((method, params)) = requests.try_recv() {
+        if method == "session/detach" {
+            assert_eq!(params["session"], json!(previous));
+        }
+        methods.push(method);
+    }
+    assert!(methods.iter().any(|method| method == "session/detach"));
+    assert!(
+        methods
+            .iter()
+            .all(|method| method != "session/close" && method != "session/cancel")
+    );
+    assert_eq!(app.session_id(), target.info.session);
+    assert!(!app.running());
 }
 
 #[tokio::test]
