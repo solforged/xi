@@ -138,15 +138,17 @@ impl Fixture {
         config.extensions.push(self.package.clone());
         config
     }
-    fn session(&self, input: Value) -> (Session, EventBus, Arc<Fake>) {
+    fn session(&self, input: Value) -> (Session, Arc<Fake>) {
         self.session_with(input, self.config())
     }
-    fn session_with(&self, input: Value, config: Config) -> (Session, EventBus, Arc<Fake>) {
+    fn session_with(&self, input: Value, config: Config) -> (Session, Arc<Fake>) {
+        self.session_on(input, config, EventBus::default())
+    }
+    fn session_on(&self, input: Value, config: Config, bus: EventBus) -> (Session, Arc<Fake>) {
         let fake = Arc::new(Fake {
             input,
             requests: Mutex::new(Vec::new()),
         });
-        let bus = EventBus::default();
         let tools = xi_tools::toolset(&config.tools).unwrap();
         let session = Session::create(
             config,
@@ -172,7 +174,7 @@ impl Fixture {
             }),
         )
         .unwrap();
-        (session, bus, fake)
+        (session, fake)
     }
 }
 async fn run(session: &Session) -> xi_kernel::TurnOutcome {
@@ -206,12 +208,122 @@ fn text(output: &xi_protocol::ToolOutput) -> String {
         .collect()
 }
 
+async fn process_id(session: &Session) -> i32 {
+    session
+        .command("identity", "")
+        .await
+        .unwrap()
+        .unwrap()
+        .message
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn wait_for_exit(pid: i32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+                Err(nix::errno::Errno::ESRCH) => return,
+                Ok(()) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) => panic!("cannot inspect extension {pid}: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("extension process survived its session");
+}
+
+#[tokio::test]
+async fn sessions_isolate_extension_processes_requests_and_lifetimes() {
+    let fixture = Fixture::new("subagents=true");
+    let bus = EventBus::default();
+    let (first, _) = fixture.session_on(json!({}), fixture.config(), bus.clone());
+    let (second, _) = fixture.session_on(json!({}), fixture.config(), bus);
+    let first_pid = process_id(&first).await;
+    let second_pid = process_id(&second).await;
+    assert_ne!(first_pid, second_pid);
+    let first_id = first.id().to_string();
+    let second_id = second.id().to_string();
+    let (first_cross, second_cross) = tokio::join!(
+        first.command("cross", &second_id),
+        second.command("cross", &first_id),
+    );
+    for reply in [first_cross, second_cross] {
+        let rejected: Vec<bool> =
+            serde_json::from_str(&reply.unwrap().unwrap().message.unwrap()).unwrap();
+        assert_eq!(rejected, [true, true]);
+    }
+    for session in [&first, &second] {
+        assert!(!session.info().await.events.iter().any(|event| {
+            matches!(&event.kind, EventKind::Custom { kind, .. } if kind == "crossed")
+        }));
+    }
+    first.close();
+    wait_for_exit(first_pid).await;
+    assert!(first.command("identity", "").await.is_err());
+    assert_eq!(process_id(&second).await, second_pid);
+    first.shutdown_extensions().await;
+    drop(second);
+    wait_for_exit(second_pid).await;
+}
+
+#[tokio::test]
+async fn overlapping_extension_egress_uses_only_its_own_session_policy() {
+    let fixture = Fixture::new("net=['127.0.0.1']");
+    let bus = EventBus::default();
+    let denied = fixture.config();
+    std::fs::write(
+        fixture.paths.config.join("config.toml"),
+        "[[rule]]\naction='net'\npattern='127.0.0.1'\neffect='allow'\n",
+    )
+    .unwrap();
+    let (first, _) = fixture.session_on(json!({}), denied, bus.clone());
+    let (second, _) = fixture.session_on(json!({}), fixture.config(), bus);
+    let url = format!("http://127.0.0.1:{}/", server());
+    let (denied, allowed) =
+        tokio::join!(first.command("fetch", &url), second.command("fetch", &url),);
+    assert!(
+        denied
+            .unwrap()
+            .unwrap()
+            .message
+            .unwrap()
+            .starts_with("403 ")
+    );
+    assert_eq!(
+        allowed.unwrap().unwrap().message.as_deref(),
+        Some("200 hello")
+    );
+    assert_eq!(egress_decision(&first.info().await.events).1, Decision::Ask);
+    assert_eq!(
+        egress_decision(&second.info().await.events).1,
+        Decision::Allow
+    );
+    first.shutdown_extensions().await;
+    second.shutdown_extensions().await;
+}
+
+#[tokio::test]
+async fn dropping_a_service_future_keeps_the_egress_receiver_available() {
+    let fixture = Fixture::new("");
+    let (session, _) = fixture.session(json!({}));
+    let pid = process_id(&session).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), session.command("slow", ""))
+            .await
+            .is_err()
+    );
+    assert_eq!(process_id(&session).await, pid);
+    session.shutdown_extensions().await;
+}
+
 #[tokio::test]
 async fn registration_full_duplex_hooks_commands_compact_and_sandbox() {
     let fixture = Fixture::new("");
     let mut config = fixture.config();
     config.compaction.keep_recent_tokens = 0;
-    let (session, bus, fake) = fixture.session_with(json!({"mode":"replace"}), config);
+    let (session, fake) = fixture.session_with(json!({"mode":"replace"}), config);
     assert!(!run(&session).await.failed);
     let info = session.info().await;
     assert_eq!(text(output(&info.events)), "replacement");
@@ -258,13 +370,13 @@ async fn registration_full_duplex_hooks_commands_compact_and_sandbox() {
             .unwrap()
             .contains("probe invoked")
     );
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 
-    let (session, bus, _) = fixture.session(json!({"mode":"sandbox"}));
+    let (session, _) = fixture.session(json!({"mode":"sandbox"}));
     assert!(!run(&session).await.failed);
     assert!(!output(&session.info().await.events).is_error);
     assert!(!fixture.workspace.join("escape").exists());
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 }
 
 #[tokio::test]
@@ -280,7 +392,7 @@ async fn pre_tool_denies_and_rewrites_before_policy() {
         (json!({"command":"rewrite me"}), "denied by policy"),
         (json!({"mode":"invalid"}), "invalid outcome"),
     ] {
-        let (session, bus, _) = fixture.session(input);
+        let (session, _) = fixture.session(input);
         run(&session).await;
         let info = session.info().await;
         assert!(output(&info.events).is_error);
@@ -288,14 +400,14 @@ async fn pre_tool_denies_and_rewrites_before_policy() {
         if reason == "denied by policy" {
             assert!(info.events.iter().any(|e| matches!(&e.kind, EventKind::ToolDecision { action, decision: Decision::Deny, .. } if action == "exec blocked command")));
         }
-        bus.shutdown_extensions().await;
+        session.shutdown_extensions().await;
     }
 }
 
 #[tokio::test]
 async fn crash_is_an_error_result_logged_and_restarted_on_next_use() {
     let fixture = Fixture::new("");
-    let (session, bus, _) = fixture.session(json!({"mode":"crash"}));
+    let (session, _) = fixture.session(json!({"mode":"crash"}));
     run(&session).await;
     let info = session.info().await;
     assert!(output(&info.events).is_error);
@@ -306,7 +418,7 @@ async fn crash_is_an_error_result_logged_and_restarted_on_next_use() {
     );
     let echoed = session.command("echo", "again").await.unwrap().unwrap();
     assert_eq!(echoed.message.as_deref(), Some("again"));
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 }
 
 /// A loopback HTTP server answering every request with `hello`.
@@ -356,7 +468,7 @@ async fn extension_egress_follows_its_manifest_and_policy() {
         "[[rule]]\naction='net'\npattern='127.0.0.1'\neffect='allow'\n",
     )
     .unwrap();
-    let (session, bus, _) =
+    let (session, _) =
         fixture.session(json!({"mode":"fetch","url":format!("http://127.0.0.1:{port}/")}));
     run(&session).await;
     let info = session.info().await;
@@ -365,10 +477,10 @@ async fn extension_egress_follows_its_manifest_and_policy() {
     assert_eq!(action, format!("net 127.0.0.1:{port}"));
     assert_eq!(decision, Decision::Allow);
     assert!(rule.is_some_and(|rule| rule.ends_with("#0")));
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 
     // A host outside the manifest's `net` list never reaches policy.
-    let (session, bus, _) =
+    let (session, _) =
         fixture.session(json!({"mode":"fetch","url":format!("http://localhost:{port}/")}));
     run(&session).await;
     let info = session.info().await;
@@ -381,11 +493,11 @@ async fn extension_egress_follows_its_manifest_and_policy() {
             Some("manifest".into())
         )
     );
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 
     // Without a rule the connection asks, and headless mode denies.
     std::fs::write(fixture.paths.config.join("config.toml"), "").unwrap();
-    let (session, bus, _) =
+    let (session, _) =
         fixture.session(json!({"mode":"fetch","url":format!("http://127.0.0.1:{port}/")}));
     run(&session).await;
     let info = session.info().await;
@@ -399,22 +511,22 @@ async fn extension_egress_follows_its_manifest_and_policy() {
             ..
         }
     )));
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 }
 
 #[tokio::test]
 async fn subagents_require_capability() {
     let fixture = Fixture::new("");
-    let (session, bus, _) = fixture.session(json!({"mode":"child"}));
+    let (session, _) = fixture.session(json!({"mode":"child"}));
     run(&session).await;
     assert!(text(output(&session.info().await.events)).contains("subagents capability"));
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 }
 
 #[tokio::test]
 async fn concurrent_children_have_linked_logs_reduced_tools_and_usage() {
     let fixture = Fixture::new("subagents=true");
-    let (session, bus, fake) = fixture.session(json!({"mode":"child"}));
+    let (session, fake) = fixture.session(json!({"mode":"child"}));
     run(&session).await;
     let info = session.info().await;
     assert_eq!(text(output(&info.events)), "first child\nsecond child");
@@ -427,6 +539,8 @@ async fn concurrent_children_have_linked_logs_reduced_tools_and_usage() {
         })
         .unwrap();
     assert_eq!(results.as_array().unwrap().len(), 2);
+    let parent_pid = process_id(&session).await;
+    let mut child_pids = std::collections::HashSet::new();
     for result in results.as_array().unwrap() {
         assert_eq!(
             result["usage"],
@@ -438,26 +552,38 @@ async fn concurrent_children_have_linked_logs_reduced_tools_and_usage() {
         assert!(
             matches!(log.root().kind, EventKind::SessionStarted { parent_session: Some(parent), .. } if parent == session.id())
         );
+        let pid = log
+            .events()
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::Custom { kind, data, .. } if kind == "turn_end" => data["pid"].as_i64(),
+                _ => None,
+            })
+            .expect("child extension ran in its own process") as i32;
+        assert_ne!(pid, parent_pid);
+        assert!(child_pids.insert(pid));
+        wait_for_exit(pid).await;
     }
     for request in fake
         .requests
         .lock()
         .unwrap()
         .iter()
-        .filter(|r| r.tools.len() == 1)
+        .filter(|r| r.tools.iter().any(|tool| tool.name == "read") && r.tools.len() == 2)
     {
         assert_eq!(request.tools[0].name, "read");
+        assert_eq!(request.tools[1].name, "probe");
     }
     assert_eq!(
         fake.requests
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.tools.len() == 1)
+            .filter(|r| r.tools.len() == 2)
             .count(),
         2
     );
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 }
 
 #[tokio::test]
@@ -469,11 +595,11 @@ async fn children_inherit_parent_read_format_without_the_editor() {
         config.tools = ["read", editor, "write", "bash", "search"]
             .map(str::to_owned)
             .into();
-        let (session, bus, fake) =
+        let (session, fake) =
             fixture.session_with(json!({"mode":"child","read_children":true}), config);
         assert!(!run(&session).await.failed);
         let requests = fake.requests.lock().unwrap().clone();
-        let children: Vec<_> = requests.iter().filter(|r| r.tools.len() == 1).collect();
+        let children: Vec<_> = requests.iter().filter(|r| r.tools.len() == 2).collect();
         assert_eq!(children.len(), 4);
         for request in children {
             assert_eq!(request.tools[0].name, "read");
@@ -495,18 +621,18 @@ async fn children_inherit_parent_read_format_without_the_editor() {
                 }
             }
         }
-        bus.shutdown_extensions().await;
+        session.shutdown_extensions().await;
     }
 }
 
 #[tokio::test]
 async fn children_reject_extension_tools_and_cancel_with_parent() {
     let fixture = Fixture::new("subagents=true");
-    let (session, bus, _) = fixture.session(json!({"mode":"unknown_child"}));
+    let (session, _) = fixture.session(json!({"mode":"unknown_child"}));
     run(&session).await;
     assert!(text(output(&session.info().await.events)).contains("parent's built-in tools"));
-    bus.shutdown_extensions().await;
-    let (session, bus, fake) = fixture.session(json!({"mode":"slow_child"}));
+    session.shutdown_extensions().await;
+    let (session, fake) = fixture.session(json!({"mode":"slow_child"}));
     let reply = session.submit(vec![Block::Text {
         text: "parent prompt".into(),
     }]);
@@ -527,7 +653,7 @@ async fn children_reject_extension_tools_and_cancel_with_parent() {
         .unwrap()
         .unwrap();
     assert!(outcome.cancelled);
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 }
 
 #[test]
@@ -562,7 +688,7 @@ async fn children_deny_asks_and_record_headless_approval() {
         "[[rule]]\neffect='ask'\naction='exec'\npattern='touch forbidden'\n",
     )
     .unwrap();
-    let (session, bus, _) = fixture.session(json!({"mode":"ask_child"}));
+    let (session, _) = fixture.session(json!({"mode":"ask_child"}));
     run(&session).await;
     let info = session.info().await;
     let path = info
@@ -583,5 +709,5 @@ async fn children_deny_asks_and_record_headless_approval() {
         }
     )));
     assert!(!fixture.workspace.join("forbidden").exists());
-    bus.shutdown_extensions().await;
+    session.shutdown_extensions().await;
 }

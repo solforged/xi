@@ -48,8 +48,7 @@ impl Session {
         if !state.extensions.as_ref().is_some_and(|e| e.running()) {
             state.extensions = Some(
                 self.0
-                    .bus
-                    .1
+                    .extensions
                     .load(
                         &state.config,
                         &state.tools_context,
@@ -81,9 +80,8 @@ impl Session {
         current: Option<Current<'_>>,
     ) -> Result<T> {
         let extensions = state.extensions.clone().unwrap_or_default();
-        let mut scope = self.0.bus.1.scope(self.id(), &extensions);
+        let mut scope = self.0.extensions.scope(&extensions);
         self.start_egress(state);
-        let mut rx = state.egress.rx.take().expect("egress receiver");
         // Cancelling this token after the wait answers open asks.
         let asks = cancel.child_token();
         let mut waiting: FuturesUnordered<BoxFuture<'static, Waiting>> = FuturesUnordered::new();
@@ -111,7 +109,7 @@ impl Session {
                         Incoming::Connect(connect) => self.decide_egress(state, connect, None, &asks),
                     }
                 }
-                Some(connect) = rx.recv() => self.decide_egress(state, connect, current, &asks),
+                Some(connect) = state.egress.rx.recv() => self.decide_egress(state, connect, current, &asks),
                 Some(done) = waiting.next() => self.finish_egress(state, done).map(|()| None),
                 result = &mut future => break result,
             };
@@ -128,7 +126,6 @@ impl Session {
                 result = Err(error);
             }
         }
-        state.egress.rx = Some(rx);
         result
     }
 
@@ -355,7 +352,6 @@ impl Session {
     ) -> BoxFuture<'static, Result<(AgentRunResult, bool)>> {
         let prepared = (|| -> Result<_> {
             let mut config = state.config.clone();
-            config.extensions.clear();
             let parent = state.backend.as_ref().expect("connected backend");
             let names = params.tools.unwrap_or_else(|| {
                 parent
@@ -420,6 +416,7 @@ impl Session {
             }
             .map_err(|_| Error::Config("child turn stopped".into()))?
             .map_err(Error::Config)?;
+            child.shutdown_extensions().await;
             let info = child.info().await;
             let tainted = {
                 let state = child.0.state.lock().await;
