@@ -316,7 +316,7 @@ Composer keys are unique. Keys inside an overlay apply only while it has focus.
 | `ctrl+g` | Edit the prompt in the external editor. |
 | `ctrl+v` | Attach an image from the local clipboard. Backspace with empty text removes the last attachment. |
 | `alt+m` | Open the model picker. |
-| `shift+tab` | Cycle reasoning through the levels the model accepts. |
+| `shift+tab` | Cycle reasoning through the levels the model accepts and save the level as the global default. |
 | `ctrl+o` | Expand the newest collapsed result; repeat to walk back. |
 | `ctrl+t` | Cycle thinking display: full, first line, hidden. |
 | Editing | `ctrl+a`/`ctrl+e` line start and end, `ctrl+b`/`ctrl+f` and arrows by character, `ctrl+w` and `alt+backspace` delete a word, `ctrl+u`/`ctrl+k` delete to line start and end. |
@@ -344,14 +344,14 @@ Action names are the snake_case names `/help` shows. A key string is `[ctrl+][al
 | `/resume` | Open the session picker. |
 | `/tree` | Open the branch overlay and check out an earlier point. |
 | `/model [PROVIDER/MODEL]` | Switch model; without an argument, open the model picker. |
-| `/reasoning [LEVEL]` | Set reasoning; without an argument, show it and the levels the model accepts. |
+| `/reasoning [LEVEL]` | Set reasoning and save it as the global default; without an argument, show it and the levels the model accepts. |
 | `/compact` | Summarize older context now. |
 | `/approvals` | Open the approvals inbox for all sessions. |
 | `/settings` | Open the settings view. |
 | `/copy` | Copy the last response through OSC 52, which also works over SSH. |
 | `/name args` | Any other name runs an extension command through `session/command`; an unknown name points to `/help`. |
 
-Built-in names are reserved, so an extension cannot shadow them. Model, reasoning, compaction and `/new` are idle only; during a turn the client says so instead of queueing the change. Reasoning changes update the footer without adding transcript lines.
+Built-in names are reserved, so an extension cannot shadow them. Model, reasoning, compaction and `/new` are idle only; during a turn the client says so instead of queueing the change. Reasoning changes update the footer without adding transcript lines, and each one saves `reasoning` to the global config so new sessions start at the same level; a failed save shows an error note.
 
 #### Composer
 
@@ -383,7 +383,7 @@ Approval scopes: `remember = session` makes the worker allow the same tool and e
 
 | Row | Scope | Change |
 |---|---|---|
-| Model, reasoning | Session | `enter` opens the model picker or cycles reasoning through the protocol methods; `ctrl+s` saves the session's value as the global default. |
+| Model, reasoning | Session | `enter` opens the model picker or cycles reasoning through the protocol methods; a reasoning change also saves the global default. `ctrl+s` saves the session's value as the global default. |
 | Thinking display | Client | Cycles `full`, `first`, `hidden` and saves `[display] thinking` to `tui.toml`. |
 | Approvals | Global default | Cycles the `approvals` preset `ask`, `reads`, `auto`. |
 | One row per built-in tool, including `hashline` | Global default | Toggles the tool in `tools`, keeping the order and any other names; the last tool cannot be removed. |
