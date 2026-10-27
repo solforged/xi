@@ -22,6 +22,8 @@ mod git;
 pub mod history;
 mod input;
 pub mod keys;
+pub mod layout;
+pub mod log;
 mod overlay;
 mod overlays;
 pub mod picker;
