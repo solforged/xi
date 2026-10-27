@@ -1,8 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::callout::Kind;
 use crate::history::Search;
 use crate::keys::Action;
-use crate::style::Line;
 use crate::{App, Error, ExternalRequest};
 
 impl App {
@@ -111,13 +111,14 @@ impl App {
                 return Ok(());
             }
             Some(Action::Expand) => {
-                let lines = self.transcript.expand(self.measure()).unwrap_or_else(|| {
+                let m = self.measure();
+                let lines = self.transcript.expand(m).unwrap_or_else(|| {
                     let why = if self.transcript.collapsed() {
-                        "  that was the oldest cut-short result · ctrl+o starts again from the newest"
+                        "that was the oldest cut-short result · ctrl+o starts again from the newest"
                     } else {
-                        "  nothing cut short yet · results longer than three lines show whole here"
+                        "nothing cut short yet · results longer than three lines show whole here"
                     };
-                    self.transcript.note(vec![Line::default().dim(why)])
+                    self.transcript.notice(Kind::Info, why, m)
                 });
                 self.commit_lines(lines);
                 return Ok(());
@@ -125,9 +126,10 @@ impl App {
             Some(Action::Thinking) => {
                 let thinking = self.transcript.thinking_display().next();
                 self.transcript.set_thinking(thinking);
-                self.note(vec![
-                    Line::default().dim(format!("  thinking display → {}", thinking.name())),
-                ]);
+                self.notice(
+                    Kind::Info,
+                    format!("thinking display → {}", thinking.name()),
+                );
                 return Ok(());
             }
             Some(Action::DeleteOrQuit) => {

@@ -15,10 +15,11 @@ use xi_protocol::methods::client::{Delta, EventParams};
 use xi_protocol::model::Pricing;
 use xi_protocol::{Block, EventKind, OutputBlock, SessionId, Timestamp, ToolCallId, ToolOutput};
 
+use crate::callout::{self, Kind, markdown};
 use crate::children::Children;
 use crate::layout::Measure;
 use crate::log::Inspect;
-use crate::style::{Line, Role, inline, lr, prose, wrap};
+use crate::style::{Line, Role, inline, lr, wrap};
 
 /// Terminal spinner frames, one every 125 ms.
 pub const SPINNER: [&str; 8] = ["┤", "┘", "┴", "└", "├", "┌", "┬", "┐"];
@@ -33,7 +34,8 @@ const DIFF_ROWS: usize = 8;
 pub enum Thinking {
     /// Show all reasoning text.
     Full,
-    /// Show a committed headline and two body rows, or the newest live line.
+    /// Show a committed headline and two rows of text, or the newest live
+    /// line.
     #[default]
     First,
     /// Hide reasoning text without hiding the activity indicator.
@@ -68,14 +70,19 @@ impl Thinking {
         match self {
             Self::Hidden => Vec::new(),
             Self::Full => {
-                let rows = prose(text, m.prose, Role::Dim);
+                let rows = thought(text, m);
                 let skip = rows.len().saturating_sub(m.stream_rows());
                 rows.into_iter()
                     .skip(skip)
                     .enumerate()
                     .map(|(i, row)| {
-                        let lead = if i == 0 { "  ∴ " } else { "    " };
-                        Line::default().dim(lead).extend(row).truncate(m.out)
+                        let lead = if i == 0 { "  ∴" } else { "  │" };
+                        let line = Line::default().dim(lead);
+                        if row.width() == 0 {
+                            line
+                        } else {
+                            line.dim(" ").extend(row).truncate(m.out)
+                        }
                     })
                     .collect()
             }
@@ -85,7 +92,7 @@ impl Thinking {
                 .map(|row| {
                     Line::default()
                         .dim("  ∴ ")
-                        .extend(inline(row, Role::Dim))
+                        .extend(inline(row, Role::Dim).italic())
                         .truncate(m.out)
                 })
                 .into_iter()
@@ -93,49 +100,96 @@ impl Thinking {
         }
     }
 
+    /// A block under `∴` and the summary's title, or `thinking` when it has
+    /// none, with the reasoning in dim italics behind a bar. First keeps two
+    /// rows of text and counts the rest.
     fn committed_rows(self, text: &str, m: Measure, elapsed: u64, output: u64) -> Vec<Line> {
         if self == Self::Hidden || text.trim().is_empty() {
             return Vec::new();
         }
-        // A title row and its paragraph gap are the headline; blank rows
-        // between paragraphs stay, so Full keeps its shape.
-        let mut rows = prose(text.trim(), m.prose, Role::Dim)
-            .into_iter()
-            .enumerate()
-            .filter(|(index, row)| *index != 1 || !row.plain().trim().is_empty())
-            .map(|(_, row)| row)
-            .collect::<Vec<_>>()
-            .into_iter();
-        let Some(first) = rows.next() else {
-            return Vec::new();
+        let (title, body) = titled(text);
+        let head = Line::default().dim("∴ ");
+        let head = match title {
+            Some(title) => head.strong(Role::Ink, inline(title, Role::Ink).plain()),
+            None => head.dim("thinking"),
         };
         let meta = if m.durations() {
-            format!("{} · {}", duration(elapsed), tokens(output))
+            format!("{} · ↓ {}", duration(elapsed), tokens(output))
         } else {
             duration(elapsed)
         };
-        let mut lines = vec![lr(
-            Line::default().dim("  ∴ ").strong(Role::Ink, first.plain()),
-            Line::default().dim(meta),
-            m.out,
-        )];
-        let count = rows.len();
-        let shown = if self == Self::First {
-            count.min(2)
-        } else {
-            count
-        };
-        for (index, row) in rows.take(shown).enumerate() {
-            let line = Line::default().dim("    ").extend(row);
-            lines.push(if index + 1 == shown && shown < count {
-                line.truncate(m.out.saturating_sub(9))
-                    .dim(" · ctrl+t")
-                    .truncate(m.out)
-            } else {
-                line.truncate(m.out)
-            });
+        let mut rows = thought(body, m);
+        if self == Self::First {
+            let mut seen = 0;
+            let keep = rows
+                .iter()
+                .position(|row| {
+                    seen += usize::from(row.width() > 0);
+                    seen > 2
+                })
+                .unwrap_or(rows.len());
+            let hidden = rows[keep..].iter().filter(|row| row.width() > 0).count();
+            rows.truncate(keep);
+            while rows.last().is_some_and(|row| row.width() == 0) {
+                rows.pop();
+            }
+            if hidden > 0 {
+                rows.push(Line::default().dim(format!(
+                    "… {} · ctrl+t",
+                    counted(hidden, "more line", "more lines")
+                )));
+            }
         }
-        lines
+        callout::Block {
+            head,
+            meta: Line::default().dim(meta),
+            bar: Role::Dim,
+            rows,
+        }
+        .lines(m.out.saturating_sub(2))
+        .into_iter()
+        .map(|line| Line::default().ink("  ").extend(line))
+        .collect()
+    }
+}
+
+/// Reasoning set in dim italics, wrapped to sit behind a bar at prose
+/// width.
+fn thought(text: &str, m: Measure) -> Vec<Line> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    markdown(
+        text,
+        callout::Block::inner(m.prose.min(m.out.saturating_sub(2))),
+        Role::Dim,
+    )
+    .into_iter()
+    .map(Line::italic)
+    .collect()
+}
+
+/// A reasoning summary's title and the text after it. A title is a first
+/// line set wholly in `**bold**` or as a `#` heading, the way OpenAI
+/// summaries send it. Raw reasoning has none.
+fn titled(text: &str) -> (Option<&str>, &str) {
+    let text = text.trim();
+    let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+    let first = first.trim();
+    let title = first
+        .strip_prefix("**")
+        .and_then(|title| title.strip_suffix("**"))
+        .filter(|title| !title.contains("**"))
+        .or_else(|| {
+            first
+                .starts_with('#')
+                .then(|| first.trim_start_matches('#').trim())
+        })
+        .filter(|title| !title.trim().is_empty());
+    match title {
+        Some(title) => (Some(title.trim()), rest.trim()),
+        None => (None, text),
     }
 }
 
@@ -428,6 +482,11 @@ pub(crate) fn counted(n: usize, one: &str, many: &str) -> String {
 /// The hint for lines cut from a block.
 pub(crate) fn more_lines(hidden: usize) -> String {
     format!("… {} · ctrl+o", counted(hidden, "more line", "more lines"))
+}
+
+/// A notice in the gutter, `mark` then `text`, wrapped at prose width.
+pub(crate) fn notice_rows(mark: Line, text: Line, m: Measure) -> Vec<Line> {
+    callout::notice(mark, text, (m.prose + 2).min(m.out))
 }
 
 /// Event timestamps are milliseconds since the epoch. No local-time library
@@ -1060,12 +1119,18 @@ impl Transcript {
         }
     }
 
-    /// Lines printed outside the event stream, such as the done line.
+    /// Lines printed outside the event stream, such as an expanded result.
     pub fn note(&mut self, lines: Vec<Line>) -> Vec<Line> {
         let mut out = Vec::new();
         self.gap(&mut out);
         self.push(&mut out, lines);
         out
+    }
+
+    /// A marked notice printed outside the event stream, such as a setting
+    /// change, the done line or an error.
+    pub fn notice(&mut self, kind: Kind, text: impl Into<Line>, m: Measure) -> Vec<Line> {
+        self.note(notice_rows(kind.mark(), text.into(), m))
     }
 
     /// Remembers a prompt or steering message until the worker echoes it.
@@ -1107,7 +1172,6 @@ impl Transcript {
 
     /// Applies a notification and returns the lines it commits.
     pub fn apply(&mut self, notification: &ClientNotification, m: Measure) -> Vec<Line> {
-        let cols = m.out;
         self.inspects.clear();
         match notification {
             ClientNotification::Reset(_) => {
@@ -1151,14 +1215,14 @@ impl Transcript {
                 self.end_turn();
                 self.calls.clear();
                 self.children.clear();
-                let mut message = "  session exited".to_owned();
+                let mut message = Line::default().ink("session exited");
                 if let Some(status) = params.status {
-                    message.push_str(&format!(" · status {status}"));
+                    message = message.dim(format!(" · status {status}"));
                 }
                 if let Some(detail) = &params.message {
-                    message.push_str(&format!(" · {detail}"));
+                    message = message.dim(format!(" · {detail}"));
                 }
-                out.extend(self.note(vec![Line::default().dim(message).truncate(cols)]));
+                out.extend(self.notice(Kind::Warn, message, m));
                 out
             }
         }
@@ -1228,20 +1292,32 @@ impl Transcript {
                 self.model = Some(model.clone());
                 self.push(
                     &mut out,
-                    [
+                    notice_rows(
+                        Kind::Info.mark(),
                         Line::default()
-                            .dim(format!("  model → {}/{}", model.provider, model.model)),
-                    ],
+                            .dim("model → ")
+                            .ink(format!("{}/{}", model.provider, model.model)),
+                        m,
+                    ),
                 );
             }
             EventKind::SandboxChanged { enabled } => {
-                let line = if *enabled {
-                    Line::default().dim("  tool sandbox on · future commands are sandboxed")
+                let (kind, text) = if *enabled {
+                    (
+                        Kind::Info,
+                        Line::default()
+                            .ink("tool sandbox on")
+                            .dim(" · future commands are sandboxed"),
+                    )
                 } else {
-                    Line::default()
-                        .brass("  tool sandbox off · unrestricted host files and network")
+                    (
+                        Kind::Warn,
+                        Line::default()
+                            .ink("tool sandbox off")
+                            .dim(" · unrestricted host files and network"),
+                    )
                 };
-                self.push(&mut out, [line]);
+                self.push(&mut out, notice_rows(kind.mark(), text, m));
             }
             // Reasoning changes are reflected in the footer, and titles in the
             // terminal title and session lists, not the transcript.
@@ -1316,7 +1392,7 @@ impl Transcript {
                     match block {
                         Block::Text { text } if !text.trim().is_empty() => {
                             self.gap(&mut out);
-                            let lines: Vec<_> = prose(text.trim(), m.prose, Role::Ink)
+                            let lines: Vec<_> = markdown(text.trim(), m.prose, Role::Ink)
                                 .into_iter()
                                 .map(|row| Line::default().ink("  ").extend(row))
                                 .collect();
@@ -1351,7 +1427,7 @@ impl Transcript {
                     _ => None,
                 };
                 if let Some(note) = note {
-                    self.push(&mut out, [Line::default().dim(format!("  {note}"))]);
+                    self.push(&mut out, notice_rows(Kind::Warn.mark(), note.into(), m));
                 }
             }
             EventKind::ToolDecision {
@@ -1472,10 +1548,13 @@ impl Transcript {
                 self.tainted = true;
                 self.push(
                     &mut out,
-                    [Line::default()
-                        .murex("◆ tainted")
-                        .dim(format!(" · {reason}. Egress on this branch now asks."))
-                        .truncate(cols)],
+                    notice_rows(
+                        Line::default().murex("◆"),
+                        Line::default()
+                            .murex("tainted")
+                            .dim(format!(" · {reason}. Egress on this branch now asks.")),
+                        m,
+                    ),
                 );
             }
             EventKind::Compaction {
@@ -1530,7 +1609,7 @@ impl Transcript {
             EventKind::TurnFailed { message } => {
                 self.push(
                     &mut out,
-                    [Line::default().sanguine("✕ ").ink(message).truncate(cols)],
+                    notice_rows(Kind::Error.mark(), message.as_str().into(), m),
                 );
             }
             EventKind::Custom { .. } => {}
@@ -1622,7 +1701,7 @@ impl Transcript {
         let cols = m.out;
         let mut lines = Vec::new();
         if !self.stream.trim().is_empty() {
-            let rows = prose(self.stream.trim(), m.prose, Role::Ink);
+            let rows = markdown(self.stream.trim(), m.prose, Role::Ink);
             if collapse {
                 let noun = if rows.len() == 1 { "line" } else { "lines" };
                 lines.push(
@@ -2291,20 +2370,23 @@ mod tests {
             let answer = text.iter().position(|line| line == "  answer").unwrap();
             match mode {
                 Thinking::Full | Thinking::First => {
-                    let first = text
+                    // Raw reasoning has no title, so the headline says what
+                    // it is and the text sits behind the bar.
+                    let head = text
                         .iter()
-                        .position(|line| line.starts_with("  ∴ first thought"))
+                        .position(|line| line.starts_with("  ∴ thinking"))
                         .unwrap();
-                    assert!(first < answer);
-                    assert!(text[first].ends_with("0.0s"));
-                    assert_eq!(text[first + 1], "    second thought");
+                    assert!(head < answer);
+                    assert!(text[head].ends_with("0.0s"));
+                    assert_eq!(text[head + 1], "  │ first thought");
+                    assert_eq!(text[head + 2], "  │ second thought");
                     assert!(
-                        rows[first]
+                        rows[head + 1]
                             .0
                             .iter()
-                            .any(|span| span.role == Role::Ink && span.bold)
+                            .filter(|span| span.text.contains("thought"))
+                            .all(|span| span.role == Role::Dim && span.italic)
                     );
-                    assert!(rows[first + 1].0.iter().all(|span| span.role == Role::Dim));
                 }
                 Thinking::Hidden => assert!(text.iter().all(|line| !line.contains("thought"))),
             }
@@ -2346,8 +2428,9 @@ mod tests {
             m(24),
         );
         assert!(rows.iter().all(|line| line.width() <= 24));
-        assert!(plain(&rows).iter().all(|line| !line.ends_with(" · ctrl+t")));
-        assert!(plain(&rows).iter().any(|line| line.contains("second")));
+        let text = plain(&rows);
+        assert_eq!(text[1..3], ["  │ abcdefghijklmnopqrst", "  │ uvwxyz"]);
+        assert!(text[3].starts_with("  │ … 1 more line"), "{text:?}");
         for mode in [Thinking::Full, Thinking::First, Thinking::Hidden] {
             t.set_thinking(mode);
             let rows = t.apply(
@@ -3219,7 +3302,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_thinking_has_a_strong_headline_meta_and_two_body_rows() {
+    fn committed_thinking_titles_its_block_and_counts_rows_past_two() {
         for cols in [250, 60] {
             let mut t = Transcript::default();
             let prior = t.apply(
@@ -3234,9 +3317,8 @@ mod tests {
                 m(cols),
             );
             let mut message = assistant(vec![Block::Thinking {
-                text:
-                    "Planning the spawn path\nFirst body row.\nSecond body row.\nHidden body row."
-                        .into(),
+                text: "**Planning the spawn path**\n\nFirst body row.\nSecond body row.\nHidden body row."
+                    .into(),
                 signature: None,
             }]);
             if let EventKind::AssistantMessage { usage, .. } = &mut message {
@@ -3254,14 +3336,15 @@ mod tests {
             assert!(rows[head].plain().ends_with(if cols == 60 {
                 "14.0s"
             } else {
-                "14.0s · 2.1k"
+                "14.0s · ↓ 2.1k"
             }));
-            assert_eq!(rows[head + 1].plain(), "    First body row.");
-            assert_eq!(rows[head + 2].plain(), "    Second body row. · ctrl+t");
+            assert_eq!(rows[head + 1].plain(), "  │ First body row.");
+            assert_eq!(rows[head + 2].plain(), "  │ Second body row.");
+            assert_eq!(rows[head + 3].plain(), "  │ … 1 more line · ctrl+t");
             assert!(!plain(&rows).iter().any(|row| row.contains("Hidden")));
             assert_eq!(prior.last().unwrap().plain(), "");
             assert_eq!(head, 0);
-            assert_eq!(rows[head + 3].plain(), "");
+            assert_eq!(rows[head + 4].plain(), "");
         }
     }
 

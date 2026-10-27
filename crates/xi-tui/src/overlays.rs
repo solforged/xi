@@ -10,6 +10,7 @@ use xi_protocol::model::{ModelRole, ModelSelector, Reasoning};
 use xi_protocol::rpc::RpcError;
 
 use crate::approvals::{Approval, Approvals, Choice};
+use crate::callout::Kind;
 use crate::editor::Editor;
 use crate::history::History;
 use crate::keys::Action;
@@ -19,7 +20,7 @@ use crate::roles::{self, Roles};
 use crate::sessions::Sessions;
 use crate::settings::{self, Settings};
 use crate::style::{Line, Role};
-use crate::transcript::Transcript;
+use crate::transcript::{Transcript, notice_rows};
 use crate::tree::{Node, Tree};
 use crate::{App, Error, ExternalRequest, config, lineage, style};
 
@@ -78,7 +79,7 @@ impl App {
             Command::SetModel(entry) => self.choose_model(entry).await,
             Command::Resume(session) => {
                 if let Err(error) = self.resume(session).await {
-                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                    self.notice(Kind::Error, error.to_string());
                 }
             }
             Command::Sessions { all } => {
@@ -95,7 +96,7 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                        self.notice(Kind::Error, error.to_string());
                     }
                 }
             }
@@ -129,9 +130,9 @@ impl App {
                     .as_deref()
                     .map(|path| config::save_thinking(path, thinking));
                 match saved {
-                    Some(Ok(())) => self.settings_note("saved · thinking display"),
-                    Some(Err(error)) => self.settings_note(error.to_string()),
-                    None => self.settings_note("not saved: no config path"),
+                    Some(Ok(())) => self.settings_note(Kind::Done, "saved · thinking display"),
+                    Some(Err(error)) => self.settings_note(Kind::Error, error.to_string()),
+                    None => self.settings_note(Kind::Warn, "not saved: no config path"),
                 }
             }
             settings::Action::Layout => {
@@ -142,10 +143,10 @@ impl App {
                 };
                 match self.set_layout(layout) {
                     Ok(()) if self.launch.tui_config.is_some() => {
-                        self.settings_note("saved · layout")
+                        self.settings_note(Kind::Done, "saved · layout")
                     }
-                    Ok(()) => self.settings_note("not saved: no config path"),
-                    Err(error) => self.settings_note(error.to_string()),
+                    Ok(()) => self.settings_note(Kind::Warn, "not saved: no config path"),
+                    Err(error) => self.settings_note(Kind::Error, error.to_string()),
                 }
             }
             settings::Action::Set { key, value } => match self.save_setting(key, value).await {
@@ -154,7 +155,7 @@ impl App {
                         settings.saved(report);
                     }
                 }
-                Err(error) => self.settings_note(error.to_string()),
+                Err(error) => self.settings_note(Kind::Error, error.to_string()),
             },
             settings::Action::EditFile => {
                 if let Some(settings) = self.overlays.get::<Settings>() {
@@ -180,14 +181,14 @@ impl App {
                             roles.saved(report);
                         }
                     }
-                    Err(error) => self.roles_note(error.to_string()),
+                    Err(error) => self.roles_note(Kind::Error, error.to_string()),
                 }
             }
             roles::Action::Pick(role) => self.pick_role(role).await,
             roles::Action::Use(model) => {
                 let name = format!("{}/{}", model.provider, model.model);
                 if self.set_model(model.into()).await {
-                    self.roles_note(format!("This session now uses {name}."));
+                    self.roles_note(Kind::Done, format!("This session now uses {name}."));
                 }
             }
             roles::Action::EditFile => {
@@ -199,9 +200,9 @@ impl App {
         }
     }
 
-    fn roles_note(&mut self, note: impl Into<String>) {
+    fn roles_note(&mut self, kind: Kind, note: impl Into<String>) {
         if let Some(roles) = self.overlays.get_mut::<Roles>() {
-            roles.note(note);
+            roles.note(kind, note);
         }
     }
 
@@ -211,7 +212,7 @@ impl App {
         self.close_overlay();
         match report {
             Ok(report) => self.overlays.push(Box::new(Roles::new(report))),
-            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+            Err(error) => self.notice(Kind::Error, error.to_string()),
         }
     }
 
@@ -230,7 +231,7 @@ impl App {
                     models, role, current, roles, reset,
                 )));
             }
-            Err(error) => self.roles_note(error.to_string()),
+            Err(error) => self.roles_note(Kind::Error, error.to_string()),
         }
     }
 
@@ -244,7 +245,7 @@ impl App {
             } else {
                 ""
             };
-            self.note(vec![Line::default().dim(format!("  no credentials{hint}"))]);
+            self.notice(Kind::Warn, Line::default().ink("no credentials").dim(hint));
         } else if self.set_model(entry.model.into()).await {
             // The model change event records the switch in scrollback.
             self.launch.attached.info.model_info = Some(entry.info);
@@ -301,7 +302,7 @@ impl App {
         let pending = match self.launch.client.approvals().await {
             Ok(pending) => pending,
             Err(error) => {
-                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                self.notice(Kind::Error, error.to_string());
                 return;
             }
         };
@@ -316,9 +317,7 @@ impl App {
                         .map(|session| (session.session, session.cwd))
                         .collect();
                 }
-                Err(error) => self.note(vec![
-                    Line::default().dim(format!("  approval workspaces: {error}")),
-                ]),
+                Err(error) => self.notice(Kind::Error, format!("approval workspaces: {error}")),
             }
         }
         let mut entries = self.own_approvals();
@@ -348,9 +347,7 @@ impl App {
         if self.queued.is_empty() {
             return true;
         }
-        self.note(vec![
-            Line::default().dim("  /resume waits for queued prompts to send"),
-        ]);
+        self.notice(Kind::Warn, "/resume waits for queued prompts to send");
         false
     }
 
@@ -372,7 +369,7 @@ impl App {
                     .push(Box::new(Sessions::new(sessions, self.session_id())));
                 self.completion = None;
             }
-            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+            Err(error) => self.notice(Kind::Error, error.to_string()),
         }
     }
 
@@ -419,9 +416,7 @@ impl App {
         }
         self.attach();
         if let Some(error) = error {
-            self.note(vec![
-                Line::default().dim(format!("  prompt history: {error}")),
-            ]);
+            self.notice(Kind::Warn, format!("prompt history: {error}"));
         }
         self.initialize_composer().await;
         Ok(())
@@ -476,14 +471,14 @@ impl App {
             }
             Err(error) => {
                 self.close_overlay();
-                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                self.notice(Kind::Error, error.to_string());
             }
         }
     }
 
-    pub(crate) fn settings_note(&mut self, note: impl Into<String>) {
+    pub(crate) fn settings_note(&mut self, kind: Kind, note: impl Into<String>) {
         if let Some(settings) = self.overlays.get_mut::<Settings>() {
-            settings.note(note);
+            settings.note(kind, note);
         }
     }
 
@@ -512,7 +507,7 @@ impl App {
                     settings.replace(report);
                 }
             }
-            Err(error) => self.settings_note(error.to_string()),
+            Err(error) => self.settings_note(Kind::Error, error.to_string()),
         }
     }
 
@@ -531,7 +526,7 @@ impl App {
                 self.overlays.push(Box::new(Picker::new(models)));
                 self.completion = None;
             }
-            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+            Err(error) => self.notice(Kind::Error, error.to_string()),
         }
     }
 
@@ -549,7 +544,7 @@ impl App {
                 true
             }
             Err(error) => {
-                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                self.notice(Kind::Error, error.to_string());
                 false
             }
         }
@@ -580,7 +575,7 @@ impl App {
         {
             Ok(()) => self.launch.attached.info.reasoning = reasoning,
             Err(error) => {
-                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                self.notice(Kind::Error, error.to_string());
                 return;
             }
         }
@@ -592,14 +587,10 @@ impl App {
             Ok(report) => {
                 if let Some(settings) = self.overlays.get_mut::<Settings>() {
                     settings.replace(report);
-                    settings.note("saved · new sessions use this reasoning level");
+                    settings.note(Kind::Done, "saved · new sessions use this reasoning level");
                 }
             }
-            Err(error) => self.note(vec![
-                Line::default()
-                    .sanguine("✕ ")
-                    .ink(format!("reasoning default not saved: {error}")),
-            ]),
+            Err(error) => self.notice(Kind::Error, format!("reasoning default not saved: {error}")),
         }
     }
 
@@ -621,9 +612,7 @@ impl App {
             Ok(()) => {
                 self.launch.attached.info.sandbox_enabled = enabled;
             }
-            Err(error) => {
-                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
-            }
+            Err(error) => self.notice(Kind::Error, error.to_string()),
         }
     }
 
@@ -658,7 +647,7 @@ impl App {
                 ..
             }) => false,
             Err(error) => {
-                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                self.notice(Kind::Error, error.to_string());
                 return;
             }
         };
@@ -705,7 +694,7 @@ impl App {
             .checkout(self.session_id(), node.target)
             .await
         {
-            self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+            self.notice(Kind::Error, error.to_string());
             return;
         }
         self.launch.attached.info.head = node.target;
@@ -735,13 +724,11 @@ impl App {
             None => "your next prompt continues from here",
         };
         self.update_completion();
-        let mut line = Line::default()
-            .brass("  ↳ ")
-            .ink("checked out · ")
-            .dim(what);
+        let mut line = Line::default().ink("checked out · ").dim(what);
         if self.transcript.tainted {
             line = line.dim(" · ").murex("◆ tainted");
         }
-        self.note(vec![line.truncate(self.cols)]);
+        let rows = notice_rows(Line::default().brass("↳"), line, self.measure());
+        self.note(rows);
     }
 }

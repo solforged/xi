@@ -10,9 +10,10 @@
 //! Drawing is a pure function from a size to lines, so every frame is
 //! testable as text.
 
+use crate::callout::{Kind, notice};
 use crate::keys::{Action, Keymap};
 use crate::status::{Form, shrink};
-use crate::style::{Line, Role, wrap};
+use crate::style::{Line, Role};
 
 /// Columns below which the side borders drop. The top and bottom rules
 /// stay, so the frame still reads as one.
@@ -105,31 +106,29 @@ pub struct Frame {
     pub hints: Vec<Hint>,
 }
 
-/// A dim note under the list, with an optional mark before it. It wraps
-/// instead of truncating, because it explains a consequence.
+/// A note under the list: a mark in the gutter, then text that wraps under
+/// itself instead of truncating, because it explains a consequence or
+/// reports a result.
 #[derive(Clone, Debug)]
 pub struct Note {
-    /// A mark such as murex `◆`.
-    pub mark: Option<Line>,
+    /// A kind's mark, or another such as murex `◆`.
+    pub mark: Line,
     /// The note's text.
     pub text: String,
 }
 
 impl Note {
-    /// A note without a mark.
+    /// A note marked by its kind.
     #[must_use]
-    pub fn new(text: impl Into<String>) -> Self {
-        Self {
-            mark: None,
-            text: text.into(),
-        }
+    pub fn new(kind: Kind, text: impl Into<String>) -> Self {
+        Self::marked(kind.mark(), text)
     }
 
-    /// A note after a mark.
+    /// A note after another mark.
     #[must_use]
     pub fn marked(mark: Line, text: impl Into<String>) -> Self {
         Self {
-            mark: Some(mark),
+            mark,
             text: text.into(),
         }
     }
@@ -222,22 +221,10 @@ fn facts(facts: &[(String, Line)], inner: usize) -> Vec<Line> {
 }
 
 fn foot(notes: &[Note], inner: usize) -> Vec<Line> {
-    let mut rows = Vec::new();
-    for note in notes {
-        let lead = note.mark.as_ref().map_or(0, |mark| mark.width() + 1);
-        for (i, row) in wrap(&note.text, inner.saturating_sub(lead))
-            .into_iter()
-            .enumerate()
-        {
-            let start = match &note.mark {
-                Some(mark) if i == 0 => mark.clone().ink(" "),
-                Some(_) => Line::default().ink(" ".repeat(lead)),
-                None => Line::default(),
-            };
-            rows.push(start.dim(row));
-        }
-    }
-    rows
+    notes
+        .iter()
+        .flat_map(|note| notice(note.mark.clone(), Line::default().ink(&note.text), inner))
+        .collect()
 }
 
 /// Rows the body groups take, with one blank row between groups.
@@ -433,6 +420,7 @@ mod tests {
             ],
             selected: Some(0),
             foot: vec![Note::new(
+                Kind::Info,
                 "Allowed once, the next publish asks again. The answer lands in the log, so any other client sees it.",
             )],
             cursor: None,
@@ -468,9 +456,9 @@ mod tests {
                 "   3 Always allow in this workspace     ",
                 "   4 Deny                               ",
                 "                                        ",
-                " Allowed once, the next publish asks    ",
-                " again. The answer lands in the log, so ",
-                " any other client sees it.              ",
+                " i Allowed once, the next publish asks  ",
+                "   again. The answer lands in the log,  ",
+                "   so any other client sees it.         ",
                 "── 1–4 choose · tab next · esc later ───",
             ]
         );
@@ -486,8 +474,8 @@ mod tests {
                 "│   3 Always allow in this w… writes .xi/config.local.toml │",
                 "│   4 Deny                                                 │",
                 "│                                                          │",
-                "│ Allowed once, the next publish asks again. The answer    │",
-                "│ lands in the log, so any other client sees it.           │",
+                "│ i Allowed once, the next publish asks again. The answer  │",
+                "│   lands in the log, so any other client sees it.         │",
                 "╰─ 1–4 choose · ↑↓ move · tab next ask · esc later ────────╯",
             ]
         );
@@ -503,8 +491,8 @@ mod tests {
                 "│   3 Always allow in this workspace                          writes .xi/config.local.toml │",
                 "│   4 Deny                                                                                 │",
                 "│                                                                                          │",
-                "│ Allowed once, the next publish asks again. The answer lands in the log, so any other     │",
-                "│ client sees it.                                                                          │",
+                "│ i Allowed once, the next publish asks again. The answer lands in the log, so any other   │",
+                "│   client sees it.                                                                        │",
                 "╰─ 1–4 choose · ↑↓ move · tab next ask · esc later ────────────────────────────────────────╯",
             ]
         );
@@ -517,8 +505,8 @@ mod tests {
         assert_eq!(
             wide[9],
             format!(
-                "│ Allowed once, the next publish asks again. The answer lands in the log, so any other client sees it.{} │",
-                " ".repeat(36)
+                "│ i Allowed once, the next publish asks again. The answer lands in the log, so any other client sees it.{} │",
+                " ".repeat(34)
             )
         );
         assert_eq!(

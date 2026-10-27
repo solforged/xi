@@ -12,8 +12,9 @@ use std::path::Path;
 use xi_protocol::event::StopReason;
 use xi_protocol::{Block, Event, EventKind, SessionId, Timestamp, ToolCallId};
 
+use crate::callout::markdown;
 use crate::layout::Measure;
-use crate::style::{Line, Role, inline, lr, prose};
+use crate::style::{Line, Role, inline, lr};
 use crate::transcript::{
     Detail, RESULT_LINES, SPINNER, Totals, blocks_text, clock, counted, duration, headline_arg,
     more_lines,
@@ -183,7 +184,7 @@ impl Child {
             ))
             .truncate(cols),
         ];
-        let rows = prose(
+        let rows = markdown(
             text.trim(),
             m.prose,
             if error { Role::Sanguine } else { Role::Ink },

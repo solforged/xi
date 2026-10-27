@@ -246,7 +246,7 @@ impl App {
                 if let Some(session) = self.deck_sessions().into_iter().nth(at)
                     && let Err(error) = self.resume(session).await
                 {
-                    self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                    self.notice(crate::callout::Kind::Error, error.to_string());
                 }
             }
             (Focus::Log, KeyCode::Up) => {

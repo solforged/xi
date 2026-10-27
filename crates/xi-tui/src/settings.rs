@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Value, json};
 use xi_protocol::methods::client::{Setting, SettingLayer, SettingsReport};
 
+use crate::callout::Kind;
 use crate::editor::Editor;
 use crate::frame::{Body, Cursor, Frame, Hint, Note, Tone};
 use crate::keys::{Action as Key, Keymap};
@@ -174,7 +175,7 @@ pub struct Settings {
     /// The latest effective settings and config file locations.
     pub report: SettingsReport,
     selected: usize,
-    note: Option<String>,
+    note: Option<(Kind, String)>,
     input: Option<NumberInput>,
 }
 
@@ -197,15 +198,16 @@ impl Settings {
         self.note = None;
     }
 
-    /// Shows a result or error below the header.
-    pub fn note(&mut self, note: impl Into<String>) {
-        self.note = Some(note.into());
+    /// Shows a result or error below the list.
+    pub fn note(&mut self, kind: Kind, note: impl Into<String>) {
+        self.note = Some((kind, note.into()));
     }
 
     /// Completes a successful global edit.
     pub fn saved(&mut self, report: SettingsReport) {
         self.replace(report);
         self.note(
+            Kind::Done,
             "Saved to the global config. Running sessions keep the settings they started with.",
         );
     }
@@ -254,7 +256,7 @@ impl Settings {
                     KeyCode::Char('u') => {
                         input.switch_unit(context_window(ctx));
                         self.note = input.editor.text().is_empty().then(|| {
-                            "Cannot preserve this threshold in the other unit; enter a new value before saving.".into()
+                            (Kind::Warn, "Cannot preserve this threshold in the other unit; enter a new value before saving.".into())
                         });
                         return Action::None;
                     }
@@ -276,7 +278,7 @@ impl Settings {
                     let number = match input.number() {
                         Ok(number) => number,
                         Err(message) => {
-                            self.note(message);
+                            self.note(Kind::Warn, message);
                             return Action::None;
                         }
                     };
@@ -362,7 +364,7 @@ impl Settings {
                         if tools.iter().any(|value| value.as_str() == Some(tool)) {
                             tools.retain(|value| value.as_str() != Some(tool));
                             if tools.is_empty() {
-                                self.note("cannot remove the last tool");
+                                self.note(Kind::Warn, "cannot remove the last tool");
                                 return Action::None;
                             }
                         } else {
@@ -627,17 +629,21 @@ impl Settings {
         }
         let note = self.note.clone().or_else(|| {
             if ROWS[self.selected] == Row::Sandbox {
-                Some("Off gives tool commands unrestricted host file and network access. Extensions stay sandboxed.".into())
+                Some((Kind::Warn, "Off gives tool commands unrestricted host file and network access. Extensions stay sandboxed.".into()))
             } else if ROWS[self.selected] == Row::Trigger {
-                Some("u switches units while editing; r removes the global override and uses inherited settings (default 80%).".into())
+                Some((Kind::Info, "u switches units while editing; r removes the global override and uses inherited settings (default 80%).".into()))
             } else {
-                (!self.report.warnings.is_empty()).then(|| self.report.warnings.join(" · "))
+                (!self.report.warnings.is_empty())
+                    .then(|| (Kind::Warn, self.report.warnings.join(" · ")))
             }
         });
         Body {
             list,
             selected: Some(selected),
-            foot: note.into_iter().map(Note::new).collect(),
+            foot: note
+                .into_iter()
+                .map(|(kind, text)| Note::new(kind, text))
+                .collect(),
             cursor,
             ..Body::default()
         }

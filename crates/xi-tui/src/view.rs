@@ -119,11 +119,13 @@ impl App {
             );
         }
         if replayed > 0 {
-            let note = self.transcript.note(vec![Line::default().dim(format!(
-                "  resumed · {replayed} events · {}",
-                home(&self.launch.attached.info.path)
-            ))]);
-            self.commit_lines(note);
+            self.notice(
+                crate::callout::Kind::Info,
+                Line::default().ink("resumed").dim(format!(
+                    " · {replayed} events · {}",
+                    home(&self.launch.attached.info.path)
+                )),
+            );
         }
         if !self.transcript.asks().is_empty() {
             self.open_own_approvals();
