@@ -30,10 +30,17 @@ use crate::{App, lineage};
 const REFRESH: Duration = Duration::from_secs(5);
 
 /// What the deck's header carries beside the title.
-const HEADER: [&str; 5] = ["model", "reasoning", "children", "taint", "approvals"];
+const HEADER: [&str; 6] = [
+    "model",
+    "reasoning",
+    "children",
+    "taint",
+    "waiting",
+    "facts",
+];
 
 /// What the header adds when the side panel, which shows it, is folded.
-const STATUS: [&str; 3] = ["context", "cache", "sandbox"];
+const STATUS: [&str; 2] = ["context", "cache"];
 
 /// The deck's state while the client owns the screen.
 #[derive(Default)]
@@ -342,12 +349,13 @@ impl App {
                     running => icons.label(Icon::Agents, Line::default().ink(running.to_string())),
                 },
                 "taint" if self.transcript.tainted => Line::default().murex("◆ tainted"),
-                "approvals" => match self.waiting() {
+                "waiting" => match self.waiting() {
                     0 => continue,
                     asks => Line::default()
                         .brass(icons.tag(Icon::Waiting, &asks.to_string()))
                         .dim(" · tab"),
                 },
+                "facts" => self.facts(),
                 "context" => {
                     let window = info.model_info.as_ref().map_or(0, |m| m.context_window);
                     let used = if window > 0 {
@@ -368,16 +376,63 @@ impl App {
                     };
                     icons.label(Icon::Cache, Line::default().ink(cache))
                 }
-                "sandbox" if info.sandbox_enabled => {
-                    icons.label(Icon::Sandbox, Line::default().dim("sandbox"))
-                }
-                "sandbox" => Line::default().brass(icons.tag(Icon::SandboxOff, "sandbox off")),
                 _ => continue,
             };
+            if segment.0.is_empty() {
+                continue;
+            }
             if !line.0.is_empty() {
                 line = line.dim(" · ");
             }
             line = line.extend(segment);
+        }
+        line
+    }
+
+    /// The approval mode, sandbox and trust as bare icons, with words in
+    /// brass only for what differs from the usual: approvals other than
+    /// `ask`, the sandbox off, an untrusted workspace. In Unicode the usual
+    /// states are left out but the sandbox's `◇`.
+    fn facts(&self) -> Line {
+        let icons = self.icons;
+        let info = &self.launch.attached.info;
+        let mode = self
+            .deck
+            .as_ref()
+            .and_then(|deck| deck.settings.as_ref())
+            .and_then(|report| report.settings.iter().find(|s| s.key == "approvals"))
+            .and_then(|setting| setting.value.as_str().map(str::to_owned));
+        let facts = [
+            match mode.as_deref() {
+                None | Some("ask") => (Icon::Approvals, None),
+                Some(mode) => (Icon::Approvals, Some(format!("approvals {mode}"))),
+            },
+            if info.sandbox_enabled {
+                (Icon::Sandbox, None)
+            } else {
+                (Icon::SandboxOff, Some("sandbox off".to_owned()))
+            },
+            if info.trusted {
+                (Icon::Trusted, None)
+            } else {
+                (Icon::Untrusted, Some("untrusted".to_owned()))
+            },
+        ];
+        let mut line = Line::default();
+        for (icon, unusual) in facts {
+            let fact = match (icons, unusual) {
+                (Icons::Nerd, None) => Line::default().dim(icons.get(icon)),
+                (Icons::Nerd, Some(word)) => {
+                    Line::default().brass(format!("{} {word}", icons.get(icon)))
+                }
+                (Icons::Unicode, None) if icon == Icon::Sandbox => Line::default().dim("◇"),
+                (Icons::Unicode, None) => continue,
+                (Icons::Unicode, Some(word)) => Line::default().brass(word),
+            };
+            if !line.0.is_empty() {
+                line = line.ink(" ");
+            }
+            line = line.extend(fact);
         }
         line
     }
@@ -522,8 +577,6 @@ impl App {
             used: self.transcript.context,
             window,
             cache_percent: (session.sent() > 0).then(|| session.cache_read * 100 / session.sent()),
-            sent: session.sent(),
-            output: session.output,
         };
         let changed = self
             .transcript
@@ -531,38 +584,6 @@ impl App {
             .iter()
             .map(|file| (file.path.clone(), file.added, file.removed))
             .collect();
-        let mut facts = Vec::new();
-        if let Some(report) = &deck.settings {
-            let value = |key: &str| {
-                report
-                    .settings
-                    .iter()
-                    .find(|setting| setting.key == key)
-                    .map(|setting| setting.value.clone())
-            };
-            if let Some(mode) = value("approvals").and_then(|v| v.as_str().map(str::to_owned)) {
-                facts.push(icons.tag(Icon::Approvals, &mode));
-            }
-            if let Some(count) = value("tools").and_then(|v| v.as_array().map(Vec::len)) {
-                facts.push(icons.tag(Icon::Tools, &count.to_string()));
-            }
-        }
-        facts.insert(
-            facts.len().min(1),
-            if info.sandbox_enabled {
-                icons.tag(Icon::Sandbox, "sandbox")
-            } else {
-                icons.tag(Icon::SandboxOff, "sandbox off")
-            },
-        );
-        facts.insert(
-            facts.len().min(2),
-            if info.trusted {
-                icons.tag(Icon::Trusted, "trusted")
-            } else {
-                icons.tag(Icon::Untrusted, "untrusted")
-            },
-        );
         let panel = Panel {
             inspect: deck.log.selected(),
             scrolled: deck.inspector,
@@ -570,7 +591,6 @@ impl App {
             changed,
             sessions,
             context,
-            facts: facts.join(" · "),
             icons,
         };
         Scene {

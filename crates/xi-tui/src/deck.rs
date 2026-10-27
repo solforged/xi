@@ -100,7 +100,7 @@ pub struct LogPane<'a> {
     pub cursor: Option<(usize, usize)>,
 }
 
-/// Context occupancy and cumulative token traffic.
+/// Context occupancy and the cache hit rate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContextGauge {
     /// Tokens in the current context.
@@ -109,10 +109,6 @@ pub struct ContextGauge {
     pub window: u64,
     /// The cache percentage, when known.
     pub cache_percent: Option<u64>,
-    /// Tokens sent to the model.
-    pub sent: u64,
-    /// Tokens produced by the model.
-    pub output: u64,
 }
 
 /// What the side panel can show.
@@ -127,10 +123,8 @@ pub struct Panel<'a> {
     pub changed: Vec<(String, usize, usize)>,
     /// Every session, for the live view's active ones and the full list.
     pub sessions: SessionsPane,
-    /// Context occupancy and traffic.
+    /// Context occupancy and cache.
     pub context: ContextGauge,
-    /// Approval mode, sandbox, trust and tool count.
-    pub facts: String,
     /// Which glyphs label the panel.
     pub icons: Icons,
 }
@@ -296,32 +290,29 @@ fn log_rows(
     (lines, cursor)
 }
 
-/// Exactly `height` panel rows: the focused view, then its keys.
+/// Exactly `height` panel rows: the focused view, then its keys while a
+/// pane has them.
 fn panel_rows(scene: &Scene<'_>, width: usize, height: usize) -> Vec<Line> {
+    let icons = scene.panel.icons;
+    let keys = match scene.focus {
+        Focus::Composer => {
+            return live_view(&scene.panel, width, height)
+                .into_iter()
+                .map(|line| line.truncate(width))
+                .collect();
+        }
+        Focus::Log => "↑↓ select · enter prints · pgup pgdn · esc back",
+        Focus::Inspector => "↑↓ scroll · alt+2 log · esc back",
+        Focus::Sessions => "↑↓ move · enter resumes · esc back",
+    };
     let Some(body) = height.checked_sub(1) else {
         return Vec::new();
     };
-    let icons = scene.panel.icons;
-    let keys = match (scene.focus, icons) {
-        (Focus::Composer, Icons::Nerd) => Line::default()
-            .extend(icons.label(Icon::Sessions, Line::default().dim("alt+1")))
-            .dim("  ")
-            .extend(icons.label(Icon::Log, Line::default().dim("alt+2")))
-            .dim("  ")
-            .extend(icons.label(Icon::Inspector, Line::default().dim("alt+3"))),
-        (Focus::Composer, Icons::Unicode) => {
-            Line::default().dim("alt+1 sessions · alt+2 log · alt+3 inspector")
-        }
-        (Focus::Log, _) => Line::default().dim("↑↓ select · enter prints · pgup pgdn · esc back"),
-        (Focus::Inspector, _) => Line::default().dim("↑↓ scroll · alt+2 log · esc back"),
-        (Focus::Sessions, _) => Line::default().dim("↑↓ move · enter resumes · esc back"),
-    };
     let mut lines = match scene.focus {
-        Focus::Composer => live_view(&scene.panel, width, body),
-        Focus::Log | Focus::Inspector => inspector_view(&scene.panel, width, body),
         Focus::Sessions => sessions_view(&scene.panel.sessions, icons, width, body),
+        _ => inspector_view(&scene.panel, width, body),
     };
-    lines.push(keys);
+    lines.push(Line::default().dim(keys));
     lines.into_iter().map(|line| line.truncate(width)).collect()
 }
 
@@ -373,8 +364,8 @@ fn elide_left(text: &str, cols: usize) -> String {
     out
 }
 
-/// What waits on you and what changed, with the context gauge and the
-/// session's facts against the bottom.
+/// What waits on you and what changed, with the context gauge against the
+/// bottom.
 fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
     let icons = panel.icons;
     let w = width.min(LIVE_MAX);
@@ -484,7 +475,7 @@ fn live_view(panel: &Panel<'_>, width: usize, height: usize) -> Vec<Line> {
                 .truncate(w),
         );
     }
-    let bottom = gauge(panel, w);
+    let bottom = vec![gauge(panel, w)];
     let room = height.saturating_sub(bottom.len() + 1);
     if top.len() > room {
         top.truncate(room.saturating_sub(1));
@@ -540,50 +531,39 @@ fn headline(inspect: &Inspect, icons: Icons) -> String {
     }
 }
 
-/// Context occupancy, traffic and the session's facts.
-fn gauge(panel: &Panel<'_>, w: usize) -> Vec<Line> {
+/// Context occupancy as a line, with the cache hit rate at its right.
+fn gauge(panel: &Panel<'_>, w: usize) -> Line {
     let icons = panel.icons;
     let context = panel.context;
-    let mut lines = Vec::new();
-    if context.window > 0 {
-        // The footer truncates; the gauge agrees with it.
-        let percent = u128::from(context.used) * 100 / u128::from(context.window);
-        let label = icons.label(Icon::Context, Line::default().ink(format!("{percent}%")));
-        let of = format!("{} of {}", tokens(context.used), tokens(context.window));
-        let bar = w.saturating_sub(label.width() + 2 + 2 + of.chars().count());
-        let filled = usize::try_from((percent * bar as u128 / 100).min(bar as u128)).unwrap_or(bar);
-        lines.push(
-            label
-                .ink("  ")
-                .brass("━".repeat(filled))
-                .dim("━".repeat(bar - filled))
-                .dim(format!("  {of}")),
-        );
-    } else {
-        lines.push(
-            icons
-                .label(Icon::Context, Line::default().ink("unknown"))
-                .dim(format!(" · {} used", tokens(context.used))),
-        );
-    }
-    let mut traffic = Line::default();
+    let mut tail = Line::default();
     if let Some(percent) = context.cache_percent {
-        traffic = icons
-            .label(Icon::Cache, Line::default().ink(format!("{percent}%")))
-            .dim(" · ");
+        tail = Line::default()
+            .dim(" · ")
+            .extend(icons.label(Icon::Cache, Line::default().ink(format!("{percent}%"))));
     }
-    lines.push(
-        traffic
-            .extend(icons.label(Icon::Sent, Line::default().ink(tokens(context.sent))))
-            .ink(" ")
-            .extend(icons.label(Icon::Received, Line::default().ink(tokens(context.output)))),
-    );
-    lines.extend(
-        wrap(&panel.facts, w.max(1))
-            .into_iter()
-            .map(|text| Line::default().dim(text)),
-    );
-    lines
+    if context.window == 0 {
+        return icons
+            .label(Icon::Context, Line::default().ink("unknown"))
+            .dim(format!(" · {} used", tokens(context.used)))
+            .extend(tail);
+    }
+    // The footer truncates; the gauge agrees with it.
+    let percent = u128::from(context.used) * 100 / u128::from(context.window);
+    let label = icons.label(Icon::Context, Line::default().ink(format!("{percent}%")));
+    let of = Line::default()
+        .dim(format!(
+            "  {} of {}",
+            tokens(context.used),
+            tokens(context.window)
+        ))
+        .extend(tail);
+    let bar = w.saturating_sub(label.width() + 2 + of.width());
+    let filled = usize::try_from((percent * bar as u128 / 100).min(bar as u128)).unwrap_or(bar);
+    label
+        .ink("  ")
+        .brass("━".repeat(filled))
+        .dim("━".repeat(bar - filled))
+        .extend(of)
 }
 
 /// The selected row: its headline fixed at the top, its whole text below,
@@ -816,10 +796,7 @@ mod tests {
                         used: 29_800,
                         window: 272_000,
                         cache_percent: Some(94),
-                        sent: 2_300_000,
-                        output: 5_500,
                     },
-                    facts: "approvals ask · ◇ sandbox · trusted · 9 tools".into(),
                     icons: Icons::Unicode,
                 },
                 focus: Focus::Composer,
@@ -905,12 +882,15 @@ mod tests {
                 .expect("the newest row fills the spare rows");
             assert!(side[latest].ends_with("+22 −16"));
             assert_eq!(side[latest + 1].trim_end(), "-     let mut command = spec");
-            assert!(side[31].starts_with("ctx 10%  ━"));
-            assert!(side[31].ends_with("29.8k of 272.0k"));
-            assert!(side[31].chars().count() <= LIVE_MAX);
-            assert_eq!(side[32], "cache 94% · ↑ 2.3M ↓ 5.5k");
-            assert_eq!(side[33], "approvals ask · ◇ sandbox · trusted · 9 tools");
-            assert_eq!(side[34], "alt+1 sessions · alt+2 log · alt+3 inspector");
+            // One strip: the gauge, its count and the cache, with no keys
+            // row while the composer has them.
+            assert!(side[34].starts_with("ctx 10%  ━"));
+            assert!(side[34].ends_with("29.8k of 272.0k · cache 94%"));
+            assert!(side[34].chars().count() <= LIVE_MAX);
+            assert!(
+                side.iter()
+                    .all(|line| !line.contains("alt+2") && !line.contains("approvals"))
+            );
         }
     }
 
@@ -975,8 +955,8 @@ mod tests {
             text.iter()
                 .any(|line| line.starts_with("\u{f448} ×5 crates/xi-tools"))
         );
-        assert!(text[27].starts_with("\u{f463} 10%  ━"));
-        assert_eq!(text[28], "\u{f49b} 94% · \u{f431} 2.3M \u{f433} 5.5k");
+        assert!(text[29].starts_with("\u{f463} 10%  ━"));
+        assert!(text[29].ends_with("29.8k of 272.0k · \u{f49b} 94%"));
         assert!(
             text.iter()
                 .all(|line| !line.contains("ctx") && !line.contains("cache"))
@@ -990,7 +970,8 @@ mod tests {
         );
         let (lines, _) = render(&scene, 176, 36);
         assert!(lines.iter().all(|line| line.width() <= 176));
-        assert!(plain(&lines)[35].ends_with("\u{f442} alt+1  \u{f451} alt+2  \u{f441} alt+3"));
+        scene.focus = Focus::Log;
+        assert!(plain(&render(&scene, 176, 36).0)[35].ends_with("esc back"));
     }
 
     #[test]
@@ -1002,14 +983,14 @@ mod tests {
             .join("\n");
         let scene = fixture.scene();
         // Waiting (3), Changes (3) and Sessions (3) with their gaps take 11
-        // of the 20 body rows above the gauge's gap and three rows.
+        // of the 18 rows above the gauge's gap and the gauge.
         let text = plain(&live_view(&scene.panel, 60, 20));
         assert!(text[12].starts_with("edit ×5"));
         assert_eq!(text[13], "+ row 0");
-        assert_eq!(text[15], "… 28 more lines · alt+3");
-        assert_eq!(text[16], "");
-        assert!(text[17].starts_with("ctx 10%"));
-        let text = plain(&live_view(&scene.panel, 60, 17));
+        assert_eq!(text[17], "… 26 more lines · alt+3");
+        assert_eq!(text[18], "");
+        assert!(text[19].starts_with("ctx 10%"));
+        let text = plain(&live_view(&scene.panel, 60, 15));
         assert!(!text.iter().any(|line| line.starts_with("edit ×5")));
     }
 
@@ -1046,10 +1027,9 @@ mod tests {
         let scene = fixture.scene();
         let text = plain(&live_view(&scene.panel, 60, 9));
         assert_eq!(text.len(), 9);
-        assert_eq!(text[4], "…");
-        assert_eq!(text[5], "");
-        assert!(text[6].starts_with("ctx 10%"));
-        assert_eq!(text[8], "approvals ask · ◇ sandbox · trusted · 9 tools");
+        assert_eq!(text[6], "…");
+        assert_eq!(text[7], "");
+        assert!(text[8].starts_with("ctx 10%"));
         assert_eq!(live_view(&scene.panel, 60, 2).len(), 2);
         assert!(live_view(&scene.panel, 60, 0).is_empty());
     }
