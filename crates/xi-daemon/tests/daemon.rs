@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::{Notify, mpsc, oneshot};
-use xi_client::peer::{Incoming, Peer, PeerError};
+use xi_rpc::{Incoming, Peer, PeerError};
 use xi_daemon::{Daemon, DaemonOptions, InProcessSpawner, Spawner, WorkerProcess};
 use xi_kernel::Backend;
 use xi_kernel::config::{DaemonSettings, Paths};

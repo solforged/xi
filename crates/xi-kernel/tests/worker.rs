@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
-use xi_client::peer::{Incoming, Peer, PeerError};
+use xi_rpc::{Incoming, Peer, PeerError};
 use xi_kernel::Backend;
 use xi_kernel::config::Paths;
 use xi_kernel::worker::{WorkerSetup, run};

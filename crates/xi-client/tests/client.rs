@@ -7,7 +7,7 @@ use tokio::io::{duplex, split};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use xi_client::client::{Client, ClientError, ClientNotification};
-use xi_client::peer::{Incoming, Peer, PeerError};
+use xi_rpc::{Incoming, Peer, PeerError};
 use xi_protocol::content::Block;
 use xi_protocol::event::{Event, EventKind, ModelRef, Remember};
 use xi_protocol::ids::{EventId, SessionId, Timestamp};

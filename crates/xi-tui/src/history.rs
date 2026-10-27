@@ -84,6 +84,7 @@ impl History {
                     write_entry(&mut temporary, entry)?;
                 }
                 temporary.flush()?;
+                temporary.as_file().sync_all()?;
                 temporary.persist(path).map_err(|error| error.error)?;
             }
         }

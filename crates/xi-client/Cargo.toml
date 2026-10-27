@@ -1,6 +1,6 @@
 [package]
 name = "xi-client"
-description = "Full-duplex JSON-RPC peer and typed client for the xi daemon."
+description = "Typed client and connection for the xi daemon."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 xi-protocol.workspace = true
+xi-rpc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

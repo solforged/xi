@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
-use xi_client::peer::{Incoming, Peer, PeerError};
+use xi_rpc::{Incoming, Peer, PeerError};
 use xi_kernel::config::{DaemonSettings, Paths, sessions_root};
 use xi_protocol::event::EventKind;
 use xi_protocol::methods::{client::*, worker::*};
