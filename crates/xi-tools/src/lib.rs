@@ -258,9 +258,6 @@ impl Tool for Kind {
         ctx: &'a Context,
     ) -> BoxFuture<'a, Ran> {
         Box::pin(async move {
-            if let Err(error) = self.crossings(&input, ctx) {
-                return output::text(call, error, true, ctx);
-            }
             if matches!(self, Self::Bash | Self::Fetch) {
                 let ran = if matches!(self, Self::Bash) {
                     bash::run(call, &input, ctx).await

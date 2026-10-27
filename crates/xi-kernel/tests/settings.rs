@@ -1081,7 +1081,13 @@ fn global_sets_keep_existing_file_permissions() {
 fn sandbox_git_ignores_worktrees_under_xi() {
     let fixture = Fixture::new();
     let git = fixture.paths.state.join("git");
-    xi_kernel::config::write_sandbox_git(&git, &fixture.paths, false).unwrap();
+    xi_kernel::sandbox::write_sandbox_git(
+        &git,
+        &fixture.paths,
+        false,
+        &xi_kernel::sandbox::probe_host(),
+    )
+    .unwrap();
     let ignore = std::fs::read_to_string(git.join("ignore")).unwrap();
     assert!(
         ignore.ends_with("\n/.xi/worktrees/\n") || ignore == "/.xi/worktrees/\n",

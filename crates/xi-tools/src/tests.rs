@@ -89,6 +89,67 @@ fn anchor(line: usize, content: &str) -> String {
     )
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn file_changes_preserve_mode_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::with_anchors();
+    for tool in ["edit", "write", "hashline"] {
+        f.put("executable", "old\n");
+        let path = f.ctx.workspace.join("executable");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+        let input = match tool {
+            "edit" => json!({"path":"executable","old":"old","new":"new"}),
+            "write" => json!({"path":"executable","content":"new\n"}),
+            "hashline" => json!({
+                "path":"executable",
+                "edits":[{"start":anchor(1, "old"),"lines":["new"]}]
+            }),
+            _ => unreachable!(),
+        };
+        let ran = f.run(tool, input).await;
+        assert!(!ran.output.is_error, "{}", text(&ran));
+        assert_eq!(f.get("executable"), "new\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o751
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_search_and_bash_return_error_results() {
+    let f = Fixture::new();
+    f.ctx.cancel.cancel();
+    for (tool, input) in [
+        ("search", json!({"glob":"*"})),
+        ("bash", json!({"command":"exit 0"})),
+    ] {
+        let ran = f.run(tool, input).await;
+        assert!(ran.output.is_error);
+        assert_eq!(text(&ran), "[cancelled]");
+    }
+}
+
+#[tokio::test]
+async fn direct_execution_validates_input_without_policy_preflight() {
+    let f = Fixture::with_anchors();
+    for (tool, input) in [
+        ("read", json!({"path":"text","offset":0})),
+        ("edit", json!({"path":"text","old":"","new":"bad"})),
+        ("write", json!({"path":"text"})),
+        ("hashline", json!({"path":"text","edits":[]})),
+        ("search", json!({"glob":"*","limit":0})),
+        ("bash", json!({"command":"exit 0","timeout":0})),
+        ("fetch", json!({"url":"not a URL"})),
+    ] {
+        let ran = f.run(tool, input).await;
+        assert!(ran.output.is_error, "{tool}: {}", text(&ran));
+    }
+    assert!(!f.ctx.workspace.join("text").exists());
+}
+
 #[test]
 fn tool_names_and_schemas_use_exact_edit_by_default() {
     let tools = crate::builtin();
@@ -620,7 +681,8 @@ mod shell {
 
     async fn wait_for_file(path: &std::path::Path) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !path.exists() {
+            // Redirection creates the file before echo writes the child PID.
+            while !fs::read_to_string(path).is_ok_and(|text| text.ends_with('\n')) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
