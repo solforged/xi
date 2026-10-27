@@ -54,11 +54,7 @@ pub(crate) fn enter_and_exec(
     // A new session detaches the controlling terminal, which closes the
     // TIOCSTI route for pushing input into the user's shell.
     setsid().map_err(setup("setsid"))?;
-    for path in &spec.protected {
-        if !path.exists() {
-            fs::create_dir_all(path).map_err(setup(format!("create {}", path.display())))?;
-        }
-    }
+    spec.create_guarded()?;
 
     let uid = getuid();
     let gid = getgid();
@@ -121,6 +117,7 @@ pub(crate) fn enter_and_exec(
         rules.extend(open_rule(Path::new(SHM), AccessFs::from_all(abi), true)?);
     }
 
+    bind_nested_writable(spec)?;
     pin_protected_ancestors(spec)?;
     for path in &spec.protected {
         bind_read_only(path)?;
@@ -290,6 +287,26 @@ fn open_rule(
         access & AccessFs::from_file(ABI_TARGET)
     };
     Ok(Some((file, access)))
+}
+
+/// Binds writable roots inside protected paths onto themselves. The later
+/// read-only remount of a protected path covers only its own mount, so
+/// these submounts stay writable and, as mount points, cannot be renamed.
+fn bind_nested_writable(spec: &Spec) -> Result<(), Error> {
+    for path in spec.nested_writable() {
+        mount(
+            Some(path.as_path()),
+            path,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(setup(format!(
+            "bind nested writable root {}",
+            path.display()
+        )))?;
+    }
+    Ok(())
 }
 
 /// Mount points cannot be renamed or unlinked. Pin the writable ancestors

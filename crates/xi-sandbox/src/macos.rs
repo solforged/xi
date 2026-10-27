@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
-use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -43,11 +42,7 @@ pub(crate) fn enter_and_exec(
 ) -> Result<Infallible, Error> {
     access(SANDBOX_EXEC, AccessFlags::X_OK).map_err(setup("locate /usr/bin/sandbox-exec"))?;
     setsid().map_err(setup("setsid"))?;
-    for path in &spec.protected {
-        if !path.exists() {
-            fs::create_dir_all(path).map_err(setup(format!("create {}", path.display())))?;
-        }
-    }
+    spec.create_guarded()?;
     let helper = std::env::current_exe().map_err(setup("locate sandbox helper"))?;
     let profile = profile(spec, &helper)?;
     let target = resolve_program(program).map_err(|source| Error::Exec {
@@ -212,6 +207,18 @@ fn profile(spec: &Spec, helper: &Path) -> Result<String, Error> {
             pinned.extend(path.ancestors().skip(1).map(Path::to_owned));
         }
     }
+    // Later rules win, so writable roots inside a protected path are allowed
+    // again here. They are pinned like mount points on Linux.
+    for path in spec.nested_writable() {
+        let canonical = canonicalize(path)?;
+        writeln!(
+            policy,
+            "(allow file-write* (subpath {}))",
+            quote(&canonical)?
+        )
+        .unwrap();
+        pinned.insert(canonical);
+    }
     for path in pinned {
         writeln!(
             policy,
@@ -291,5 +298,28 @@ mod tests {
         )));
         assert!(!policy.contains(&format!("(subpath {socket})")));
         assert!(!policy.contains(&format!("(local unix-socket (literal {socket}))")));
+    }
+
+    #[test]
+    fn nested_writable_roots_are_allowed_after_the_protected_denies() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap().join("workspace");
+        let tmp = root.path().canonicalize().unwrap().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let spec = Spec::new(&workspace, &tmp);
+        spec.create_guarded().unwrap();
+        let policy = profile(&spec, Path::new("/helper")).unwrap();
+        let xi = quote(&workspace.join(".xi")).unwrap();
+        let worktrees = quote(&workspace.join(crate::WORKTREES)).unwrap();
+        let deny = policy
+            .find(&format!("(deny file-write* (subpath {xi}))"))
+            .unwrap();
+        let allow = policy
+            .rfind(&format!("(allow file-write* (subpath {worktrees}))"))
+            .unwrap();
+        let pin = policy
+            .find(&format!("(deny file-write-unlink (literal {worktrees}))"))
+            .unwrap();
+        assert!(deny < allow && allow < pin, "{policy}");
     }
 }

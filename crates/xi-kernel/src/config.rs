@@ -891,25 +891,49 @@ fn approval_rules(config: &Config) -> Vec<RuleSpec> {
             (config.workspace.join(".git/hooks"), true),
             (config.workspace.join(".xi"), true),
         ] {
-            ask_path(&mut rules, ActionKind::Write, &path, descendants);
+            path_rules(
+                &mut rules,
+                Decision::Ask,
+                ActionKind::Write,
+                &path,
+                descendants,
+            );
         }
+        // The sandbox keeps the worktree directory writable inside `.xi`.
+        path_rules(
+            &mut rules,
+            Decision::Allow,
+            ActionKind::Write,
+            &config.workspace.join(xi_sandbox::WORKTREES),
+            true,
+        );
     }
     rules
 }
 
 fn ask_path(rules: &mut Vec<RuleSpec>, action: ActionKind, path: &Path, descendants: bool) {
+    path_rules(rules, Decision::Ask, action, path, descendants);
+}
+
+fn path_rules(
+    rules: &mut Vec<RuleSpec>,
+    effect: Decision,
+    action: ActionKind,
+    path: &Path,
+    descendants: bool,
+) {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
     let pattern = globset::escape(&path.to_string_lossy()).replace('\\', "\\\\");
     if descendants {
         rules.push(RuleSpec {
-            effect: Decision::Ask,
+            effect,
             action,
             pattern: format!("{}/**", pattern.trim_end_matches('/')),
             when: Condition::Always,
         });
     }
     rules.push(RuleSpec {
-        effect: Decision::Ask,
+        effect,
         action,
         pattern,
         when: Condition::Always,
@@ -1043,10 +1067,14 @@ fn write_sandbox_git_with(
                 .join("git/ignore")
         });
     let ignore = dir.join("ignore");
-    match std::fs::read(&excludes) {
-        Ok(patterns) => std::fs::write(&ignore, patterns)?,
-        Err(_) => std::fs::write(&ignore, "")?,
+    let mut patterns = std::fs::read(&excludes).unwrap_or_default();
+    // Worktrees made inside the sandbox are nested checkouts; keep them out
+    // of the outer repository's status and `git add -A`.
+    if !patterns.is_empty() && !patterns.ends_with(b"\n") {
+        patterns.push(b'\n');
     }
+    patterns.extend_from_slice(format!("/{}/\n", xi_sandbox::WORKTREES).as_bytes());
+    std::fs::write(&ignore, patterns)?;
     text.push_str(&format!(
         "[core]\n\texcludesFile = {}\n",
         quote(&ignore.to_string_lossy())
