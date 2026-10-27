@@ -6,6 +6,7 @@ use xi_protocol::Timestamp;
 use xi_protocol::methods::client::EventParams;
 use xi_protocol::model::Reasoning;
 
+use crate::frame;
 use crate::screen::Screen;
 use crate::status::{Segment, fit};
 use crate::style::{Line, Role, lr};
@@ -233,26 +234,7 @@ impl App {
     pub(crate) fn live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
         let cols = self.cols;
         let mut lines = self.transcript.live(cols, self.frame);
-        if self.focus == Focus::Approval
-            && let Some(approvals) = &self.approvals
-        {
-            if !lines.is_empty() {
-                lines.push(Line::default());
-            }
-            lines.extend(approvals.render(cols, self.session_id()));
-        }
-        if self.focus == Focus::Tree
-            && let Some(tree) = &self.tree
-        {
-            if !lines.is_empty() {
-                lines.push(Line::default());
-            }
-            let composer = self.editor.render(cols, Role::Dim, "").0.len();
-            let rows = self
-                .rows
-                .saturating_sub(composer + 3 + usize::from(!self.images.is_empty()));
-            lines.extend(tree.render(cols, rows, Timestamp::now()));
-        }
+        let transcript_rows = lines.len();
         if self.running() {
             if !lines.is_empty() {
                 lines.push(Line::default());
@@ -296,10 +278,45 @@ impl App {
                 cols,
             ));
         }
+        let border = if self.focus != Focus::Composer {
+            Role::Dim
+        } else if self.transcript.tainted {
+            Role::Murex
+        } else {
+            Role::Brass
+        };
+        let hint = if self.running() {
+            "enter steers · alt+enter queues · esc stops"
+        } else {
+            "enter sends · ctrl+j new line · /help"
+        };
+        let (composer, (row, col)) = self.editor.render(cols, border, hint);
         let attachment_rows = usize::from(!self.images.is_empty());
-        let overlay_rows = self
-            .rows
-            .saturating_sub(self.editor.render(cols, Role::Dim, "").0.len() + 3 + attachment_rows);
+        // The frame gets what is left after the composer, the status line
+        // and the turn's own rows; streamed rows above it scroll off first.
+        let reserved = composer.len() + 1 + attachment_rows + lines.len() - transcript_rows;
+        let overlay_rows = self.rows.saturating_sub(1 + reserved);
+        let mut overlay_cursor = None;
+        let framed = match self.focus {
+            Focus::Approval => self.approvals.as_ref().map(|approvals| {
+                (
+                    approvals.frame(&self.keymap),
+                    approvals.body(frame::inner(cols), self.session_id()),
+                )
+            }),
+            Focus::Tree => self.tree.as_ref().map(|tree| {
+                (
+                    tree.frame(&self.keymap),
+                    tree.body(frame::inner(cols), Timestamp::now()),
+                )
+            }),
+            _ => None,
+        };
+        if let Some((framed, body)) = framed {
+            let (rows, cursor) = frame::draw(&framed, body, cols, overlay_rows.max(4));
+            overlay_cursor = cursor.map(|(row, col)| (lines.len() + row, col));
+            lines.extend(rows);
+        }
         if self.focus == Focus::Models
             && let Some(picker) = &self.picker
         {
@@ -310,14 +327,13 @@ impl App {
         {
             lines.extend(sessions.render(cols, overlay_rows, Timestamp::now()));
         }
-        let mut overlay_cursor = None;
         if self.focus == Focus::Settings
             && let Some(settings) = &self.settings
         {
             let info = &self.launch.attached.info;
             let (overlay, cursor) = settings.render(
                 cols,
-                overlay_rows.saturating_sub(lines.len()),
+                overlay_rows,
                 &info.model,
                 info.reasoning,
                 self.transcript.thinking_display(),
@@ -341,18 +357,6 @@ impl App {
         {
             lines.extend(menu.render(cols, overlay_rows.min(8)));
         }
-        let border = if self.focus != Focus::Composer {
-            Role::Dim
-        } else if self.transcript.tainted {
-            Role::Murex
-        } else {
-            Role::Brass
-        };
-        let hint = if self.running() {
-            "enter steers · alt+enter queues · esc stops"
-        } else {
-            "enter sends · ctrl+j new line · /help"
-        };
         if !self.images.is_empty() {
             let count = self.images.len();
             let noun = if count == 1 { "image" } else { "images" };
@@ -362,7 +366,6 @@ impl App {
                     .truncate(cols),
             );
         }
-        let (composer, (row, col)) = self.editor.render(cols, border, hint);
         let top = lines.len();
         lines.extend(composer);
         lines.push(self.footer(cols));

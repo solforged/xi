@@ -1369,7 +1369,8 @@ async fn taint_approval_hides_persistent_scopes_without_renumbering_deny() {
     let overlay = live_text(&app);
     assert!(overlay.contains("1 Allow once"));
     assert!(overlay.contains("4 Deny"));
-    assert!(overlay.contains("tainted branch: only once or deny"));
+    assert!(overlay.contains("◆ ? approval · bash"), "{overlay}");
+    assert!(overlay.contains("session and workspace grants are not offered"));
     assert!(!overlay.contains("2 Allow for this session"));
     assert!(!overlay.contains("3 Always allow"));
     for c in ['2', '3'] {

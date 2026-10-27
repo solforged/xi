@@ -116,20 +116,21 @@ impl App {
     }
 
     async fn tree_key(&mut self, key: KeyEvent) {
+        let action = self.keymap.action(key);
         let Some(tree) = self.tree.as_mut() else {
             self.focus = Focus::Composer;
             return;
         };
         let page = isize::try_from(self.rows / 2).unwrap_or(1).max(1);
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => tree.step(-1),
-            KeyCode::Down | KeyCode::Char('j') => tree.step(1),
-            KeyCode::PageUp => tree.step(-page),
-            KeyCode::PageDown => tree.step(page),
-            KeyCode::Home => tree.jump(false),
-            KeyCode::End => tree.jump(true),
-            KeyCode::Enter => self.checkout().await,
-            KeyCode::Esc | KeyCode::Char('q') => self.close_tree(),
+        match (action, key.code) {
+            (Some(Action::Up), _) | (_, KeyCode::Char('k')) => tree.step(-1),
+            (Some(Action::Down), _) | (_, KeyCode::Char('j')) => tree.step(1),
+            (Some(Action::Send), _) => self.checkout().await,
+            (Some(Action::Escape), _) | (_, KeyCode::Char('q')) => self.close_tree(),
+            (_, KeyCode::PageUp) => tree.step(-page),
+            (_, KeyCode::PageDown) => tree.step(page),
+            (_, KeyCode::Home) => tree.jump(false),
+            (_, KeyCode::End) => tree.jump(true),
             _ => {}
         }
     }
@@ -251,8 +252,27 @@ impl App {
                 return Ok(());
             }
             Focus::Approval => {
-                let choice = match key.code {
-                    KeyCode::Char(c)
+                let choice = match (action, key.code) {
+                    (Some(Action::Send), _) => {
+                        self.approvals.as_ref().and_then(Approvals::selected)
+                    }
+                    (Some(direction @ (Action::Up | Action::Down)), _) => {
+                        if let Some(approvals) = self.approvals.as_mut() {
+                            approvals.step(direction == Action::Down);
+                        }
+                        None
+                    }
+                    (Some(Action::Complete), _) => {
+                        if let Some(approvals) = self.approvals.as_mut() {
+                            approvals.next();
+                        }
+                        None
+                    }
+                    (Some(Action::Escape), _) => {
+                        self.close_overlay();
+                        None
+                    }
+                    (_, KeyCode::Char(c))
                         if !key
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -260,17 +280,6 @@ impl App {
                         self.approvals
                             .as_ref()
                             .and_then(|approvals| approvals.shortcut(c))
-                    }
-                    KeyCode::Enter => self.approvals.as_ref().and_then(Approvals::selected),
-                    KeyCode::Up | KeyCode::Down => {
-                        if let Some(approvals) = self.approvals.as_mut() {
-                            approvals.step(key.code == KeyCode::Down);
-                        }
-                        None
-                    }
-                    KeyCode::Esc | KeyCode::Tab => {
-                        self.close_overlay();
-                        None
                     }
                     _ => None,
                 };
