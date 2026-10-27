@@ -10,7 +10,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use crate::style::Line;
+use crate::style::{Line, Rgb};
 
 /// How long the width must hold still before a frame is drawn.
 const SETTLE: Duration = Duration::from_millis(150);
@@ -54,6 +54,9 @@ impl Settle {
 pub struct Screen<W: Write> {
     out: W,
     color: bool,
+    /// The deck's raised surface, when the terminal reported its
+    /// background. Inline rows never draw it: scrollback reflows them.
+    surface: Option<Rgb>,
     /// Terminal width now.
     cols: usize,
     /// Width of each live row as last drawn, for counting the rows it takes
@@ -71,6 +74,7 @@ impl<W: Write> Screen<W> {
         Self {
             out,
             color,
+            surface: None,
             cols: cols.max(1),
             widths: Vec::new(),
             cursor: (0, 0),
@@ -87,6 +91,11 @@ impl<W: Write> Screen<W> {
     /// Clears the display and native scrollback in the next synchronized frame.
     pub fn clear(&mut self) {
         self.clear = true;
+    }
+
+    /// Sets the colour the deck draws raised spans on.
+    pub fn set_surface(&mut self, surface: Option<Rgb>) {
+        self.surface = surface;
     }
 
     /// Writes a terminal control sequence before the next frame flushes it.
@@ -132,10 +141,10 @@ impl<W: Write> Screen<W> {
             }
             let width = if line.width() > self.cols {
                 let line = line.clone().truncate(self.cols);
-                line.write_ansi(&mut buf, self.color);
+                line.write_ansi(&mut buf, self.color, self.surface);
                 line.width()
             } else {
-                line.write_ansi(&mut buf, self.color);
+                line.write_ansi(&mut buf, self.color, self.surface);
                 line.width()
             };
             // A full row leaves the cursor waiting to wrap on the last
@@ -186,7 +195,7 @@ impl<W: Write> Screen<W> {
             self.rewind(&mut buf);
         }
         for line in committed {
-            line.write_ansi(&mut buf, self.color);
+            line.write_ansi(&mut buf, self.color, None);
             buf.push_str("\r\n");
         }
         let skip = live.len().saturating_sub(rows.max(1));
@@ -199,7 +208,7 @@ impl<W: Write> Screen<W> {
             if i > 0 {
                 buf.push_str("\r\n");
             }
-            line.write_ansi(&mut buf, self.color);
+            line.write_ansi(&mut buf, self.color, None);
         }
         let last = live.len().saturating_sub(1);
         let target = cursor.and_then(|(r, c)| {

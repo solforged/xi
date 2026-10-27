@@ -1241,15 +1241,16 @@ impl Transcript {
                 self.children.clear();
                 self.gap(&mut out);
                 let text = blocks_text(xi_protocol::skill::typed(content));
-                let rows = wrap(&text, m.prose);
-                let lines = rows.iter().enumerate().map(|(i, row)| {
-                    let lead = if i == 0 {
-                        Line::default().brass("ξ ")
-                    } else {
-                        Line::default().ink("  ")
-                    };
-                    lead.ink(row).truncate(cols)
-                });
+                // A brass bar down the prompt's left, a blank row above and
+                // below it, all on the raised surface where the deck has one.
+                let rows = wrap(&text, m.prose.min(cols.saturating_sub(3)).max(1));
+                let bar = || Line::default().brass("┃").raise();
+                let lines = std::iter::once(bar())
+                    .chain(
+                        rows.iter()
+                            .map(|row| bar().ink("  ").ink(row).raise().truncate(cols)),
+                    )
+                    .chain(std::iter::once(bar()));
                 self.push(&mut out, lines.collect::<Vec<_>>());
                 self.blank = false;
                 self.gap(&mut out);
@@ -2963,7 +2964,10 @@ mod tests {
         for own in [first, steering] {
             let lines =
                 plain(&t.apply_live(&ev(EventKind::UserMessage { content: own }, 0), m(80)));
-            assert!(lines.iter().any(|line| line.starts_with("ξ ")), "{lines:?}");
+            assert!(
+                lines.iter().any(|line| line.starts_with("┃  ")),
+                "{lines:?}"
+            );
             assert!(lines.iter().all(|line| !line.contains("another client")));
         }
         assert!(t.sent.is_empty());
@@ -2986,7 +2990,7 @@ mod tests {
         assert!(text[header + 1..].iter().all(|line| line.starts_with("  ")));
         assert!(lines.iter().all(|line| line.width() <= 36));
         let replay = plain(&Transcript::default().apply(&peer, m(36)));
-        assert!(replay.iter().any(|line| line.starts_with("ξ peer note")));
+        assert!(replay.iter().any(|line| line.starts_with("┃  peer note")));
         let fresh = plain(&Transcript::default().apply_live(&peer, m(36)));
         assert!(
             fresh
@@ -3138,7 +3142,9 @@ mod tests {
             ),
             m(250),
         );
-        assert!(user.iter().all(|line| line.width() <= 90));
+        // The bar and two cells, then 88 cells of prose.
+        assert!(user.iter().all(|line| line.width() <= 91));
+        assert!(user.iter().any(|line| line.width() > 85));
         let answer = t.apply(
             &ev(assistant(vec![Block::Text { text: text.clone() }]), 1),
             m(250),

@@ -24,6 +24,9 @@ unicode-width.workspace = true
 xi-client.workspace = true
 xi-protocol.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["poll"] }
+
 [dev-dependencies]
 xi-daemon.workspace = true
 xi-kernel.workspace = true

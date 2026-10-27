@@ -275,7 +275,7 @@ mod tests {
             36,
         );
         let mut plain = String::new();
-        fitted.line.write_ansi(&mut plain, false);
+        fitted.line.write_ansi(&mut plain, false, None);
         assert_eq!(plain, fitted.line.plain());
         assert!(plain.contains("◆ tainted · ? 1 waiting"));
         assert_eq!(fitted.line.width(), 36);

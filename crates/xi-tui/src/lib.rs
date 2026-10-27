@@ -36,6 +36,7 @@ pub mod sessions;
 pub mod settings;
 pub mod status;
 pub mod style;
+mod surface;
 pub mod transcript;
 pub mod tree;
 mod view;
@@ -166,6 +167,9 @@ struct App {
     layout: Layout,
     /// Which glyphs the deck draws.
     icons: icons::Icons,
+    /// Whether the deck's raised surfaces draw, which the terminal decides
+    /// by reporting its background.
+    surfaces: bool,
     /// The deck while the client owns the alternate screen.
     deck: Option<Deck>,
     /// Terminal controls written before the next frame.
@@ -222,6 +226,10 @@ pub async fn run(launch: Launch) -> Result<(), Error> {
     let _title_stack = TitleStack::push()?;
     let mut raw = Some(Raw::enter()?);
     let mut screen = Screen::new(std::io::stdout(), color, usize::from(cols));
+    // Before the key reader starts, which would take the terminal's answer.
+    let surface = if color { surface::query() } else { None };
+    screen.set_surface(surface);
+    app.surfaces = surface.is_some();
     let mut settle = Settle::new(cols);
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(125));
@@ -434,6 +442,7 @@ impl App {
             keymap: config.keymap,
             layout: config.layout,
             icons: config.icons,
+            surfaces: false,
             deck: config.layout.deck_at(cols, rows).then(Deck::default),
             controls: Vec::new(),
             title: None,

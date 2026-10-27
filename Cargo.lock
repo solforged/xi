@@ -3412,6 +3412,7 @@ dependencies = [
  "futures",
  "ignore",
  "image",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",

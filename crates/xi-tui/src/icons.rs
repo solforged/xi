@@ -33,30 +33,10 @@ pub enum Icon {
     Agents,
     /// Asks waiting on you.
     Waiting,
-    /// When the session started.
-    Clock,
-    /// The session's head event.
-    Head,
-    /// The session's event count.
-    Events,
-    /// Changed files.
-    Changes,
-    /// Other sessions.
-    Sessions,
     /// Context occupancy.
     Context,
     /// The cache hit rate.
     Cache,
-    /// The approval mode.
-    Approvals,
-    /// The sandbox is on.
-    Sandbox,
-    /// The sandbox is off.
-    SandboxOff,
-    /// The workspace is trusted.
-    Trusted,
-    /// The workspace is untrusted.
-    Untrusted,
     /// An unanswered approval.
     Ask,
     /// The attached session.
@@ -139,18 +119,8 @@ fn table(icon: Icon) -> (&'static str, &'static str, &'static str) {
         Icon::Reasoning => ("\u{f400}", "think ", ""), // light_bulb
         Icon::Agents => ("\u{f4fd}", "agents ", " running"), // people
         Icon::Waiting => ("\u{f49a}", "? ", " waiting"), // bell
-        Icon::Clock => ("\u{f43a}", "", ""),     // clock
-        Icon::Head => ("\u{f417}", "head #", ""), // git_commit
-        Icon::Events => ("\u{f4ed}", "", ""),    // log
-        Icon::Changes => ("\u{f440}", "", ""),   // diff
-        Icon::Sessions => ("\u{f442}", "", ""),  // comment_discussion
         Icon::Context => ("\u{f463}", "ctx ", ""), // meter
         Icon::Cache => ("\u{f49b}", "cache ", ""), // cache
-        Icon::Approvals => ("\u{f45e}", "approvals ", ""), // checklist
-        Icon::Sandbox => ("\u{f49c}", "◇ ", ""), // shield
-        Icon::SandboxOff => ("\u{f513}", "", ""), // shield_x
-        Icon::Trusted => ("\u{f4a1}", "", ""),   // verified
-        Icon::Untrusted => ("\u{f4a3}", "", ""), // unverified
         Icon::Ask => ("\u{f420}", "? ", ""),     // question
         Icon::Current => ("\u{f444}", "● ", ""), // dot_fill
         Icon::Running => ("\u{f46a}", "┤ ", ""), // sync
