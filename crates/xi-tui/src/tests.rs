@@ -639,6 +639,9 @@ async fn shift_tab_cycles_the_models_levels_and_updates_the_footer() {
         let params = request(&mut requests, "session/set_reasoning");
         assert_eq!(params["session"], json!(app.session_id()));
         assert_eq!(params["reasoning"], expected.name());
+        let params = request(&mut requests, "config/set");
+        assert_eq!(params["key"], "reasoning");
+        assert_eq!(params["value"], expected.name());
         assert_eq!(app.launch.attached.info.reasoning, expected);
         assert!(
             app.footer(160)
@@ -671,9 +674,31 @@ async fn reasoning_command_accepts_xhigh_without_a_transcript_note() {
         request(&mut requests, "session/set_reasoning")["reasoning"],
         "xhigh"
     );
+    assert_eq!(request(&mut requests, "config/set")["value"], "xhigh");
     assert_eq!(app.launch.attached.info.reasoning, Reasoning::XHigh);
     assert!(app.footer(160).plain().contains("think xhigh"));
     assert!(app.commit.is_empty());
+}
+
+#[tokio::test]
+async fn reasoning_change_notes_a_failed_default_save() {
+    let (launch, mut requests) = launch_with(
+        snapshot(false),
+        FakeData {
+            reject_setting: true,
+            ..FakeData::default()
+        },
+    )
+    .await;
+    let mut app = App::new(launch, 160, 24);
+    app.commit.clear();
+    app.command("/reasoning high").await.unwrap();
+    request(&mut requests, "config/set");
+    assert_eq!(app.launch.attached.info.reasoning, Reasoning::High);
+    assert!(app.commit.iter().any(|line| {
+        line.plain()
+            .contains("reasoning default not saved: setting rejected")
+    }));
 }
 
 #[tokio::test]
@@ -2259,6 +2284,8 @@ async fn settings_saves_session_model_and_reasoning_and_returns_from_picker() {
         request(&mut requests, "session/set_reasoning")["reasoning"],
         "high"
     );
+    assert_eq!(request(&mut requests, "config/set")["value"], "high");
+    assert!(live_text(&app).contains("new sessions use this reasoning level"));
     app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
         .await
         .unwrap();

@@ -5,7 +5,7 @@ use xi_protocol::SessionId;
 use xi_protocol::event::ModelRef;
 use xi_protocol::methods::client::{
     AttachResult, EventParams, ListParams, ModelEntry, OpenParams, PendingApproval, SessionSummary,
-    SetSettingParams, SettingsParams,
+    SetSettingParams, SettingsParams, SettingsReport,
 };
 use xi_protocol::model::Reasoning;
 use xi_protocol::rpc::RpcError;
@@ -126,27 +126,14 @@ impl App {
                     None => self.settings_note("not saved: no config path"),
                 }
             }
-            settings::Action::Set { key, value } => {
-                let params = self.settings_params();
-                match self
-                    .launch
-                    .client
-                    .set_setting(SetSettingParams {
-                        cwd: params.cwd,
-                        configs: params.configs,
-                        key: key.into(),
-                        value,
-                    })
-                    .await
-                {
-                    Ok(report) => {
-                        if let Some(settings) = self.overlays.get_mut::<Settings>() {
-                            settings.saved(report);
-                        }
+            settings::Action::Set { key, value } => match self.save_setting(key, value).await {
+                Ok(report) => {
+                    if let Some(settings) = self.overlays.get_mut::<Settings>() {
+                        settings.saved(report);
                     }
-                    Err(error) => self.settings_note(error.to_string()),
                 }
-            }
+                Err(error) => self.settings_note(error.to_string()),
+            },
             settings::Action::EditFile => {
                 if let Some(settings) = self.overlays.get::<Settings>() {
                     self.external_requested = Some(ExternalRequest::Settings(
@@ -386,6 +373,24 @@ impl App {
         }
     }
 
+    /// Writes a global setting through the daemon.
+    async fn save_setting(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<SettingsReport, ClientError> {
+        let params = self.settings_params();
+        self.launch
+            .client
+            .set_setting(SetSettingParams {
+                cwd: params.cwd,
+                configs: params.configs,
+                key: key.into(),
+                value,
+            })
+            .await
+    }
+
     pub(crate) async fn refresh_settings(&mut self) {
         match self.launch.client.settings(self.settings_params()).await {
             Ok(report) => {
@@ -463,7 +468,27 @@ impl App {
             .await
         {
             Ok(()) => self.launch.attached.info.reasoning = reasoning,
-            Err(error) => self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]),
+            Err(error) => {
+                self.note(vec![Line::default().sanguine("✕ ").ink(error.to_string())]);
+                return;
+            }
+        }
+        // The chosen level also becomes the global default for new sessions.
+        match self
+            .save_setting("reasoning", reasoning.name().into())
+            .await
+        {
+            Ok(report) => {
+                if let Some(settings) = self.overlays.get_mut::<Settings>() {
+                    settings.replace(report);
+                    settings.note("saved · new sessions use this reasoning level");
+                }
+            }
+            Err(error) => self.note(vec![
+                Line::default()
+                    .sanguine("✕ ")
+                    .ink(format!("reasoning default not saved: {error}")),
+            ]),
         }
     }
 
