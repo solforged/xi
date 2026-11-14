@@ -1,2 +1,6 @@
 /target
 /.claude/
+/.devenv*
+/.direnv/
+/devenv.local.nix
+/devenv.local.yaml
