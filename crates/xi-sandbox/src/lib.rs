@@ -94,6 +94,9 @@ const SYSTEM_READABLE: &[&str] = &[
     "/Library/Developer/CommandLineTools",
     "/Library/Developer/PrivateFrameworks",
     "/Applications/Xcode.app",
+    // Nix tools on PATH load their libraries from other store paths, as on
+    // Linux. The store is world-readable and holds no user secrets.
+    "/nix/store",
     "/private/etc",
     "/etc",
     "/private/var/db/timezone",
